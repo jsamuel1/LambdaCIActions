@@ -1,0 +1,130 @@
+# Spec 02 — microVM Runners
+
+Status: **Draft** · Plane: Compute
+
+How LambdaCIActions builds runner images, provisions ephemeral microVMs, boots the GitHub
+Actions runner agent, and reaps them. This is the compute engine.
+
+## Contents
+- [What is a Lambda microVM here](#what-is-a-lambda-microvm-here)
+- [Runner flavors](#runner-flavors)
+- [Image build & snapshot pipeline](#image-build--snapshot-pipeline)
+- [Runner bootstrap](#runner-bootstrap)
+- [Provisioning lifecycle](#provisioning-lifecycle)
+- [Reaping & timeouts](#reaping--timeouts)
+- [Caching & pre-warming](#caching--pre-warming)
+- [Constraints](#constraints)
+
+---
+
+## What is a Lambda microVM here
+
+An ephemeral, snapshot-booted VM (Graviton/arm64) that hosts a **single** GitHub Actions
+job then self-terminates. Compared to CodeBuild: faster start (snapshot boot), a real full
+OS, VPC-attachable, and per-second billed. Compared to shared Lambda: full VM isolation.
+
+Key numbers (from reference + AWS docs, to validate in [ROADMAP](../ROADMAP.md) M1):
+
+- Boot from snapshot: seconds.
+- Max lifetime: up to 8h (we cap lower by default).
+- Size: e.g. 2 vCPU / 4 GB ≈ \$0.0044/min, per-second billing.
+- Arch: **arm64 only**.
+
+## Runner flavors
+
+A **flavor** = a named runner image + resource shape + label. Selected per job from
+`runs-on` labels (see [03](03-workflow-ingestion.md)).
+
+| Flavor | Label | Base | vCPU/Mem | Contents |
+|---|---|---|---|---|
+| `base` | `lambda-ci` | Ubuntu arm64 + runner agent | 2 / 4 GB | git, curl, common toolchain |
+| `docker` | `lambda-ci-docker` | base + dockerd (DinD) | 4 / 8 GB | Docker daemon, buildx |
+| `node` | `lambda-ci-node` | base + Node LTS + pnpm | 2 / 4 GB | Node, package managers |
+| `custom-*` | per-repo | per-repo Dockerfile | configurable | repo-specified |
+
+Flavors are defined once globally; a repo may **override** the mapping (e.g. `ubuntu-latest`
+→ `node`) or register a `custom-*` image. Mapping stored in DynamoDB `FlavorMap`.
+
+## Image build & snapshot pipeline
+
+Mirrors the reference's staged approach, generalized to a flavor catalog.
+
+```
+microvm/
+  Dockerfile.base        # base flavor
+  Dockerfile.docker      # DinD flavor
+  Dockerfile.node        # node flavor
+  bootstrap/             # runner bootstrap scripts (shared)
+  flavors.json           # flavor catalog: name, dockerfile, size, arch, label
+scripts/build-images.ts  # build + snapshot + publish ARNs
+```
+
+Build steps (per flavor):
+
+1. Stage the flavor's `Dockerfile.<flavor>` as the build `Dockerfile`; zip `microvm/`.
+2. Upload to the microVM **code bucket**.
+3. Trigger microVM image build → snapshot.
+4. Poll to completion; prune old image versions (keep last N).
+5. Write the resulting **image ARN** to config (SSM/DynamoDB): `MICROVM_IMAGE_ARN_<FLAVOR>`.
+
+Because image ARNs must exist before the orchestrator can launch runners, deploy is
+**phased** (see [05-infrastructure](05-infrastructure.md)): infra → build images → deploy orchestrator.
+
+## Runner bootstrap
+
+Baked into the image; runs at microVM boot:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+# JIT config + metadata arrive as boot data (env/user-data) from Provision λ
+: "${JIT_CONFIG:?}"; : "${RUN_ID:?}"; : "${JOB_ID:?}"
+cd /opt/actions-runner
+# emit "running" heartbeat to the mgmt store (via signed callback or CW metric)
+./run.sh --jitconfig "${JIT_CONFIG}"   # runs exactly one job, then exits
+# self-terminate: agent exit → microVM shutdown; Reaper backstops orphans
+shutdown -h now
+```
+
+- JIT config is **single-use** (see [01](01-github-app.md)); nothing long-lived on disk.
+- Bootstrap emits lifecycle heartbeats (`booted`, `running`, `job_done`) so the UI shows
+  live status without polling GitHub.
+- DinD flavor also starts `dockerd` before `run.sh`.
+
+## Provisioning lifecycle
+
+Owned by **Provision λ** (SQS consumer):
+
+```
+receive msg {installation_id, repo_id, run_id, job_id, labels}
+  ├─ dedupe on (repo_id, run_id, job_id)            # idempotency
+  ├─ resolve flavor  → image ARN                     # FlavorMap + flavors.json
+  ├─ mint installation token → JIT config            # GitHub App (01)
+  ├─ launch microVM(image ARN, size, boot data)      # tag: lca:run=<run_id>
+  ├─ write Run: status=provisioning → running
+  └─ on launch error → throw → SQS retry → DLQ; Run=failed(reason)
+```
+
+State machine: `queued → provisioning → running → completed | failed | timed_out`.
+Transitions written to DynamoDB `Run` rows for the UI.
+
+## Reaping & timeouts
+
+- **Per-runner cap**: `MAX_RUNNER_LIFETIME` (default well under 8h) enforced by the runner itself and by the Reaper.
+- **Reaper λ** (EventBridge schedule): lists microVMs tagged `lca:run=*`; terminates any past cap; closes `Run` rows with no live microVM (`timed_out`/`orphaned`).
+- **Stuck-queue signal**: `Run` in `provisioning` beyond threshold ⇒ UI health warning (likely a quota wall — see [05](05-infrastructure.md)).
+
+## Caching & pre-warming
+
+The biggest reference win was baking dependencies into the snapshot:
+
+- Pre-install language toolchains, common CLIs, and **Docker layers** into the flavor image → saves minutes/build.
+- Optional job-level cache: mount an EFS/S3-backed cache dir for package managers (Phase 3).
+- Warm pool intentionally out of scope for v1 (single-use only); revisit if boot latency proves painful.
+
+## Constraints
+
+- **arm64 only** — native x86 deps need arm64 builds or (slow) emulation. Flag at ingestion.
+- **No runner reuse** — clean isolation, but every job pays boot; mitigated by snapshots.
+- **Quota-bound concurrency** — request microVM quota increases early.
+- **Snapshot storage** — small fixed monthly cost per flavor image; prune old versions.
