@@ -1,0 +1,14 @@
+{
+  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md. M1 ships only `base`.",
+  "flavors": [
+    {
+      "name": "base",
+      "label": "lambda-ci",
+      "dockerfile": "Dockerfile.base",
+      "arch": "arm64",
+      "vcpu": 2,
+      "memoryMb": 4096,
+      "description": "Ubuntu arm64 + GitHub Actions runner agent + git/curl/common toolchain."
+    }
+  ]
+}

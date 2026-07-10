@@ -1,0 +1,90 @@
+# M1 deploy runbook — one microVM runs one job
+
+The phased deploy for ROADMAP **M1** (ADR-011). Bootstraps the control + compute plane for
+a single test repo. `<env>` is `dev` unless noted; region `us-west-2` or `us-east-1`
+(default quota → ~256 concurrent @4 GB, no increase needed).
+
+Prereqs: Node ≥ 18, AWS CLI configured for the target account, a GitHub account/org you can
+install an App on.
+
+```sh
+npm install
+npm run build          # tsc → dist/
+npm test               # builds + runs unit tests
+```
+
+## Phase 0 — secrets (out-of-band, ADR-008)
+
+The webhook secret + App PEM are SecureStrings that CloudFormation can't create. The
+GitHub App bootstrap script (phase 3) writes them. Nothing to do here yet — just know CDK
+only *references* `/lca/<env>/github/*`.
+
+Also seed the claimed-labels config the Ingest λ reads:
+
+```sh
+aws ssm put-parameter --name /lca/dev/config/runner-labels \
+  --type String --value 'lambda-ci' --overwrite --region us-west-2
+```
+
+## Phase 1 — infra (image build bucket + role)
+
+```sh
+npx cdk deploy LCA-Image-dev -c env=dev -c region=us-west-2
+```
+
+Publishes `/lca/dev/config/image-code-bucket` to SSM. No orchestrator yet (image ARNs
+don't exist).
+
+## Phase 2 — build the microVM image
+
+Stages `microvm/Dockerfile.base`, zips the context, uploads it, runs `create-microvm-image`,
+polls to `CREATED`, and publishes the image ARN to `/lca/dev/config/image-arn-base`.
+
+```sh
+npm run build:images -- --env dev --region us-west-2
+# preview only:
+npm run build:images -- --env dev --region us-west-2 --dry-run
+```
+
+**arm64 only** (AGENTS.md / ADR-007) — the base image + runner tarball are Graviton.
+
+## Phase 3 — orchestrator + GitHub App
+
+Deploy the control plane, then register the App against the now-live webhook URL.
+
+```sh
+npx cdk deploy LCA-Control-dev -c env=dev -c region=us-west-2
+# note the WebhookUrl output, e.g. https://<id>.execute-api.us-west-2.amazonaws.com/webhook
+```
+
+Register the App (one interactive browser click — the manifest flow can't be headless;
+see scripts/README.md). This writes `app-id` / `app-pem` / `webhook-secret` to SSM:
+
+```sh
+node scripts/create-github-app.mjs \
+  --console-url https://example.com \
+  --webhook-url https://<id>.execute-api.us-west-2.amazonaws.com/webhook \
+  --env dev --region us-west-2
+```
+
+Install the App on the test repo (the script prints the exact URL).
+
+## Verify (M1 exit criterion)
+
+1. In the test repo, add a workflow job with `runs-on: lambda-ci`.
+2. Push / trigger it → GitHub sends `workflow_job=queued` → Ingest λ (HMAC ✓, label ✓) →
+   SQS → Provision λ mints a JIT config and `run-microvm`s the base image.
+3. The microVM's `/run` hook launches the runner; the job runs and reports success in
+   GitHub; the VM self-terminates.
+
+Capture boot latency, job duration, and per-job cost (2nd M1 exit criterion) from the
+Provision λ logs + CloudWatch runner log stream.
+
+## Teardown (dev)
+
+```sh
+npx cdk destroy LCA-Control-dev LCA-Image-dev -c env=dev -c region=us-west-2
+# then delete built images + SSM params if fully resetting:
+#   aws lambda delete-microvm-image --image-identifier <arn>
+#   aws ssm delete-parameters --names /lca/dev/config/image-arn-base ...
+```

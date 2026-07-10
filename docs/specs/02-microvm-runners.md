@@ -23,6 +23,15 @@ An ephemeral, snapshot-booted VM (Graviton/arm64) that hosts a **single** GitHub
 job then self-terminates. Compared to CodeBuild: faster start (snapshot boot), a real full
 OS, VPC-attachable, and per-second billed. Compared to shared Lambda: full VM isolation.
 
+> **API surface** (confirmed; see [ADR-012](../DECISIONS.md)): images are built with
+> `create-microvm-image` (Dockerfile → `CREATED` image ARN); a microVM is launched with
+> `run-microvm --image-identifier <ARN>` and an optional `--run-hook-payload` (≤16 KB).
+> The image implements HTTP **lifecycle hooks** (default `:8080`): `/run` (post-boot,
+> gates traffic until 200), `/terminate` (pre-teardown), `/suspend` `/resume` (idle;
+> unused for single-use). Teardown is `terminate-microvm`. Per-VM endpoints need a JWE
+> from `create-microvm-auth-token`. Quota = total memory of `RUNNING`/`SUSPENDED` VMs
+> per region.
+
 Key numbers (from reference + AWS docs, to validate in [ROADMAP](../ROADMAP.md) M1):
 
 - Boot from snapshot: seconds.
@@ -72,24 +81,28 @@ Because image ARNs must exist before the orchestrator can launch runners, deploy
 
 ## Runner bootstrap
 
-Baked into the image; runs at microVM boot:
+Baked into the image as a **run-hook HTTP server** (default `:8080`), not a plain boot
+script — this matches the real `run-microvm` contract (see [ADR-012](../DECISIONS.md)).
+Provision λ passes the JIT config + job metadata as the `--run-hook-payload` JSON; Lambda
+delivers it to `POST /run` after the snapshot boots.
 
-```sh
-#!/usr/bin/env bash
-set -euo pipefail
-# JIT config + metadata arrive as boot data (env/user-data) from Provision λ
-: "${JIT_CONFIG:?}"; : "${RUN_ID:?}"; : "${JOB_ID:?}"
-cd /opt/actions-runner
-# emit "running" heartbeat to the mgmt store (via signed callback or CW metric)
-./run.sh --jitconfig "${JIT_CONFIG}"   # runs exactly one job, then exits
-# self-terminate: agent exit → microVM shutdown; Reaper backstops orphans
-shutdown -h now
+```
+POST /run   { jitConfig, runId, jobId, repoFullName, labels }   (≤16 KB payload)
+  ├─ parse payload; validate required fields
+  ├─ (DinD flavor: start dockerd first)
+  ├─ cd /opt/actions-runner
+  ├─ ./run.sh --jitconfig <jitConfig>     # runs exactly ONE job, then exits
+  ├─ return 200 quickly so Lambda un-gates traffic; run the job in the background
+  └─ on agent exit → call `terminate-microvm` (self-terminate); Reaper backstops orphans
+
+POST /terminate   # fires pre-teardown; best-effort final status report
 ```
 
-- JIT config is **single-use** (see [01](01-github-app.md)); nothing long-lived on disk.
-- Bootstrap emits lifecycle heartbeats (`booted`, `running`, `job_done`) so the UI shows
-  live status without polling GitHub.
-- DinD flavor also starts `dockerd` before `run.sh`.
+- JIT config is **single-use** (see [01](01-github-app.md)); it arrives in the payload,
+  never in surviving env/user-data, and nothing long-lived lands on disk.
+- The hook emits lifecycle signals (`booted`, `running`, `job_done`) so the UI shows live
+  status without polling GitHub.
+- DinD flavor starts `dockerd` inside `/run` before invoking `run.sh`.
 
 ## Provisioning lifecycle
 
@@ -100,7 +113,8 @@ receive msg {installation_id, repo_id, run_id, job_id, labels}
   ├─ dedupe on (repo_id, run_id, job_id)            # idempotency
   ├─ resolve flavor  → image ARN                     # FlavorMap + flavors.json
   ├─ mint installation token → JIT config            # GitHub App (01)
-  ├─ launch microVM(image ARN, size, boot data)      # tag: lca:run=<run_id>
+  ├─ run-microvm(--image-identifier <ARN>,           # tag: lca:run=<run_id>
+  │              --run-hook-payload <JSON jit+meta>)  # ≤16 KB (ADR-012)
   ├─ write Run: status=provisioning → running
   └─ on launch error → throw → SQS retry → DLQ; Run=failed(reason)
 ```
