@@ -4,13 +4,36 @@
   "private": true,
   "type": "module",
   "description": "CI/CD platform on AWS Lambda microVMs — drop-in GitHub Actions runner replacement.",
+  "bin": {
+    "lca": "dist/bin/lca.js"
+  },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:fast": "node --test test/manifest.test.mjs",
+    "synth": "npm run build && cdk synth",
+    "cdk": "cdk",
+    "build:images": "node scripts/build-images.mjs",
     "app:create": "node scripts/create-github-app.mjs",
     "app:manifest": "node scripts/create-github-app.mjs --dry-run"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.140",
+    "@types/node": "^20.14.0",
+    "aws-cdk": "^2.150.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.600.0",
+    "@aws-sdk/client-sqs": "^3.600.0",
+    "@aws-sdk/client-ssm": "^3.600.0",
+    "aws-cdk-lib": "^2.150.0",
+    "constructs": "^10.3.0"
   },
   "license": "UNLICENSED"
 }

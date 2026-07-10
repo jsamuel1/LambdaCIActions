@@ -85,3 +85,34 @@ path-scoped `ssm:GetParameter`.
 **Decision**: Three-step deploy; image ARNs published to SSM by the build script.
 **Why**: Breaks the chicken-and-egg; matches reference.
 **Consequences**: Deploy is not a single `cdk deploy`; documented in [05](specs/05-infrastructure.md).
+
+## ADR-012 — microVM boot via `run-microvm` + `/run` lifecycle hook (not user-data + `run.sh`)
+**Status**: Accepted (v1) · supersedes the bootstrap sketch in early [spec 02](specs/02-microvm-runners.md)
+**Context**: Specs 01/02 were drafted before the AWS Lambda microVM API surface was
+confirmed. They assumed a self-hosted-runner-style boot: JIT config injected as
+`env`/user-data, image runs `./run.sh --jitconfig …` then `shutdown -h now`. The real
+Lambda microVM API works differently:
+- **Launch**: `run-microvm --image-identifier <ARN>` (only the image ARN is required).
+  Optional `--run-hook-payload` carries **≤16 KB** of per-launch data.
+- **Snapshot build**: `create-microvm-image` from a Dockerfile → a `CREATED` image ARN.
+- **Lifecycle hooks**: the image implements an HTTP server (default **:8080**) exposing
+  `/run` (fires after snapshot boot; traffic gated until it returns 200), `/terminate`
+  (pre-teardown), and `/suspend` `/resume` (idle — unused for single-use runners).
+- **Teardown**: `terminate-microvm` (we call it after the job; Reaper backstops orphans).
+- **Endpoint auth**: each microVM has a dedicated HTTPS endpoint; requests need a JWE from
+  `create-microvm-auth-token`, port-scoped + expiring.
+- **Capacity**: account-level quota = total memory across `RUNNING`/`SUSPENDED` microVMs
+  per region (vertically bumpable ~4x via Service Quotas).
+**Decision**: Provision λ passes the JIT config + job metadata as the **`run-hook-payload`
+JSON** (well under 16 KB). The baked-in image runs a small **run-hook HTTP server**: on
+`POST /run` it parses the payload, writes the JIT config, launches the runner agent
+(`./run.sh --jitconfig …`) for exactly one job, then returns 200; on job exit it calls
+`terminate-microvm` (self-terminate), with the Reaper as a backstop. No JIT token is ever
+placed in user-data/env that survives, and nothing long-lived lands on disk.
+**Why**: Matches the actual API contract; keeps the single-use + leak-safe properties of
+ADR-003/006; 16 KB is ample for a JIT config + labels + repo ref.
+**Consequences**: The image must ship a run-hook server (not just a bootstrap shell
+script). Provision λ needs `create-microvm-auth-token` only if it health-checks the
+endpoint (v1 skips this — fire-and-forget launch, rely on `workflow_job` status +
+Reaper). Payload cap (16 KB) bounds what we can inject at launch — larger config must be
+fetched by the runner post-boot.

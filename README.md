@@ -74,19 +74,21 @@ docs/
     03-workflow-ingestion.md  Parsing existing workflows → runner routing
     04-web-ui.md           Management console + management API
     05-infrastructure.md   CDK stacks, secrets, deploy phases
-bin/        (planned) CDK app entrypoint
-lib/        (planned) CDK stacks/constructs
-src/        (planned) Lambda function source
-microvm/    (planned) microVM image Dockerfiles + runner bootstrap
-web/        (planned) management UI (frontend + management API)
-scripts/    (planned) build/deploy helpers
-test/       (planned) tests
+bin/        CDK app entrypoint (lca.ts)
+lib/        CDK stacks (image-stack.ts, control-stack.ts)
+src/        Lambda source (ingest/, provision/, shared/)
+microvm/    microVM image Dockerfiles + run-hook lifecycle server
+scripts/    build/deploy helpers (create-github-app, build-images)
+test/       unit tests (node --test)
 ```
 
 ## Status
 
-**Design / spec phase.** This first round of specs is for review — no code yet.
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the delivery plan.
+**M1 in progress** — the spike (one microVM runs one job) is implemented: `ImageStack` +
+`ControlStack`, the Ingest → SQS → Provision hot path, and the `base` microVM image with
+its run-hook lifecycle server. See [docs/DEPLOY-M1.md](docs/DEPLOY-M1.md) to deploy and
+[docs/ROADMAP.md](docs/ROADMAP.md) for the full plan. Specs 01–05 + ADRs remain the design
+source of truth.
 
 ## License
 
