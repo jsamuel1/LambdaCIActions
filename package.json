@@ -5,7 +5,7 @@
   "type": "module",
   "description": "CI/CD platform on AWS Lambda microVMs — drop-in GitHub Actions runner replacement.",
   "scripts": {
-    "test": "node --test 'test/**/*.test.mjs'",
+    "test": "node --test test/*.test.mjs",
     "app:create": "node scripts/create-github-app.mjs",
     "app:manifest": "node scripts/create-github-app.mjs --dry-run"
   },

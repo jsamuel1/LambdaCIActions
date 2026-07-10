@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       # Repo is package.json-less until real code lands (M1). Guard every step so
       # CI is meaningful now (script smoke test) and auto-upgrades once code exists.
