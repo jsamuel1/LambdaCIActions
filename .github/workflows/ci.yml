@@ -1,0 +1,68 @@
+name: CI
+
+# Dogfooding note:
+# Today these jobs run on GitHub-hosted `ubuntu-latest`. Once the LambdaCIActions
+# platform is live (ROADMAP M1+), flip `runs-on` to our own microVM runners:
+#
+#   runs-on: [self-hosted, lambda-ci]           # base flavor
+#   runs-on: [self-hosted, lambda-ci-node]      # node flavor
+#
+# That is the single-line change spec 03 (label mode) is built around — this repo
+# should be the first consumer of its own CI. Until M1 lands we stay on
+# ubuntu-latest so CI is green from day one. See docs/specs/03-workflow-ingestion.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest      # TODO(M1): → [self-hosted, lambda-ci-node] to dogfood
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Repo is package.json-less until real code lands (M1). Guard every step so
+      # CI is meaningful now (script smoke test) and auto-upgrades once code exists.
+      - name: Install dependencies (if package.json present)
+        run: |
+          if [ -f package.json ]; then npm ci || npm install; else echo "no package.json yet — skipping"; fi
+
+      - name: Lint (if configured)
+        run: |
+          if [ -f package.json ] && npm run | grep -q '^  lint'; then npm run lint; else echo "no lint script — skipping"; fi
+
+      - name: Build (if configured)
+        run: |
+          if [ -f package.json ] && npm run | grep -q '^  build'; then npm run build; else echo "no build script — skipping"; fi
+
+      - name: Test (if configured)
+        run: |
+          if [ -f package.json ] && npm run | grep -q '^  test'; then npm test; else echo "no test script — skipping"; fi
+
+      # Always-on smoke test: the bootstrap script must parse + render its manifest.
+      - name: Smoke-test GitHub App manifest generator
+        run: node scripts/create-github-app.mjs --dry-run --env ci
+
+  docs-check:
+    runs-on: ubuntu-latest      # TODO(M1): → [self-hosted, lambda-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure design docs exist
+        run: |
+          set -e
+          for f in README.md AGENTS.md docs/ARCHITECTURE.md docs/DECISIONS.md docs/ROADMAP.md \
+                   docs/specs/01-github-app.md docs/specs/02-microvm-runners.md \
+                   docs/specs/03-workflow-ingestion.md docs/specs/04-web-ui.md \
+                   docs/specs/05-infrastructure.md; do
+            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
+          done
+          echo "all design docs present"
