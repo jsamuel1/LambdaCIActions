@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+.pnp.*
+
+# build / cdk
+dist/
+cdk.out/
+*.tsbuildinfo
+
+# env & secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# logs / os
+*.log
+.DS_Store
+
+# ide
+.idea/
+.vscode/
