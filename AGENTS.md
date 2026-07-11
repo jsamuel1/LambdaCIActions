@@ -5,7 +5,29 @@ Guidance for AI coding agents working in this repo.
 ## What this is
 A CI/CD platform running GitHub Actions jobs on **AWS Lambda microVMs** — a drop-in
 replacement for GitHub-hosted/self-hosted runners. GitHub App for onboarding, workflow
-ingestion for routing, web UI for management. **Currently spec/design phase — no code yet.**
+ingestion for routing, web UI for management. Built milestone-by-milestone (M1..M5, see
+`docs/ROADMAP.md`) via the Kermes full_auto kanban pipeline.
+
+## Full-auto task lifecycle (READ THIS if you are a kanban worker)
+This repo runs under Kermes **full_auto**. When you are spawned on an `in_progress`
+milestone card, you own the card through to review handoff. The spawn primer gives you
+ONLY the task title + description — the handoff contract lives here:
+
+1. Implement the milestone scope in your worktree. Match the spec + add/adjust ADRs.
+2. Run the gate before handoff: `npm ci && npm run build` && `npm test` && `npx cdk synth`.
+   Do not hand off red.
+3. **Commit** your work on the task branch (`kermes/task-<slug>`). Never leave verified
+   work uncommitted — an empty branch strands the milestone.
+4. Leave a `task_comment` summarizing what shipped + what was tested + the commit hash.
+5. **When done and green, call `task_request_review` on your own card.** This is the ONLY
+   thing that advances the card into the review→merge pipeline — if you just stop, the
+   card freezes in `in_progress` and the milestone chain stalls. Do NOT `task_close`
+   (that terminates the lifecycle and skips review+merge).
+6. If you genuinely cannot finish (blocked, ambiguous spec, unrecoverable failure),
+   `task_comment` the reason and `task_fail` the card — do not exit silently.
+
+Do NOT push to `main` directly. Landing happens in the merge stage via a PR (`gh pr
+merge`); base branch is always `main`.
 
 ## Read first
 - `README.md` — vision + repo map.
