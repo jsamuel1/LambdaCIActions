@@ -150,3 +150,68 @@ export interface RepoRecord {
   createdAt: string;
   updatedAt: string;
 }
+
+/**
+ * Capability/compat signals heuristically extracted from a job's steps (spec 03 §
+ * Parsing model → `step_signals`). Feeds `runs-on` → flavor routing (signal-based
+ * upgrade) and compatibility analysis. All best-effort; never authoritative.
+ */
+export interface StepSignals {
+  /**
+   * True if the job needs a Docker-capable flavor: has `container:`, any `services:`,
+   * a step `uses:` matching `docker/*`, or a `run:` line invoking `docker`/`docker-compose`.
+   */
+  needs_docker: boolean;
+  /** Explicit arch tokens seen (`arm64`/`aarch64`/`amd64`/`x86_64`) across runs-on, container, run text. */
+  arch_hints: string[];
+  /** De-duped list of every step `uses:` value, in first-seen order. */
+  known_actions: string[];
+}
+
+/**
+ * A single normalized job from a parsed workflow (spec 03 § Parsing model).
+ * Raw model only — `route`/`compat` are added by later M3 routing/compat wiring, not here.
+ */
+export interface ParsedJob {
+  id: string;
+  /**
+   * `runs-on` normalized to a string[]. Unresolvable matrix expressions (`${{ matrix.os }}`)
+   * are preserved verbatim as the raw expression string.
+   */
+  runs_on: string[];
+  /** `job.container.image` (accepts string or `{ image }` object form); null if absent. */
+  container: string | null;
+  /** Keys of `job.services`; empty if none. */
+  services: string[];
+  /** Reusable-workflow ref (`job.uses`); null if not a reusable-workflow call. */
+  uses: string | null;
+  /**
+   * Statically-resolvable `strategy.matrix` dimensions, string-coerced. Excludes the
+   * `include`/`exclude` keys. Empty object if no static matrix.
+   */
+  matrix_dims: Record<string, string[]>;
+  step_signals: StepSignals;
+}
+
+/**
+ * A parsed GitHub Actions workflow file, normalized for routing + compat (spec 03 §
+ * Parsing model). Produced by `parseWorkflow`. `route`/`compat` fields are intentionally
+ * NOT present yet — routing + compat wiring is a later M3 slice.
+ */
+export interface ParsedWorkflow {
+  path: string;
+  name: string;
+  /** `on:` normalized to trigger-name string[] (accepts string, array, or map forms). */
+  on: string[];
+  jobs: ParsedJob[];
+}
+
+/** Thrown by `parseWorkflow` when the YAML is malformed / not a mapping. Catchable by callers. */
+export class WorkflowParseError extends Error {
+  readonly path: string;
+  constructor(path: string, message: string, options?: { cause?: unknown }) {
+    super(`${path}: ${message}`, options);
+    this.name = 'WorkflowParseError';
+    this.path = path;
+  }
+}
