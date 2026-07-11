@@ -176,7 +176,8 @@ export interface ParsedJob {
   id: string;
   /**
    * `runs-on` normalized to a string[]. Unresolvable matrix expressions (`${{ matrix.os }}`)
-   * are preserved verbatim as the raw expression string.
+   * are preserved verbatim as the raw expression string. The runner-group object form
+   * `{ group, labels }` contributes its `labels` (where LCA routing labels live).
    */
   runs_on: string[];
   /** `job.container.image` (accepts string or `{ image }` object form); null if absent. */

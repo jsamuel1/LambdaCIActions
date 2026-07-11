@@ -23,6 +23,26 @@ test('array runs-on is preserved as an array', () => {
   assert.deepEqual(wf.jobs[0].runs_on, ['self-hosted', 'lambda-ci-docker']);
 });
 
+// 2b. runner-group object form: labels extracted (LCA routing label lives under `labels`).
+test('runs-on runner-group object form extracts labels (array)', () => {
+  const wf = parseWorkflow(
+    PATH,
+    'jobs:\n  build:\n    runs-on:\n      group: my-group\n      labels: [self-hosted, lambda-ci-docker]\n',
+  );
+  assert.deepEqual(wf.jobs[0].runs_on, ['self-hosted', 'lambda-ci-docker']);
+});
+test('runs-on runner-group object form extracts labels (scalar)', () => {
+  const wf = parseWorkflow(
+    PATH,
+    'jobs:\n  build:\n    runs-on:\n      group: my-group\n      labels: lambda-ci-node\n',
+  );
+  assert.deepEqual(wf.jobs[0].runs_on, ['lambda-ci-node']);
+});
+test('runs-on runner-group object form with no labels yields []', () => {
+  const wf = parseWorkflow(PATH, 'jobs:\n  build:\n    runs-on:\n      group: my-group\n');
+  assert.deepEqual(wf.jobs[0].runs_on, []);
+});
+
 // 3. on: string / array / map all normalize to string[].
 test('on: string form normalizes to string[]', () => {
   const wf = parseWorkflow(PATH, 'on: push\njobs: {}\n');

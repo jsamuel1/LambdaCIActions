@@ -41,12 +41,8 @@ function scalarToString(v: unknown): string | null {
   return null;
 }
 
-/**
- * Normalize a `runs-on` value (string | array | expression) to a string[].
- * Unresolvable matrix expressions (`${{ matrix.os }}`) are preserved verbatim.
- */
-function normalizeRunsOn(v: unknown): string[] {
-  if (v == null) return [];
+/** Flatten a scalar or array of scalars to a string[] (nulls dropped). */
+function scalarsToArray(v: unknown): string[] {
   const s = scalarToString(v);
   if (s !== null) return [s];
   if (Array.isArray(v)) {
@@ -57,6 +53,25 @@ function normalizeRunsOn(v: unknown): string[] {
     }
     return out;
   }
+  return [];
+}
+
+/**
+ * Normalize a `runs-on` value to a string[].
+ *
+ * Handles all valid GitHub Actions shapes:
+ *  - string (`ubuntu-latest`) and matrix expressions (`${{ matrix.os }}`) — preserved verbatim.
+ *  - array (`[self-hosted, lambda-ci-docker]`).
+ *  - runner-group object form `{ group: X, labels: [...] }` — the LCA routing labels live under
+ *    `labels`, so they MUST be extracted (dropping them silently breaks label-based routing).
+ *    `labels` accepts a scalar or an array; `group` is not a routing label and is ignored here.
+ */
+function normalizeRunsOn(v: unknown): string[] {
+  if (v == null) return [];
+  const s = scalarToString(v);
+  if (s !== null) return [s];
+  if (Array.isArray(v)) return scalarsToArray(v);
+  if (isRecord(v)) return scalarsToArray(v.labels);
   return [];
 }
 
