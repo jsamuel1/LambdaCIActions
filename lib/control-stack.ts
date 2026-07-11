@@ -8,6 +8,12 @@ import * as apigw from 'aws-cdk-lib/aws-apigatewayv2';
 import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as ddb from 'aws-cdk-lib/aws-dynamodb';
 import { RemovalPolicy } from 'aws-cdk-lib';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +27,7 @@ export interface ControlStackProps extends StackProps {
   envName: string;
   ssmPrefix: string; // /lca/<env>
   tagPrefix: string; // lca
+  table: ddb.ITable; // shared DynamoDB table (DataStack)
 }
 
 /**
@@ -40,7 +47,7 @@ export class ControlStack extends Stack {
   constructor(scope: Construct, id: string, props: ControlStackProps) {
     super(scope, id, props);
 
-    const { envName, ssmPrefix, tagPrefix } = props;
+    const { envName, ssmPrefix, tagPrefix, table } = props;
     const paramArn = (name: string) =>
       `arn:${this.partition}:ssm:${this.region}:${this.account}:parameter${name}`;
 
@@ -85,9 +92,12 @@ export class ControlStack extends Stack {
         WEBHOOK_SECRET_PARAM: `${ssmPrefix}/github/webhook-secret`,
         RUNNER_LABELS_PARAM: `${ssmPrefix}/config/runner-labels`,
         QUEUE_URL: queue.queueUrl,
+        TABLE_NAME: table.tableName,
       },
     });
     queue.grantSendMessages(ingest);
+    // Ingest writes run rows (queued + status transitions) and installation/repo config.
+    table.grantWriteData(ingest);
     ingest.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'ReadWebhookConfig',
@@ -122,11 +132,14 @@ export class ControlStack extends Stack {
         APP_PEM_PARAM: `${ssmPrefix}/github/app-pem`,
         IMAGE_ARN_PARAM_PREFIX: `${ssmPrefix}/config/image-arn-`,
         TAG_PREFIX: tagPrefix,
+        TABLE_NAME: table.tableName,
       },
     });
     provision.addEventSource(
       new SqsEventSource(queue, { batchSize: 5, reportBatchItemFailures: true }),
     );
+    // Provision transitions run rows (provisioning → running / failed).
+    table.grantWriteData(provision);
 
     // Provision reads App PEM + image ARNs (path-scoped).
     provision.addToRolePolicy(
@@ -163,6 +176,74 @@ export class ControlStack extends Stack {
       }),
     );
 
+    // ---- Reaper λ + EventBridge schedule (spec 02 reaping, M2) ----
+    const reaperLogGroup = new logs.LogGroup(this, 'ReaperLogGroup', {
+      logGroupName: `/aws/lambda/lca-${envName}-reaper`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const reaper = new NodejsFunction(this, 'ReaperFn', {
+      functionName: `lca-${envName}-reaper`,
+      runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(SRC, 'reaper', 'handler.ts'),
+      handler: 'handler',
+      timeout: Duration.seconds(120),
+      memorySize: 256,
+      reservedConcurrentExecutions: 1, // one sweep at a time
+      logGroup: reaperLogGroup,
+      bundling,
+      environment: {
+        TAG_PREFIX: tagPrefix,
+        TABLE_NAME: table.tableName,
+      },
+    });
+    // Reaper reads/updates run rows (incl. the status GSI) and lists/terminates tagged VMs.
+    table.grantReadWriteData(reaper);
+    reaper.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ListMicroVMs',
+        actions: ['lambda:ListMicroVMs'],
+        resources: ['*'],
+      }),
+    );
+    reaper.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'TerminateTaggedMicroVMs',
+        actions: ['lambda:TerminateMicroVM', 'lambda:GetMicroVM'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { [`aws:ResourceTag/${tagPrefix}:managed`]: 'true' },
+        },
+      }),
+    );
+    new events.Rule(this, 'ReaperSchedule', {
+      ruleName: `lca-${envName}-reaper-schedule`,
+      description: 'Periodic microVM lifetime-cap + orphan reconciliation sweep',
+      schedule: events.Schedule.rate(Duration.minutes(5)),
+      targets: [new targets.LambdaFunction(reaper)],
+    });
+
+    // ---- DLQ alarming (spec 05 observability) ----
+    // Any message landing in the DLQ means a job repeatedly failed to provision — page.
+    const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
+      topicName: `lca-${envName}-alarms`,
+      displayName: `LambdaCIActions ${envName} alarms`,
+    });
+    const dlqDepthAlarm = new cloudwatch.Alarm(this, 'DLQDepthAlarm', {
+      alarmName: `lca-${envName}-provision-dlq-depth`,
+      alarmDescription: 'Provisioning DLQ has messages — jobs failed to provision after retries',
+      metric: dlq.metricApproximateNumberOfMessagesVisible({
+        period: Duration.minutes(1),
+        statistic: 'Maximum',
+      }),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    dlqDepthAlarm.addAlarmAction(new cwactions.SnsAction(alarmTopic));
+
     // ---- API Gateway: POST /webhook ----
     const httpApi = new apigw.HttpApi(this, 'WebhookApi', {
       apiName: `lca-${envName}-webhook`,
@@ -180,5 +261,7 @@ export class ControlStack extends Stack {
     });
     new CfnOutput(this, 'ProvisionQueueUrl', { value: queue.queueUrl });
     new CfnOutput(this, 'ProvisionDLQUrl', { value: dlq.queueUrl });
+    new CfnOutput(this, 'ReaperFunctionName', { value: reaper.functionName });
+    new CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn });
   }
 }

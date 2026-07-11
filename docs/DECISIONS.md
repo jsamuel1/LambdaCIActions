@@ -116,3 +116,39 @@ script). Provision λ needs `create-microvm-auth-token` only if it health-checks
 endpoint (v1 skips this — fire-and-forget launch, rely on `workflow_job` status +
 Reaper). Payload cap (16 KB) bounds what we can inject at launch — larger config must be
 fetched by the runner post-boot.
+
+## ADR-013 — Forward-only run state machine, guarded by conditional writes (M2)
+**Status**: Accepted (v1)
+**Context**: Multiple independent producers write a run's status: Ingest (`queued`, plus
+`running`/terminal from `workflow_job` status webhooks), Provision (`provisioning` →
+`running`/`failed`), and the Reaper (`timed_out`/`failed`). GitHub redelivers webhooks and
+SQS is at-least-once, so events arrive duplicated and out of order (a late `running`
+webhook can land after `completed`).
+**Decision**: Model status as a strictly ordered rank
+(`queued`<`provisioning`<`running`<terminal) and make every transition a DynamoDB
+conditional update that applies only from a status from which the target is reachable.
+Same-status rewrites are idempotent no-ops; backward moves and terminal→anything are
+rejected at the database, not in application logic. The transition helper returns a
+boolean (applied vs guarded-out) so callers (esp. Provision) can skip duplicate work.
+**Why**: The database is the single serialization point across all producers — pushing the
+invariant into the conditional write means no producer can create a ghost or regress a run
+regardless of delivery order or concurrency, without distributed locking.
+**Consequences**: Provision's idempotency guard is the `queued→provisioning` transition
+(a duplicate SQS delivery whose run already advanced is skipped, so no double-launch). A
+genuinely lost transition (DB fault) is backstopped by the Reaper, not retried inline.
+
+## ADR-014 — GSI1 status/time index for run reconciliation (M2)
+**Status**: Accepted (v1)
+**Context**: The Reaper (and later the UI) must enumerate runs in a non-terminal status
+(`queued`/`provisioning`/`running`) every few minutes to reconcile ghosts. A table scan
+grows with retained history.
+**Decision**: A single GSI (`gsi1`), sparse over run rows: `gsi1pk=RUNSTATUS#<status>`,
+`gsi1sk=<updatedAt ISO>`. Terminal rows carry a DynamoDB TTL (90d) so history ages out.
+The GSI keys are re-stamped on every transition so a row always sits in exactly one status
+partition.
+**Why**: Reaping cost scales with *active* runs, not total history; the time sort key lets
+the UI page recent runs per status. Single sparse GSI keeps write amplification low and
+fits the ADR-009 single-table model.
+**Consequences**: Every transition writes both `status` and the two GSI keys. `queued`
+runs also appear in the index; the Reaper treats long-`queued` rows as a quota-wall signal
+(spec 05 stuck-queue).

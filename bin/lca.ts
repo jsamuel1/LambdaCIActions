@@ -12,6 +12,7 @@
 import { App } from 'aws-cdk-lib';
 import { ImageStack } from '../lib/image-stack.js';
 import { ControlStack } from '../lib/control-stack.js';
+import { DataStack } from '../lib/data-stack.js';
 
 const app = new App();
 
@@ -34,15 +35,26 @@ const imageStack = new ImageStack(app, `LCA-Image-${envName}`, {
   ssmPrefix,
 });
 
+// Phase 1: shared data plane (DynamoDB single-table, ADR-009). Deployed alongside infra —
+// the control plane reads its table name from SSM, so there's no hard CFN dependency, but
+// the table must exist before Ingest/Provision/Reaper run.
+const dataStack = new DataStack(app, `LCA-Data-${envName}`, {
+  env,
+  envName,
+  ssmPrefix,
+});
+
 // Phase 3: control plane. Depends on image ARNs living in SSM (published by the build
-// script in phase 2). We add an explicit stack dependency so `cdk deploy --all` orders
-// them, though the real gate is the phased deploy documented in spec 05.
+// script in phase 2) and the shared table (DataStack). We add explicit stack dependencies
+// so `cdk deploy --all` orders them, though the real gate is the phased deploy (spec 05).
 const controlStack = new ControlStack(app, `LCA-Control-${envName}`, {
   env,
   envName,
   ssmPrefix,
   tagPrefix,
+  table: dataStack.table,
 });
 controlStack.addDependency(imageStack);
+controlStack.addDependency(dataStack);
 
 app.synth();
