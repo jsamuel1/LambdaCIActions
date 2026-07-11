@@ -207,6 +207,30 @@ export interface ParsedWorkflow {
   jobs: ParsedJob[];
 }
 
+/**
+ * Compatibility level for a job/workflow (spec 03 § Compatibility analysis), worst-wins:
+ * `ok` < `warn` < `risk` < `block`. `block` ⇒ Ingest won't claim the job.
+ */
+export type CompatLevel = 'ok' | 'warn' | 'risk' | 'block';
+
+/** A single compat finding. `code` is a stable machine tag; `text` is operator-facing. */
+export interface CompatMessage {
+  level: 'warn' | 'risk' | 'block';
+  code: string;
+  text: string;
+}
+
+/**
+ * Result of analyzing one job's compatibility (spec 03). `level` is the worst rule that
+ * fired (default `ok`); `eligible` is `level !== 'block'` (spec 03 § routing — Ingest only
+ * claims a job when routing says eligible).
+ */
+export interface CompatResult {
+  level: CompatLevel;
+  eligible: boolean;
+  messages: CompatMessage[];
+}
+
 /** Thrown by `parseWorkflow` when the YAML is malformed / not a mapping. Catchable by callers. */
 export class WorkflowParseError extends Error {
   readonly path: string;
