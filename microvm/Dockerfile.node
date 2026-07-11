@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.node — the `node` flavor microVM image (docs/specs/02-microvm-runners.md,
+# capabilities: ["node"]). Base runner + a full Node.js LTS toolchain (node/npm/pnpm/yarn)
+# preinstalled so Node jobs skip per-run toolchain setup.
+#
+# This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
+# staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
+# layers the extra toolchain on top. Keep the base layers in sync with Dockerfile.base.
+#
+# HARD RULE (AGENTS.md): arm64 ONLY. Lambda microVMs are Graviton-only — the base image,
+# the runner agent tarball, and every binary below must be arm64. Do NOT switch to an
+# x86_64 base or the snapshot build will produce an unbootable image.
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ARG RUNNER_VERSION=2.319.1
+ARG NODE_MAJOR=20
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_DIR=/opt/actions-runner \
+    RUN_HOOK_PORT=8080
+
+# Common toolchain + the runner agent's runtime deps. Node is needed both for the
+# run-hook server and for the GitHub Actions runner's node-based actions.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git jq unzip tar gzip sudo \
+      libicu70 lsb-release awscli \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- node flavor extras -----------------------------------------------------------------
+# Enable Corepack (ships with Node) and pin pnpm + yarn so Node jobs get a ready toolchain.
+# arm64 wheels/binaries are used throughout (no x86 assumptions).
+RUN corepack enable \
+    && corepack prepare pnpm@latest --activate \
+    && corepack prepare yarn@stable --activate \
+    && npm install -g npm@latest \
+    && node --version && npm --version && pnpm --version && yarn --version
+# ----------------------------------------------------------------------------------------
+
+# GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
+RUN mkdir -p ${RUNNER_DIR} \
+    && curl -fsSL -o /tmp/runner.tar.gz \
+       https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz \
+    && tar -xzf /tmp/runner.tar.gz -C ${RUNNER_DIR} \
+    && rm /tmp/runner.tar.gz \
+    && ${RUNNER_DIR}/bin/installdependencies.sh
+
+# The lifecycle-hook server (ADR-012). It receives the JIT config via POST /run and
+# launches the runner agent for exactly one job, then self-terminates.
+COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
+
+# The runner must NOT run as root (agent refuses); create an unprivileged user that owns
+# the runner dir and can sudo for job steps that need it.
+RUN useradd -m -s /bin/bash runner \
+    && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && chown -R runner:runner ${RUNNER_DIR}
+
+USER runner
+WORKDIR ${RUNNER_DIR}
+
+EXPOSE 8080
+# Entrypoint is the run-hook server; it blocks until /run then supervises the single job.
+ENTRYPOINT ["node", "/opt/actions-runner/run-hook.mjs"]

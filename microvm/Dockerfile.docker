@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.docker — the `docker` flavor microVM image (docs/specs/02-microvm-runners.md,
+# capabilities: ["docker"]). Base runner + the Docker engine so container:/services: jobs
+# and `docker build/run` steps work inside the microVM. Larger footprint (4 vCPU / 8 GB).
+#
+# This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
+# staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
+# layers the Docker engine on top. Keep the base layers in sync with Dockerfile.base.
+#
+# HARD RULE (AGENTS.md): arm64 ONLY. Lambda microVMs are Graviton-only — the base image,
+# the runner agent tarball, Docker, and every binary below must be arm64. Do NOT switch to
+# an x86_64 base or the snapshot build will produce an unbootable image.
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ARG RUNNER_VERSION=2.319.1
+ARG NODE_MAJOR=20
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_DIR=/opt/actions-runner \
+    RUN_HOOK_PORT=8080
+
+# Common toolchain + the runner agent's runtime deps. Node is needed both for the
+# run-hook server and for the GitHub Actions runner's node-based actions.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git jq unzip tar gzip sudo \
+      libicu70 lsb-release awscli \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- docker flavor extras ---------------------------------------------------------------
+# Install the Docker engine from Docker's official arm64 apt repo. The daemon is started
+# per job by the run-hook (the snapshot has no init), and the `runner` user is added to the
+# docker group so job steps can talk to the socket without sudo. arm64 packages only.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+       > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+# ----------------------------------------------------------------------------------------
+
+# GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
+RUN mkdir -p ${RUNNER_DIR} \
+    && curl -fsSL -o /tmp/runner.tar.gz \
+       https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz \
+    && tar -xzf /tmp/runner.tar.gz -C ${RUNNER_DIR} \
+    && rm /tmp/runner.tar.gz \
+    && ${RUNNER_DIR}/bin/installdependencies.sh
+
+# The lifecycle-hook server (ADR-012). It receives the JIT config via POST /run and
+# launches the runner agent for exactly one job, then self-terminates.
+COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
+
+# The runner must NOT run as root (agent refuses); create an unprivileged user that owns
+# the runner dir, can sudo for job steps that need it, and is in the docker group so it
+# can drive the Docker daemon.
+RUN useradd -m -s /bin/bash runner \
+    && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && groupadd -f docker \
+    && usermod -aG docker runner \
+    && chown -R runner:runner ${RUNNER_DIR}
+
+USER runner
+WORKDIR ${RUNNER_DIR}
+
+EXPOSE 8080
+# Entrypoint is the run-hook server; it blocks until /run then supervises the single job.
+# (The run-hook is responsible for starting dockerd before the job runs — see spec 02.)
+ENTRYPOINT ["node", "/opt/actions-runner/run-hook.mjs"]
