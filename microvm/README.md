@@ -10,6 +10,8 @@ and [ADR-012](../docs/DECISIONS.md).
 microvm/
   flavors.json            Flavor catalog (name, label, dockerfile, arch, size)
   Dockerfile.base         `base` flavor — Ubuntu arm64 + runner agent + run-hook
+  Dockerfile.node         `node` flavor — base + Node.js LTS toolchain (npm/pnpm/yarn)
+  Dockerfile.docker       `docker` flavor — base + Docker engine (arm64, 4 vCPU / 8 GB)
   bootstrap/
     run-hook.mjs          Lifecycle-hook HTTP server (:8080): /run, /terminate, /healthz
 ```

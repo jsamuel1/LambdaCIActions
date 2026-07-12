@@ -6,6 +6,7 @@ CDK stacks, secret handling, the phased deploy (image ARNs must exist before the
 orchestrator), IAM posture, and operational concerns (quotas, cost, observability).
 
 ## Contents
+- [Toolchain prerequisites](#toolchain-prerequisites)
 - [Stack decomposition](#stack-decomposition)
 - [Secrets (SSM SecureString)](#secrets-ssm-securestring)
 - [Phased deployment](#phased-deployment)
@@ -16,6 +17,42 @@ orchestrator), IAM posture, and operational concerns (quotas, cost, observabilit
 - [Cost model](#cost-model)
 - [Environments](#environments)
 - [Open questions](#open-questions)
+
+---
+
+## Toolchain prerequisites
+
+The compute plane is built on **AWS Lambda MicroVMs** (GA 22 Jun 2026), exposed as a
+distinct service namespace: `lambda-microvms` (API version **2025-09-09**) — NOT under
+`aws lambda`. Tooling that predates the GA model cannot see the API and the phased deploy
+will fail at the image-build step. Minimum versions:
+
+| Tool | Minimum | Notes |
+|---|---|---|
+| **AWS CLI v2** | **≥ 2.35.17** | First versions shipping the `lambda-microvms` service model. `2.33.15` (and the Amazon Linux 2023 `awscli-2` dnf package as of 2026-07) do **not** have it. Verify with `aws lambda-microvms help`. |
+| **botocore** | **≥ 1.43.44** | Ships `botocore/data/lambda-microvms/2025-09-09/`. Verify: `python3 -c "import boto3; boto3.client('lambda-microvms', region_name='us-west-2').create_microvm_image"`. |
+| **boto3** | **≥ 1.43.44** | Pairs with the botocore floor above (any `@aws-sdk/client-lambda-microvms` for TS Lambdas must likewise post-date the GA model). |
+| Node.js | ≥ 18 | Bootstrap scripts use built-ins only. |
+| CDK v2 | ≥ 2.113 | App is CDK v2 TypeScript. |
+
+**Check before deploying:**
+```bash
+aws --version                       # want ≥ 2.35.17
+aws lambda-microvms help >/dev/null && echo "lambda-microvms OK"
+aws lambda-microvms list-managed-microvm-images --region us-west-2
+```
+If the system CLI is too old, install the standalone AWS CLI v2 to a user prefix (no root)
+and prepend it to `PATH` — do not rely on the distro package:
+```bash
+curl -sL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp/awscli-install
+/tmp/awscli-install/aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Region note: the managed base image (`arn:aws:lambda:<region>:aws:microvm-image:al2023-1`)
+must exist in the target region. Confirmed present in `us-west-2`; `list-managed-microvm-images`
+is the source of truth per region.
 
 ---
 

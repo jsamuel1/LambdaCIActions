@@ -78,7 +78,8 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   }
 
   // 1. flavor → image ARN
-  const flavor = resolveFlavor(req.labels);
+  const { flavor, reason: flavorReason } = resolveFlavor(req.labels);
+  console.log(JSON.stringify({ msg: 'flavor resolved', runId: req.runId, jobId: req.jobId, flavor, reason: flavorReason }));
   const imageArn = await getParam(`${IMAGE_ARN_PARAM_PREFIX}${flavor}`);
 
   // 2. mint single-use JIT config (GitHub App chain)

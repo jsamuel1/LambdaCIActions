@@ -1,5 +1,5 @@
 {
-  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md. M1 ships only `base`.",
+  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md & docs/specs/03-workflow-ingestion.md. All arm64/Graviton only.",
   "flavors": [
     {
       "name": "base",
@@ -8,7 +8,28 @@
       "arch": "arm64",
       "vcpu": 2,
       "memoryMb": 4096,
+      "capabilities": [],
       "description": "Ubuntu arm64 + GitHub Actions runner agent + git/curl/common toolchain."
+    },
+    {
+      "name": "node",
+      "label": "lambda-ci-node",
+      "dockerfile": "Dockerfile.node",
+      "arch": "arm64",
+      "vcpu": 2,
+      "memoryMb": 4096,
+      "capabilities": ["node"],
+      "description": "base + Node.js LTS toolchain (node/npm/pnpm/yarn) preinstalled for arm64."
+    },
+    {
+      "name": "docker",
+      "label": "lambda-ci-docker",
+      "dockerfile": "Dockerfile.docker",
+      "arch": "arm64",
+      "vcpu": 4,
+      "memoryMb": 8192,
+      "capabilities": ["docker"],
+      "description": "base + Docker engine (rootful daemon started per-job, runner in docker group) for container:/services: jobs and docker build/run, arm64 images. Larger footprint (4 vCPU / 8 GB)."
     }
   ]
 }
