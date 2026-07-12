@@ -45,7 +45,7 @@ merge`); base branch is always `main`.
 
 ## Hard rules
 - arm64 only — don't assume x86 binaries/base images.
-- Least privilege IAM per Lambda (see 05); microVM launch/terminate scoped by resource tag.
+- Least privilege IAM per Lambda (see 05); microVM launch/terminate scoped to account/region — NOT by VM tag (the GA `lambda-microvms` API can't tag VMs; run↔VM mapping lives in the run store, see ADR-015).
 - Don't put secret **values** in the UI/API — presence/health only.
 - GitHub `contents:write` (auto-rewrite PRs) is **off by default** — don't enable without explicit decision.
 

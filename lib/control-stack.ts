@@ -47,7 +47,11 @@ export class ControlStack extends Stack {
   constructor(scope: Construct, id: string, props: ControlStackProps) {
     super(scope, id, props);
 
-    const { envName, ssmPrefix, tagPrefix, table } = props;
+    const { envName, ssmPrefix, table } = props;
+    // NOTE: props.tagPrefix is retained for future taggable resources (e.g. image tags via
+    // lambda-microvms TagResource) but is NOT used for microVM launch/terminate isolation —
+    // the GA API can't tag VMs (ADR-015). void it to satisfy noUnusedLocals.
+    void props.tagPrefix;
     const paramArn = (name: string) =>
       `arn:${this.partition}:ssm:${this.region}:${this.account}:parameter${name}`;
 
@@ -131,7 +135,6 @@ export class ControlStack extends Stack {
         APP_ID_PARAM: `${ssmPrefix}/github/app-id`,
         APP_PEM_PARAM: `${ssmPrefix}/github/app-pem`,
         IMAGE_ARN_PARAM_PREFIX: `${ssmPrefix}/config/image-arn-`,
-        TAG_PREFIX: tagPrefix,
         TABLE_NAME: table.tableName,
       },
     });
@@ -153,25 +156,31 @@ export class ControlStack extends Stack {
         ],
       }),
     );
-    // Launch/terminate ONLY tagged microVMs (spec 05). RunMicroVM is a create op that
-    // stamps the tag; we gate it with a RequestTag condition and terminate by resource tag.
+    // Launch/terminate microVMs (spec 05, corrected in ADR-015). The GA lambda-microvms
+    // API does NOT support tagging a VM at launch, so the pre-GA aws:RequestTag /
+    // aws:ResourceTag least-privilege gate is impossible. Isolation instead comes from:
+    //   (a) the dedicated per-env execution role stamped on each VM (executionRoleArn),
+    //   (b) the run store being the authoritative run↔VM mapping, and
+    //   (c) scoping actions to this account/region.
+    // Actions use the `lambda:` prefix (lambda-microvms signs as `lambda`) with GA operation
+    // casing (`Microvm`, not `MicroVM`).
     provision.addToRolePolicy(
       new iam.PolicyStatement({
-        sid: 'LaunchTaggedMicroVMs',
-        actions: ['lambda:RunMicroVM'],
+        sid: 'LaunchMicroVMs',
+        actions: ['lambda:RunMicrovm'],
         resources: ['*'],
         conditions: {
-          StringEquals: { [`aws:RequestTag/${tagPrefix}:managed`]: 'true' },
+          StringEquals: { 'aws:RequestedRegion': this.region },
         },
       }),
     );
     provision.addToRolePolicy(
       new iam.PolicyStatement({
-        sid: 'TerminateTaggedMicroVMs',
-        actions: ['lambda:TerminateMicroVM', 'lambda:GetMicroVM'],
+        sid: 'TerminateMicroVMs',
+        actions: ['lambda:TerminateMicrovm', 'lambda:GetMicrovm'],
         resources: ['*'],
         conditions: {
-          StringEquals: { [`aws:ResourceTag/${tagPrefix}:managed`]: 'true' },
+          StringEquals: { 'aws:RequestedRegion': this.region },
         },
       }),
     );
@@ -194,26 +203,29 @@ export class ControlStack extends Stack {
       logGroup: reaperLogGroup,
       bundling,
       environment: {
-        TAG_PREFIX: tagPrefix,
         TABLE_NAME: table.tableName,
       },
     });
-    // Reaper reads/updates run rows (incl. the status GSI) and lists/terminates tagged VMs.
+    // Reaper reads/updates run rows (incl. the status GSI) and lists/terminates VMs.
+    // Correlation is by the run store's persisted microvmId, not tags (ADR-015).
     table.grantReadWriteData(reaper);
     reaper.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'ListMicroVMs',
-        actions: ['lambda:ListMicroVMs'],
+        actions: ['lambda:ListMicrovms'],
         resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:RequestedRegion': this.region },
+        },
       }),
     );
     reaper.addToRolePolicy(
       new iam.PolicyStatement({
-        sid: 'TerminateTaggedMicroVMs',
-        actions: ['lambda:TerminateMicroVM', 'lambda:GetMicroVM'],
+        sid: 'TerminateMicroVMs',
+        actions: ['lambda:TerminateMicrovm', 'lambda:GetMicrovm'],
         resources: ['*'],
         conditions: {
-          StringEquals: { [`aws:ResourceTag/${tagPrefix}:managed`]: 'true' },
+          StringEquals: { 'aws:RequestedRegion': this.region },
         },
       }),
     );

@@ -13,14 +13,15 @@ import { resolveFlavor } from './flavor.js';
  * Per message:
  *   1. Resolve the job's labels → flavor → image ARN (from SSM, published by build script).
  *   2. Mint a single-use JIT runner config via the GitHub App.
- *   3. `run-microvm` from the image ARN, passing the JIT config + metadata as the
- *      run-hook payload; tag the VM `lca:run=<runId>`.
+ *   3. `RunMicrovm` from the image ARN, passing the JIT config + metadata as the
+ *      run-hook payload. The run↔VM mapping is persisted via the run store's `microvmId`
+ *      (the GA API can't tag VMs — ADR-015), not a VM tag.
  *
  * Failure → throw → the record is reported in `batchItemFailures` so SQS redelivers it
  * (visibility timeout) and, after maxReceiveCount, routes to the DLQ. We use partial batch
  * responses so one poison message doesn't fail its whole batch.
  *
- * Env: APP_ID_PARAM, APP_PEM_PARAM, IMAGE_ARN_PARAM_PREFIX, TAG_PREFIX, TABLE_NAME,
+ * Env: APP_ID_PARAM, APP_PEM_PARAM, IMAGE_ARN_PARAM_PREFIX, TABLE_NAME,
  *      [RUNNER_ROLE_ARN].
  */
 
@@ -29,7 +30,6 @@ const lambda = new LambdaClient({});
 const APP_ID_PARAM = process.env.APP_ID_PARAM!;
 const APP_PEM_PARAM = process.env.APP_PEM_PARAM!;
 const IMAGE_ARN_PARAM_PREFIX = process.env.IMAGE_ARN_PARAM_PREFIX!; // e.g. /lca/dev/config/image-arn-
-const TAG_PREFIX = process.env.TAG_PREFIX ?? 'lca';
 const RUNNER_ROLE_ARN = process.env.RUNNER_ROLE_ARN; // optional microVM execution role
 
 export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
@@ -111,7 +111,6 @@ async function provisionOne(record: SQSRecord): Promise<void> {
       imageArn,
       runId: req.runId,
       jobId: req.jobId,
-      tagPrefix: TAG_PREFIX,
       payload,
       executionRoleArn: RUNNER_ROLE_ARN,
     }));

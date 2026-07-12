@@ -49,9 +49,11 @@ export class ImageStack extends Stack {
       autoDeleteObjects: envName !== 'prod',
     });
 
-    // Role assumed by the microVM image build. Scoped to the code bucket + the image
-    // build API surface (create-microvm-image and friends live under the `lambda:` action
-    // namespace for the microVM control plane).
+    // Role assumed by the microVM image BUILD. Passed to `create-microvm-image` via
+    // --build-role-arn, so it must be assumable by the microVM service principal, and it
+    // reads the build context from the code bucket. IAM actions live under the `lambda:`
+    // prefix (the lambda-microvms API signs as `lambda`), with the GA operation casing
+    // (`Microvm`, not `MicroVM`) — ADR-015.
     this.buildRole = new iam.Role(this, 'ImageBuildRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       description: 'LambdaCIActions microVM image build role',
@@ -61,10 +63,13 @@ export class ImageStack extends Stack {
       new iam.PolicyStatement({
         sid: 'MicroVMImageBuild',
         actions: [
-          'lambda:CreateMicroVMImage',
-          'lambda:GetMicroVMImage',
-          'lambda:ListMicroVMImages',
-          'lambda:DeleteMicroVMImage',
+          'lambda:CreateMicrovmImage',
+          'lambda:GetMicrovmImage',
+          'lambda:GetMicrovmImageBuild',
+          'lambda:ListMicrovmImages',
+          'lambda:ListMicrovmImageVersions',
+          'lambda:DeleteMicrovmImage',
+          'lambda:DeleteMicrovmImageVersion',
         ],
         // Image ARNs aren't known until built; scope to this account/region.
         resources: ['*'],
@@ -74,12 +79,17 @@ export class ImageStack extends Stack {
       }),
     );
 
-    // Record the code bucket name in SSM so the build script can discover it without a
-    // CFN export lookup.
+    // Record the code bucket name + build role ARN in SSM so the build script can discover
+    // them without a CFN export lookup.
     new ssm.StringParameter(this, 'CodeBucketParam', {
       parameterName: `${ssmPrefix}/config/image-code-bucket`,
       stringValue: this.codeBucket.bucketName,
       description: 'S3 bucket for microVM image build contexts',
+    });
+    new ssm.StringParameter(this, 'BuildRoleParam', {
+      parameterName: `${ssmPrefix}/config/image-build-role-arn`,
+      stringValue: this.buildRole.roleArn,
+      description: 'IAM role ARN passed to create-microvm-image --build-role-arn',
     });
 
     new CfnOutput(this, 'CodeBucketName', { value: this.codeBucket.bucketName });

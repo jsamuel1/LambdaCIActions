@@ -16,9 +16,9 @@ function iso(msAgo) {
 
 test('overCapVms terminates only VMs past the lifetime cap', () => {
   const vms = [
-    { microvmId: 'young', launchedAt: NOW - 60_000 }, // 1m old
-    { microvmId: 'old', launchedAt: NOW - cfg.maxLifetimeMs - 1000 }, // past cap
-    { microvmId: 'unknown-age' }, // no launchedAt → skipped
+    { microvmId: 'young', state: 'RUNNING', startedAt: NOW - 60_000 }, // 1m old
+    { microvmId: 'old', state: 'RUNNING', startedAt: NOW - cfg.maxLifetimeMs - 1000 }, // past cap
+    { microvmId: 'unknown-age', state: 'RUNNING' }, // no startedAt → skipped
   ];
   const over = overCapVms(vms, cfg, NOW);
   assert.deepEqual(over.map((v) => v.microvmId), ['old']);
@@ -26,20 +26,30 @@ test('overCapVms terminates only VMs past the lifetime cap', () => {
 
 test('reconcileRuns times out running runs with no live VM past the grace period', () => {
   const runs = [
-    { repoId: 1, runId: 100, jobId: 1, status: 'running', updatedAt: iso(cfg.orphanGraceMs + 60_000), labels: [] },
+    { repoId: 1, runId: 100, jobId: 1, status: 'running', updatedAt: iso(cfg.orphanGraceMs + 60_000), labels: [], microvmId: 'vm-100' },
   ];
-  const live = new Set(); // no live VM for run 100
+  const live = new Set(); // vm-100 no longer live
   const out = reconcileRuns(runs, live, cfg, NOW);
   assert.equal(out.length, 1);
   assert.equal(out[0].to, 'timed_out');
   assert.equal(out[0].run.runId, 100);
 });
 
+test('reconcileRuns times out running runs that never recorded a microVM id', () => {
+  const runs = [
+    { repoId: 1, runId: 101, jobId: 1, status: 'running', updatedAt: iso(cfg.orphanGraceMs + 60_000), labels: [] },
+  ];
+  const out = reconcileRuns(runs, new Set(['vm-999']), cfg, NOW);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].to, 'timed_out');
+  assert.match(out[0].reason, /no microVM id recorded/);
+});
+
 test('reconcileRuns leaves running runs that still have a live VM', () => {
   const runs = [
-    { repoId: 1, runId: 100, jobId: 1, status: 'running', updatedAt: iso(cfg.orphanGraceMs + 60_000), labels: [] },
+    { repoId: 1, runId: 100, jobId: 1, status: 'running', updatedAt: iso(cfg.orphanGraceMs + 60_000), labels: [], microvmId: 'vm-100' },
   ];
-  const live = new Set([100]);
+  const live = new Set(['vm-100']);
   assert.equal(reconcileRuns(runs, live, cfg, NOW).length, 0);
 });
 

@@ -2,18 +2,25 @@ import { LambdaClient } from '@aws-sdk/client-lambda';
 import type { RunHookPayload } from './types.js';
 
 /**
- * microVM launch wrapper (ADR-012).
+ * microVM launch wrapper (ADR-012, corrected for the GA `lambda-microvms` API 2025-09-09).
  *
- * The Lambda microVM control plane exposes `run-microvm` / `terminate-microvm` under the
- * `lambda:` service. The AWS SDK v3 command classes for these are NEW and may not be
- * present in every SDK minor, so we call them through the client's generic command
- * pipeline and keep the request/response shapes local. This isolates the one spot that
- * depends on the microVM API surface — if the SDK command names shift, only this file
- * changes.
+ * The Lambda microVM control plane is a DISTINCT service — `@aws-sdk/client-lambda-microvms`
+ * (CLI: `aws lambda-microvms ...`), NOT the base `lambda` service. Commands: RunMicrovm,
+ * ListMicrovms, TerminateMicrovm, GetMicrovm. We call them through the client's generic
+ * command pipeline and keep the request/response shapes local, so a single file owns the
+ * dependency on the microVM API surface.
  *
- * Launch is fire-and-forget in M1: we tag the VM `lca:run=<runId>` and rely on the
- * `workflow_job` status webhook + the Reaper λ for lifecycle, rather than health-checking
- * the per-VM endpoint (which would need a create-microvm-auth-token JWE).
+ * IMPORTANT (correction vs the pre-GA design): the real API does NOT support tagging a
+ * microVM at launch — `RunMicrovm` has no `tags`, `ListMicrovms` items carry no tags, and
+ * microVMs are not a taggable resource. So we CANNOT tag `lca:run=<runId>` on the VM and
+ * cannot filter/reconcile by tag. The run↔microVM mapping is instead persisted in the run
+ * store (the provision handler stamps `microvmId` on the run record); the Reaper correlates
+ * live VM ids against that stored mapping. IAM isolation likewise cannot use
+ * aws:RequestTag/ResourceTag on the VM (see ADR-015).
+ *
+ * Launch is fire-and-forget: we hand the JIT config to the `/run` hook via runHookPayload
+ * and rely on the `workflow_job` status webhook + the Reaper for lifecycle, rather than
+ * health-checking the per-VM endpoint (which would need a CreateMicrovmAuthToken JWE).
  */
 
 const RUN_HOOK_PAYLOAD_MAX = 16 * 1024;
@@ -22,23 +29,31 @@ export interface LaunchParams {
   imageArn: string;
   runId: number;
   jobId: number;
-  tagPrefix: string; // e.g. 'lca'
   payload: RunHookPayload;
   executionRoleArn?: string;
+  /** Optional auto-suspend policy; single-use runners generally omit this (run once, terminate). */
+  idlePolicy?: {
+    maxIdleDurationSeconds: number;
+    suspendedDurationSeconds: number;
+    autoResumeEnabled: boolean;
+  };
+  /** Optional hard cap on total VM lifetime, seconds. */
+  maximumDurationInSeconds?: number;
 }
 
 export interface LaunchResult {
   microvmId: string;
+  state: string;
+  endpoint: string;
 }
 
-/** A running microVM as returned by the tag-scoped list. */
-export interface ManagedMicroVM {
+/** A live microVM as returned by ListMicrovms — id + state + start time ONLY (no tags/runId). */
+export interface LiveMicroVM {
   microvmId: string;
-  runId?: number;
-  jobId?: number;
-  /** Epoch ms the VM entered RUNNING, if the API surfaces it. */
-  launchedAt?: number;
-  state?: string;
+  state: string;
+  imageArn?: string;
+  /** Epoch ms the VM started, from `startedAt`. */
+  startedAt?: number;
 }
 
 /**
@@ -49,13 +64,14 @@ export interface ManagedMicroVM {
 type CommandCtor = new (input: Record<string, unknown>) => object;
 
 async function loadCommand(name: string): Promise<CommandCtor> {
-  // Dynamic import keeps a missing export from breaking module load; we fail loudly only
-  // when a launch is actually attempted against an SDK that lacks the command.
-  const mod = (await import('@aws-sdk/client-lambda')) as Record<string, unknown>;
+  // The microVM commands live in a SEPARATE SDK package. Dynamic import keeps a missing
+  // package/export from breaking module load; we fail loudly only when the operation is
+  // actually attempted against an SDK that lacks microVM support.
+  const mod = (await import('@aws-sdk/client-lambda-microvms')) as Record<string, unknown>;
   const ctor = mod[name] as CommandCtor | undefined;
   if (!ctor) {
     throw new Error(
-      `@aws-sdk/client-lambda is missing ${name}; upgrade the SDK to a version with microVM support (ADR-012)`,
+      `@aws-sdk/client-lambda-microvms is missing ${name}; install/upgrade the microVM SDK (API 2025-09-09, ADR-012/015)`,
     );
   }
   return ctor;
@@ -72,56 +88,58 @@ export async function launchMicroVM(
     );
   }
 
-  const RunMicroVMCommand = await loadCommand('RunMicroVMCommand');
+  const RunMicrovmCommand = await loadCommand('RunMicrovmCommand');
   const input: Record<string, unknown> = {
-    ImageIdentifier: params.imageArn,
-    RunHookPayload: payloadJson,
-    Tags: {
-      [`${params.tagPrefix}:managed`]: 'true',
-      [`${params.tagPrefix}:run`]: String(params.runId),
-      [`${params.tagPrefix}:job`]: String(params.jobId),
-    },
+    imageIdentifier: params.imageArn,
+    runHookPayload: payloadJson,
   };
-  if (params.executionRoleArn) input.ExecutionRoleArn = params.executionRoleArn;
+  if (params.executionRoleArn) input.executionRoleArn = params.executionRoleArn;
+  if (params.idlePolicy) input.idlePolicy = params.idlePolicy;
+  if (params.maximumDurationInSeconds !== undefined) {
+    input.maximumDurationInSeconds = params.maximumDurationInSeconds;
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const res = (await client.send(new RunMicroVMCommand(input) as any)) as {
-    MicroVMId?: string;
-    MicrovmId?: string;
+  const res = (await client.send(new RunMicrovmCommand(input) as any)) as {
+    microvmId?: string;
+    state?: string;
+    endpoint?: string;
   };
-  const microvmId = res.MicroVMId ?? res.MicrovmId;
-  if (!microvmId) throw new Error('run-microvm returned no microVM id');
-  return { microvmId };
+  if (!res.microvmId) throw new Error('RunMicrovm returned no microvmId');
+  return {
+    microvmId: res.microvmId,
+    state: res.state ?? 'PENDING',
+    endpoint: res.endpoint ?? '',
+  };
 }
 
 /**
- * List microVMs this deployment manages (tagged `<prefix>:managed=true`), for the Reaper
- * (spec 02 § Reaping). Handles pagination + the two casings the API might use for ids /
- * tags. Returns a normalized shape so the Reaper doesn't depend on the raw response.
+ * List live microVMs for the Reaper (spec 02 § Reaping). The GA API cannot filter by tag,
+ * so this lists ALL microVMs in the account/region (optionally scoped by image ARN) and
+ * returns a normalized id/state/startedAt shape. The Reaper correlates these ids against
+ * the run store's persisted `microvmId` — the run store, not a VM tag, is the source of
+ * truth for which run a VM belongs to.
  */
-export async function listManagedMicroVMs(
+export async function listMicroVMs(
   client: LambdaClient,
-  tagPrefix: string,
-): Promise<ManagedMicroVM[]> {
-  const ListMicroVMsCommand = await loadCommand('ListMicroVMsCommand');
-  const out: ManagedMicroVM[] = [];
+  opts: { imageIdentifier?: string } = {},
+): Promise<LiveMicroVM[]> {
+  const ListMicrovmsCommand = await loadCommand('ListMicrovmsCommand');
+  const out: LiveMicroVM[] = [];
   let nextToken: string | undefined;
 
   do {
-    const input: Record<string, unknown> = {
-      Filters: { [`${tagPrefix}:managed`]: 'true' },
-    };
-    if (nextToken) input.NextToken = nextToken;
+    const input: Record<string, unknown> = {};
+    if (opts.imageIdentifier) input.imageIdentifier = opts.imageIdentifier;
+    if (nextToken) input.nextToken = nextToken;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const res = (await client.send(new ListMicroVMsCommand(input) as any)) as {
-      MicroVMs?: RawMicroVM[];
-      Microvms?: RawMicroVM[];
-      NextToken?: string;
+    const res = (await client.send(new ListMicrovmsCommand(input) as any)) as {
+      items?: RawMicroVM[];
+      nextToken?: string;
     };
-    const vms = res.MicroVMs ?? res.Microvms ?? [];
-    for (const vm of vms) out.push(normalizeMicroVM(vm, tagPrefix));
-    nextToken = res.NextToken;
+    for (const vm of res.items ?? []) out.push(normalizeMicroVM(vm));
+    nextToken = res.nextToken;
   } while (nextToken);
 
   return out;
@@ -129,42 +147,37 @@ export async function listManagedMicroVMs(
 
 /**
  * Terminate a microVM by id (spec 02 teardown). Best-effort: a VM that already
- * self-terminated may 404 — the caller treats that as success.
+ * self-terminated may error — the caller treats that as success.
  */
 export async function terminateMicroVM(
   client: LambdaClient,
   microvmId: string,
 ): Promise<void> {
-  const TerminateMicroVMCommand = await loadCommand('TerminateMicroVMCommand');
+  const TerminateMicrovmCommand = await loadCommand('TerminateMicrovmCommand');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await client.send(new TerminateMicroVMCommand({ MicroVMId: microvmId } as any) as any);
+  await client.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId } as any) as any);
 }
 
 interface RawMicroVM {
-  MicroVMId?: string;
-  MicrovmId?: string;
-  State?: string;
-  Tags?: Record<string, string>;
-  LaunchTime?: string | number;
-  CreatedTime?: string | number;
+  microvmId?: string;
+  state?: string;
+  imageArn?: string;
+  startedAt?: string | number | Date;
 }
 
-function normalizeMicroVM(vm: RawMicroVM, tagPrefix: string): ManagedMicroVM {
-  const tags = vm.Tags ?? {};
-  const runTag = tags[`${tagPrefix}:run`];
-  const jobTag = tags[`${tagPrefix}:job`];
-  const launch = vm.LaunchTime ?? vm.CreatedTime;
-  let launchedAt: number | undefined;
-  if (typeof launch === 'number') launchedAt = launch;
-  else if (typeof launch === 'string') {
-    const t = Date.parse(launch);
-    if (!Number.isNaN(t)) launchedAt = t;
+function normalizeMicroVM(vm: RawMicroVM): LiveMicroVM {
+  let startedAt: number | undefined;
+  const s = vm.startedAt;
+  if (s instanceof Date) startedAt = s.getTime();
+  else if (typeof s === 'number') startedAt = s;
+  else if (typeof s === 'string') {
+    const t = Date.parse(s);
+    if (!Number.isNaN(t)) startedAt = t;
   }
   return {
-    microvmId: (vm.MicroVMId ?? vm.MicrovmId) as string,
-    runId: runTag !== undefined ? Number(runTag) : undefined,
-    jobId: jobTag !== undefined ? Number(jobTag) : undefined,
-    launchedAt,
-    state: vm.State,
+    microvmId: vm.microvmId as string,
+    state: vm.state ?? 'UNKNOWN',
+    imageArn: vm.imageArn,
+    startedAt,
   };
 }
