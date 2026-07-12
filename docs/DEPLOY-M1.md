@@ -4,8 +4,21 @@ The phased deploy for ROADMAP **M1** (ADR-011). Bootstraps the control + compute
 a single test repo. `<env>` is `dev` unless noted; region `us-west-2` or `us-east-1`
 (default quota → ~256 concurrent @4 GB, no increase needed).
 
-Prereqs: Node ≥ 18, AWS CLI configured for the target account, a GitHub account/org you can
-install an App on.
+Prereqs: Node ≥ 18, a GitHub account/org you can install an App on, and an **AWS CLI
+that has the `lambda-microvms` service** (GA API `2025-09-09`, a separate namespace from
+`aws lambda`). That means **AWS CLI ≥ 2.35.17** — the Amazon Linux 2023 `awscli-2` dnf
+package (2.33.15) is too old and the image-build phase will fail. Check + install:
+
+```sh
+aws --version                                   # want ≥ 2.35.17
+aws lambda-microvms help >/dev/null && echo OK   # must succeed
+# if too old, install the standalone v2 to a user prefix (no root):
+curl -sL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp/awscli-install
+/tmp/awscli-install/aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
+export PATH="$HOME/.local/bin:$PATH"
+```
+Any boto3/botocore used alongside must be ≥ 1.43.44. Full matrix: `docs/specs/05-infrastructure.md` § Toolchain prerequisites.
 
 ```sh
 npm install
@@ -85,6 +98,6 @@ Provision λ logs + CloudWatch runner log stream.
 ```sh
 npx cdk destroy LCA-Control-dev LCA-Image-dev -c env=dev -c region=us-west-2
 # then delete built images + SSM params if fully resetting:
-#   aws lambda delete-microvm-image --image-identifier <arn>
+#   aws lambda-microvms delete-microvm-image --image-identifier <arn>
 #   aws ssm delete-parameters --names /lca/dev/config/image-arn-base ...
 ```
