@@ -50,7 +50,10 @@ Manifest highlights:
     "contents": "read",          // read .github/workflows for ingestion
     "metadata": "read"
   },
-  "default_events": ["workflow_job", "installation", "installation_repositories", "push"]
+  "default_events": ["workflow_job", "push"]
+  // NOTE: `installation` / `installation_repositories` are App lifecycle events delivered
+  // automatically — they are received at runtime but are NOT valid in `default_events`
+  // (GitHub rejects the manifest). Do not list them here.
 }
 ```
 

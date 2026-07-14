@@ -101,10 +101,12 @@ function buildManifest() {
     },
     default_events: [
       'workflow_job', // hot-path trigger
-      'installation', // app installed/removed/suspended
-      'installation_repositories', // repos added/removed
       'push', // re-parse workflows on .github/workflows change
     ],
+    // NOTE: `installation` and `installation_repositories` are App LIFECYCLE events that
+    // GitHub delivers to every App automatically — they are NOT subscribable via
+    // default_events (and aren't gated by a permission). Listing them makes the manifest
+    // invalid ("Default events unsupported"). The webhook still receives them at runtime.
   };
 }
 

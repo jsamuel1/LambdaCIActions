@@ -20,8 +20,14 @@ test('manifest declares the exact permissions spec 01 requires', () => {
 
 test('manifest subscribes to the required webhook events', () => {
   const m = buildManifest();
-  for (const ev of ['workflow_job', 'installation', 'installation_repositories', 'push']) {
+  // Only subscribable events belong in default_events. `installation` /
+  // `installation_repositories` are App lifecycle events delivered automatically and are
+  // NOT valid in a manifest's default_events (GitHub rejects them).
+  for (const ev of ['workflow_job', 'push']) {
     assert.ok(m.default_events.includes(ev), `missing event ${ev}`);
+  }
+  for (const ev of ['installation', 'installation_repositories']) {
+    assert.ok(!m.default_events.includes(ev), `${ev} must NOT be in default_events (not subscribable)`);
   }
 });
 
