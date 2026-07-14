@@ -152,3 +152,46 @@ fits the ADR-009 single-table model.
 **Consequences**: Every transition writes both `status` and the two GSI keys. `queued`
 runs also appear in the index; the Reaper treats long-`queued` rows as a quota-wall signal
 (spec 05 stuck-queue).
+
+## ADR-015 — Correct to the GA `lambda-microvms` API; drop tag-based VM isolation (M3)
+**Status**: Accepted (v1) · corrects [ADR-012](#adr-012); supersedes the tag-scoped-IAM
+assumption in ADR-006 / early spec 05
+**Context**: ADR-012 and the M1/M2 implementation were written against a *guessed* microVM
+API surface — `aws lambda create-microvm-image --architecture --code S3Bucket=…`,
+`RunMicroVMCommand` with a `Tags` map, tag-filtered `ListMicroVMs`, and IAM gated by
+`aws:RequestTag`/`aws:ResourceTag`. Verified against the **GA API** (AWS Lambda MicroVMs,
+announced 2026-06-22; service model `lambda-microvms` API version **2025-09-09**, in AWS
+CLI ≥ 2.35.17 / boto3 ≥ 1.43.44), the real surface differs:
+- It is a **distinct service** — `aws lambda-microvms …` / `@aws-sdk/client-lambda-microvms`
+  — not `aws lambda`. IAM actions still use the `lambda:` prefix (the service signs as
+  `lambda`) but with GA operation casing: `RunMicrovm`, `CreateMicrovmImage`,
+  `ListMicrovms`, `TerminateMicrovm`, `GetMicrovm` (note `Microvm`, not `MicroVM`).
+- **`CreateMicrovmImage`** requires `--base-image-arn` (a managed base, e.g.
+  `arn:aws:lambda:<region>:aws:microvm-image:al2023-1`), `--build-role-arn`, and
+  `--code-artifact uri=s3://…`. It is versioned: returns `{imageArn, imageVersion,
+  state:CREATING}`; poll `GetMicrovmImage` until `state=CREATED`.
+- **`RunMicrovm`** takes `imageIdentifier` (+ optional `executionRoleArn`, `idlePolicy`,
+  `runHookPayload`, `maximumDurationInSeconds`). It has **no `tags`** — you cannot tag a VM
+  at launch. `ListMicrovms` items carry only `microvmId/state/imageArn/imageVersion/
+  startedAt` (no tags, no runId), and microVMs are not a taggable resource.
+**Decision**:
+1. Call the `lambda-microvms` namespace with the real parameter shapes (build script +
+   `src/shared/microvm.ts` wrapper via `@aws-sdk/client-lambda-microvms`).
+2. **The run↔VM mapping is the run store, not a VM tag.** Provision stamps
+   `RunRecord.microvmId` when the VM reaches `running`; the Reaper lists live VMs (id +
+   `startedAt` only) and reconciles against that persisted id — a `running` run whose
+   `microvmId` is no longer live (or was never recorded) past the orphan grace → `timed_out`.
+3. **IAM isolation cannot use `aws:RequestTag`/`aws:ResourceTag` on the VM** (no tags).
+   Provision/Reaper microVM actions are scoped to the account/region (`aws:RequestedRegion`);
+   runtime isolation comes from the dedicated per-env **execution role** stamped on each VM
+   and the run store as the authoritative mapping.
+**Why**: The tag-based design is physically impossible on the GA API. The run store already
+had to hold `microvmId` for status/UX, so it is the natural source of truth; region-scoped
+IAM + per-env execution role is the available least-privilege posture until/unless the API
+adds VM tagging or resource-level ARNs.
+**Consequences**: `TAG_PREFIX` is no longer consumed by Provision/Reaper (the
+`ControlStack` `tagPrefix` prop is retained only for future taggable resources, e.g. image
+tags via `TagResource`). Reaper terminates over-cap VMs by `startedAt`. IAM is coarser than
+the original tag-gated intent — revisit if the API gains VM-level resource ARNs or tagging.
+Toolchain floor (CLI ≥ 2.35.17, boto3/botocore ≥ 1.43.44) is documented in spec 05
+§ Toolchain prerequisites and AGENTS.md.

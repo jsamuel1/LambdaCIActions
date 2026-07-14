@@ -14,7 +14,7 @@
 FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.319.1
-ARG NODE_MAJOR=20
+ARG NODE_MAJOR=24
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_DIR=/opt/actions-runner \
     RUN_HOOK_PORT=8080
@@ -30,7 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # --- node flavor extras -----------------------------------------------------------------
 # Enable Corepack (ships with Node) and pin pnpm + yarn so Node jobs get a ready toolchain.
-# arm64 wheels/binaries are used throughout (no x86 assumptions).
+# arm64 wheels/binaries are used throughout (no x86 assumptions). NODE_MAJOR tracks the
+# current Node LTS (24) so the latest npm/pnpm/yarn install cleanly — do not pin to an EOL
+# major; the toolchain's `@latest`/`@stable` now require a modern Node runtime.
 RUN corepack enable \
     && corepack prepare pnpm@latest --activate \
     && corepack prepare yarn@stable --activate \

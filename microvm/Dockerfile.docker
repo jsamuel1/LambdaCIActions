@@ -14,7 +14,7 @@
 FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.319.1
-ARG NODE_MAJOR=20
+ARG NODE_MAJOR=24
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_DIR=/opt/actions-runner \
     RUN_HOOK_PORT=8080

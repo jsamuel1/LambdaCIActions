@@ -1,10 +1,15 @@
-import type { ManagedMicroVM } from '../shared/microvm.js';
+import type { LiveMicroVM } from '../shared/microvm.js';
 import type { RunRecord } from '../shared/types.js';
 
 /**
- * Pure reaping decisions (spec 02 \u00a7 Reaping & timeouts). No AWS here \u2014 the handler feeds
+ * Pure reaping decisions (spec 02 § Reaping & timeouts). No AWS here — the handler feeds
  * these functions the live microVM list + DB run rows and acts on the results. Keeps the
  * lifetime-cap / orphan / stuck logic unit-testable.
+ *
+ * Correction (ADR-015): the GA `lambda-microvms` API does not tag VMs, so we cannot read a
+ * `runId` off a VM. The run↔VM mapping lives in the run store (`RunRecord.microvmId`). The
+ * handler builds the set of live VM ids and the map of run→microvmId; these functions work
+ * purely on microvm id, never on tags.
  */
 
 export interface ReaperConfig {
@@ -22,14 +27,14 @@ export const DEFAULT_REAPER_CONFIG: ReaperConfig = {
   orphanGraceMs: 5 * 60 * 1000, // 5m
 };
 
-/** microVMs to terminate because they exceeded the lifetime cap. */
+/** microVMs to terminate because they exceeded the lifetime cap (by `startedAt`). */
 export function overCapVms(
-  vms: ManagedMicroVM[],
+  vms: LiveMicroVM[],
   cfg: ReaperConfig,
   now: number,
-): ManagedMicroVM[] {
+): LiveMicroVM[] {
   return vms.filter(
-    (vm) => vm.launchedAt !== undefined && now - vm.launchedAt > cfg.maxLifetimeMs,
+    (vm) => vm.startedAt !== undefined && now - vm.startedAt > cfg.maxLifetimeMs,
   );
 }
 
@@ -40,15 +45,20 @@ export interface RunDisposition {
 }
 
 /**
- * Given the active (`provisioning`/`running`) runs and the set of run ids that STILL have
- * a live microVM, decide which run rows are ghosts and how to close them:
- *   - `running` with no live VM, older than the orphan grace  → timed_out (orphaned VM)
+ * Given the active (`provisioning`/`running`) runs and the set of microVM ids that are
+ * CURRENTLY live, decide which run rows are ghosts and how to close them:
+ *   - `running` with a persisted `microvmId` that is no longer live, older than the orphan
+ *     grace  → timed_out (the VM vanished / self-terminated)
+ *   - `running` with NO persisted `microvmId` at all, past the orphan grace → timed_out
+ *     (launch never stamped an id — treat as lost)
  *   - `provisioning`/`queued` older than the stuck threshold  → failed (never launched;
- *     likely a quota wall) \u2014 spec 05 stuck-queue signal.
+ *     likely a quota wall) — spec 05 stuck-queue signal.
+ *
+ * The mapping is by microvm id (from the run store), NOT by tag — the GA API doesn't tag VMs.
  */
 export function reconcileRuns(
   activeRuns: RunRecord[],
-  liveRunIds: ReadonlySet<number>,
+  liveMicrovmIds: ReadonlySet<string>,
   cfg: ReaperConfig,
   now: number,
 ): RunDisposition[] {
@@ -56,11 +66,15 @@ export function reconcileRuns(
   for (const run of activeRuns) {
     const ageMs = now - Date.parse(run.updatedAt);
     if (run.status === 'running') {
-      if (!liveRunIds.has(run.runId) && ageMs > cfg.orphanGraceMs) {
+      const vmLive = run.microvmId !== undefined && liveMicrovmIds.has(run.microvmId);
+      if (!vmLive && ageMs > cfg.orphanGraceMs) {
+        const detail = run.microvmId
+          ? `microVM ${run.microvmId} no longer live`
+          : 'no microVM id recorded';
         out.push({
           run,
           to: 'timed_out',
-          reason: `orphaned: no live microVM for run ${run.runId} after ${Math.round(
+          reason: `orphaned: ${detail} for run ${run.runId} after ${Math.round(
             ageMs / 1000,
           )}s`,
         });

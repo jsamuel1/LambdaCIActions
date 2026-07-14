@@ -1,15 +1,20 @@
 #!/usr/bin/env node
 // @ts-nocheck
 /**
- * build-images.mjs — phase 2 of the deploy (spec 05 / ADR-011).
+ * build-images.mjs — phase 2 of the deploy (spec 05 / ADR-011), corrected for the GA
+ * `lambda-microvms` API (2025-09-09).
  *
  * For each flavor in microvm/flavors.json:
  *   1. Stage the flavor's Dockerfile.<flavor> as `Dockerfile` in a temp build context.
  *   2. Zip the microvm/ context.
  *   3. Upload the zip to the image code bucket (from ImageStack; discovered via SSM).
- *   4. Trigger `create-microvm-image` from the uploaded context.
- *   5. Poll until CREATED; prune old image versions (keep last N).
+ *   4. `aws lambda-microvms create-microvm-image` from the uploaded context (requires a
+ *      base image ARN + build role ARN + code-artifact uri).
+ *   5. Poll `get-microvm-image` until state=CREATED; prune old image versions (keep last N).
  *   6. Publish the resulting image ARN to SSM: <ssmPrefix>/config/image-arn-<flavor>.
+ *
+ * Requires AWS CLI >= 2.35.17 (ships the `lambda-microvms` service). See
+ * docs/specs/05-infrastructure.md § Toolchain prerequisites.
  *
  * Zero npm deps — Node built-ins + AWS CLI (matches create-github-app.mjs conventions).
  *
@@ -108,7 +113,7 @@ function cpDir(from, to) {
   }
 }
 
-function buildFlavor(flavor, bucket) {
+function buildFlavor(flavor, ctx) {
   console.log(`\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.vcpu}vCPU/${flavor.memoryMb}MB) ===`);
   if (flavor.arch !== 'arm64') {
     // AGENTS.md hard rule — microVMs are Graviton only.
@@ -119,30 +124,55 @@ function buildFlavor(flavor, bucket) {
   const key = `image-contexts/${flavor.name}/${path.basename(zipPath)}`;
   console.log(`  staged + zipped → ${zipPath}`);
 
-  aws(['s3', 'cp', zipPath, `s3://${bucket}/${key}`]);
-  console.log(`  uploaded → s3://${bucket}/${key}`);
+  aws(['s3', 'cp', zipPath, `s3://${ctx.bucket}/${key}`]);
+  console.log(`  uploaded → s3://${ctx.bucket}/${key}`);
 
-  // Trigger the snapshot build from the uploaded context. The exact param shape depends on
-  // the create-microvm-image API; we pass the context location + a name tagged by flavor.
+  // Trigger the snapshot build via the GA lambda-microvms API (ADR-015). create-microvm-image
+  // is NOT idempotent — a name that already exists returns ValidationException. So: if the
+  // image already exists, UPDATE it (adds a new version); otherwise CREATE it. Both take the
+  // base image ARN + build role + code-artifact uri and return { imageArn, imageVersion,
+  // state:CREATING }; poll get-microvm-image for CREATED.
   const imageName = `lca-${ENV}-${flavor.name}`;
-  const r = aws([
-    'lambda',
-    'create-microvm-image',
-    '--image-name',
-    imageName,
-    '--architecture',
-    flavor.arch,
-    '--code',
-    `S3Bucket=${bucket},S3Key=${key}`,
-  ]);
-  const imageArn = DRY_RUN ? `arn:aws:lambda:${REGION || 'REGION'}:ACCOUNT:microvm-image/${imageName}` : JSON.parse(r.stdout).ImageArn;
-  console.log(`  build triggered → ${imageArn}`);
+  const imageArnFull = `arn:aws:lambda:${ctx.region}:${ctx.accountId}:microvm-image:${imageName}`;
+  const exists = imageExists(imageArnFull);
+  const commonArgs = [
+    '--base-image-arn',
+    ctx.baseImageArn,
+    '--build-role-arn',
+    ctx.buildRoleArn,
+    '--code-artifact',
+    `uri=s3://${ctx.bucket}/${key}`,
+    '--description',
+    `LambdaCIActions ${flavor.name} flavor (${ENV})`,
+  ];
+  let imageArn;
+  if (exists) {
+    console.log(`  image ${imageName} exists → update-microvm-image (new version)`);
+    const r = aws(['lambda-microvms', 'update-microvm-image', '--image-identifier', imageArnFull, ...commonArgs]);
+    imageArn = DRY_RUN ? imageArnFull : JSON.parse(r.stdout).imageArn;
+    console.log(`  update triggered → ${imageArn}`);
+  } else {
+    const r = aws(['lambda-microvms', 'create-microvm-image', '--name', imageName, ...commonArgs]);
+    imageArn = DRY_RUN ? imageArnFull : JSON.parse(r.stdout).imageArn;
+    console.log(`  build triggered → ${imageArn}`);
+  }
 
   pollUntilCreated(imageArn);
-  pruneOldVersions(imageName);
+  pruneOldVersions(imageArn);
 
   ssmPut(`${SSM_PREFIX}/config/image-arn-${flavor.name}`, imageArn);
   return imageArn;
+}
+
+// True if a microVM image already exists at this ARN (so we update vs create).
+// get-microvm-image requires the FULL ARN (a bare name → ValidationException).
+function imageExists(imageArn) {
+  if (DRY_RUN) return false;
+  const full = REGION
+    ? ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn, '--region', REGION]
+    : ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn];
+  const r = spawnSync('aws', full, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  return r.status === 0;
 }
 
 function pollUntilCreated(imageArn) {
@@ -152,11 +182,13 @@ function pollUntilCreated(imageArn) {
   }
   const deadline = Date.now() + 20 * 60 * 1000; // 20 min ceiling
   for (;;) {
-    const r = aws(['lambda', 'get-microvm-image', '--image-identifier', imageArn]);
-    const state = JSON.parse(r.stdout).State;
+    const r = aws(['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn]);
+    const state = JSON.parse(r.stdout).state;
     console.log(`  state=${state}`);
-    if (state === 'CREATED') return;
-    if (state === 'FAILED') throw new Error(`image build FAILED for ${imageArn}`);
+    if (state === 'CREATED' || state === 'UPDATED') return;
+    if (state === 'CREATE_FAILED' || state === 'UPDATE_FAILED') {
+      throw new Error(`image build ${state} for ${imageArn}`);
+    }
     if (Date.now() > deadline) throw new Error(`image build timed out for ${imageArn}`);
     spawnSync('sleep', ['15']);
   }
@@ -168,17 +200,48 @@ function pruneOldVersions(imageName) {
     return;
   }
   try {
-    const r = aws(['lambda', 'list-microvm-images', '--output', 'json']);
-    const images = (JSON.parse(r.stdout).Images || [])
-      .filter((im) => im.ImageName === imageName)
-      .sort((a, b) => new Date(b.CreatedAt) - new Date(a.CreatedAt));
-    for (const stale of images.slice(KEEP_VERSIONS)) {
-      aws(['lambda', 'delete-microvm-image', '--image-identifier', stale.ImageArn]);
-      console.log(`  pruned old image ${stale.ImageArn}`);
+    // Each rebuild of the same image name adds a VERSION; prune old versions, keep last N.
+    const r = aws([
+      'lambda-microvms',
+      'list-microvm-image-versions',
+      '--image-identifier',
+      imageName,
+      '--output',
+      'json',
+    ]);
+    const versions = (JSON.parse(r.stdout).items || [])
+      .slice()
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    for (const stale of versions.slice(KEEP_VERSIONS)) {
+      aws([
+        'lambda-microvms',
+        'delete-microvm-image-version',
+        '--image-identifier',
+        imageName,
+        '--image-version',
+        stale.imageVersion,
+      ]);
+      console.log(`  pruned old version ${imageName}:${stale.imageVersion}`);
     }
   } catch (e) {
     console.log(`  (prune skipped: ${e.message})`);
   }
+}
+
+function accountId() {
+  const r = aws(['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']);
+  return r.stdout.trim();
+}
+
+function discoverBaseImageArn() {
+  if (DRY_RUN) return `arn:aws:lambda:${REGION || 'REGION'}:aws:microvm-image:al2023-1`;
+  // The managed arm64 AL2023 base image. list-managed-microvm-images is the source of truth
+  // per region; pick the al2023 base (fall back to the first managed image).
+  const r = aws(['lambda-microvms', 'list-managed-microvm-images', '--output', 'json']);
+  const items = JSON.parse(r.stdout).items || [];
+  if (items.length === 0) throw new Error('no managed microVM base images in this region');
+  const al2023 = items.find((i) => /al2023/i.test(i.imageArn));
+  return (al2023 || items[0]).imageArn;
 }
 
 function main() {
@@ -186,10 +249,23 @@ function main() {
   console.log(`Building ${flavors.length} flavor(s) for env=${ENV}${DRY_RUN ? ' (dry-run)' : ''}`);
 
   const bucket = DRY_RUN ? '<image-code-bucket>' : ssmGet(`${SSM_PREFIX}/config/image-code-bucket`);
-  console.log(`code bucket: ${bucket}`);
+  const buildRoleArn = DRY_RUN
+    ? '<image-build-role-arn>'
+    : ssmGet(`${SSM_PREFIX}/config/image-build-role-arn`);
+  const baseImageArn = discoverBaseImageArn();
+  console.log(`code bucket:    ${bucket}`);
+  console.log(`build role:     ${buildRoleArn}`);
+  console.log(`base image ARN: ${baseImageArn}`);
 
+  const ctx = {
+    bucket,
+    buildRoleArn,
+    baseImageArn,
+    region: REGION || 'us-west-2',
+    accountId: DRY_RUN ? 'ACCOUNT' : accountId(),
+  };
   const results = {};
-  for (const flavor of flavors) results[flavor.name] = buildFlavor(flavor, bucket);
+  for (const flavor of flavors) results[flavor.name] = buildFlavor(flavor, ctx);
 
   console.log('\nDone. Image ARNs published to SSM:');
   for (const [name, arn] of Object.entries(results)) console.log(`  ${name}: ${arn}`);

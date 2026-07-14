@@ -117,11 +117,14 @@ Least privilege per Lambda:
 |---|---|
 | Ingest | read webhook secret; `sqs:SendMessage`; `dynamodb:PutItem/UpdateItem` (installations, runs) |
 | Provision | read app-pem + image ARNs; mint GitHub tokens (network egress); launch/terminate **tagged** microVMs; write runs |
-| Reaper | list/terminate tagged microVMs; update run rows |
+| Reaper | list live microVMs + terminate orphans (by run-store `microvmId`); update run rows |
 | Mgmt API | read all plane tables; write **config** entities only; **no** token minting, **no** microVM launch |
 | Image build | `s3:*` on code bucket; microVM image build APIs |
 
-microVM launch/terminate scoped by resource tag `lca:managed=true` / `lca:run=<id>`.
+microVM launch/terminate IAM is scoped to account/region (`aws:RequestedRegion`), NOT by
+VM tag — the GA `lambda-microvms` API doesn't support tagging a VM (see ADR-015). Runtime
+isolation comes from the dedicated per-env execution role + the run store as the
+authoritative run↔VM mapping.
 
 ## Networking
 
