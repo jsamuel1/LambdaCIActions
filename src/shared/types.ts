@@ -65,13 +65,17 @@ export interface ProvisionRequest {
   labels: string[];
 }
 
-/** The JSON we hand to `run-microvm --run-hook-payload` (delivered to /run). Keep <16 KB. */
+/**
+ * The JSON we hand to `run-microvm --run-hook-payload` (delivered to /run). HARD cap 4096
+ * bytes (GA lambda-microvms). The JIT config alone exceeds this, so it is NOT inlined — we
+ * pass only a small reference; the /run hook fetches the config from DynamoDB (ADR-015).
+ */
 export interface RunHookPayload {
-  jitConfig: string;
-  runId: number;
-  jobId: number;
-  repoFullName: string;
-  labels: string[];
+  /** DynamoDB ref to the stashed JIT config (see run-store jitConfigRef). */
+  ref: string;
+  /** AWS region + table so the in-microVM hook can construct a DynamoDB client. */
+  region: string;
+  table: string;
 }
 
 /** GitHub App credentials read from SSM. */

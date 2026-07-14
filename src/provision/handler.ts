@@ -3,7 +3,7 @@ import type { SQSEvent, SQSBatchResponse, SQSRecord } from 'aws-lambda';
 import { getParam } from '../shared/ssm.js';
 import { generateJitConfig } from '../shared/github-app.js';
 import { launchMicroVM } from '../shared/microvm.js';
-import { transitionRun } from '../shared/run-store.js';
+import { transitionRun, putJitConfig } from '../shared/run-store.js';
 import type { ProvisionRequest, RunHookPayload } from '../shared/types.js';
 import { resolveFlavor } from './flavor.js';
 
@@ -96,13 +96,19 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     labels: req.labels,
   });
 
-  // 3. launch the microVM with the JIT config as run-hook payload
-  const payload: RunHookPayload = {
+  // 3. stash the JIT config in DynamoDB (the 4 KB run-hook payload can't hold it inline,
+  //    ADR-015) and build the small reference payload the /run hook will resolve.
+  const ref = await putJitConfig(req.repoId, {
     jitConfig,
     runId: req.runId,
     jobId: req.jobId,
     repoFullName: req.repoFullName,
     labels: req.labels,
+  });
+  const payload: RunHookPayload = {
+    ref,
+    region: process.env.AWS_REGION ?? 'us-west-2',
+    table: process.env.TABLE_NAME ?? '',
   };
 
   let microvmId: string;
@@ -113,6 +119,8 @@ async function provisionOne(record: SQSRecord): Promise<void> {
       jobId: req.jobId,
       payload,
       executionRoleArn: RUNNER_ROLE_ARN,
+      // Per-run runtime logs (run-hook + runner agent) — diagnosable failures (ADR-016).
+      logGroup: `/aws/lambda/microvms/runs/lca-${process.env.LCA_ENV ?? 'dev'}`,
     }));
   } catch (err) {
     // Launch failed — record the failure so the run isn't a ghost, then rethrow so SQS

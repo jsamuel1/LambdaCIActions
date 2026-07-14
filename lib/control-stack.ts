@@ -75,7 +75,12 @@ export class ControlStack extends Stack {
     const bundling = {
       minify: true,
       sourceMap: false,
-      target: 'node20',
+      target: 'node22',
+      // NodejsFunction externalizes `@aws-sdk/*` by default (present in the Lambda runtime).
+      // But `@aws-sdk/client-lambda-microvms` is a NEW package NOT in the runtime — it must be
+      // BUNDLED or the Provision/Reaper dynamic import fails at runtime ("Cannot find package").
+      // Setting externalModules to only the base SDK bundles everything else (incl. microvms).
+      externalModules: ['@aws-sdk/client-lambda'],
     };
     const ingestLogGroup = new logs.LogGroup(this, 'IngestLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-ingest`,
@@ -84,7 +89,7 @@ export class ControlStack extends Stack {
     });
     const ingest = new NodejsFunction(this, 'IngestFn', {
       functionName: `lca-${envName}-ingest`,
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64, // arm64 everywhere (ADR-010)
       entry: path.join(SRC, 'ingest', 'handler.ts'),
       handler: 'handler',
@@ -114,6 +119,28 @@ export class ControlStack extends Stack {
     );
 
     // ---- Provision λ ----
+    // microVM execution role (ADR-015): stamped on each VM via run-microvm --execution-role-arn.
+    // The VM's /run hook uses it to read its JIT config item from DynamoDB (the config is
+    // passed by reference, not inline, because the run-hook payload cap is 4 KB). Also the
+    // per-env isolation boundary now that VM tagging isn't available. Trusts the Lambda
+    // service principal (microVMs are part of the Lambda service).
+    const microvmExecRole = new iam.Role(this, 'MicrovmExecRole', {
+      roleName: `lca-${envName}-microvm-exec`,
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      description: 'Execution role stamped on LambdaCIActions microVMs (reads JIT config from DDB)',
+    });
+    // Read-only on the run table so the /run hook can fetch its JIT config item.
+    table.grantReadData(microvmExecRole);
+    // Runtime logs: the VM writes run-hook + runner output to the per-run log group
+    // Provision passes at launch (ADR-016).
+    microvmExecRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'MicrovmRuntimeLogs',
+        actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
+        resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/microvms/*`],
+      }),
+    );
+
     const provisionLogGroup = new logs.LogGroup(this, 'ProvisionLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-provision`,
       retention: logs.RetentionDays.TWO_WEEKS,
@@ -121,7 +148,7 @@ export class ControlStack extends Stack {
     });
     const provision = new NodejsFunction(this, 'ProvisionFn', {
       functionName: `lca-${envName}-provision`,
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64,
       entry: path.join(SRC, 'provision', 'handler.ts'),
       handler: 'handler',
@@ -136,14 +163,22 @@ export class ControlStack extends Stack {
         APP_PEM_PARAM: `${ssmPrefix}/github/app-pem`,
         IMAGE_ARN_PARAM_PREFIX: `${ssmPrefix}/config/image-arn-`,
         TABLE_NAME: table.tableName,
+        RUNNER_ROLE_ARN: microvmExecRole.roleArn,
       },
     });
+    // Provision must write the JIT config item (side-store) + stamp run rows.
+    table.grantReadWriteData(provision);
+    // Provision passes the exec role to run-microvm — needs iam:PassRole for it.
+    provision.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'PassMicrovmExecRole',
+        actions: ['iam:PassRole'],
+        resources: [microvmExecRole.roleArn],
+      }),
+    );
     provision.addEventSource(
       new SqsEventSource(queue, { batchSize: 5, reportBatchItemFailures: true }),
     );
-    // Provision transitions run rows (provisioning → running / failed).
-    table.grantWriteData(provision);
-
     // Provision reads App PEM + image ARNs (path-scoped).
     provision.addToRolePolicy(
       new iam.PolicyStatement({
@@ -174,6 +209,16 @@ export class ControlStack extends Stack {
         },
       }),
     );
+    // RunMicrovm attaches network connectors (INTERNET_EGRESS so the runner reaches GitHub,
+    // HTTP_INGRESS for the per-VM endpoint that receives the /run hook); launching requires
+    // lambda:PassNetworkConnector on each. Scope to the aws-managed connectors.
+    provision.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'PassNetworkConnectors',
+        actions: ['lambda:PassNetworkConnector'],
+        resources: ['arn:aws:lambda:*:aws:network-connector:aws-network-connector:*'],
+      }),
+    );
     provision.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'TerminateMicroVMs',
@@ -193,7 +238,7 @@ export class ControlStack extends Stack {
     });
     const reaper = new NodejsFunction(this, 'ReaperFn', {
       functionName: `lca-${envName}-reaper`,
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64,
       entry: path.join(SRC, 'reaper', 'handler.ts'),
       handler: 'handler',
