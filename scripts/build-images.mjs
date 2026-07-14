@@ -127,36 +127,52 @@ function buildFlavor(flavor, ctx) {
   aws(['s3', 'cp', zipPath, `s3://${ctx.bucket}/${key}`]);
   console.log(`  uploaded → s3://${ctx.bucket}/${key}`);
 
-  // Trigger the snapshot build via the GA lambda-microvms API (ADR-015):
-  //   create-microvm-image --base-image-arn <managed al2023 arm64>
-  //                         --build-role-arn <ImageStack role>
-  //                         --code-artifact uri=s3://... --name <image>
-  // Returns { imageArn, imageVersion, state:CREATING }. Poll get-microvm-image for CREATED.
+  // Trigger the snapshot build via the GA lambda-microvms API (ADR-015). create-microvm-image
+  // is NOT idempotent — a name that already exists returns ValidationException. So: if the
+  // image already exists, UPDATE it (adds a new version); otherwise CREATE it. Both take the
+  // base image ARN + build role + code-artifact uri and return { imageArn, imageVersion,
+  // state:CREATING }; poll get-microvm-image for CREATED.
   const imageName = `lca-${ENV}-${flavor.name}`;
-  const r = aws([
-    'lambda-microvms',
-    'create-microvm-image',
+  const imageArnFull = `arn:aws:lambda:${ctx.region}:${ctx.accountId}:microvm-image:${imageName}`;
+  const exists = imageExists(imageArnFull);
+  const commonArgs = [
     '--base-image-arn',
     ctx.baseImageArn,
     '--build-role-arn',
     ctx.buildRoleArn,
     '--code-artifact',
     `uri=s3://${ctx.bucket}/${key}`,
-    '--name',
-    imageName,
     '--description',
     `LambdaCIActions ${flavor.name} flavor (${ENV})`,
-  ]);
-  const imageArn = DRY_RUN
-    ? `arn:aws:lambda:${REGION || 'REGION'}:ACCOUNT:microvm-image:${imageName}`
-    : JSON.parse(r.stdout).imageArn;
-  console.log(`  build triggered → ${imageArn}`);
+  ];
+  let imageArn;
+  if (exists) {
+    console.log(`  image ${imageName} exists → update-microvm-image (new version)`);
+    const r = aws(['lambda-microvms', 'update-microvm-image', '--image-identifier', imageArnFull, ...commonArgs]);
+    imageArn = DRY_RUN ? imageArnFull : JSON.parse(r.stdout).imageArn;
+    console.log(`  update triggered → ${imageArn}`);
+  } else {
+    const r = aws(['lambda-microvms', 'create-microvm-image', '--name', imageName, ...commonArgs]);
+    imageArn = DRY_RUN ? imageArnFull : JSON.parse(r.stdout).imageArn;
+    console.log(`  build triggered → ${imageArn}`);
+  }
 
   pollUntilCreated(imageArn);
-  pruneOldVersions(imageName);
+  pruneOldVersions(imageArn);
 
   ssmPut(`${SSM_PREFIX}/config/image-arn-${flavor.name}`, imageArn);
   return imageArn;
+}
+
+// True if a microVM image already exists at this ARN (so we update vs create).
+// get-microvm-image requires the FULL ARN (a bare name → ValidationException).
+function imageExists(imageArn) {
+  if (DRY_RUN) return false;
+  const full = REGION
+    ? ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn, '--region', REGION]
+    : ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn];
+  const r = spawnSync('aws', full, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  return r.status === 0;
 }
 
 function pollUntilCreated(imageArn) {
@@ -212,6 +228,11 @@ function pruneOldVersions(imageName) {
   }
 }
 
+function accountId() {
+  const r = aws(['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']);
+  return r.stdout.trim();
+}
+
 function discoverBaseImageArn() {
   if (DRY_RUN) return `arn:aws:lambda:${REGION || 'REGION'}:aws:microvm-image:al2023-1`;
   // The managed arm64 AL2023 base image. list-managed-microvm-images is the source of truth
@@ -236,7 +257,13 @@ function main() {
   console.log(`build role:     ${buildRoleArn}`);
   console.log(`base image ARN: ${baseImageArn}`);
 
-  const ctx = { bucket, buildRoleArn, baseImageArn };
+  const ctx = {
+    bucket,
+    buildRoleArn,
+    baseImageArn,
+    region: REGION || 'us-west-2',
+    accountId: DRY_RUN ? 'ACCOUNT' : accountId(),
+  };
   const results = {};
   for (const flavor of flavors) results[flavor.name] = buildFlavor(flavor, ctx);
 
