@@ -12,6 +12,8 @@ export interface WorkflowJobEvent {
     name: string;
     status: string;
     conclusion?: string | null; // set on action=completed
+    /** Name of the enclosing workflow (GitHub adds this to workflow_job payloads). */
+    workflow_name?: string | null;
   };
   repository: {
     id: number;
@@ -63,6 +65,41 @@ export interface ProvisionRequest {
   runId: number;
   jobId: number;
   labels: string[];
+  /** Rendered job name from the webhook (matches stored analyses; M3-S4). */
+  jobName?: string;
+  /** Enclosing workflow name from the webhook (matches stored analyses; M3-S4). */
+  workflowName?: string | null;
+}
+
+/**
+ * A GitHub `push` webhook payload (subset). Only used to detect pushes touching
+ * `.github/workflows/**` so Discovery can re-parse the repo (spec 03 § Discovery).
+ */
+export interface PushEvent {
+  ref: string;
+  repository: {
+    id: number;
+    name: string;
+    full_name: string;
+    owner: { login: string };
+  };
+  installation?: { id: number };
+  commits?: { added?: string[]; removed?: string[]; modified?: string[] }[];
+  head_commit?: { added?: string[]; removed?: string[]; modified?: string[] } | null;
+}
+
+/**
+ * The message Ingest enqueues onto the discovery queue — one per repo to (re)scan
+ * (spec 03 § Discovery). Consumed by the Discovery λ.
+ */
+export interface DiscoveryRequest {
+  installationId: number;
+  repoId: number;
+  repoFullName: string; // owner/repo
+  owner: string;
+  repo: string;
+  /** Why the scan fired (logging / debugging only). */
+  reason: 'push' | 'installation' | 'manual';
 }
 
 /**
@@ -151,6 +188,11 @@ export interface RepoRecord {
   repoId: number;
   repoFullName: string;
   enabled: boolean;
+  /**
+   * Per-repo explicit `label → flavor` override map (spec 03 routing step 1). Set via
+   * the management UI (M4); consumed by Provision when resolving a job's flavor.
+   */
+  flavorMap?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
 }
@@ -178,6 +220,11 @@ export interface StepSignals {
  */
 export interface ParsedJob {
   id: string;
+  /**
+   * The job's custom `name:` if set (string-coerced), else null. Needed to match a
+   * `workflow_job` webhook (which carries the RENDERED name) back to the parsed job.
+   */
+  name: string | null;
   /**
    * `runs-on` normalized to a string[]. Unresolvable matrix expressions (`${{ matrix.os }}`)
    * are preserved verbatim as the raw expression string. The runner-group object form
@@ -233,6 +280,33 @@ export interface CompatResult {
   level: CompatLevel;
   eligible: boolean;
   messages: CompatMessage[];
+}
+
+/**
+ * A persisted per-workflow analysis row (M3-S4 wiring; ADR-009 single table).
+ *
+ * Keys: PK = `REPO#<repoId>`, SK = `WF#<path>` — one item per workflow file, upserted by
+ * the Discovery λ, read by Ingest (claim-time compat) and Provision (signals).
+ */
+export interface WorkflowAnalysisRecord {
+  repoId: number;
+  installationId: number;
+  repoFullName: string;
+  path: string;
+  /** Workflow `name:` (falls back to file basename). */
+  name: string;
+  /** Normalized parse output; absent when the file failed to parse. */
+  parsed?: ParsedWorkflow;
+  /** Per-job compat results + folded workflow level; absent when parse failed. */
+  compat?: { level: CompatLevel; jobs: Record<string, CompatResult> };
+  /** Per-job flavor resolution (routing preview for the UI); absent when parse failed. */
+  routes?: Record<string, { flavor: string; reason: string }>;
+  /** Parse failure detail (WorkflowParseError message); analysis fields absent. */
+  parseError?: string;
+  /** Git blob sha of the parsed content (spec 03 `last_parsed_sha`). */
+  lastParsedSha?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /** Thrown by `parseWorkflow` when the YAML is malformed / not a mapping. Catchable by callers. */

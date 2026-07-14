@@ -71,6 +71,19 @@ export class ControlStack extends Stack {
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
 
+    // ---- SQS: workflow-discovery scans (M3-S4) ----
+    // Standard queue: scans are idempotent upserts, so duplicate delivery is harmless and
+    // FIFO ordering buys nothing.
+    const discoveryDlq = new sqs.Queue(this, 'DiscoveryDLQ', {
+      queueName: `lca-${envName}-discovery-dlq`,
+      retentionPeriod: Duration.days(14),
+    });
+    const discoveryQueue = new sqs.Queue(this, 'DiscoveryQueue', {
+      queueName: `lca-${envName}-discovery`,
+      visibilityTimeout: Duration.seconds(360), // headroom over the Discovery λ timeout
+      deadLetterQueue: { queue: discoveryDlq, maxReceiveCount: 3 },
+    });
+
     // ---- Ingest λ ----
     const bundling = {
       minify: true,
@@ -101,12 +114,15 @@ export class ControlStack extends Stack {
         WEBHOOK_SECRET_PARAM: `${ssmPrefix}/github/webhook-secret`,
         RUNNER_LABELS_PARAM: `${ssmPrefix}/config/runner-labels`,
         QUEUE_URL: queue.queueUrl,
+        DISCOVERY_QUEUE_URL: discoveryQueue.queueUrl,
         TABLE_NAME: table.tableName,
       },
     });
     queue.grantSendMessages(ingest);
-    // Ingest writes run rows (queued + status transitions) and installation/repo config.
-    table.grantWriteData(ingest);
+    discoveryQueue.grantSendMessages(ingest);
+    // Ingest writes run rows (queued + status transitions) and installation/repo config,
+    // and reads stored workflow analyses for the claim-time compat gate (M3-S4).
+    table.grantReadWriteData(ingest);
     ingest.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'ReadWebhookConfig',
@@ -230,6 +246,50 @@ export class ControlStack extends Stack {
       }),
     );
 
+    // ---- Discovery λ (M3-S4, spec 03 § Discovery) ----
+    // Fetches .github/workflows/** via the GitHub App installation token, parses +
+    // analyzes compat, persists WorkflowAnalysisRecords for Ingest/Provision/UI.
+    const discoveryLogGroup = new logs.LogGroup(this, 'DiscoveryLogGroup', {
+      logGroupName: `/aws/lambda/lca-${envName}-discovery`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const discovery = new NodejsFunction(this, 'DiscoveryFn', {
+      functionName: `lca-${envName}-discovery`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(SRC, 'discover', 'handler.ts'),
+      handler: 'handler',
+      // A full-repo scan is N sequential GitHub fetches; give it room.
+      timeout: Duration.seconds(300),
+      memorySize: 256,
+      // GitHub API rate-limit friendliness: one scan at a time is plenty.
+      reservedConcurrentExecutions: 2,
+      logGroup: discoveryLogGroup,
+      bundling,
+      environment: {
+        APP_ID_PARAM: `${ssmPrefix}/github/app-id`,
+        APP_PEM_PARAM: `${ssmPrefix}/github/app-pem`,
+        TABLE_NAME: table.tableName,
+      },
+    });
+    discovery.addEventSource(
+      new SqsEventSource(discoveryQueue, { batchSize: 1, reportBatchItemFailures: true }),
+    );
+    // Writes workflow-analysis rows; reads the repo row (FlavorMap).
+    table.grantReadWriteData(discovery);
+    // Reads the App credentials to mint installation tokens (contents:read fetches).
+    discovery.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadDiscoveryConfig',
+        actions: ['ssm:GetParameter'],
+        resources: [
+          paramArn(`${ssmPrefix}/github/app-id`),
+          paramArn(`${ssmPrefix}/github/app-pem`),
+        ],
+      }),
+    );
+
     // ---- Reaper λ + EventBridge schedule (spec 02 reaping, M2) ----
     const reaperLogGroup = new logs.LogGroup(this, 'ReaperLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-reaper`,
@@ -318,6 +378,7 @@ export class ControlStack extends Stack {
     });
     new CfnOutput(this, 'ProvisionQueueUrl', { value: queue.queueUrl });
     new CfnOutput(this, 'ProvisionDLQUrl', { value: dlq.queueUrl });
+    new CfnOutput(this, 'DiscoveryQueueUrl', { value: discoveryQueue.queueUrl });
     new CfnOutput(this, 'ReaperFunctionName', { value: reaper.functionName });
     new CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn });
   }

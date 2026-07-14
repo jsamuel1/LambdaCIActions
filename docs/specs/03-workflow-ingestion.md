@@ -42,6 +42,18 @@ Mechanics:
 3. Fetch each file's content (record the commit `sha`).
 4. Parse → upsert `Workflow` rows (keyed by path) with `last_parsed_sha`.
 
+**Implementation (M3-S4, ADR-017)**: discovery runs in a dedicated λ behind a standard
+SQS queue (`lca-<env>-discovery`), fed by the Ingest λ. Each scan upserts one
+`WorkflowAnalysisRecord` per file (`pk=REPO#<repoId>`, `sk=WF#<path>`) holding the parse
+output, per-job compat, and a routing preview computed with the repo's FlavorMap.
+Malformed YAML persists as a `parseError` row (surfaced in the UI, not retried).
+
+Consumers correlate a `workflow_job` webhook to its analysis by **rendered name**
+(`workflow_job.workflow_name` → workflow `name`, `workflow_job.name` → job `name:` or
+id; matrix renders match by `"name ("` prefix) and **fail open**: Ingest skips a claim
+only on an unambiguous `block` match; Provision degrades to label-only routing when no
+analysis matches.
+
 ## Parsing model
 
 Parse YAML into a normalized structure (don't attempt full GitHub semantics — extract what

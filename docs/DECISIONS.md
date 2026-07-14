@@ -231,3 +231,39 @@ exposure. The exec role finally gives the VM a scoped identity (read-only JIT fe
 name + ref format) delivered via the payload. Rotating the hook-path prefix is AWS's
 call — the server tolerates both shapes. Terminal-state JIT items age out via TTL; a
 failed launch leaves an orphaned JITCONFIG item that TTLs away harmlessly.
+
+## ADR-017 — Workflow discovery wiring: async scans, rendered-name matching, fail-open gates (M3-S4)
+
+**Status**: accepted
+**Context**: M3-S1..S3 shipped `parseWorkflow` + `analyzeCompat` as pure, unconsumed
+modules. Wiring them in needs three decisions: (a) where discovery (GitHub fetch → parse →
+persist) runs, (b) how a `workflow_job` webhook is correlated back to a stored analysis —
+the webhook carries only the *rendered* job name + workflow name, never the file path or
+job id — and (c) what happens when that correlation fails.
+**Decision**:
+- **Discovery is its own λ behind a standard SQS queue** (`lca-<env>-discovery`), fed by
+  Ingest on `push` events touching `.github/workflows/**` and on
+  `installation.created` / `installation_repositories.added`. Scans are idempotent
+  upserts (one `WorkflowAnalysisRecord` per file: `pk=REPO#<repoId>, sk=WF#<path>`), so a
+  standard queue + redelivery is safe; FIFO buys nothing. Parse failures are persisted as
+  `parseError` rows (UI-surfaceable), never retried as infra failures.
+- **Analyses store parse output + compat + routing preview** computed with the repo's
+  FlavorMap override, so what the UI shows matches what Provision resolves.
+- **Webhook → analysis correlation is by rendered name** (`workflow_job.workflow_name` →
+  parsed `name`, `workflow_job.name` → job `name:` or id, matrix renders matched by
+  `"name ("` prefix). The parser now extracts each job's `name:` for this.
+- **Both consumers fail OPEN**: Ingest's claim-time compat gate only skips a claim on an
+  unambiguous `block` match; Provision's signal threading degrades to label-only routing
+  when no analysis matches. An ambiguous match (same rendered name in two workflows, no
+  `workflow_name`) is treated as no match.
+**Why**: Fetching N files inline in the webhook handler would blow its 10 s budget and
+GitHub's delivery timeout; async scans keep Ingest hot-path fast. Rendered-name matching
+is the only correlation GitHub gives us without an extra API call per job. Failing open
+preserves the M1..M2 invariant that a labeled job always gets a runner — a stale or
+missing analysis must never strand a job (the label IS the operator's explicit intent);
+compat `block` is advisory routing, not a security boundary.
+**Consequences**: A renamed job/workflow can miss its analysis until the next push re-scan
+(acceptable: fail-open). Jobs with expression-bearing custom names (`name: ${{ … }}`)
+never match — they route label-only. The claim gate adds one DDB Query per claimed
+webhook (single-digit ms, small partitions). Manual "re-scan" (spec 03) needs only an SQS
+send to the discovery queue — the M4 UI can reuse the same message shape.
