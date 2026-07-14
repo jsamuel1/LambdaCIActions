@@ -144,6 +144,19 @@ function buildFlavor(flavor, ctx) {
     `uri=s3://${ctx.bucket}/${key}`,
     '--description',
     `LambdaCIActions ${flavor.name} flavor (${ENV})`,
+    // Declare the hooks (ADR-012): our run-hook server listens on :8080. The `run` hook
+    // receives the launch's runHookPayload at POST /run. The API REQUIRES the `ready` image
+    // hook whenever any lifecycle hook is enabled — /ready signals init-complete so the
+    // snapshot is taken in a ready state. Without run: RunMicrovm rejects the payload.
+    '--hooks',
+    JSON.stringify({
+      port: Number(flavor.runHookPort ?? 8080),
+      microvmImageHooks: { ready: 'ENABLED', readyTimeoutInSeconds: 120 },
+      microvmHooks: { run: 'ENABLED', runTimeoutInSeconds: 30 },
+    }),
+    // Capture build + hook logs to CloudWatch so ready/run hook failures are diagnosable.
+    '--logging',
+    JSON.stringify({ cloudWatch: { logGroup: `/aws/lambda/microvms/lca-${ENV}-${flavor.name}` } }),
   ];
   let imageArn;
   if (exists) {

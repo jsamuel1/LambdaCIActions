@@ -8,15 +8,17 @@
  * Traffic to the VM is gated until `/run` returns 200, so we ACK fast and run the actual
  * GitHub Actions job in the background.
  *
- * Contract:
- *   POST /run        body = { jitConfig, runId, jobId, repoFullName, labels }  (<=16 KB)
- *                    -> 200 immediately; runner agent runs ONE job in the background
+ * Contract (ADR-015 — run-hook payload cap is 4 KB, so the JIT config is passed by
+ * REFERENCE, not inline):
+ *   POST /run        body = { ref, region, table }   (small; <4 KB)
+ *                    -> hook fetches the JIT config from DynamoDB by ref, then
+ *                       200 immediately; runner agent runs ONE job in the background
  *   POST /terminate  fires pre-teardown; best-effort final log flush
  *   GET  /healthz    liveness
  *
  * Single-use semantics (ADR-003/006): the JIT config is consumed by exactly one
  * `run.sh --jitconfig` invocation; on agent exit we self-terminate via `terminate-microvm`
- * (the Reaper λ backstops orphans). Zero runtime deps — Node built-ins only.
+ * (the Reaper λ backstops orphans). Zero runtime deps — Node built-ins + the baked-in AWS CLI.
  */
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
@@ -24,7 +26,7 @@ import fs from 'node:fs';
 
 const PORT = parseInt(process.env.RUN_HOOK_PORT || '8080', 10);
 const RUNNER_DIR = process.env.RUNNER_DIR || '/opt/actions-runner';
-const MAX_PAYLOAD_BYTES = 16 * 1024; // run-hook payload hard cap
+const MAX_PAYLOAD_BYTES = 4096; // GA lambda-microvms run-hook payload hard cap (ADR-015)
 
 let jobStarted = false; // guard: this microVM runs exactly one job
 
@@ -61,7 +63,7 @@ function selfTerminate(reason) {
     log('no microvm id available; relying on Reaper', {});
     return;
   }
-  const r = spawnSync('aws', ['lambda', 'terminate-microvm', '--microvm-id', microvmId], {
+  const r = spawnSync('aws', ['lambda-microvms', 'terminate-microvm', '--microvm-identifier', microvmId], {
     encoding: 'utf8',
   });
   if (r.status !== 0) {
@@ -69,14 +71,57 @@ function selfTerminate(reason) {
   }
 }
 
-// The microVM's own id is exposed to the guest via the instance metadata file that the
-// Lambda microVM runtime writes at boot. Path is stable per the runtime contract.
+// The microVM's own id is exposed to the guest via instance metadata. The exact location
+// is undocumented — try the known candidates and log what exists so we can pin it down
+// from runtime logs (ADR-016 diagnosability).
 function readMicrovmId() {
-  try {
-    return fs.readFileSync('/run/microvm/id', 'utf8').trim();
-  } catch {
-    return null;
+  const candidates = [
+    '/run/microvm/id',
+    '/etc/microvm-id',
+    '/proc/device-tree/microvm-id',
+  ];
+  for (const p of candidates) {
+    try {
+      const v = fs.readFileSync(p, 'utf8').trim();
+      if (v) return v;
+    } catch {
+      /* try next */
+    }
   }
+  // Env fallbacks the runtime may set.
+  for (const k of ['MICROVM_ID', 'AWS_LAMBDA_MICROVM_ID', 'LAMBDA_MICROVM_ID']) {
+    if (process.env[k]) return process.env[k];
+  }
+  try {
+    log('microvm id discovery failed', {
+      runDir: fs.existsSync('/run/microvm') ? fs.readdirSync('/run/microvm') : 'no /run/microvm',
+      envKeys: Object.keys(process.env).filter((k) => /microvm|lambda/i.test(k)),
+    });
+  } catch {
+    /* best-effort */
+  }
+  return null;
+}
+
+// Fetch the stashed JIT config from DynamoDB by ref (ADR-015). Uses the baked-in AWS CLI
+// (no npm deps in the image). The ref encodes the item's pk; sk is the fixed JITCONFIG_SK.
+function fetchJitConfig({ ref, region, table }) {
+  const pk = ref.split('#JITCONFIG')[0];
+  const key = JSON.stringify({ pk: { S: pk }, sk: { S: 'JITCONFIG' } });
+  const args = ['dynamodb', 'get-item', '--table-name', table, '--key', key, '--output', 'json'];
+  if (region) args.push('--region', region);
+  const r = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`dynamodb get-item failed: ${r.stderr || r.stdout}`);
+  const out = JSON.parse(r.stdout || '{}');
+  if (!out.Item) throw new Error(`no JIT config item for ref ${ref}`);
+  const it = out.Item;
+  return {
+    jitConfig: it.jitConfig?.S,
+    runId: Number(it.runId?.N),
+    jobId: Number(it.jobId?.N),
+    repoFullName: it.repoFullName?.S,
+    labels: (it.labels?.L ?? []).map((x) => x.S),
+  };
 }
 
 function runJob(payload) {
@@ -107,14 +152,31 @@ function runJob(payload) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Log EVERY request (path + method) — essential for diagnosing platform hook probes.
+  // Platform lifecycle hooks arrive under the runtime prefix, e.g.
+  //   POST /aws/lambda-microvms/runtime/v1/ready | /run | /terminate
+  // (observed from live build logs). Short aliases kept for local testing.
+  const HOOK_PREFIX = '/aws/lambda-microvms/runtime/v1';
+  const rawPath = (req.url || '').split('?')[0];
+  const path = rawPath.startsWith(HOOK_PREFIX) ? rawPath.slice(HOOK_PREFIX.length) : rawPath;
+  log('request', { method: req.method, url: req.url, hook: path });
   try {
-    if (req.method === 'GET' && req.url === '/healthz') {
+    if (req.method === 'GET' && path === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/run') {
+    // The `ready` image hook: fires during image build once the app has finished
+    // initializing, so the snapshot is captured in a ready state. Required whenever any
+    // lifecycle hook is enabled. Match any method.
+    if (path === '/ready') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ready":true}');
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/run') {
       if (jobStarted) {
         // single-use guard — never accept a second job on the same VM
         res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -122,17 +184,41 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const raw = await readBody(req);
-      let payload;
+      let ptr;
       try {
-        payload = JSON.parse(raw);
+        ptr = JSON.parse(raw);
       } catch {
+        log('run payload not JSON', { raw: raw.slice(0, 512) });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end('{"error":"invalid JSON payload"}');
         return;
       }
+      // The platform may deliver the launch payload wrapped (observed empirically — log the
+      // raw body to diagnose). Accept both the bare payload and common wrapper keys.
+      if (ptr && typeof ptr.runHookPayload === 'string') {
+        try { ptr = JSON.parse(ptr.runHookPayload); } catch { /* fall through */ }
+      } else if (ptr && typeof ptr.payload === 'string') {
+        try { ptr = JSON.parse(ptr.payload); } catch { /* fall through */ }
+      }
+      if (!ptr || !ptr.ref || !ptr.table) {
+        log('run payload missing ref/table', { raw: raw.slice(0, 512) });
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end('{"error":"missing ref/table"}');
+        return;
+      }
+      // Resolve the JIT config by reference (the payload itself can't hold it, ADR-015).
+      let payload;
+      try {
+        payload = fetchJitConfig(ptr);
+      } catch (err) {
+        log('jit config fetch failed', { error: err.message, ref: ptr.ref });
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end('{"error":"jit config fetch failed"}');
+        return;
+      }
       if (!payload.jitConfig || !payload.runId || !payload.jobId) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end('{"error":"missing jitConfig/runId/jobId"}');
+        res.end('{"error":"resolved config missing jitConfig/runId/jobId"}');
         return;
       }
       jobStarted = true;
@@ -143,7 +229,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/terminate') {
+    if (req.method === 'POST' && path === '/terminate') {
       log('terminate hook fired', {});
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');

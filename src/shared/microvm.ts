@@ -23,7 +23,7 @@ import type { RunHookPayload } from './types.js';
  * health-checking the per-VM endpoint (which would need a CreateMicrovmAuthToken JWE).
  */
 
-const RUN_HOOK_PAYLOAD_MAX = 16 * 1024;
+const RUN_HOOK_PAYLOAD_MAX = 4096; // GA lambda-microvms hard cap (service model), NOT 16KB
 
 export interface LaunchParams {
   imageArn: string;
@@ -31,6 +31,9 @@ export interface LaunchParams {
   jobId: number;
   payload: RunHookPayload;
   executionRoleArn?: string;
+  /** CloudWatch log group for the VM's runtime output (run-hook + runner). Without this
+   *  a failed boot/job is a black box — always set in production (ADR-016). */
+  logGroup?: string;
   /** Optional auto-suspend policy; single-use runners generally omit this (run once, terminate). */
   idlePolicy?: {
     maxIdleDurationSeconds: number;
@@ -82,9 +85,21 @@ export async function launchMicroVM(
   params: LaunchParams,
 ): Promise<LaunchResult> {
   const payloadJson = JSON.stringify(params.payload);
-  if (Buffer.byteLength(payloadJson, 'utf8') > RUN_HOOK_PAYLOAD_MAX) {
+  const payloadBytes = Buffer.byteLength(payloadJson, 'utf8');
+  // The payload is now just a small reference (the JIT config lives in DynamoDB, ADR-015),
+  // so it fits the 4 KB cap trivially. Keep the guard + a size log as a safety net against
+  // an accidentally-oversized ref payload.
+  console.log(
+    JSON.stringify({
+      msg: 'run-hook payload size',
+      totalBytes: payloadBytes,
+      cap: RUN_HOOK_PAYLOAD_MAX,
+      runId: params.runId,
+    }),
+  );
+  if (payloadBytes > RUN_HOOK_PAYLOAD_MAX) {
     throw new Error(
-      `run-hook payload ${Buffer.byteLength(payloadJson)} bytes exceeds 16 KB cap (ADR-012)`,
+      `run-hook payload ${payloadBytes} bytes exceeds ${RUN_HOOK_PAYLOAD_MAX}-byte cap (ADR-015)`,
     );
   }
 
@@ -94,6 +109,7 @@ export async function launchMicroVM(
     runHookPayload: payloadJson,
   };
   if (params.executionRoleArn) input.executionRoleArn = params.executionRoleArn;
+  if (params.logGroup) input.logging = { cloudWatch: { logGroup: params.logGroup } };
   if (params.idlePolicy) input.idlePolicy = params.idlePolicy;
   if (params.maximumDurationInSeconds !== undefined) {
     input.maximumDurationInSeconds = params.maximumDurationInSeconds;

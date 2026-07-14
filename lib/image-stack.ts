@@ -59,6 +59,14 @@ export class ImageStack extends Stack {
       description: 'LambdaCIActions microVM image build role',
     });
     this.codeBucket.grantRead(this.buildRole);
+    // Build + hook logs to CloudWatch (the build passes --logging pointing at this group).
+    this.buildRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'MicroVMBuildLogs',
+        actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
+        resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/microvms/*`],
+      }),
+    );
     this.buildRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'MicroVMImageBuild',

@@ -13,7 +13,7 @@
 # x86_64 base or the snapshot build will produce an unbootable image.
 FROM --platform=linux/arm64 ubuntu:22.04
 
-ARG RUNNER_VERSION=2.319.1
+ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_DIR=/opt/actions-runner \

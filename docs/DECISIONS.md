@@ -195,3 +195,39 @@ tags via `TagResource`). Reaper terminates over-cap VMs by `startedAt`. IAM is c
 the original tag-gated intent — revisit if the API gains VM-level resource ARNs or tagging.
 Toolchain floor (CLI ≥ 2.35.17, boto3/botocore ≥ 1.43.44) is documented in spec 05
 § Toolchain prerequisites and AGENTS.md.
+
+## ADR-016 — JIT config by reference; empirically-verified microVM hook contract (M3)
+**Status**: Accepted (v1) · amends [ADR-012](#adr-012) (payload + hook details)
+**Context**: First live runs against the GA `lambda-microvms` API surfaced three contract
+details that no documentation states (all verified from real launches + build logs):
+1. **`runHookPayload` hard cap is 4096 bytes** (service model constraint) — NOT the 16 KB
+   ADR-012 assumed. A GitHub `encoded_jit_config` alone is ~4.1 KB, so it can NEVER be
+   passed inline.
+2. **Enabling any lifecycle hook requires the `ready` image hook** — `create/update-microvm-image`
+   rejects `microvmHooks.run=ENABLED` unless `microvmImageHooks.ready=ENABLED`. The build
+   boots the image and POSTs the ready hook; the snapshot is taken only after it returns 200
+   (a 4xx/timeout fails the build with "Ready hook check failed").
+3. **Hooks are delivered under a runtime path prefix**: the platform requests
+   `POST /aws/lambda-microvms/runtime/v1/<hook>` (`/ready`, `/run`, `/terminate`) on the
+   declared hooks port — NOT the bare `/<hook>` paths. Observed from live build logs; the
+   in-image server must strip the prefix (ours logs every request for diagnosability).
+Also: `RunMicrovm` requires `lambda:PassNetworkConnector` on the aws-managed connectors
+(`INTERNET_EGRESS`, `HTTP_INGRESS`) and `iam:PassRole` for the execution role.
+**Decision**:
+- Provision stashes `{jitConfig, runId, jobId, repoFullName, labels}` in the shared table
+  (item `pk=RUN#…, sk=JITCONFIG`, TTL 30 min) and passes only `{ref, region, table}`
+  (~100 B) as the run-hook payload. The `/run` hook resolves the ref via the baked-in AWS
+  CLI (`dynamodb get-item`) using the **microVM execution role** (`lca-<env>-microvm-exec`,
+  read-only on the table), which Provision stamps on every launch via `--execution-role-arn`
+  (and holds `iam:PassRole` for).
+- Images declare `hooks = { port: 8080, microvmImageHooks: { ready: ENABLED },
+  microvmHooks: { run: ENABLED } }` and ship a hook server that answers both the prefixed
+  runtime paths and bare paths, logging every request. Build logging (`--logging
+  cloudWatch`) is always on: `/aws/lambda/microvms/<image-name>`.
+**Why**: The 4 KB cap makes by-reference the only option; the run store already holds the
+run↔VM mapping (ADR-015), so it is the natural side-store, and the TTL bounds JIT-config
+exposure. The exec role finally gives the VM a scoped identity (read-only JIT fetch).
+**Consequences**: The microVM image and the control plane now share a contract (table
+name + ref format) delivered via the payload. Rotating the hook-path prefix is AWS's
+call — the server tolerates both shapes. Terminal-state JIT items age out via TTL; a
+failed launch leaves an orphaned JITCONFIG item that TTLs away harmlessly.

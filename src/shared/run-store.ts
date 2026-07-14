@@ -6,6 +6,7 @@ import {
   PutCommand,
   UpdateCommand,
   QueryCommand,
+  GetCommand,
 } from '@aws-sdk/lib-dynamodb';
 import type { RunRecord, RunStatus } from './types.js';
 
@@ -238,4 +239,75 @@ function isConditionalFailed(err: unknown): boolean {
     err !== null &&
     (err as { name?: string }).name === 'ConditionalCheckFailedException'
   );
+}
+
+// ---- JIT config side-store (ADR-015: run-hook payload cap is 4 KB) ---------
+// The GA lambda-microvms `runHookPayload` hard cap is 4096 bytes, but a GitHub
+// encoded_jit_config alone is ~4 KB — it does not fit inline. So Provision stashes the
+// JIT config (+ minimal metadata) here, keyed by an opaque ref, and passes ONLY the ref
+// in the launch payload; the microVM's /run hook fetches it. Short TTL so the secret-ish
+// JIT config doesn't linger. Stored as a separate item under the run's pk.
+
+/** JIT config item TTL: 30 min (a runner claims its JIT config within seconds of boot). */
+const JITCONFIG_TTL_SECONDS = 30 * 60;
+
+export const JITCONFIG_SK = 'JITCONFIG';
+
+export interface JitConfigPayload {
+  jitConfig: string;
+  runId: number;
+  jobId: number;
+  repoFullName: string;
+  labels: string[];
+}
+
+/** The opaque reference handed to the microVM (small; fits the 4 KB payload trivially). */
+export function jitConfigRef(repoId: number, runId: number, jobId: number): string {
+  return `${runPk(repoId, runId, jobId)}#${JITCONFIG_SK}`;
+}
+
+/** Stash the JIT config for a run; returns the ref to embed in runHookPayload. */
+export async function putJitConfig(
+  repoId: number,
+  payload: JitConfigPayload,
+  now: Date = new Date(),
+): Promise<string> {
+  const pk = runPk(repoId, payload.runId, payload.jobId);
+  await requireDoc().send(
+    new PutCommand({
+      TableName: TABLE,
+      Item: {
+        pk,
+        sk: JITCONFIG_SK,
+        entity: 'JITCONFIG',
+        jitConfig: payload.jitConfig,
+        runId: payload.runId,
+        jobId: payload.jobId,
+        repoFullName: payload.repoFullName,
+        labels: payload.labels,
+        ttl: Math.floor(now.getTime() / 1000) + JITCONFIG_TTL_SECONDS,
+      },
+    }),
+  );
+  return jitConfigRef(repoId, payload.runId, payload.jobId);
+}
+
+/** Fetch a stashed JIT config by ref (used by the microVM /run hook). */
+export async function getJitConfigByRef(ref: string): Promise<JitConfigPayload | undefined> {
+  const [pk] = ref.split(`#${JITCONFIG_SK}`);
+  const res = await requireDoc().send(
+    new GetCommand({
+      TableName: TABLE,
+      Key: { pk: `${pk}`, sk: JITCONFIG_SK },
+    }),
+  );
+  if (!res.Item) return undefined;
+  const i = res.Item;
+  return {
+    jitConfig: i.jitConfig as string,
+    runId: i.runId as number,
+    jobId: i.jobId as number,
+    repoFullName: i.repoFullName as string,
+    labels: (i.labels as string[]) ?? [],
+  };
 }
