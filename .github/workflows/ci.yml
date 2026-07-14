@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest      # TODO(M1): → [self-hosted, lambda-ci-node] to dogfood
+    runs-on: [self-hosted, lambda-ci-node]   # dogfood: node flavor microVM (was ubuntu-latest)
     steps:
       - uses: actions/checkout@v4
 
