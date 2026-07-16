@@ -32,6 +32,8 @@ export function toProvisionRequest(event: WorkflowJobEvent): ProvisionRequest {
     runId: event.workflow_job.run_id,
     jobId: event.workflow_job.id,
     labels: event.workflow_job.labels,
+    jobName: event.workflow_job.name,
+    workflowName: event.workflow_job.workflow_name ?? null,
   };
 }
 

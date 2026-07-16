@@ -4,14 +4,19 @@ import { getParam } from '../shared/ssm.js';
 import { generateJitConfig } from '../shared/github-app.js';
 import { launchMicroVM } from '../shared/microvm.js';
 import { transitionRun, putJitConfig } from '../shared/run-store.js';
+import { listWorkflowAnalyses } from '../shared/workflow-store.js';
+import { getRepo } from '../shared/install-store.js';
+import { matchJobAnalysis } from '../ingest/job-match.js';
 import type { ProvisionRequest, RunHookPayload } from '../shared/types.js';
-import { resolveFlavor } from './flavor.js';
+import { resolveFlavor, type ResolveOptions } from './flavor.js';
 
 /**
  * Provision λ — SQS consumer (spec 02 provisioning lifecycle, ADR-012).
  *
  * Per message:
  *   1. Resolve the job's labels → flavor → image ARN (from SSM, published by build script).
+ *      Resolution consumes the repo's FlavorMap override + the parsed job's step signals
+ *      from the stored workflow analysis when available (M3-S4) — label-only otherwise.
  *   2. Mint a single-use JIT runner config via the GitHub App.
  *   3. `RunMicrovm` from the image ARN, passing the JIT config + metadata as the
  *      run-hook payload. The run↔VM mapping is persisted via the run store's `microvmId`
@@ -77,8 +82,13 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     return;
   }
 
-  // 1. flavor → image ARN
-  const { flavor, reason: flavorReason } = resolveFlavor(req.labels);
+  // 1. flavor → image ARN. FlavorMap override + parsed step signals are best-effort: a
+  //    missing analysis / DB fault degrades to label-only routing, never a failed launch.
+  const resolveOpts = await lookupResolveOptions(req).catch((err) => {
+    console.error(JSON.stringify({ msg: 'resolve-options lookup failed (label-only)', error: errMsg(err) }));
+    return {} as ResolveOptions;
+  });
+  const { flavor, reason: flavorReason } = resolveFlavor(req.labels, resolveOpts);
   console.log(JSON.stringify({ msg: 'flavor resolved', runId: req.runId, jobId: req.jobId, flavor, reason: flavorReason }));
   const imageArn = await getParam(`${IMAGE_ARN_PARAM_PREFIX}${flavor}`);
 
@@ -162,4 +172,27 @@ async function provisionOne(record: SQSRecord): Promise<void> {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Assemble ResolveOptions for a job: the repo's FlavorMap override (repo row) + the
+ * job's parsed step signals (stored workflow analysis, matched by rendered name).
+ * Either half may be absent — resolveFlavor treats missing opts as label-only.
+ */
+async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptions> {
+  const opts: ResolveOptions = {};
+
+  const repo = await getRepo(req.installationId, req.repoId).catch(() => undefined);
+  if (repo?.flavorMap) opts.flavorMap = repo.flavorMap;
+
+  if (req.jobName) {
+    const analyses = await listWorkflowAnalyses(req.repoId).catch(() => []);
+    const match = matchJobAnalysis(analyses, {
+      workflowName: req.workflowName,
+      jobName: req.jobName,
+    });
+    if (match) opts.signals = match.job.step_signals;
+  }
+
+  return opts;
 }

@@ -189,6 +189,7 @@ function computeStepSignals(
 
 function parseJob(id: string, raw: unknown): ParsedJob {
   const job = isRecord(raw) ? raw : {};
+  const name = scalarToString(job.name);
   const runsOn = normalizeRunsOn(job['runs-on']);
   const container = normalizeContainer(job.container);
   const services = normalizeServices(job.services);
@@ -198,6 +199,7 @@ function parseJob(id: string, raw: unknown): ParsedJob {
 
   return {
     id,
+    name,
     runs_on: runsOn,
     container,
     services,

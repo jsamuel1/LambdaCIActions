@@ -4,24 +4,40 @@ import { getParam } from '../shared/ssm.js';
 import { verifySignature } from '../shared/hmac.js';
 import { shouldClaim, toProvisionRequest, dedupeKey } from './filter.js';
 import { planInstallation } from './install-filter.js';
+import { matchJobAnalysis } from './job-match.js';
+import {
+  pushTouchesWorkflows,
+  pushToDiscoveryRequest,
+  installationToDiscoveryRequests,
+} from '../discover/filter.js';
 import { putQueuedRun, transitionRun } from '../shared/run-store.js';
+import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import {
   upsertInstallation,
   setInstallationFlags,
   enableRepo,
   disableRepo,
 } from '../shared/install-store.js';
-import type { WorkflowJobEvent, InstallationEvent, RunStatus } from '../shared/types.js';
+import type {
+  WorkflowJobEvent,
+  InstallationEvent,
+  PushEvent,
+  DiscoveryRequest,
+  RunStatus,
+} from '../shared/types.js';
 
 /**
  * Ingest λ — API Gateway `POST /webhook` handler (spec 01 webhook handling).
  *
  * 1. Verify `X-Hub-Signature-256` HMAC over the RAW body (constant-time).
- * 2. Branch on `X-GitHub-Event`. For `workflow_job` + `queued` + our label → enqueue a
- *    provisioning request onto SQS. Everything else acks fast (best-effort / no-op in M1).
+ * 2. Branch on `X-GitHub-Event`. For `workflow_job` + `queued` + our label → compat-gate
+ *    against the stored workflow analysis (block ⇒ don't claim, spec 03) → enqueue a
+ *    provisioning request onto SQS. `push` touching `.github/workflows/**` and
+ *    installation repo grants → enqueue discovery scans (M3-S4). Everything else acks fast.
  * 3. Always return 2xx quickly so GitHub's delivery never times out; real work is async.
  *
- * Env: WEBHOOK_SECRET_PARAM, RUNNER_LABELS_PARAM, QUEUE_URL, TABLE_NAME.
+ * Env: WEBHOOK_SECRET_PARAM, RUNNER_LABELS_PARAM, QUEUE_URL, DISCOVERY_QUEUE_URL,
+ *      TABLE_NAME.
  */
 
 const sqs = new SQSClient({});
@@ -29,6 +45,7 @@ const sqs = new SQSClient({});
 const WEBHOOK_SECRET_PARAM = process.env.WEBHOOK_SECRET_PARAM!;
 const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM!;
 const QUEUE_URL = process.env.QUEUE_URL!;
+const DISCOVERY_QUEUE_URL = process.env.DISCOVERY_QUEUE_URL;
 
 function json(statusCode: number, body: unknown): APIGatewayProxyResultV2 {
   return { statusCode, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
@@ -66,8 +83,38 @@ export async function handler(
     return handleInstallation(payload as InstallationEvent);
   }
 
-  // push / other events: acked fast; workflow re-parse lands in M3.
+  if (ghEvent === 'push') {
+    return handlePush(payload as PushEvent);
+  }
+
+  // other events: acked fast.
   return json(202, { ok: true, ignored: ghEvent });
+}
+
+/** Enqueue one discovery scan (best-effort — a lost scan is recovered by the next push). */
+async function enqueueDiscovery(req: DiscoveryRequest): Promise<void> {
+  if (!DISCOVERY_QUEUE_URL) return; // discovery not wired in this env
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: DISCOVERY_QUEUE_URL,
+      MessageBody: JSON.stringify(req),
+    }),
+  );
+}
+
+/** `push` touching `.github/workflows/**` → re-scan the repo (spec 03 § Discovery). */
+async function handlePush(evt: PushEvent): Promise<APIGatewayProxyResultV2> {
+  if (!pushTouchesWorkflows(evt)) {
+    return json(202, { ok: true, ignored: 'push (no workflow changes)' });
+  }
+  const req = pushToDiscoveryRequest(evt);
+  if (!req) return json(202, { ok: true, ignored: 'push (no installation)' });
+  try {
+    await enqueueDiscovery(req);
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'discovery enqueue failed', error: errMsg(err) }));
+  }
+  return json(202, { ok: true, discovery: req.repoFullName });
 }
 
 async function handleWorkflowJob(
@@ -87,6 +134,31 @@ async function handleWorkflowJob(
 
   if (!shouldClaim(wf, claimedLabels)) {
     return json(202, { ok: true, claimed: false });
+  }
+
+  // Compat gate (spec 03 § routing): a job whose stored analysis says `block` is not
+  // eligible — don't claim it (GitHub-hosted still runs it). Fail OPEN: no stored
+  // analysis / no unambiguous match / a DB fault must never stop a labeled job.
+  try {
+    const analyses = await listWorkflowAnalyses(wf.repository.id);
+    const match = matchJobAnalysis(analyses, {
+      workflowName: wf.workflow_job.workflow_name,
+      jobName: wf.workflow_job.name,
+    });
+    if (match?.compat && !match.compat.eligible) {
+      console.log(
+        JSON.stringify({
+          msg: 'job not claimed — compat block',
+          repo: wf.repository.full_name,
+          job: wf.workflow_job.name,
+          workflow: match.workflow.path,
+          messages: match.compat.messages.map((m) => m.code),
+        }),
+      );
+      return json(202, { ok: true, claimed: false, blocked: true });
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'compat gate lookup failed (failing open)', error: errMsg(err) }));
   }
 
   const msg = toProvisionRequest(wf);
@@ -167,6 +239,17 @@ async function handleInstallation(
     console.error(JSON.stringify({ msg: 'installation lifecycle failed', action: evt.action, error: errMsg(err) }));
     // Still 202 — GitHub retries on 5xx would just replay; our writes are idempotent, but
     // a persistent DB fault shouldn't wedge GitHub's delivery queue.
+  }
+
+  // Newly-granted repos get an initial workflow scan (spec 03 § Discovery). Best-effort.
+  for (const req of installationToDiscoveryRequests(evt)) {
+    try {
+      await enqueueDiscovery(req);
+    } catch (err) {
+      console.error(
+        JSON.stringify({ msg: 'install discovery enqueue failed', repo: req.repoFullName, error: errMsg(err) }),
+      );
+    }
   }
   return json(202, { ok: true, action: evt.action });
 }

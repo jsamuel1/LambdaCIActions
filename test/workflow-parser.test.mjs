@@ -170,3 +170,12 @@ test('arch hints are collected from runs-on, container, and run text', () => {
   );
   assert.deepEqual(wf.jobs[0].step_signals.arch_hints.sort(), ['arm64', 'x86_64']);
 });
+
+test('extracts custom job name; null when absent (M3-S4 webhook matching)', () => {
+  const wf = parseWorkflow(
+    PATH,
+    'jobs:\n  b1:\n    name: Build & Test\n    runs-on: lambda-ci\n  b2:\n    runs-on: lambda-ci\n',
+  );
+  assert.equal(wf.jobs[0].name, 'Build & Test');
+  assert.equal(wf.jobs[1].name, null);
+});

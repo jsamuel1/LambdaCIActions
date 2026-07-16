@@ -137,3 +137,63 @@ export async function generateJitConfig(params: {
 export function _clearTokenCache(): void {
   tokenCache.clear();
 }
+
+// ---- workflow discovery (spec 03 § Discovery) -------------------------------
+
+/** A workflow file listed under `.github/workflows` (subset of the contents API shape). */
+export interface WorkflowFileRef {
+  path: string;
+  sha: string;
+}
+
+/**
+ * List `*.yml|*.yaml` files under `.github/workflows` for a repo (contents:read).
+ * A repo without the directory (404) yields `[]` — not an error.
+ */
+export async function listWorkflowFiles(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+}): Promise<WorkflowFileRef[]> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  let body: { type: string; path: string; sha: string; name: string }[];
+  try {
+    ({ body } = await githubJson<{ type: string; path: string; sha: string; name: string }[]>(
+      `/repos/${params.owner}/${params.repo}/contents/.github/workflows`,
+      { token, tokenType: 'token' },
+    ));
+  } catch (err) {
+    // No workflows directory → nothing to ingest.
+    if (err instanceof Error && err.message.includes('HTTP 404')) return [];
+    throw err;
+  }
+  if (!Array.isArray(body)) return [];
+  return body
+    .filter((f) => f.type === 'file' && /\.ya?ml$/i.test(f.name))
+    .map((f) => ({ path: f.path, sha: f.sha }));
+}
+
+/**
+ * Fetch one file's raw contents (contents:read). The contents API returns base64 for
+ * files ≤ 1 MB — plenty for workflow YAML.
+ */
+export async function getFileContent(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  path: string;
+}): Promise<{ content: string; sha: string }> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{ content?: string; encoding?: string; sha: string }>(
+    `/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}`,
+    { token, tokenType: 'token' },
+  );
+  if (body.encoding !== 'base64' || typeof body.content !== 'string') {
+    throw new Error(`GitHub contents for '${params.path}' not base64 (encoding=${body.encoding})`);
+  }
+  return { content: Buffer.from(body.content, 'base64').toString('utf8'), sha: body.sha };
+}

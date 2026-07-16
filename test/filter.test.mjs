@@ -30,7 +30,14 @@ test('does not claim jobs without our label', () => {
 test('projects a webhook event into a provision request', () => {
   const event = {
     action: 'queued',
-    workflow_job: { id: 42, run_id: 7, labels: ['lambda-ci'], name: 'build', status: 'queued' },
+    workflow_job: {
+      id: 42,
+      run_id: 7,
+      labels: ['lambda-ci'],
+      name: 'build',
+      status: 'queued',
+      workflow_name: 'CI',
+    },
     repository: { id: 99, name: 'repo', full_name: 'octo/repo', owner: { login: 'octo' } },
     installation: { id: 555 },
   };
@@ -44,7 +51,19 @@ test('projects a webhook event into a provision request', () => {
     runId: 7,
     jobId: 42,
     labels: ['lambda-ci'],
+    jobName: 'build',
+    workflowName: 'CI',
   });
+});
+
+test('workflowName defaults to null when the webhook omits it', () => {
+  const event = {
+    action: 'queued',
+    workflow_job: { id: 1, run_id: 2, labels: [], name: 'j', status: 'queued' },
+    repository: { id: 3, name: 'r', full_name: 'o/r', owner: { login: 'o' } },
+    installation: { id: 4 },
+  };
+  assert.equal(toProvisionRequest(event).workflowName, null);
 });
 
 test('dedupe key is stable and combines repo/run/job', () => {
