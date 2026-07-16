@@ -267,3 +267,38 @@ compat `block` is advisory routing, not a security boundary.
 never match — they route label-only. The claim gate adds one DDB Query per claimed
 webhook (single-digit ms, small partitions). Manual "re-scan" (spec 03) needs only an SQS
 send to the discovery queue — the M4 UI can reuse the same message shape.
+
+## ADR-018 — Self-terminate via run-row readback (no in-guest microVM id source) (M3)
+**Status**: Accepted (v1) · amends [ADR-016](#adr-016) (teardown path)
+**Context**: The `/run` hook is supposed to call `terminate-microvm` on ITSELF at job end
+so the VM dies instantly. That requires the VM's own `microvmId` — and live runs show the
+guest has **no way to discover it**: `/run/microvm/id`, `/etc/microvm-id`, and
+`/proc/device-tree/microvm-id` don't exist, and the environment carries only
+`AWS_LAMBDA_MICROVM_IMAGE_{ARN,VERSION,NAME}` (image identity, not VM identity). Result:
+every job fell through to "no microvm id available; relying on Reaper" and idled until
+the 5-minute Reaper sweep — ~5 min of dead billing per job (≈ \$0.022 at 2 vCPU/4 GB) and
+slower quota release. Passing the id INTO the launch payload is a chicken/egg: the id
+doesn't exist until `RunMicrovm` returns, after the payload is fixed.
+**Decision**: **Run-row readback.** Provision already persists the run↔VM mapping
+(ADR-015); make that write the id channel:
+1. Provision stamps `RunRecord.microvmId` via a dedicated `stampMicrovmId` write that is
+   **unconditional** (only `attribute_exists(pk)`) and happens BEFORE the
+   `running` transition — the forward-only status guard must never drop the mapping when
+   an ultra-fast job's `completed` webhook wins the race.
+2. At job end the hook derives the run-row key from the JIT config ref it already holds
+   (`RUN#…#JITCONFIG` → pk `RUN#…`, sk `RUN`), reads `microvmId` back with the baked-in
+   AWS CLI (short retry for the write race), and calls `terminate-microvm` on itself.
+3. The microVM exec role gains `lambda:TerminateMicrovm` scoped to the region (the GA API
+   has no VM-level resource ARNs/tags to scope tighter — ADR-015); the Reaper stays as
+   the backstop for crashed hooks / lost writes.
+**Why**: The readback needs no new infrastructure (table + exec-role read grant already
+exist), no API the platform doesn't offer, and no payload change. Alternatives rejected:
+writing the id to the JITCONFIG item (second write path for the same fact — the run row
+IS the mapping per ADR-015); shortening the Reaper sweep (still pays idle minutes, just
+fewer); per-VM endpoint hostname parsing (endpoint shape is undocumented/unstable and the
+hook never sees its own endpoint).
+**Consequences**: A VM can terminate any VM in the region if the exec role is misused —
+acceptable because the role only exists inside our own single-use VMs; revisit when the
+API grows VM-scoped ARNs. If the readback misses (row gone, DDB outage), behavior
+degrades exactly to the old Reaper-only path. `test/run-hook.test.mjs` pins the
+ref→run-row key derivation against the run store so the two sides can't drift.

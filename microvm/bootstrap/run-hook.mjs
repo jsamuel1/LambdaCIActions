@@ -29,6 +29,9 @@ const RUNNER_DIR = process.env.RUNNER_DIR || '/opt/actions-runner';
 const MAX_PAYLOAD_BYTES = 4096; // GA lambda-microvms run-hook payload hard cap (ADR-015)
 
 let jobStarted = false; // guard: this microVM runs exactly one job
+// The {ref, region, table} pointer delivered to /run — kept so selfTerminate can read the
+// run row (which Provision stamps with our microvmId post-launch, ADR-018).
+let runCtx = null;
 
 function log(msg, extra) {
   // structured line → CloudWatch (the UI reads via log_ref, spec 05)
@@ -54,20 +57,73 @@ function readBody(req) {
   });
 }
 
-// Self-terminate this microVM. The metadata endpoint hands us our own id; we call
-// terminate-microvm so the VM disappears the instant the job is done (no idle billing).
+// Self-terminate this microVM so it disappears the instant the job is done (no idle
+// billing). There is NO reliable in-guest id source (ADR-016: no /run/microvm/id, env
+// only carries AWS_LAMBDA_MICROVM_IMAGE_*), so the authoritative path is the RUN ROW
+// READBACK (ADR-018): Provision stamps `microvmId` on the run record seconds after
+// RunMicrovm returns; by job end (minutes later) it is there — fetch it by the same
+// {ref, region, table} pointer we resolved the JIT config with.
 function selfTerminate(reason) {
-  const microvmId = process.env.MICROVM_ID || readMicrovmId();
+  const microvmId = process.env.MICROVM_ID || readMicrovmId() || readMicrovmIdFromRunStore();
   log('self-terminate', { reason, microvmId });
   if (!microvmId) {
     log('no microvm id available; relying on Reaper', {});
     return;
   }
-  const r = spawnSync('aws', ['lambda-microvms', 'terminate-microvm', '--microvm-identifier', microvmId], {
-    encoding: 'utf8',
-  });
+  const args = ['lambda-microvms', 'terminate-microvm', '--microvm-identifier', microvmId];
+  if (runCtx?.region) args.push('--region', runCtx.region);
+  const r = spawnSync('aws', args, { encoding: 'utf8' });
   if (r.status !== 0) {
     log('terminate-microvm failed; Reaper will backstop', { stderr: r.stderr });
+  }
+}
+
+// Derive the run row key from the JIT config ref (`RUN#<repo>#<run>#<job>#JITCONFIG`).
+// Exported pure so tests can pin the contract with the run store (ADR-018).
+export function runRowKeyFromRef(ref) {
+  const pk = ref.split('#JITCONFIG')[0];
+  return { pk, sk: 'RUN' };
+}
+
+// Read our own microvmId back from the run row (ADR-018). Provision writes it right
+// after launch; selfTerminate fires at job end, so it is present in all but a razor-thin
+// race — retry a few times to cover a slow `running` transition write.
+function readMicrovmIdFromRunStore(attempts = 3, delayMs = 2000) {
+  if (!runCtx?.ref || !runCtx?.table) return null;
+  const { pk, sk } = runRowKeyFromRef(runCtx.ref);
+  const key = JSON.stringify({ pk: { S: pk }, sk: { S: sk } });
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) sleepSync(delayMs);
+    const args = [
+      'dynamodb', 'get-item',
+      '--table-name', runCtx.table,
+      '--key', key,
+      '--projection-expression', 'microvmId',
+      '--output', 'json',
+    ];
+    if (runCtx.region) args.push('--region', runCtx.region);
+    const r = spawnSync('aws', args, { encoding: 'utf8' });
+    if (r.status !== 0) {
+      log('run row microvmId fetch failed', { attempt: i + 1, stderr: (r.stderr || '').slice(0, 512) });
+      continue;
+    }
+    try {
+      const id = JSON.parse(r.stdout || '{}').Item?.microvmId?.S;
+      if (id) return id;
+    } catch {
+      /* malformed output — retry */
+    }
+    log('run row has no microvmId yet', { attempt: i + 1 });
+  }
+  return null;
+}
+
+// Blocking sleep — fine here: selfTerminate runs after the job, nothing else is pending.
+function sleepSync(ms) {
+  try {
+    spawnSync('sleep', [String(ms / 1000)]);
+  } catch {
+    /* best-effort */
   }
 }
 
@@ -222,6 +278,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       jobStarted = true;
+      runCtx = { ref: ptr.ref, region: ptr.region, table: ptr.table }; // for selfTerminate readback
       // ACK fast so Lambda un-gates traffic; run the job in the background.
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
@@ -247,6 +304,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => log('run-hook listening', { port: PORT }));
+// Only bind the port when executed as the entrypoint — importing this module (tests)
+// must not start a server.
+if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+  server.listen(PORT, () => log('run-hook listening', { port: PORT }));
+}
 
 export { server };

@@ -3,7 +3,7 @@ import type { SQSEvent, SQSBatchResponse, SQSRecord } from 'aws-lambda';
 import { getParam } from '../shared/ssm.js';
 import { generateJitConfig } from '../shared/github-app.js';
 import { launchMicroVM } from '../shared/microvm.js';
-import { transitionRun, putJitConfig } from '../shared/run-store.js';
+import { transitionRun, putJitConfig, stampMicrovmId } from '../shared/run-store.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
@@ -146,14 +146,27 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     throw err;
   }
 
-  // 4. mark running + stamp the microVM id / flavor
+  // 4. stamp the run↔VM mapping FIRST and unconditionally (ADR-018): the /run hook reads
+  //    `microvmId` back off this row at job end to self-terminate, and the Reaper
+  //    correlates against it — it must land even if the status already raced ahead (an
+  //    ultra-fast job's `completed` webhook can beat this write; transitionRun's
+  //    forward-only guard would then drop the mapping on the floor).
+  await stampMicrovmId({
+    repoId: req.repoId,
+    runId: req.runId,
+    jobId: req.jobId,
+    microvmId,
+  }).catch((err) => {
+    console.error(JSON.stringify({ msg: 'microvmId stamp failed', error: errMsg(err) }));
+  });
+
+  // 5. mark running
   await transitionRun({
     repoId: req.repoId,
     runId: req.runId,
     jobId: req.jobId,
     to: 'running',
     flavor,
-    microvmId,
   }).catch((err) => {
     console.error(JSON.stringify({ msg: 'running transition failed', error: errMsg(err) }));
   });
