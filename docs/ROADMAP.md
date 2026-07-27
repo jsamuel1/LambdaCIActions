@@ -29,13 +29,13 @@ Make the hot path production-shaped.
 - Installation lifecycle webhooks (install/uninstall/suspend/repos-changed).
 - 🎯 Kill/timeout/failure paths verified; no ghost "running" runs; DLQ alarming.
 
-## M3 — Flavors & ingestion
+## M3 — Flavors & ingestion ✅ verified 2026-07-27
 Multiple runner types + workflow awareness.
 - Flavor catalog (`base`, `docker`, `node`) + per-repo `FlavorMap`.
 - Discovery + parser: `.github/workflows/**` → normalized model; `push` re-parse.
 - `runs-on` → flavor routing; `label` mode.
 - Compatibility analysis (`ok`/`warn`/`risk`/`block`).
-- 🎯 A repo with docker + node jobs routes each to the right flavor with no YAML edits beyond adding LCA labels.
+- 🎯 **verified** — A repo with docker + node jobs routes each to the right flavor with no YAML edits beyond adding LCA labels. Evidence: [`docs/VERIFY-M3.md`](VERIFY-M3.md) (`jsamuel1/lca-m3-verify` run `30244719785`, all three jobs green on `base`/`node`/`docker` microVMs). Verification found + fixed one platform defect: the `docker` flavor could never start `dockerd` (ADR-020).
 
 ## M4 — Web UI & Management API
 Operator visibility + control.

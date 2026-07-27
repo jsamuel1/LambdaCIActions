@@ -344,3 +344,48 @@ read to the VM's own run row; re-evaluate both before onboarding mutually-distru
 tenants or enabling public-fork PR runs. If the readback misses (row gone, DDB outage),
 behavior degrades exactly to the old Reaper-only path. `test/run-hook.test.mjs` pins the
 ref→run-row key derivation against the run store so the two sides can't drift.
+
+## ADR-020 — Docker flavor needs `additionalOsCapabilities=ALL` + a root entrypoint (M3)
+
+**Status**: accepted
+**Context**: M3 verification against the deployed dev stack routed `lambda-ci-docker` jobs
+to the `docker` flavor correctly, but every one of them failed at `docker version` with
+`dial unix /var/run/docker.sock: connect: no such file or directory`. Three separate
+in-guest constraints were established by probe jobs on real microVMs:
+1. **Nothing starts dockerd.** The snapshot has no init; spec 02 assumed the run-hook would
+   start the daemon, but no pre-run hook was ever shipped.
+2. **`sudo` can never escalate.** The guest boots with `NoNewPrivs: 1`, so sudo fails with
+   *"The \"no new privileges\" flag is set"* — a non-root entrypoint can never reach root.
+3. **A default microVM cannot host a rootful daemon.** `CapEff/CapPrm/CapInh` are all
+   empty, `/sys` is mounted read-only and `/sys/fs/cgroup` is an empty read-only dir.
+   `mount -t cgroup2` fails with EPERM even inside `unshare -Urmn` (a user namespace grants
+   `CapEff=…ffffffffff` but mounting sysfs/cgroup2 is still denied), so dockerd dies with
+   `failed to start daemon: Devices cgroup isn't mounted`. Rootless docker is not an escape
+   hatch either — the same cgroup/mount denial applies, and `dockerd-rootless.sh` isn't
+   shipped by the Docker apt packages we install.
+**Decision**: the `docker` flavor is built with the GA API's
+**`--additional-os-capabilities ALL`** (the only supported value) and keeps a **root
+entrypoint**; `run-hook.mjs` uses `setpriv --reuid/--regid/--init-groups` to drop to the
+`runner` user for the agent (the agent refuses to run as root, and a *downward* privilege
+change is permitted under `no_new_privs`). `microvm/bootstrap/pre-run.docker.sh` — baked in
+as `${RUNNER_DIR}/pre-run.sh` and executed by the run-hook before the agent — mounts
+cgroup2 if absent, starts `dockerd`, and polls the API with a bounded 120s wait so a broken
+daemon surfaces its own log in the job output rather than stalling the whole microVM
+lifetime (the run-hook logs the nonzero hook exit and still starts the agent, so the job
+fails at its first `docker` step with GitHub reporting it — dropping the agent instead would
+leave the GitHub job hanging until its own timeout). Cold daemon init measured 32–39 s, so
+the bound has to leave real headroom. The capability grant is declared per flavor in
+`microvm/flavors.json` (`osCapabilities`), so `base`/`node` remain unprivileged and keep
+their `USER runner` entrypoints.
+**Why**: the alternatives were worse. Rootless docker is blocked by the same kernel
+constraints; running the agent itself as root is rejected by the agent; and granting the
+capability fleet-wide would hand every job (including plain `lambda-ci` ones) a privileged
+guest for no benefit. Scoping the grant to the one flavor whose *stated purpose* is
+`docker build/run` keeps the blast radius equal to the capability the user opted into by
+choosing that label.
+**Consequences**: `lambda-ci-docker` runs in a more privileged microVM than the other
+flavors — acceptable because each microVM is single-use, single-tenant and self-terminating
+(ADR-003/006), but it must be documented in the flavor catalog UI (M4) so operators can see
+what a label grants. Adding a future flavor that needs host-level privileges is now a
+one-line catalog change. `test/image-content.test.mjs` pins the whole contract (hook wiring,
+root entrypoint scoped to docker-capable flavors, no `sudo`, bounded readiness wait, arm64).

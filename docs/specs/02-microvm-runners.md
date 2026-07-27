@@ -47,7 +47,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | Flavor | Label | Base | vCPU/Mem | Contents |
 |---|---|---|---|---|
 | `base` | `lambda-ci` | Ubuntu arm64 + runner agent | 2 / 4 GB | git, curl, common toolchain |
-| `docker` | `lambda-ci-docker` | base + dockerd (DinD) | 4 / 8 GB | Docker daemon, buildx |
+| `docker` | `lambda-ci-docker` | base + dockerd (DinD) | 4 / 8 GB | Docker daemon, buildx. **Privileged** — built with `additionalOsCapabilities=ALL` + root entrypoint (ADR-020) |
 | `node` | `lambda-ci-node` | base + Node LTS + pnpm | 2 / 4 GB | Node, package managers |
 | `custom-*` | per-repo | per-repo Dockerfile | configurable | repo-specified |
 
@@ -89,9 +89,10 @@ delivers it to `POST /run` after the snapshot boots.
 ```
 POST /run   { ref, region, table }        (≤ 4 KB payload — JIT config by reference, ADR-016)
   ├─ resolve ref → { jitConfig, runId, jobId, … } via DynamoDB get-item (exec role)
-  ├─ (DinD flavor: start dockerd first)
+  ├─ (flavor pre-run hook, if present: ${RUNNER_DIR}/pre-run.sh — docker flavor starts dockerd)
   ├─ cd /opt/actions-runner
   ├─ ./run.sh --jitconfig <jitConfig>     # runs exactly ONE job, then exits
+  │    (when the entrypoint is root: setpriv --reuid/--regid/--init-groups runner)
   ├─ return 200 quickly so Lambda un-gates traffic; run the job in the background
   └─ on agent exit → read own microvmId back off the run row (Provision stamped it
      post-launch, ADR-019) → `terminate-microvm` (self-terminate); Reaper backstops
@@ -107,7 +108,13 @@ POST /terminate   # fires pre-teardown; best-effort final status report
   never in surviving env/user-data, and nothing long-lived lands on disk.
 - The hook emits lifecycle signals (`booted`, `running`, `job_done`) so the UI shows live
   status without polling GitHub.
-- DinD flavor starts `dockerd` inside `/run` before invoking `run.sh`.
+- The `docker` flavor runs its **pre-run hook** (`${RUNNER_DIR}/pre-run.sh`) before the
+  agent: it mounts cgroup2 and starts `dockerd`, then the run-hook drops root → `runner`
+  with `setpriv`. That flavor is the only one built with `additionalOsCapabilities=ALL`
+  and the only one whose entrypoint stays root — a default microVM has an empty capability
+  set, a read-only `/sys` and no writable cgroup hierarchy, so a rootful daemon cannot
+  start, and in-guest `sudo` can never escalate (`NoNewPrivs: 1`). See **ADR-020** and
+  `docs/VERIFY-M3.md`. Cold `dockerd` init measures ~40 s on 4 vCPU Graviton.
 
 ## Provisioning lifecycle
 

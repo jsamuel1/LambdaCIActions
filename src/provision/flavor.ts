@@ -27,6 +27,12 @@ export interface FlavorDef {
   vcpu: number;
   memoryMb: number;
   capabilities: string[];
+  /**
+   * Extra guest OS capabilities requested at image-build time (ADR-020). Only `ALL` is
+   * accepted by the GA `lambda-microvms` API today; scoped to docker-capable flavors so
+   * `base`/`node` stay unprivileged. Consumed by `scripts/build-images.mjs`.
+   */
+  osCapabilities?: string[];
   description: string;
 }
 
