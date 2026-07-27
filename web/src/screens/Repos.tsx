@@ -119,8 +119,9 @@ export function Repos({
         </table>
       </div>
       <p className="muted">
-        `adopt` mode (standard-label mapping) lands in M5 — selecting it now records intent but
-        routing still requires explicit LCA labels.
+        Disabling a repo (or setting mode `off`) stops LambdaCIActions claiming its jobs — GitHub
+        runs them on its own runners instead. `adopt` mode (standard-label mapping) lands in M5:
+        selecting it now records intent but routing still requires explicit LCA labels.
       </p>
     </div>
   );

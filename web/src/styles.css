@@ -85,6 +85,18 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .stack { display: flex; flex-direction: column; gap: 14px; }
 
+/*
+ * Layout helpers. These exist as CLASSES rather than inline `style={{...}}` attributes
+ * because the console is served with a `self`-only CSP (ADR-022) and no `'unsafe-inline'`
+ * in `style-src` — a browser drops inline style attributes outright, so any layout
+ * expressed that way would silently disappear in production while working in dev.
+ */
+.tight { margin: 0; }
+.spacer { flex: 1; }
+.clickable { cursor: pointer; }
+.gap-top { margin-top: 10px; }
+.workflow { margin-bottom: 18px; }
+
 pre.logs {
   background: #0b0d12;
   border: 1px solid var(--line);

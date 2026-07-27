@@ -100,10 +100,16 @@ Resolution order (first match wins):
    | any + docker signals | `docker` |
    | `self-hosted` + our labels | matched flavor |
 4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it.
-5. **Fallback** — `base`; record a warning if uncertain.
+5. **Fallback** — the repo's operator-chosen `defaultFlavor` (set from the console, [04](04-web-ui.md))
+   if present and valid, else `base`; record a warning if uncertain.
 
 The Ingest λ ([01](01-github-app.md)) only *claims* a `workflow_job` if routing says
 `eligible` for that job's labels. Non-eligible jobs are ignored (GitHub-hosted still runs them).
+
+**Repo opt-out** (ADR-025): before enqueueing a claimed job, Ingest reads the repo row and
+drops the job when the console has set `enabled=false` or `mode='off'`. The management plane
+only writes that config — this is where it takes effect. The check fails **open**: a missing
+repo row (pre-M4 onboarding) or a DynamoDB fault never blocks a labeled job.
 
 ## Compatibility analysis
 

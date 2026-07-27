@@ -217,15 +217,17 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * Assemble ResolveOptions for a job: the repo's FlavorMap override (repo row) + the
- * job's parsed step signals (stored workflow analysis, matched by rendered name).
- * Either half may be absent — resolveFlavor treats missing opts as label-only.
+ * Assemble ResolveOptions for a job: the repo's FlavorMap override + operator-chosen
+ * defaultFlavor (repo row, written by the console — spec 04) + the job's parsed step signals
+ * (stored workflow analysis, matched by rendered name). Any part may be absent —
+ * resolveFlavor treats missing opts as label-only.
  */
 async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptions> {
   const opts: ResolveOptions = {};
 
   const repo = await getRepo(req.installationId, req.repoId).catch(() => undefined);
   if (repo?.flavorMap) opts.flavorMap = repo.flavorMap;
+  if (repo?.defaultFlavor) opts.defaultFlavor = repo.defaultFlavor;
 
   if (req.jobName) {
     const analyses = await listWorkflowAnalyses(req.repoId).catch(() => []);

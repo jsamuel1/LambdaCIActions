@@ -89,7 +89,7 @@ export function RunDetail({
     <div className="stack">
       <div className="card">
         <div className="row">
-          <h2 style={{ margin: 0 }}>{r.repoFullName}</h2>
+          <h2 className="tight">{r.repoFullName}</h2>
           <StatusBadge status={r.status} />
           <span className="muted">
             run {r.runId} · job {r.jobId}
@@ -131,7 +131,7 @@ export function RunDetail({
 
       <div className="card">
         <div className="row">
-          <h3 style={{ margin: 0 }}>Logs</h3>
+          <h3 className="tight">Logs</h3>
           <span className="muted">{events.length} events</span>
           <button onClick={() => setTailing((t) => !t)}>{tailing ? 'Pause tail' : 'Resume tail'}</button>
         </div>

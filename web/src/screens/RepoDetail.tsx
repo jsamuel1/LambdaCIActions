@@ -61,9 +61,9 @@ export function RepoDetail({
     <div className="stack">
       <div className="card">
         <div className="row">
-          <h2 style={{ margin: 0 }}>{repo.repoFullName}</h2>
+          <h2 className="tight">{repo.repoFullName}</h2>
           <CompatRollupView roll={wf.data.compat} />
-          <span className="spacer" style={{ flex: 1 }} />
+          <span className="spacer" />
           <button onClick={rescan}>Re-scan</button>
           <button onClick={() => navigate(`/runs?repo=${repo.repoId}`)}>Runs</button>
         </div>
@@ -79,7 +79,7 @@ export function RepoDetail({
         <h3>Workflows</h3>
         {!wf.data.workflows.length && <p className="muted">No workflows parsed yet — run a re-scan.</p>}
         {wf.data.workflows.map((w) => (
-          <div key={w.path} style={{ marginBottom: 18 }}>
+          <div key={w.path} className="workflow">
             <div className="row">
               <strong>{w.path}</strong>
               <CompatBadge level={w.compatLevel} />
@@ -178,7 +178,7 @@ export function RepoDetail({
             )}
           </tbody>
         </table>
-        <div className="row" style={{ marginTop: 10 }}>
+        <div className="row gap-top">
           <input
             type="text"
             placeholder="runner label, e.g. ubuntu-latest"

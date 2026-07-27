@@ -6,7 +6,8 @@ Status: **Implemented (M4)** · Plane: Management
 > `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-020) (auth),
 > [ADR-023](../DECISIONS.md#adr-021) (run-history index), [ADR-024](../DECISIONS.md#adr-022)
 > (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-023) (mgmt IAM boundary),
-> [ADR-026](../DECISIONS.md#adr-024) (polling). Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
+> [ADR-026](../DECISIONS.md#adr-024) (polling), [ADR-027](../DECISIONS.md#adr-025) (where
+> console config is enforced). Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
 
 The operator console: install/manage the GitHub App, see which repos + workflows are
 onboarded, inspect live and historical runs with logs, and tune flavor mappings. Backed by
@@ -79,8 +80,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/me` | Session introspection (login, installations, expiry) | ✅ |
 | `GET /api/installations` | List installations the caller can admin | ✅ |
 | `GET /api/repos?installation=<id>` | List repos + compat rollup | ✅ |
-| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor`, `flavorMap` | ✅ |
-| `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
+| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor`, `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`) | ✅ |
@@ -179,6 +179,14 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   400, so a run's status/microVM id can't be patched through the config endpoint.
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo
   row and emit a structured log line with the actor and the patch.
+- **Config takes effect in the control plane** (ADR-025): the management λ only writes repo
+  config. `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
+  `defaultFlavor` by `resolveFlavor`'s fallback. Both fail open, so a config read fault
+  cannot stop a labeled job.
+- **CSP and inline styles**: the console CSP has `style-src 'self'` with no
+  `unsafe-inline`, so browsers drop `style="…"` attributes. React's `style={{…}}` compiles to
+  exactly that — all layout lives in `web/src/styles.css` and `test/web-stack.test.mjs`
+  fails the build if an inline style returns.
 
 ## Resolved questions
 

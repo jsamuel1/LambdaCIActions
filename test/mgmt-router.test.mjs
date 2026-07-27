@@ -68,3 +68,11 @@ test('asPositiveInt rejects non-numeric, zero, and negatives', () => {
   assert.equal(asPositiveInt('12abc'), undefined);
   assert.equal(asPositiveInt(undefined), undefined);
 });
+
+test('a malformed percent-escape in a path param does not throw', () => {
+  // decodeURIComponent('%') throws; matchRoute must degrade to the raw segment so the
+  // handler answers 400 (asPositiveInt rejects it) rather than 500.
+  const r = matchRoute('GET', '/api/runs/%/2/3');
+  assert.equal(r.kind, 'match');
+  assert.equal(asPositiveInt(r.match.params.repoId), undefined);
+});

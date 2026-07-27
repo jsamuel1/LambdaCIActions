@@ -10,7 +10,9 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
  *   3. Signal-based upgrade                 — if the job needs a capability the resolved flavor
  *                                             lacks (e.g. Docker), upgrade to the smallest flavor
  *                                             that provides it.
- *   4. Fallback                             — `base`; record a warning reason.
+ *   4. Fallback                             — the repo's operator-chosen `defaultFlavor`
+ *                                             (console, spec 04) if set, else `base`; record a
+ *                                             warning reason.
  *
  * NOTE: the spec-03 **adopt-mode standard-label map** (mapping GitHub's `ubuntu-*` labels to
  * flavors for zero-YAML-edit onboarding) is intentionally deferred to **M5 — Drop-in & polish**.
@@ -51,6 +53,12 @@ export type FlavorMap = Record<string, string>;
 export interface ResolveOptions {
   /** Per-repo FlavorMap override (highest precedence). */
   flavorMap?: FlavorMap;
+  /**
+   * Per-repo operator-chosen fallback flavor (console `defaultFlavor`, spec 04). Used
+   * instead of the catalog `base` when no map entry / explicit label matched. Ignored when
+   * it does not name a catalog flavor.
+   */
+  defaultFlavor?: string;
   /** Signals derived from the job's steps (drive signal-based upgrade). */
   signals?: JobSignals;
 }
@@ -123,9 +131,13 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     );
   }
 
-  // 4. Fallback — base; record a warning. Signal upgrade still applies (e.g. docker needed).
+  // 4. Fallback — the repo's operator-chosen defaultFlavor if set + valid, else base;
+  //    record a warning. Signal upgrade still applies (e.g. docker needed).
+  const repoDefault = opts.defaultFlavor && byName(opts.defaultFlavor) ? opts.defaultFlavor : undefined;
   return applySignalUpgrade(
-    { flavor: DEFAULT_FLAVOR, reason: 'fallback to base (no matching label)' },
+    repoDefault
+      ? { flavor: repoDefault, reason: `fallback to repo defaultFlavor '${repoDefault}' (no matching label)` }
+      : { flavor: DEFAULT_FLAVOR, reason: 'fallback to base (no matching label)' },
     opts.signals,
   );
 }

@@ -103,3 +103,16 @@ test('parseCookies handles spacing, encoding, and junk segments', () => {
   assert.equal(map.b, '2');
   assert.equal(parseCookies(undefined).x, undefined);
 });
+
+// --- Malformed cookie robustness (M4 review fix) ------------------------------
+// parseCookies runs on the entry path BEFORE the handler's try/catch, so a URIError from a
+// bad percent-escape would surface as 500 instead of the intended 401.
+test('a malformed percent-escape does not throw', () => {
+  const c = parseCookies('lca_session=%; other=ok');
+  assert.equal(c.lca_session, '%', 'undecodable value kept raw (fails signature check)');
+  assert.equal(c.other, 'ok', 'sibling cookies still parse');
+});
+
+test('well-formed escapes are still decoded', () => {
+  assert.equal(parseCookies('a=b%20c').a, 'b c');
+});

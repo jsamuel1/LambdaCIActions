@@ -2,7 +2,7 @@ import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { getParam } from '../shared/ssm.js';
 import { verifySignature } from '../shared/hmac.js';
-import { shouldClaim, toProvisionRequest, dedupeKey } from './filter.js';
+import { shouldClaim, toProvisionRequest, dedupeKey, isRepoOptedOut } from './filter.js';
 import { planInstallation } from './install-filter.js';
 import { matchJobAnalysis } from './job-match.js';
 import {
@@ -17,6 +17,7 @@ import {
   setInstallationFlags,
   enableRepo,
   disableRepo,
+  getRepo,
 } from '../shared/install-store.js';
 import type {
   WorkflowJobEvent,
@@ -134,6 +135,28 @@ async function handleWorkflowJob(
 
   if (!shouldClaim(wf, claimedLabels)) {
     return json(202, { ok: true, claimed: false });
+  }
+
+  // Repo opt-out gate (spec 04 Repos screen / ADR-025): the console's `enabled=false` and
+  // `mode='off'` are enforced HERE — the management plane only writes config. Fails OPEN:
+  // a missing row (pre-M4 repos) or a DDB fault must never stop a labeled job.
+  try {
+    const repo = await getRepo(wf.installation.id, wf.repository.id);
+    if (isRepoOptedOut(repo)) {
+      console.log(
+        JSON.stringify({
+          msg: 'job not claimed — repo opted out',
+          repo: wf.repository.full_name,
+          enabled: repo?.enabled,
+          mode: repo?.mode ?? 'label',
+        }),
+      );
+      return json(202, { ok: true, claimed: false, disabled: true });
+    }
+  } catch (err) {
+    console.error(
+      JSON.stringify({ msg: 'repo opt-out lookup failed (failing open)', error: errMsg(err) }),
+    );
   }
 
   // Compat gate (spec 03 § routing): a job whose stored analysis says `block` is not

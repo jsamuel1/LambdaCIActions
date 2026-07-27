@@ -85,3 +85,35 @@ test('node flavor upgrades to docker when docker signal present', () => {
 test('fallback base upgrades to docker under docker signal', () => {
   assert.equal(resolveFlavor(['ubuntu-latest'], { signals: { needs_docker: true } }).flavor, 'docker');
 });
+
+// --- Per-repo defaultFlavor fallback (console config, M4 review fix) ----------
+// The console writes `defaultFlavor` on the repo row; before this fix nothing read it, so
+// the operator's choice silently did nothing and every unlabeled job landed on `base`.
+
+test('repo defaultFlavor replaces the base fallback', () => {
+  const res = resolveFlavor(['self-hosted'], { defaultFlavor: 'node' });
+  assert.equal(res.flavor, 'node');
+  assert.match(res.reason, /defaultFlavor/);
+});
+
+test('an explicit LCA label still beats defaultFlavor', () => {
+  assert.equal(resolveFlavor(['lambda-ci'], { defaultFlavor: 'node' }).flavor, 'base');
+});
+
+test('a FlavorMap entry still beats defaultFlavor', () => {
+  const res = resolveFlavor(['big'], { flavorMap: { big: 'docker' }, defaultFlavor: 'node' });
+  assert.equal(res.flavor, 'docker');
+});
+
+test('an unknown defaultFlavor falls back to base rather than an invalid flavor', () => {
+  const res = resolveFlavor(['self-hosted'], { defaultFlavor: 'gpu-mega' });
+  assert.equal(res.flavor, 'base');
+});
+
+test('signal upgrade still applies on top of defaultFlavor', () => {
+  const res = resolveFlavor(['self-hosted'], {
+    defaultFlavor: 'node',
+    signals: { needs_docker: true },
+  });
+  assert.equal(res.flavor, 'docker');
+});

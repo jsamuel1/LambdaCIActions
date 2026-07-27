@@ -93,7 +93,15 @@ export function decodeSession(
   return parsed;
 }
 
-/** Parse a `Cookie:` header into a map. Tolerates spaces + empty segments. */
+/**
+ * Parse a `Cookie:` header into a map. Tolerates spaces + empty segments.
+ *
+ * Decoding is per-segment and fault-tolerant: a client can send an arbitrary cookie value,
+ * and `decodeURIComponent` throws `URIError` on a malformed escape (e.g. `lca_session=%`).
+ * Since this runs on the entry path for every request, a throw here would surface as an
+ * unhandled 500 rather than the intended 401 — so an undecodable value is kept raw (it will
+ * simply fail signature verification).
+ */
 export function parseCookies(header: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!header) return out;
@@ -102,7 +110,14 @@ export function parseCookies(header: string | undefined): Record<string, string>
     if (!seg) continue;
     const eq = seg.indexOf('=');
     if (eq <= 0) continue;
-    out[seg.slice(0, eq).trim()] = decodeURIComponent(seg.slice(eq + 1).trim());
+    const raw = seg.slice(eq + 1).trim();
+    let value: string;
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      value = raw;
+    }
+    out[seg.slice(0, eq).trim()] = value;
   }
   return out;
 }

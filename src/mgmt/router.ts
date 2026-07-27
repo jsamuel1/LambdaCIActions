@@ -87,7 +87,15 @@ function matchTemplate(
     const t = tSegs[i];
     if (t.startsWith('{') && t.endsWith('}')) {
       const name = t.slice(1, -1);
-      const value = decodeURIComponent(segments[i]);
+      // A malformed percent-escape (`/api/runs/%/2/3`) makes decodeURIComponent throw. This
+      // runs before the handler's error boundary, so swallow it and keep the raw segment —
+      // every param is subsequently validated (asPositiveInt) and will 400, not 500.
+      let value: string;
+      try {
+        value = decodeURIComponent(segments[i]);
+      } catch {
+        value = segments[i];
+      }
       if (value.length === 0) return undefined;
       params[name] = value;
     } else if (t !== segments[i]) {

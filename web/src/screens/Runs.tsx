@@ -114,7 +114,7 @@ export function Runs({
               {rows.map((r) => (
                 <tr
                   key={`${r.repoId}-${r.runId}-${r.jobId}`}
-                  style={{ cursor: 'pointer' }}
+                  className="clickable"
                   onClick={() => navigate(`/runs/${r.repoId}/${r.runId}/${r.jobId}`)}
                 >
                   <td>{r.repoFullName}</td>

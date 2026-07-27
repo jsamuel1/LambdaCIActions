@@ -6,9 +6,14 @@
 //   2. the console bucket must never be public.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { WebStack } from '../dist/lib/web-stack.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function synth() {
   const app = new App();
@@ -86,4 +91,23 @@ test('the app shell ships a self-only CSP that denies framing', () => {
   // The S3 (app shell) behavior must actually reference it.
   const cfg = distribution(t);
   assert.ok(cfg.DefaultCacheBehavior.ResponseHeadersPolicyId, 'shell has no headers policy');
+});
+
+test('the SPA source carries no inline style attributes (CSP style-src self)', () => {
+  // `style-src 'self'` with no `unsafe-inline` means browsers DROP `style="..."` attributes.
+  // React's `style={{...}}` prop compiles to exactly that, so any inline style would work in
+  // a dev server and silently vanish behind CloudFront. Layout lives in web/src/styles.css.
+  const webSrc = path.join(REPO_ROOT, 'web', 'src');
+  const offenders = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.tsx?$/.test(e.name) && fs.readFileSync(p, 'utf8').includes('style={{')) {
+        offenders.push(path.relative(webSrc, p));
+      }
+    }
+  };
+  walk(webSrc);
+  assert.deepEqual(offenders, [], 'inline styles are dropped by the console CSP');
 });

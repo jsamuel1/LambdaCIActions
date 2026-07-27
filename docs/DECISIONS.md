@@ -695,3 +695,34 @@ then advances a `since` watermark (newest event held, +1 ms). Re-sending a spent
 the first implementation did, replays the same page indefinitely; `test/mgmt-logs.test.mjs`
 pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
 WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
+
+## ADR-025 — Console repo config is enforced in Ingest, not the management plane (M4)
+**Status**: Accepted (v1) · follows [ADR-023](#adr-023)
+**Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
+`defaultFlavor`. ADR-023 deliberately restricts the Mgmt λ to config writes — it cannot
+touch the hot path. That leaves an obvious gap: writing config is not the same as *honoring*
+it. As first implemented, `enabled=false` / `mode='off'` and `defaultFlavor` were persisted
+and rendered, but no control-plane code read them, so the console's Disable button and
+default-flavor selector were cosmetic — the platform kept claiming the repo's jobs and kept
+falling back to `base`.
+**Decision**: the **control plane** enforces console config at the points that already own
+those decisions:
+- **Claim gate** — `src/ingest/handler.ts` reads the repo row before enqueueing a claimed
+  job and drops it when `isRepoOptedOut(repo)` (`enabled === false` or `mode === 'off'`),
+  logging `claimed: false, disabled: true`. This sits AFTER the label filter (so an
+  unlabeled job costs no read) and beside the existing compat gate.
+- **Flavor fallback** — `resolveFlavor` takes `opts.defaultFlavor` from the repo row and
+  uses it instead of catalog `base` when no FlavorMap entry and no explicit LCA label
+  matched. FlavorMap and explicit labels still win; an unknown flavor name is ignored;
+  signal-based upgrade still applies on top.
+**Why**: keeping enforcement in Ingest/Provision preserves the plane boundary — the
+management λ never gains hot-path permissions — and puts each rule where its data already
+lives. Alternatives rejected: having the Mgmt λ mutate the runner-label config (would widen
+its IAM and couple planes); a separate "disabled repos" table (a second source of truth for
+a field the repo row already has).
+**Consequences**: one extra `GetItem` per claimed job. Both gates **fail OPEN** — a missing
+repo row (repos onboarded before M4) or a DynamoDB fault must never stop a labeled job, per
+spec 03 § routing. Consequently a *disabled* repo whose row read fails will still run that
+job; that is the deliberate trade (availability over strictness) and matches the compat
+gate. `mode='adopt'` is not an opt-out — it is treated as `label` until the M5
+standard-label map ships. `test/filter.test.mjs` and `test/flavor.test.mjs` pin both.
