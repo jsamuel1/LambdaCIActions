@@ -405,12 +405,12 @@ root entrypoint scoped to docker-capable flavors, no `sudo`, bounded readiness w
 
 ## ADR-021 — microVMs hold no ambient AWS authority: brokered run-hook operations (M3)
 **Status**: Accepted (v1) · supersedes the IAM half of [ADR-019](#adr-019) · amends
-[ADR-015](#adr-015) (payload-by-reference access path)
+[ADR-016](#adr-016) (payload-by-reference access path)
 **Context**: The microVM execution role (`lca-<env>-microvm-exec`) is stamped on VMs that
 execute **untrusted workflow code**, and carried two grants that couldn't be scoped where
 they were:
 1. `dynamodb:GetItem`/`Query`/`Scan` table-wide, via `table.grantReadData(microvmExecRole)`
-   — needed so the hook could resolve its JIT config by reference (ADR-015) and read its
+   — needed so the hook could resolve its JIT config by reference (ADR-016) and read its
    own `microvmId` (ADR-019). A VM could read **any** run's row.
 2. `lambda:TerminateMicrovm` on `Resource: "*"`, region-conditioned only (ADR-019). Any VM
    could terminate any VM in the account/region.
@@ -427,7 +427,7 @@ operations on the VM's behalf:
    SHA-256 on the JIT config item (`hookTokenHash`) **and mirrors the same hash onto the
    durable run row** when it stamps `microvmId`, then passes the plaintext to the VM in
    the run-hook payload — which already had to carry the ref and stays well under the 4 KB
-   cap (ADR-015). The payload's `table` field is replaced by `broker` + `token`.
+   cap (ADR-016). The payload's `table` field is replaced by `broker` + `token`.
 2. The in-VM hook invokes the broker with `{action, ref, token}`. `action=jitconfig`
    returns that run's stashed config; `action=terminate` reads that run's `microvmId` and
    terminates it. The item key is derived **from the token-bound ref**, never from
@@ -473,8 +473,7 @@ platform deadline behind it). The bound exists at all because the AWS CLI otherw
 `spawnSync` forever if the guest's network is broken, which would strand the VM with no ACK
 and no retry; the backoff is exponential across attempts, since the reserved-concurrency cap
 below can legitimately throttle a launch burst and flat retries would all land in the same
-throttle window. And one more function
-to deploy. The
+throttle window. And it is one more function to deploy. The
 broker is capped at 20 reserved concurrent executions: its only callers are untrusted VMs
 (one call at boot, one at job end), so a pathological VM fleet must not be able to drain the
 account's unreserved concurrency pool out from under the control plane. The broker is now

@@ -162,7 +162,7 @@ export class ControlStack extends Stack {
 
     // ---- Hook broker λ (ADR-021) ----
     // The control-plane mediator for everything a microVM needs from AWS: fetch its own JIT
-    // config (ADR-015 by-reference payload) and terminate itself at job end (ADR-019). The VM
+    // config (ADR-016 by-reference payload) and terminate itself at job end (ADR-019). The VM
     // authenticates with a per-run capability token minted by Provision; the broker derives
     // the DynamoDB key from the token-bound ref, so a VM can only ever touch its own run
     // partition and never learns any microvmId (not even its own).

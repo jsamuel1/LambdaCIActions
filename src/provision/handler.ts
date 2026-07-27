@@ -117,7 +117,7 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   });
 
   // 3. stash the JIT config in DynamoDB (the 4 KB run-hook payload can't hold it inline,
-  //    ADR-015) together with the HASH of a freshly minted per-run capability token
+  //    ADR-016) together with the HASH of a freshly minted per-run capability token
   //    (ADR-021). The plaintext token goes only to the VM, in its launch payload: it is
   //    what lets the VM ask the hook broker for its own JIT config and its own
   //    self-terminate, WITHOUT holding table-wide DDB read or region-wide

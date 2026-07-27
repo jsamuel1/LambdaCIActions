@@ -86,7 +86,7 @@ export async function launchMicroVM(
 ): Promise<LaunchResult> {
   const payloadJson = JSON.stringify(params.payload);
   const payloadBytes = Buffer.byteLength(payloadJson, 'utf8');
-  // The payload is now just a small reference (the JIT config lives in DynamoDB, ADR-015),
+  // The payload is now just a small reference (the JIT config lives in DynamoDB, ADR-016),
   // so it fits the 4 KB cap trivially. Keep the guard + a size log as a safety net against
   // an accidentally-oversized ref payload.
   console.log(
@@ -99,7 +99,7 @@ export async function launchMicroVM(
   );
   if (payloadBytes > RUN_HOOK_PAYLOAD_MAX) {
     throw new Error(
-      `run-hook payload ${payloadBytes} bytes exceeds ${RUN_HOOK_PAYLOAD_MAX}-byte cap (ADR-015)`,
+      `run-hook payload ${payloadBytes} bytes exceeds ${RUN_HOOK_PAYLOAD_MAX}-byte cap (ADR-016)`,
     );
   }
 

@@ -105,7 +105,9 @@ export interface DiscoveryRequest {
 /**
  * The JSON we hand to `run-microvm --run-hook-payload` (delivered to /run). HARD cap 4096
  * bytes (GA lambda-microvms). The JIT config alone exceeds this, so it is NOT inlined — we
- * pass only a small reference; the /run hook fetches the config from DynamoDB (ADR-015).
+ * pass only a small reference; the /run hook resolves it through the hook broker λ, which is
+ * the only AWS surface the VM can reach (ADR-016 by-reference payload, ADR-020 brokered
+ * access).
  */
 export interface RunHookPayload {
   /** DynamoDB ref to the stashed JIT config (see run-store jitConfigRef). */

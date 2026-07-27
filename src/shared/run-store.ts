@@ -298,7 +298,7 @@ function isConditionalFailed(err: unknown): boolean {
   );
 }
 
-// ---- JIT config side-store (ADR-015: run-hook payload cap is 4 KB) ---------
+// ---- JIT config side-store (ADR-016: run-hook payload cap is 4 KB) ---------
 // The GA lambda-microvms `runHookPayload` hard cap is 4096 bytes, but a GitHub
 // encoded_jit_config alone is ~4 KB — it does not fit inline. So Provision stashes the
 // JIT config (+ minimal metadata) here, keyed by an opaque ref, and passes ONLY the ref

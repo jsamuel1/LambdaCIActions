@@ -8,7 +8,7 @@
  * Traffic to the VM is gated until `/run` returns 200, so we ACK fast and run the actual
  * GitHub Actions job in the background.
  *
- * Contract (ADR-015 — run-hook payload cap is 4 KB, so the JIT config is passed by
+ * Contract (ADR-016 — run-hook payload cap is 4 KB, so the JIT config is passed by
  * REFERENCE, not inline; ADR-021 — the VM holds NO ambient AWS authority beyond invoking
  * the hook broker):
  *   POST /run        body = { ref, region, broker, token }   (small; <4 KB)
@@ -30,7 +30,7 @@ import os from 'node:os';
 const PORT = parseInt(process.env.RUN_HOOK_PORT || '8080', 10);
 const RUNNER_DIR = process.env.RUNNER_DIR || '/opt/actions-runner';
 const RUNNER_USER = process.env.RUNNER_USER || 'runner';
-const MAX_PAYLOAD_BYTES = 4096; // GA lambda-microvms run-hook payload hard cap (ADR-015)
+const MAX_PAYLOAD_BYTES = 4096; // GA lambda-microvms run-hook payload hard cap (ADR-016)
 
 let jobStarted = false; // guard: this microVM runs exactly one job
 // The {ref, region, broker, token} pointer delivered to /run — kept so selfTerminate can
@@ -290,7 +290,7 @@ function sleepSync(ms) {
   }
 }
 
-// Fetch the stashed JIT config through the hook broker (ADR-015 by-reference payload,
+// Fetch the stashed JIT config through the hook broker (ADR-016 by-reference payload,
 // ADR-021 brokered access). The VM has no DynamoDB permission at all — the broker validates
 // the capability token and returns the config for THIS run only.
 function fetchJitConfig() {
@@ -416,7 +416,7 @@ const server = http.createServer(async (req, res) => {
         res.end('{"error":"missing ref/broker/token"}');
         return;
       }
-      // Resolve the JIT config through the broker (the payload can't hold it, ADR-015; the
+      // Resolve the JIT config through the broker (the payload can't hold it, ADR-016; the
       // VM can't read DynamoDB, ADR-021). runCtx must be set first — callBroker reads it.
       runCtx = { ref: ptr.ref, region: ptr.region, broker: ptr.broker, token: ptr.token };
       let payload;

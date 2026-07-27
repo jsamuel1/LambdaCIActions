@@ -14,7 +14,7 @@ import { hookTokenMatches, keysFromRef, parseHookRequest } from './broker-core.j
  *
  * Now the VM holds ONE permission — `lambda:InvokeFunction` on this function — and a
  * per-run capability token. Two actions:
- *   jitconfig  → return the run's own stashed JIT config (ADR-015 by-reference payload)
+ *   jitconfig  → return the run's own stashed JIT config (ADR-016 by-reference payload)
  *   terminate  → look up the run's own `microvmId` and terminate THAT VM
  *
  * The item key is derived from the token-bound `ref`, never from free-form caller input, so
