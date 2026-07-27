@@ -74,8 +74,13 @@ export function validateRepoPatch(input: unknown): ValidationResult<RepoConfigPa
     }
   }
   if (input.defaultFlavor !== undefined) {
-    if (typeof input.defaultFlavor !== 'string' || !flavorNames().includes(input.defaultFlavor)) {
-      errors.push(`defaultFlavor must be a known flavor (${flavorNames().join(', ')})`);
+    // `null` clears the override — the repo reverts to the catalog default (`base`).
+    // Without an explicit clear a defaultFlavor, once set, would be permanent: the
+    // validator rejects everything but known flavor names.
+    if (input.defaultFlavor === null) {
+      patch.defaultFlavor = null;
+    } else if (typeof input.defaultFlavor !== 'string' || !flavorNames().includes(input.defaultFlavor)) {
+      errors.push(`defaultFlavor must be a known flavor (${flavorNames().join(', ')}) or null to clear`);
     } else {
       patch.defaultFlavor = input.defaultFlavor;
     }

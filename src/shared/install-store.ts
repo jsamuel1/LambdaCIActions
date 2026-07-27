@@ -211,7 +211,8 @@ export async function listRepos(installationId: number): Promise<RepoRecord[]> {
 export interface RepoConfigPatch {
   enabled?: boolean;
   mode?: RepoMode;
-  defaultFlavor?: string;
+  /** A known flavor name, or `null` to clear the override (revert to catalog default). */
+  defaultFlavor?: string | null;
   flavorMap?: Record<string, string>;
 }
 
@@ -229,6 +230,7 @@ export async function patchRepoConfig(
 ): Promise<RepoRecord | undefined> {
   const iso = new Date().toISOString();
   const sets = ['updatedAt = :now', 'updatedBy = :actor'];
+  const removes: string[] = [];
   const values: Record<string, unknown> = { ':now': iso, ':actor': actor };
 
   if (patch.enabled !== undefined) {
@@ -240,8 +242,14 @@ export async function patchRepoConfig(
     values[':mode'] = patch.mode;
   }
   if (patch.defaultFlavor !== undefined) {
-    sets.push('defaultFlavor = :df');
-    values[':df'] = patch.defaultFlavor;
+    if (patch.defaultFlavor === null) {
+      // Clear the override — REMOVE the attribute so provisioning's `repo?.defaultFlavor`
+      // falls back to the catalog default rather than reading a stale value.
+      removes.push('defaultFlavor');
+    } else {
+      sets.push('defaultFlavor = :df');
+      values[':df'] = patch.defaultFlavor;
+    }
   }
   if (patch.flavorMap !== undefined) {
     sets.push('flavorMap = :fm');
@@ -253,7 +261,7 @@ export async function patchRepoConfig(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: installPk(installationId), sk: repoSk(repoId) },
-        UpdateExpression: `SET ${sets.join(', ')}`,
+        UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
         ConditionExpression: 'attribute_exists(pk)',
         ...(patch.mode !== undefined
           ? { ExpressionAttributeNames: { '#mode': 'mode' } }

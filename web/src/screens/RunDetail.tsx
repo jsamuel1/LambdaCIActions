@@ -30,6 +30,12 @@ export function RunDetail({
   const tokenRef = useRef<string | undefined>(undefined);
   /** Newest event timestamp already rendered — the tail watermark when tokens run out. */
   const sinceRef = useRef<number | undefined>(undefined);
+  /**
+   * In-flight guard: the 4 s interval fires regardless of how long a pull takes, and two
+   * overlapping pulls would send the SAME nextToken/watermark — CloudWatch answers both
+   * with the same page, which appends every line twice. One pull at a time.
+   */
+  const pullingRef = useRef(false);
   const preRef = useRef<HTMLPreElement | null>(null);
 
   const status = run.data?.run.status;
@@ -48,6 +54,8 @@ export function RunDetail({
   useEffect(() => {
     let cancelled = false;
     async function pull(): Promise<void> {
+      if (pullingRef.current) return;
+      pullingRef.current = true;
       try {
         const page = await api.runLogs(repoId, runId, jobId, {
           nextToken: tokenRef.current,
@@ -68,6 +76,8 @@ export function RunDetail({
         tokenRef.current = page.nextToken ?? undefined;
       } catch (e) {
         if (!cancelled) setLogErr(e instanceof Error ? e.message : String(e));
+      } finally {
+        pullingRef.current = false;
       }
     }
     void pull();

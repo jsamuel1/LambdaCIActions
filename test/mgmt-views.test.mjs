@@ -201,6 +201,14 @@ test('repo patch accepts the config surface', () => {
   assert.deepEqual(r.value, { enabled: false, mode: 'adopt', defaultFlavor: 'node' });
 });
 
+// M4 review fix: without an explicit clear, a defaultFlavor override would be permanent —
+// the validator rejects every non-flavor value, and the store only ever SETs the attribute.
+test('repo patch accepts defaultFlavor:null as "clear the override"', () => {
+  const r = validateRepoPatch({ defaultFlavor: null });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value, { defaultFlavor: null });
+});
+
 test('repo patch rejects unknown fields (no privilege creep via body)', () => {
   const r = validateRepoPatch({ enabled: true, status: 'completed', microvmId: 'mv-1' });
   assert.equal(r.ok, false);

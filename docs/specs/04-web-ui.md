@@ -80,7 +80,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/me` | Session introspection (login, installations, expiry) | ✅ |
 | `GET /api/installations` | List installations the caller can admin | ✅ |
 | `GET /api/repos?installation=<id>` | List repos + compat rollup | ✅ |
-| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor`, `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
+| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`) | ✅ |
@@ -137,9 +137,9 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   missing)** — not 403 — to avoid an existence oracle on guessed run ids.
 - A user with **zero installations** still gets a session (with an empty grant list) so the
   Setup screen is reachable for first-run onboarding — the empty list authorizes nothing:
-  every repo/run route answers 403, every list is empty, and `/api/health` (whose counts
-  are platform-wide) is explicitly denied. Installing the App and re-logging-in picks up
-  the grant.
+  repo routes answer 403, run routes 404 (the deny-as-not-found rule above), every list is
+  empty, and `/api/health` (whose counts are platform-wide) is explicitly denied. Installing
+  the App and re-logging-in picks up the grant.
 - Cognito is **not** used in v1 (ADR-022 rationale).
 - Secrets are shown as **presence/health only** ("webhook secret: set ✓") — never values.
   The API reads presence via `ssm:DescribeParameters`, which cannot return a value, and the

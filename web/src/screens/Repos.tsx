@@ -86,11 +86,12 @@ export function Repos({
                   <select
                     value={r.defaultFlavor ?? ''}
                     disabled={busy === r.repoId || !flavors.data}
-                    onChange={(e) => patch(r, { defaultFlavor: e.target.value })}
+                    onChange={(e) =>
+                      // Empty selection clears the override (API accepts null → REMOVE).
+                      patch(r, { defaultFlavor: e.target.value === '' ? null : e.target.value })
+                    }
                   >
-                    <option value="" disabled>
-                      (catalog default)
-                    </option>
+                    <option value="">(catalog default)</option>
                     {(flavors.data?.flavors ?? []).map((f) => (
                       <option key={f.name} value={f.name}>
                         {f.name}

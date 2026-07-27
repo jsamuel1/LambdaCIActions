@@ -26,21 +26,28 @@ export function Runs({
     5000,
   );
   const [older, setOlder] = useState<Run[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
+  /**
+   * Older-pages cursor. THREE states, not two: `undefined` = no older page loaded yet
+   * (fall back to the head page's cursor), a string = resume here, `null` = the index is
+   * exhausted. Conflating `null` with `undefined` would make an exhausted history fall
+   * back to the head cursor — the button would never disappear and clicking it would
+   * re-walk the same pages forever.
+   */
+  const [cursor, setCursor] = useState<string | null | undefined>(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreErr, setMoreErr] = useState<string | undefined>(undefined);
 
   // A filter change invalidates every appended page and its cursor.
   useEffect(() => {
     setOlder([]);
-    setCursor(null);
+    setCursor(undefined);
     setMoreErr(undefined);
   }, [repoFilter, status]);
 
   if (runs.error) return <ErrorBox message={runs.error} />;
 
   const headCursor = runs.data?.nextCursor ?? null;
-  const nextCursor = cursor ?? headCursor;
+  const nextCursor = cursor === undefined ? headCursor : cursor;
   const seen = new Set<string>();
   const rows = [...(runs.data?.runs ?? []), ...older].filter((r) => {
     const key = `${r.repoId}-${r.runId}-${r.jobId}`;

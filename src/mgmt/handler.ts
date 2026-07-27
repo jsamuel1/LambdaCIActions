@@ -82,7 +82,7 @@ const OAUTH_CLIENT_SECRET_PARAM =
 const RUN_LOG_GROUP = process.env.RUN_LOG_GROUP ?? `/aws/lambda/microvms/runs/lca-${ENV_NAME}`;
 const DISCOVERY_QUEUE_URL = process.env.DISCOVERY_QUEUE_URL ?? '';
 /** Public origin of the console (CloudFront). Used to build the OAuth redirect URI. */
-const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN ?? '';
+const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN ?? '').replace(/\/+$/, '');
 
 const sqs = new SQSClient({});
 
@@ -195,7 +195,7 @@ function cookieHeader(event: APIGatewayProxyEventV2): string | undefined {
 
 function redirectUri(): string {
   if (!PUBLIC_ORIGIN) throw new Error('PUBLIC_ORIGIN not configured for the mgmt API');
-  return `${PUBLIC_ORIGIN.replace(/\/+$/, '')}/auth/callback`;
+  return `${PUBLIC_ORIGIN}/auth/callback`;
 }
 
 /**
