@@ -5,23 +5,50 @@
 // ControlStack (webhook → ingest → SQS → provision → microVM). DataStack / MgmtStack /
 // WebStack / AuthStack land in later milestones.
 //
-// Environment selection: `-c env=dev|prod` (default dev). Account/region come from the
-// standard CDK env vars (CDK_DEFAULT_ACCOUNT / CDK_DEFAULT_REGION) or `-c region=…`.
+// Environment selection: `-c env=dev|prod` (default dev). Account/region are PINNED in
+// `.env.local` (ADR-018, see .env.local.example) — deploys refuse to run against ambient
+// credentials that don't match the pin. Credential-less `cdk synth` (CI gate) is exempt.
 // Secrets are NEVER defined here — they are created out-of-band (ADR-008) and referenced
 // by ARN/path inside the stacks.
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { App } from 'aws-cdk-lib';
 import { ImageStack } from '../lib/image-stack.js';
 import { ControlStack } from '../lib/control-stack.js';
 import { DataStack } from '../lib/data-stack.js';
+import { loadEnvLocal, validateTarget } from '../lib/deploy-env.js';
 
 const app = new App();
 
 const envName = (app.node.tryGetContext('env') as string | undefined) ?? 'dev';
-const region =
-  (app.node.tryGetContext('region') as string | undefined) ??
-  process.env.CDK_DEFAULT_REGION ??
-  'us-west-2';
-const account = process.env.CDK_DEFAULT_ACCOUNT;
+const requestedRegion = (app.node.tryGetContext('region') as string | undefined) ?? null;
+
+// Deploy-target pin (ADR-018). CDK_DEFAULT_ACCOUNT is only set when the CDK CLI resolved
+// real credentials — i.e. any invocation that COULD reach an account (deploy, diff,
+// credentialed synth). In that case .env.local is mandatory and must match the ambient
+// account. Credential-less synth (CI build gate, fresh worktrees) proceeds unpinned.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const envLocal = loadEnvLocal(repoRoot);
+const ambientAccount = process.env.CDK_DEFAULT_ACCOUNT;
+
+let account: string | undefined;
+let region: string;
+if (ambientAccount || envLocal) {
+  const target = validateTarget(envLocal, { region: requestedRegion });
+  if (ambientAccount && ambientAccount !== target.account) {
+    throw new Error(
+      `Deploy-target mismatch: credentials resolve to account ${ambientAccount}, but .env.local ` +
+        `pins LCA_DEPLOY_ACCOUNT=${target.account}.\n` +
+        'Switch AWS_PROFILE/credentials to the pinned account, or update .env.local deliberately.',
+    );
+  }
+  account = target.account;
+  region = target.region;
+} else {
+  // No credentials AND no pin: synth-only path (CI). Nothing can be deployed from here.
+  account = undefined;
+  region = requestedRegion ?? process.env.CDK_DEFAULT_REGION ?? 'us-west-2';
+}
 
 const env = { account, region };
 const ssmPrefix = `/lca/${envName}`;

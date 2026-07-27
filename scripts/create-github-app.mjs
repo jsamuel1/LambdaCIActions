@@ -31,6 +31,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -56,13 +57,36 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
 const CONSOLE_URL = args['console-url'];
 const WEBHOOK_URL = args['webhook-url'];
 const ORG = args['org'] || null;
 const ENV = args['env'] || 'dev';
-const REGION = args['region'] || null;
+let REGION = args['region'] || null;
 const PORT = parseInt(args['port'] || '8976', 10);
 const DRY_RUN = Boolean(args['dry-run']);
+
+// Deploy-target pin (ADR-018): this script writes SecureStrings to SSM — it must not run
+// against an unintended account. Dry runs exempt (no AWS calls). Guard lives in
+// lib/deploy-env.ts (shared with the CDK app), hence the dist/ import.
+async function guardDeployTarget() {
+  if (DRY_RUN) return;
+  let mod;
+  try {
+    mod = await import(path.join(REPO_ROOT, 'dist', 'lib', 'deploy-env.js'));
+  } catch {
+    console.error('ERROR: dist/lib/deploy-env.js not found — run `npm run build` first.');
+    process.exit(1);
+  }
+  try {
+    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION });
+    REGION = target.region; // pin wins — SSM writes always carry --region <pin>
+  } catch (e) {
+    console.error(`ERROR: ${e.message}`);
+    process.exit(1);
+  }
+}
 
 function assertArgs() {
   if (!DRY_RUN && (!CONSOLE_URL || !WEBHOOK_URL)) {
@@ -227,6 +251,7 @@ function openBrowser(url) {
 // ---------------------------------------------------------------------------
 async function main() {
   assertArgs();
+  await guardDeployTarget();
   const manifest = buildManifest();
 
   if (DRY_RUN) {

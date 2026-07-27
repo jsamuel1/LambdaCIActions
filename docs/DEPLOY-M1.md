@@ -26,6 +26,21 @@ npm run build          # tsc → dist/
 npm test               # builds + runs unit tests
 ```
 
+## Phase -1 — pin the deploy target (ADR-018)
+
+Every deploy-touching command (cdk deploy/diff, `build:images`, `app:create`) refuses to
+run without a `.env.local` pinning the target account + region — and refuses if your
+credentials resolve to a different account:
+
+```sh
+cp .env.local.example .env.local
+# edit: LCA_DEPLOY_ACCOUNT=<12-digit account>  LCA_DEPLOY_REGION=us-west-2
+#       (optional) AWS_PROFILE=<profile to use when the shell doesn't set one>
+```
+
+`.env.local` is gitignored — never commit it. If you pass `--region`/`-c region`
+anywhere, it must match the pin (or just omit it — the pin wins).
+
 ## Phase 0 — secrets (out-of-band, ADR-008)
 
 The webhook secret + App PEM are SecureStrings that CloudFormation can't create. The
