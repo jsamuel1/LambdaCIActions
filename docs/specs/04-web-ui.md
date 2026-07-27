@@ -108,7 +108,10 @@ the unfiltered multi-status view returns `nextCursor: null` — narrow by repo o
 page deeper (ADR-023). Because the run indexes are not keyed by installation, authorization
 is a **post-query filter**, so filtered endpoints walk up to 5 index pages per request to
 fill a page of visible rows; `nextCursor` is null only when the index is exhausted
-(`src/mgmt/paging.ts`, `test/mgmt-authz-paging.test.mjs`).
+(`src/mgmt/paging.ts`, `test/mgmt-authz-paging.test.mjs`). `limit` is a **floor** on those
+endpoints: because the cursor addresses an index page, a response may carry a few rows beyond
+`limit` (whatever the last fetched page contributed) rather than dropping rows the cursor can
+no longer reach.
 
 `GET /api/health` counts are **platform-wide** (the status index is not per-installation),
 while `stuck` and every run list are filtered to the session's installations. Counts follow

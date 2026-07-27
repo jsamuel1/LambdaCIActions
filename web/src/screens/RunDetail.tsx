@@ -23,6 +23,10 @@ export function RunDetail({
   const [pages, setPages] = useState<LogPage[]>([]);
   const [logErr, setLogErr] = useState<string | undefined>(undefined);
   const [tailing, setTailing] = useState(true);
+  /** True when the newest poll returned no events (the tail is caught up). */
+  const [caughtUp, setCaughtUp] = useState(false);
+  /** The newest poll's `pending` flag — the API's "no stream yet" signal. */
+  const [pendingFlag, setPendingFlag] = useState(true);
   const tokenRef = useRef<string | undefined>(undefined);
   /** Newest event timestamp already rendered — the tail watermark when tokens run out. */
   const sinceRef = useRef<number | undefined>(undefined);
@@ -34,6 +38,9 @@ export function RunDetail({
   // Reset the log buffer when the run identity changes.
   useEffect(() => {
     setPages([]);
+    setCaughtUp(false);
+    setPendingFlag(true);
+    setTailing(true);
     tokenRef.current = undefined;
     sinceRef.current = undefined;
   }, [repoId, runId, jobId]);
@@ -48,6 +55,8 @@ export function RunDetail({
         });
         if (cancelled) return;
         setLogErr(undefined);
+        setCaughtUp(page.events.length === 0);
+        setPendingFlag(page.pending);
         if (page.events.length) {
           setPages((prev) => [...prev, page]);
           const newest = page.events.reduce((max, e) => (e.timestamp > max ? e.timestamp : max), 0);
@@ -74,16 +83,19 @@ export function RunDetail({
     };
   }, [repoId, runId, jobId, tailing]);
 
-  // Stop tailing once the job is terminal AND a page came back empty — nothing more to read.
+  // Stop tailing once the job is terminal AND a poll came back empty — nothing more to read.
+  // (`pages` only holds non-empty pages, so the caught-up signal has to be tracked separately.)
   useEffect(() => {
-    if (terminal && pages.length && pages[pages.length - 1].events.length === 0) setTailing(false);
-  }, [terminal, pages]);
+    if (terminal && caughtUp) setTailing(false);
+  }, [terminal, caughtUp]);
 
   if (run.error) return <ErrorBox message={run.error} />;
   if (!run.data) return <Loading what="run" />;
   const r = run.data.run;
   const events = pages.flatMap((p) => p.events);
-  const pending = events.length === 0 && (pages.length === 0 || pages[pages.length - 1].pending);
+  // The API's `pending` flag is authoritative: an empty first page with a live stream is
+  // "caught up", not "waiting for the microVM".
+  const pending = events.length === 0 && pendingFlag;
 
   return (
     <div className="stack">

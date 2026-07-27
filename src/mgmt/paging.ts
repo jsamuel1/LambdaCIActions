@@ -10,6 +10,12 @@
  * `collectVisible` keeps pulling index pages until it has a full page of VISIBLE rows, the
  * index is exhausted, or a page budget is spent. Kept pure (no AWS types) so the contract is
  * unit-testable — see `test/mgmt-authz-paging.test.mjs`.
+ *
+ * `limit` is a **floor**, not a hard cap: the returned cursor is an index-PAGE cursor, so
+ * truncating a page's surplus visible rows would lose them for good (resuming at that cursor
+ * skips them). We therefore return every visible row collected — up to one index page beyond
+ * `limit` — rather than silently dropping run history. The client already de-duplicates
+ * appended pages by run key.
  */
 
 /** How many index pages a single request will walk while filtering for visibility. */
@@ -37,5 +43,6 @@ export async function collectVisible<T>(
     // client can resume rather than silently losing history.
     if (!cursor || out.length >= limit) break;
   }
-  return { runs: out.slice(0, limit), nextCursor: cursor };
+  // No slice: see the module doc — a page cursor cannot express "resume mid-page".
+  return { runs: out, nextCursor: cursor };
 }

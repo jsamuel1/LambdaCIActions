@@ -88,6 +88,23 @@ test('the page budget bounds a hostile ratio of foreign rows', async () => {
   assert.equal(res.nextCursor, `c${MAX_FILTER_PAGES}`, 'the client can resume rather than losing history');
 });
 
+test('surplus visible rows in the final page are returned, not dropped', async () => {
+  // The cursor is an index-PAGE cursor: resuming at it skips everything the page contained.
+  // Truncating to `limit` would therefore lose run 3 permanently.
+  const pages = [
+    { runs: [run(1, 11), run(2, 99)], nextCursor: 'c1' },
+    { runs: [run(2, 11), run(3, 11)], nextCursor: 'c2' },
+  ];
+  let i = 0;
+  const res = await collectVisible(async () => pages[i++], visible, 2);
+  assert.deepEqual(
+    res.runs.map((r) => r.runId),
+    [1, 2, 3],
+    'a row collected inside the last fetched page must not be sliced away',
+  );
+  assert.equal(res.nextCursor, 'c2');
+});
+
 test('a caller-supplied cursor is honoured on the first fetch', async () => {
   const seen = [];
   await collectVisible(
