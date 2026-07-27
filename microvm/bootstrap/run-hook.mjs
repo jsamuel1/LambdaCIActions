@@ -9,15 +9,17 @@
  * GitHub Actions job in the background.
  *
  * Contract (ADR-015 — run-hook payload cap is 4 KB, so the JIT config is passed by
- * REFERENCE, not inline):
- *   POST /run        body = { ref, region, table }   (small; <4 KB)
- *                    -> hook fetches the JIT config from DynamoDB by ref, then
- *                       200 immediately; runner agent runs ONE job in the background
+ * REFERENCE, not inline; ADR-021 — the VM holds NO ambient AWS authority beyond invoking
+ * the hook broker):
+ *   POST /run        body = { ref, region, broker, token }   (small; <4 KB)
+ *                    -> hook asks the broker λ for its JIT config (token-authorized to
+ *                       this run only), then 200 immediately; runner agent runs ONE job
+ *                       in the background
  *   POST /terminate  fires pre-teardown; best-effort final log flush
  *   GET  /healthz    liveness
  *
  * Single-use semantics (ADR-003/006): the JIT config is consumed by exactly one
- * `run.sh --jitconfig` invocation; on agent exit we self-terminate via `terminate-microvm`
+ * `run.sh --jitconfig` invocation; on agent exit we ask the broker to terminate this VM
  * (the Reaper λ backstops orphans). Zero runtime deps — Node built-ins + the baked-in AWS CLI.
  */
 import http from 'node:http';
@@ -30,14 +32,19 @@ const RUNNER_USER = process.env.RUNNER_USER || 'runner';
 const MAX_PAYLOAD_BYTES = 4096; // GA lambda-microvms run-hook payload hard cap (ADR-015)
 
 let jobStarted = false; // guard: this microVM runs exactly one job
-// The {ref, region, table} pointer delivered to /run — kept so selfTerminate can read the
-// run row (which Provision stamps with our microvmId post-launch, ADR-019).
+// The {ref, region, broker, token} pointer delivered to /run — kept so selfTerminate can
+// call the broker with the same per-run capability token (ADR-021).
 let runCtx = null;
 
 function log(msg, extra) {
   // structured line → CloudWatch (the UI reads via log_ref, spec 05)
   const rec = { ts: new Date().toISOString(), src: 'run-hook', msg, ...extra };
   process.stdout.write(JSON.stringify(rec) + '\n');
+}
+
+// The capability token is a bearer secret (ADR-021) — never log a payload verbatim.
+export function redact(raw) {
+  return String(raw).replace(/("token"\s*:\s*")[^"]*(")/g, '$1<redacted>$2');
 }
 
 function readBody(req) {
@@ -58,68 +65,78 @@ function readBody(req) {
   });
 }
 
-// Self-terminate this microVM so it disappears the instant the job is done (no idle
-// billing). There is NO reliable in-guest id source (ADR-016: no /run/microvm/id, env
-// only carries AWS_LAMBDA_MICROVM_IMAGE_*), so the authoritative path is the RUN ROW
-// READBACK (ADR-019): Provision stamps `microvmId` on the run record seconds after
-// RunMicrovm returns; by job end (minutes later) it is there — fetch it by the same
-// {ref, region, table} pointer we resolved the JIT config with.
+// Ask the control plane to terminate this microVM the instant the job is done (no idle
+// billing). The VM does NOT hold `lambda:TerminateMicrovm` and never learns its own
+// microvmId (ADR-021): it invokes the hook broker λ with its per-run capability token, and
+// the broker resolves the id off this run's row (stamped by Provision post-launch, ADR-019)
+// and terminates that VM. A VM therefore cannot target anyone else's VM.
 function selfTerminate(reason) {
-  const microvmId = process.env.MICROVM_ID || readMicrovmId() || readMicrovmIdFromRunStore();
-  log('self-terminate', { reason, microvmId });
-  if (!microvmId) {
-    log('no microvm id available; relying on Reaper', {});
+  log('self-terminate requested', { reason });
+  const res = callBroker('terminate');
+  if (!res || res.ok !== true) {
+    log('brokered terminate failed; Reaper will backstop', { error: res?.error ?? 'invoke failed' });
     return;
   }
-  const args = ['lambda-microvms', 'terminate-microvm', '--microvm-identifier', microvmId];
-  if (runCtx?.region) args.push('--region', runCtx.region);
-  const r = spawnSync('aws', args, { encoding: 'utf8' });
-  if (r.status !== 0) {
-    log('terminate-microvm failed; Reaper will backstop', { stderr: r.stderr });
+  if (res.terminated === false) log('broker had no VM to terminate; Reaper will backstop', {});
+}
+
+// Invoke the hook broker λ via the baked-in AWS CLI (no npm deps in the image). The VM's
+// execution role grants exactly one action — lambda:InvokeFunction on this function ARN.
+// Retries cover the razor-thin window where Provision hasn't stamped microvmId yet.
+function callBroker(action, attempts = 3, delayMs = 2000) {
+  if (!runCtx?.ref || !runCtx?.broker || !runCtx?.token) {
+    log('broker call skipped: no broker context', { action });
+    return null;
   }
+  const payload = JSON.stringify({ action, ref: runCtx.ref, token: runCtx.token });
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) sleepSync(delayMs);
+    const outFile = `/tmp/broker-${action}-${i}.json`;
+    const args = [
+      'lambda', 'invoke',
+      '--function-name', runCtx.broker,
+      '--cli-binary-format', 'raw-in-base64-out',
+      '--payload', payload,
+      outFile,
+    ];
+    if (runCtx.region) args.push('--region', runCtx.region);
+    const r = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    if (r.status !== 0) {
+      log('broker invoke failed', { action, attempt: i + 1, stderr: (r.stderr || '').slice(0, 512) });
+      continue;
+    }
+    let body;
+    try {
+      body = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+    } catch (err) {
+      log('broker response unreadable', { action, attempt: i + 1, error: err.message });
+      continue;
+    } finally {
+      try { fs.unlinkSync(outFile); } catch { /* best-effort */ }
+    }
+    if (body?.ok !== true) {
+      log('broker denied request', { action, attempt: i + 1, error: body?.error });
+      return body ?? null; // an auth failure won't fix itself — don't burn retries
+    }
+    // For terminate, an ok:true with terminated:false means "id not stamped yet" — retry.
+    if (action === 'terminate' && body.terminated === false && i + 1 < attempts) continue;
+    return body;
+  }
+  return null;
 }
 
 // Derive the run row key from the JIT config ref (`RUN#<repo>#<run>#<job>#JITCONFIG`).
-// Exported pure so tests can pin the contract with the run store (ADR-019).
+// The VM no longer reads the run row itself (ADR-021 — the broker does, from the same ref
+// bound to the capability token), but the derivation stays pinned by tests as the shared
+// contract between the compute plane's ref and the control plane's run-row key.
 export function runRowKeyFromRef(ref) {
   const pk = ref.split('#JITCONFIG')[0];
   return { pk, sk: 'RUN' };
 }
 
-// Read our own microvmId back from the run row (ADR-019). Provision writes it right
-// after launch; selfTerminate fires at job end, so it is present in all but a razor-thin
-// race — retry a few times to cover a slow `running` transition write.
-function readMicrovmIdFromRunStore(attempts = 3, delayMs = 2000) {
-  if (!runCtx?.ref || !runCtx?.table) return null;
-  const { pk, sk } = runRowKeyFromRef(runCtx.ref);
-  const key = JSON.stringify({ pk: { S: pk }, sk: { S: sk } });
-  for (let i = 0; i < attempts; i++) {
-    if (i > 0) sleepSync(delayMs);
-    const args = [
-      'dynamodb', 'get-item',
-      '--table-name', runCtx.table,
-      '--key', key,
-      '--projection-expression', 'microvmId',
-      '--output', 'json',
-    ];
-    if (runCtx.region) args.push('--region', runCtx.region);
-    const r = spawnSync('aws', args, { encoding: 'utf8' });
-    if (r.status !== 0) {
-      log('run row microvmId fetch failed', { attempt: i + 1, stderr: (r.stderr || '').slice(0, 512) });
-      continue;
-    }
-    try {
-      const id = JSON.parse(r.stdout || '{}').Item?.microvmId?.S;
-      if (id) return id;
-    } catch {
-      /* malformed output — retry */
-    }
-    log('run row has no microvmId yet', { attempt: i + 1 });
-  }
-  return null;
-}
 
-// Blocking sleep — fine here: selfTerminate runs after the job, nothing else is pending.
+// Blocking sleep — fine here: broker retries happen either before the job starts or after
+// it finishes, with nothing else pending.
 function sleepSync(ms) {
   try {
     spawnSync('sleep', [String(ms / 1000)]);
@@ -128,56 +145,21 @@ function sleepSync(ms) {
   }
 }
 
-// The microVM's own id is exposed to the guest via instance metadata. The exact location
-// is undocumented — try the known candidates and log what exists so we can pin it down
-// from runtime logs (ADR-016 diagnosability).
-function readMicrovmId() {
-  const candidates = [
-    '/run/microvm/id',
-    '/etc/microvm-id',
-    '/proc/device-tree/microvm-id',
-  ];
-  for (const p of candidates) {
-    try {
-      const v = fs.readFileSync(p, 'utf8').trim();
-      if (v) return v;
-    } catch {
-      /* try next */
-    }
-  }
-  // Env fallbacks the runtime may set.
-  for (const k of ['MICROVM_ID', 'AWS_LAMBDA_MICROVM_ID', 'LAMBDA_MICROVM_ID']) {
-    if (process.env[k]) return process.env[k];
-  }
-  try {
-    log('microvm id discovery failed', {
-      runDir: fs.existsSync('/run/microvm') ? fs.readdirSync('/run/microvm') : 'no /run/microvm',
-      envKeys: Object.keys(process.env).filter((k) => /microvm|lambda/i.test(k)),
-    });
-  } catch {
-    /* best-effort */
-  }
-  return null;
-}
 
-// Fetch the stashed JIT config from DynamoDB by ref (ADR-015). Uses the baked-in AWS CLI
-// (no npm deps in the image). The ref encodes the item's pk; sk is the fixed JITCONFIG_SK.
-function fetchJitConfig({ ref, region, table }) {
-  const pk = ref.split('#JITCONFIG')[0];
-  const key = JSON.stringify({ pk: { S: pk }, sk: { S: 'JITCONFIG' } });
-  const args = ['dynamodb', 'get-item', '--table-name', table, '--key', key, '--output', 'json'];
-  if (region) args.push('--region', region);
-  const r = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
-  if (r.status !== 0) throw new Error(`dynamodb get-item failed: ${r.stderr || r.stdout}`);
-  const out = JSON.parse(r.stdout || '{}');
-  if (!out.Item) throw new Error(`no JIT config item for ref ${ref}`);
-  const it = out.Item;
+// Fetch the stashed JIT config through the hook broker (ADR-015 by-reference payload,
+// ADR-021 brokered access). The VM has no DynamoDB permission at all — the broker validates
+// the capability token and returns the config for THIS run only.
+function fetchJitConfig() {
+  const res = callBroker('jitconfig');
+  if (!res || res.ok !== true) {
+    throw new Error(`broker jitconfig failed: ${res?.error ?? 'invoke failed'}`);
+  }
   return {
-    jitConfig: it.jitConfig?.S,
-    runId: Number(it.runId?.N),
-    jobId: Number(it.jobId?.N),
-    repoFullName: it.repoFullName?.S,
-    labels: (it.labels?.L ?? []).map((x) => x.S),
+    jitConfig: res.jitConfig,
+    runId: Number(res.runId),
+    jobId: Number(res.jobId),
+    repoFullName: res.repoFullName,
+    labels: res.labels ?? [],
   };
 }
 
@@ -272,7 +254,7 @@ const server = http.createServer(async (req, res) => {
       try {
         ptr = JSON.parse(raw);
       } catch {
-        log('run payload not JSON', { raw: raw.slice(0, 512) });
+        log('run payload not JSON', { raw: redact(raw).slice(0, 512) });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end('{"error":"invalid JSON payload"}');
         return;
@@ -284,16 +266,18 @@ const server = http.createServer(async (req, res) => {
       } else if (ptr && typeof ptr.payload === 'string') {
         try { ptr = JSON.parse(ptr.payload); } catch { /* fall through */ }
       }
-      if (!ptr || !ptr.ref || !ptr.table) {
-        log('run payload missing ref/table', { raw: raw.slice(0, 512) });
+      if (!ptr || !ptr.ref || !ptr.broker || !ptr.token) {
+        log('run payload missing ref/broker/token', { raw: redact(raw).slice(0, 512) });
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end('{"error":"missing ref/table"}');
+        res.end('{"error":"missing ref/broker/token"}');
         return;
       }
-      // Resolve the JIT config by reference (the payload itself can't hold it, ADR-015).
+      // Resolve the JIT config through the broker (the payload can't hold it, ADR-015; the
+      // VM can't read DynamoDB, ADR-021). runCtx must be set first — callBroker reads it.
+      runCtx = { ref: ptr.ref, region: ptr.region, broker: ptr.broker, token: ptr.token };
       let payload;
       try {
-        payload = fetchJitConfig(ptr);
+        payload = fetchJitConfig();
       } catch (err) {
         log('jit config fetch failed', { error: err.message, ref: ptr.ref });
         res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -306,7 +290,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       jobStarted = true;
-      runCtx = { ref: ptr.ref, region: ptr.region, table: ptr.table }; // for selfTerminate readback
+      runCtx = { ref: ptr.ref, region: ptr.region, broker: ptr.broker, token: ptr.token };
       // ACK fast so Lambda un-gates traffic; run the job in the background.
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');

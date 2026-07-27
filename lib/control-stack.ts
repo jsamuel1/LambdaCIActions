@@ -136,32 +136,20 @@ export class ControlStack extends Stack {
 
     // ---- Provision λ ----
     // microVM execution role (ADR-015): stamped on each VM via run-microvm --execution-role-arn.
-    // The VM's /run hook uses it to read its JIT config item from DynamoDB (the config is
-    // passed by reference, not inline, because the run-hook payload cap is 4 KB). Also the
-    // per-env isolation boundary now that VM tagging isn't available. Trusts the Lambda
-    // service principal (microVMs are part of the Lambda service).
+    // microVMs run UNTRUSTED workflow code, so this role is deliberately the thinnest thing
+    // that still works (ADR-021): runtime logs + `lambda:InvokeFunction` on the hook broker.
+    // It holds NO DynamoDB access and NO `lambda:TerminateMicrovm` — both of those used to be
+    // unscopable here (a shared role can't express a per-VM `dynamodb:LeadingKeys`, and the GA
+    // microVM API has no VM-level ARNs/tags — ADR-015), which made a VM able to read other
+    // runs' rows, harvest their `microvmId`, and terminate them (the ADR-019 amplifier).
+    // Also still the per-env isolation boundary. Trusts the Lambda service principal
+    // (microVMs are part of the Lambda service).
     const microvmExecRole = new iam.Role(this, 'MicrovmExecRole', {
       roleName: `lca-${envName}-microvm-exec`,
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description: 'Execution role stamped on LambdaCIActions microVMs (reads JIT config from DDB)',
+      description:
+        'Execution role stamped on LambdaCIActions microVMs (invokes the hook broker only)',
     });
-    // Read-only on the run table so the /run hook can fetch its JIT config item — and, at
-    // job end, read its own microvmId back off the run row for self-terminate (ADR-019).
-    table.grantReadData(microvmExecRole);
-    // Self-terminate (ADR-019): the hook calls terminate-microvm on ITSELF at job end so
-    // the VM dies instantly instead of idling until the Reaper sweep (~5 min of billing).
-    // The GA API has no VM-level resource ARNs/tags (ADR-015), so scope to the region —
-    // this role only ever lives inside our own VMs.
-    microvmExecRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'SelfTerminate',
-        actions: ['lambda:TerminateMicrovm'],
-        resources: ['*'],
-        conditions: {
-          StringEquals: { 'aws:RequestedRegion': this.region },
-        },
-      }),
-    );
     // Runtime logs: the VM writes run-hook + runner output to the per-run log group
     // Provision passes at launch (ADR-016).
     microvmExecRole.addToPolicy(
@@ -169,6 +157,55 @@ export class ControlStack extends Stack {
         sid: 'MicrovmRuntimeLogs',
         actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
         resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/microvms/*`],
+      }),
+    );
+
+    // ---- Hook broker λ (ADR-021) ----
+    // The control-plane mediator for everything a microVM needs from AWS: fetch its own JIT
+    // config (ADR-015 by-reference payload) and terminate itself at job end (ADR-019). The VM
+    // authenticates with a per-run capability token minted by Provision; the broker derives
+    // the DynamoDB key from the token-bound ref, so a VM can only ever touch its own run
+    // partition and never learns any microvmId (not even its own).
+    const hookBrokerLogGroup = new logs.LogGroup(this, 'HookBrokerLogGroup', {
+      logGroupName: `/aws/lambda/lca-${envName}-hook-broker`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    const hookBroker = new NodejsFunction(this, 'HookBrokerFn', {
+      functionName: `lca-${envName}-hook-broker`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(SRC, 'hook', 'handler.ts'),
+      handler: 'handler',
+      timeout: Duration.seconds(30),
+      memorySize: 256,
+      logGroup: hookBrokerLogGroup,
+      bundling,
+      environment: {
+        TABLE_NAME: table.tableName,
+      },
+    });
+    // Reads the JIT config item (token hash + config) and the run row's microvmId.
+    table.grantReadData(hookBroker);
+    // Terminates the caller's own VM on its behalf. Still region-scoped only — the GA API
+    // has no VM-level ARNs (ADR-015) — but this authority now lives in the control plane,
+    // where the target id is chosen by us, not by untrusted in-VM code.
+    hookBroker.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'BrokeredTerminate',
+        actions: ['lambda:TerminateMicrovm'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:RequestedRegion': this.region },
+        },
+      }),
+    );
+    // The VM's ONLY AWS privilege besides logs: invoke this one function.
+    microvmExecRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'InvokeHookBroker',
+        actions: ['lambda:InvokeFunction'],
+        resources: [hookBroker.functionArn],
       }),
     );
 
@@ -195,6 +232,7 @@ export class ControlStack extends Stack {
         IMAGE_ARN_PARAM_PREFIX: `${ssmPrefix}/config/image-arn-`,
         TABLE_NAME: table.tableName,
         RUNNER_ROLE_ARN: microvmExecRole.roleArn,
+        HOOK_BROKER_NAME: hookBroker.functionName,
       },
     });
     // Provision must write the JIT config item (side-store) + stamp run rows.
@@ -395,6 +433,7 @@ export class ControlStack extends Stack {
     new CfnOutput(this, 'ProvisionDLQUrl', { value: dlq.queueUrl });
     new CfnOutput(this, 'DiscoveryQueueUrl', { value: discoveryQueue.queueUrl });
     new CfnOutput(this, 'ReaperFunctionName', { value: reaper.functionName });
+    new CfnOutput(this, 'HookBrokerFunctionName', { value: hookBroker.functionName });
     new CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn });
   }
 }

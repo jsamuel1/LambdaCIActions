@@ -110,9 +110,27 @@ export interface DiscoveryRequest {
 export interface RunHookPayload {
   /** DynamoDB ref to the stashed JIT config (see run-store jitConfigRef). */
   ref: string;
-  /** AWS region + table so the in-microVM hook can construct a DynamoDB client. */
+  /** AWS region so the in-microVM hook can reach the broker. */
   region: string;
-  table: string;
+  /**
+   * Hook broker function name/ARN the VM invokes for its JIT config + self-terminate
+   * (ADR-021). The VM has NO direct DynamoDB or TerminateMicrovm permission.
+   */
+  broker: string;
+  /**
+   * Per-run capability token (plaintext, VM-only). The broker authorizes actions on this
+   * run by comparing its SHA-256 against the hash stored on the JIT config item.
+   */
+  token: string;
+}
+
+/** What a microVM asks the hook broker λ to do on its own run (ADR-021). */
+export interface HookBrokerRequest {
+  action: 'jitconfig' | 'terminate';
+  /** The run's JIT config ref — the ONLY partition this request can touch. */
+  ref: string;
+  /** Per-run capability token issued at launch. */
+  token: string;
 }
 
 /** GitHub App credentials read from SSM. */

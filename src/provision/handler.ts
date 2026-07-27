@@ -1,9 +1,11 @@
 import { LambdaClient } from '@aws-sdk/client-lambda';
+import { randomBytes } from 'node:crypto';
 import type { SQSEvent, SQSBatchResponse, SQSRecord } from 'aws-lambda';
 import { getParam } from '../shared/ssm.js';
 import { generateJitConfig } from '../shared/github-app.js';
 import { launchMicroVM } from '../shared/microvm.js';
 import { transitionRun, putJitConfig, stampMicrovmId } from '../shared/run-store.js';
+import { hashHookToken } from '../hook/broker-core.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
@@ -26,7 +28,7 @@ import { resolveFlavor, type ResolveOptions } from './flavor.js';
  * (visibility timeout) and, after maxReceiveCount, routes to the DLQ. We use partial batch
  * responses so one poison message doesn't fail its whole batch.
  *
- * Env: APP_ID_PARAM, APP_PEM_PARAM, IMAGE_ARN_PARAM_PREFIX, TABLE_NAME,
+ * Env: APP_ID_PARAM, APP_PEM_PARAM, IMAGE_ARN_PARAM_PREFIX, TABLE_NAME, HOOK_BROKER_NAME,
  *      [RUNNER_ROLE_ARN].
  */
 
@@ -107,18 +109,25 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   });
 
   // 3. stash the JIT config in DynamoDB (the 4 KB run-hook payload can't hold it inline,
-  //    ADR-015) and build the small reference payload the /run hook will resolve.
+  //    ADR-015) together with the HASH of a freshly minted per-run capability token
+  //    (ADR-021). The plaintext token goes only to the VM, in its launch payload: it is
+  //    what lets the VM ask the hook broker for its own JIT config and its own
+  //    self-terminate, WITHOUT holding table-wide DDB read or region-wide
+  //    TerminateMicrovm itself.
+  const hookToken = randomBytes(32).toString('base64url');
   const ref = await putJitConfig(req.repoId, {
     jitConfig,
     runId: req.runId,
     jobId: req.jobId,
     repoFullName: req.repoFullName,
     labels: req.labels,
+    hookTokenHash: hashHookToken(hookToken),
   });
   const payload: RunHookPayload = {
     ref,
     region: process.env.AWS_REGION ?? 'us-west-2',
-    table: process.env.TABLE_NAME ?? '',
+    broker: process.env.HOOK_BROKER_NAME ?? '',
+    token: hookToken,
   };
 
   let microvmId: string;
@@ -146,10 +155,10 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     throw err;
   }
 
-  // 4. stamp the run↔VM mapping FIRST and unconditionally (ADR-019): the /run hook reads
-  //    `microvmId` back off this row at job end to self-terminate, and the Reaper
-  //    correlates against it — it must land even if the status already raced ahead (an
-  //    ultra-fast job's `completed` webhook can beat this write; transitionRun's
+  // 4. stamp the run↔VM mapping FIRST and unconditionally (ADR-019): the hook broker reads
+  //    `microvmId` off this row to self-terminate on the VM's behalf (ADR-021), and the
+  //    Reaper correlates against it — it must land even if the status already raced ahead
+  //    (an ultra-fast job's `completed` webhook can beat this write; transitionRun's
   //    forward-only guard would then drop the mapping on the floor).
   await stampMicrovmId({
     repoId: req.repoId,

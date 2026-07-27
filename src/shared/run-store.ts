@@ -289,6 +289,13 @@ export interface JitConfigPayload {
   jobId: number;
   repoFullName: string;
   labels: string[];
+  /**
+   * SHA-256 of the per-run hook capability token (ADR-021). Only the hash is stored; the
+   * plaintext is handed to the microVM in its launch payload and never persisted. The hook
+   * broker compares a presented token against this to authorize jitconfig/terminate on
+   * THIS run only.
+   */
+  hookTokenHash?: string;
 }
 
 /** The opaque reference handed to the microVM (small; fits the 4 KB payload trivially). */
@@ -315,6 +322,7 @@ export async function putJitConfig(
         jobId: payload.jobId,
         repoFullName: payload.repoFullName,
         labels: payload.labels,
+        ...(payload.hookTokenHash ? { hookTokenHash: payload.hookTokenHash } : {}),
         ttl: Math.floor(now.getTime() / 1000) + JITCONFIG_TTL_SECONDS,
       },
     }),
@@ -339,5 +347,30 @@ export async function getJitConfigByRef(ref: string): Promise<JitConfigPayload |
     jobId: i.jobId as number,
     repoFullName: i.repoFullName as string,
     labels: (i.labels as string[]) ?? [],
+    hookTokenHash: i.hookTokenHash as string | undefined,
+  };
+}
+
+/**
+ * Read the `microvmId` off a run row addressed by its EXPLICIT key (ADR-021). Used by the
+ * hook broker, which derives the key from the caller's capability-token-bound ref rather
+ * than from caller-supplied ids, so a microVM can never address another run's row.
+ */
+export async function getRunFieldsByKey(
+  pk: string,
+  sk: string = RUN_SK,
+): Promise<{ microvmId?: string; status?: RunStatus } | undefined> {
+  const res = await requireDoc().send(
+    new GetCommand({
+      TableName: TABLE,
+      Key: { pk, sk },
+      ProjectionExpression: 'microvmId, #s',
+      ExpressionAttributeNames: { '#s': 'status' },
+    }),
+  );
+  if (!res.Item) return undefined;
+  return {
+    microvmId: res.Item.microvmId as string | undefined,
+    status: res.Item.status as RunStatus | undefined,
   };
 }

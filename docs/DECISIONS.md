@@ -215,18 +215,20 @@ Also: `RunMicrovm` requires `lambda:PassNetworkConnector` on the aws-managed con
 (`INTERNET_EGRESS`, `HTTP_INGRESS`) and `iam:PassRole` for the execution role.
 **Decision**:
 - Provision stashes `{jitConfig, runId, jobId, repoFullName, labels}` in the shared table
-  (item `pk=RUN#…, sk=JITCONFIG`, TTL 30 min) and passes only `{ref, region, table}`
-  (~100 B) as the run-hook payload. The `/run` hook resolves the ref via the baked-in AWS
-  CLI (`dynamodb get-item`) using the **microVM execution role** (`lca-<env>-microvm-exec`,
-  read-only on the table), which Provision stamps on every launch via `--execution-role-arn`
-  (and holds `iam:PassRole` for).
+  (item `pk=RUN#…, sk=JITCONFIG`, TTL 30 min) and passes only a small pointer (~200 B) as
+  the run-hook payload. **Amended by [ADR-020](#adr-020)**: the pointer is now
+  `{ref, region, broker, token}` and the `/run` hook resolves the ref by invoking the hook
+  broker λ, not by calling DynamoDB itself — the **microVM execution role**
+  (`lca-<env>-microvm-exec`, stamped on every launch via `--execution-role-arn`, which
+  Provision holds `iam:PassRole` for) no longer has any table access.
 - Images declare `hooks = { port: 8080, microvmImageHooks: { ready: ENABLED },
   microvmHooks: { run: ENABLED } }` and ship a hook server that answers both the prefixed
   runtime paths and bare paths, logging every request. Build logging (`--logging
   cloudWatch`) is always on: `/aws/lambda/microvms/<image-name>`.
 **Why**: The 4 KB cap makes by-reference the only option; the run store already holds the
 run↔VM mapping (ADR-015), so it is the natural side-store, and the TTL bounds JIT-config
-exposure. The exec role finally gives the VM a scoped identity (read-only JIT fetch).
+exposure. The exec role gives the VM a scoped identity (narrowed to broker-invoke-only by
+ADR-020).
 **Consequences**: The microVM image and the control plane now share a contract (table
 name + ref format) delivered via the payload. Rotating the hook-path prefix is AWS's
 call — the server tolerates both shapes. Terminal-state JIT items age out via TTL; a
@@ -325,25 +327,33 @@ writing the id to the JITCONFIG item (second write path for the same fact — th
 IS the mapping per ADR-015); shortening the Reaper sweep (still pays idle minutes, just
 fewer); per-VM endpoint hostname parsing (endpoint shape is undocumented/unstable and the
 hook never sees its own endpoint).
-**Consequences**: **Accepted cross-tenant risk.** The grant is region-scoped, not
-VM-scoped, so *anything* executing inside a microVM can terminate *any* microVM in the
+**Consequences**: **Accepted cross-tenant risk — SUPERSEDED by [ADR-020](#adr-020), which
+removed both grants from the VM.** As originally shipped the grant was region-scoped, not
+VM-scoped, so *anything* executing inside a microVM could terminate *any* microVM in the
 account/region. The role lives inside VMs that run **untrusted workflow code** — a
-malicious or compromised PR in any onboarded repo can enumerate nothing (no `List*`
-granted) but can kill another tenant's in-flight job given its id, i.e. a cross-tenant
-denial-of-service primitive. Accepted for now because (a) the GA `lambda-microvms` API
+malicious or compromised PR in any onboarded repo could enumerate nothing (no `List*`
+granted) but could kill another tenant's in-flight job given its id, i.e. a cross-tenant
+denial-of-service primitive. Accepted at the time because (a) the GA `lambda-microvms` API
 exposes no VM-level resource ARNs or tags to scope against (ADR-015), (b) the blast
 radius is bounded to job availability — no data access, since each VM is its own VM with
 its own single-use JIT credentials — and (c) the alternative (Reaper-only) costs ~5 min
-of idle billing on every job. **Known amplifier**: the exec role's run-table grant is
-`grantReadData` (table-wide `GetItem`/`Query`/`Scan`, pre-dating this ADR), so a VM can
-read other runs' rows and harvest their `microvmId` — target ids are therefore
-discoverable from inside a VM, and the table-wide read is itself worth tightening to the
-VM's own `RUN#…` partition independently of this decision. **Revisit triggers**: re-scope
-`TerminateMicrovm` to VM-level ARNs the moment the API supports them; narrow the run-table
-read to the VM's own run row; re-evaluate both before onboarding mutually-distrusting
-tenants or enabling public-fork PR runs. If the readback misses (row gone, DDB outage),
-behavior degrades exactly to the old Reaper-only path. `test/run-hook.test.mjs` pins the
-ref→run-row key derivation against the run store so the two sides can't drift.
+of idle billing on every job. **Amplifier (also closed by ADR-020)**: the exec role's
+run-table grant was `grantReadData` (table-wide `GetItem`/`Query`/`Scan`, pre-dating this
+ADR), so a VM could read other runs' rows and harvest their `microvmId` — target ids were
+discoverable from inside a VM.
+
+**Amendment (ADR-020, M3)**: step 2 and step 3 above no longer describe the shipped system.
+The VM does **not** read the run row and does **not** hold `lambda:TerminateMicrovm`; it
+invokes the hook broker λ with a per-run capability token and the broker performs the
+readback + terminate inside the control plane. The readback *mechanism* of this ADR is
+unchanged and still authoritative (Provision's unconditional `stampMicrovmId` remains the
+id channel) — only the principal that executes it moved. Both revisit triggers are
+therefore discharged for the exec role: DynamoDB read is gone entirely, and
+`TerminateMicrovm` is region-scoped on a control-plane role whose target id is chosen by
+our code, not by workflow code. **Still open**: re-scope the broker's `TerminateMicrovm` to
+VM-level ARNs the moment the GA API exposes them. If the readback misses (row gone, DDB
+outage), behavior degrades exactly to the old Reaper-only path. `test/run-hook.test.mjs`
+pins the ref→run-row key derivation against the run store so the two sides can't drift.
 
 ## ADR-020 — Docker flavor needs `additionalOsCapabilities=ALL` + a root entrypoint (M3)
 
@@ -389,3 +399,64 @@ flavors — acceptable because each microVM is single-use, single-tenant and sel
 what a label grants. Adding a future flavor that needs host-level privileges is now a
 one-line catalog change. `test/image-content.test.mjs` pins the whole contract (hook wiring,
 root entrypoint scoped to docker-capable flavors, no `sudo`, bounded readiness wait, arm64).
+
+## ADR-021 — microVMs hold no ambient AWS authority: brokered run-hook operations (M3)
+**Status**: Accepted (v1) · supersedes the IAM half of [ADR-019](#adr-019) · amends
+[ADR-015](#adr-015) (payload-by-reference access path)
+**Context**: The microVM execution role (`lca-<env>-microvm-exec`) is stamped on VMs that
+execute **untrusted workflow code**, and carried two grants that couldn't be scoped where
+they were:
+1. `dynamodb:GetItem`/`Query`/`Scan` table-wide, via `table.grantReadData(microvmExecRole)`
+   — needed so the hook could resolve its JIT config by reference (ADR-015) and read its
+   own `microvmId` (ADR-019). A VM could read **any** run's row.
+2. `lambda:TerminateMicrovm` on `Resource: "*"`, region-conditioned only (ADR-019). Any VM
+   could terminate any VM in the account/region.
+Together they compose into a cross-tenant DoS with **discoverable targets**: read other
+rows → harvest `microvmId` → terminate that job.
+Neither is fixable in IAM alone. DynamoDB's `dynamodb:LeadingKeys` matches literal
+partition-key values, and one role is shared by every VM in the env, so there is no
+condition that says "only *your* `RUN#…` partition". The GA `lambda-microvms` API exposes
+no VM-level ARNs or tags (ADR-015), so `TerminateMicrovm` cannot be resource-scoped at all.
+**Decision**: **Remove the authority from the VM instead of trying to scope it.** A new
+control-plane **hook broker λ** (`lca-<env>-hook-broker`, `src/hook/`) performs both
+operations on the VM's behalf:
+1. Provision mints a 32-byte per-run **capability token** at launch, stores only its
+   SHA-256 on the JIT config item (`hookTokenHash`), and passes the plaintext to the VM in
+   the run-hook payload — which already had to carry the ref and stays well under the 4 KB
+   cap (ADR-015). The payload's `table` field is replaced by `broker` + `token`.
+2. The in-VM hook invokes the broker with `{action, ref, token}`. `action=jitconfig`
+   returns that run's stashed config; `action=terminate` reads that run's `microvmId` and
+   terminates it. The item key is derived **from the token-bound ref**, never from
+   free-form caller input, and a bad token / unknown ref get the identical `unauthorized`
+   response so a VM can't probe which refs exist.
+3. The exec role is cut to exactly two things: its own log group (ADR-016) and
+   `lambda:InvokeFunction` on the single broker function ARN. No DynamoDB. No
+   `TerminateMicrovm`.
+**Why**: This converts an unscopable ambient permission into a **capability**: the authority
+a VM holds is now a function of a secret it was individually issued, which is exactly the
+per-VM scoping IAM couldn't express. It also removes `microvmId` from the compute plane
+altogether — a VM never learns any VM id, including its own, so there is no target to
+harvest even if a workflow escapes the runner user. Alternatives rejected:
+`dynamodb:LeadingKeys` (can't express a per-VM value from a shared role); a per-run IAM
+role (a role create/delete per job — quota-bound, slow on the hot path, and
+`iam:CreateRole` in the control plane is worse than the problem); pre-signed API Gateway
+URL (equivalent trust model, but adds a public-internet edge for an operation that has no
+reason to be reachable off-account); leaving read table-wide and only fixing terminate
+(leaves the harvesting primitive intact for the next privileged operation added).
+**Consequences**: One extra Lambda invoke on the boot path (~50 ms, off the critical
+latency budget since the hook ACKs `/run` after it) and one more function to deploy. The
+broker is now the single audited chokepoint for microVM→control-plane calls, so future
+run-hook needs (status reporting, artifact hand-off) extend it rather than re-widening the
+exec role. The token is a bearer secret inside the VM: it authorizes only that run's own
+config + self-terminate, expires with the JIT config item's 30-min TTL, and the hook redacts
+it from logs — but workflow code CAN read it from the payload, so it must never be reused
+for anything broader than "my own run". Residual risk: the broker's own
+`lambda:TerminateMicrovm` is still region-scoped (`Resource: "*"`) — unchanged from ADR-019
+and unavoidable until the API ships VM-level ARNs — but it is no longer reachable by
+untrusted code, and the id it acts on comes from our own run store.
+**Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
+`LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM
+control actions, and an `InvokeFunction` pinned to the broker ARN — so a future
+`grantReadData(microvmExecRole)` fails the build. `test/hook-broker.test.mjs` pins the
+token hashing/compare and the ref→key derivation (rejecting other entities, `RUN#…#RUN`,
+wildcards, and non-numeric ids).
