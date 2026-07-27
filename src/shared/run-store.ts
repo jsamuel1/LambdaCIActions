@@ -220,23 +220,35 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
  * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/017). Separate from
  * transitionRun because the mapping must be recorded even if the status already advanced
  * (e.g. an ultra-fast job whose `completed` webhook beat the `running` transition) — the
- * microVM /run hook reads this back at job end to self-terminate, and the Reaper
- * correlates live VMs against it. Only requires the row to exist.
+ * hook broker reads this back at job end to self-terminate on the VM's behalf, and the
+ * Reaper correlates live VMs against it. Only requires the row to exist.
+ *
+ * Also mirrors the run's hook capability token hash (ADR-020) onto the row. The JIT config
+ * item carrying the same hash ages out after 30 min (JITCONFIG_TTL_SECONDS), but a job may
+ * legitimately run for hours (Reaper's cap is 2h), and self-terminate fires at job END — so
+ * the durable run row, not the short-lived JIT item, has to be what authorizes `terminate`.
  */
 export async function stampMicrovmId(input: {
   repoId: number;
   runId: number;
   jobId: number;
   microvmId: string;
+  hookTokenHash?: string;
 }): Promise<boolean> {
+  const setParts = ['microvmId = :mid'];
+  const values: Record<string, unknown> = { ':mid': input.microvmId };
+  if (input.hookTokenHash) {
+    setParts.push('hookTokenHash = :hth');
+    values[':hth'] = input.hookTokenHash;
+  }
   try {
     await requireDoc().send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: runPk(input.repoId, input.runId, input.jobId), sk: RUN_SK },
-        UpdateExpression: 'SET microvmId = :mid',
+        UpdateExpression: `SET ${setParts.join(', ')}`,
         ConditionExpression: 'attribute_exists(pk)',
-        ExpressionAttributeValues: { ':mid': input.microvmId },
+        ExpressionAttributeValues: values,
       }),
     );
     return true;
@@ -359,12 +371,12 @@ export async function getJitConfigByRef(ref: string): Promise<JitConfigPayload |
 export async function getRunFieldsByKey(
   pk: string,
   sk: string = RUN_SK,
-): Promise<{ microvmId?: string; status?: RunStatus } | undefined> {
+): Promise<{ microvmId?: string; status?: RunStatus; hookTokenHash?: string } | undefined> {
   const res = await requireDoc().send(
     new GetCommand({
       TableName: TABLE,
       Key: { pk, sk },
-      ProjectionExpression: 'microvmId, #s',
+      ProjectionExpression: 'microvmId, hookTokenHash, #s',
       ExpressionAttributeNames: { '#s': 'status' },
     }),
   );
@@ -372,5 +384,6 @@ export async function getRunFieldsByKey(
   return {
     microvmId: res.Item.microvmId as string | undefined,
     status: res.Item.status as RunStatus | undefined,
+    hookTokenHash: res.Item.hookTokenHash as string | undefined,
   };
 }

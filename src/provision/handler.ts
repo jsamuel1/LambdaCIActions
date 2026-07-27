@@ -159,12 +159,15 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   //    `microvmId` off this row to self-terminate on the VM's behalf (ADR-021), and the
   //    Reaper correlates against it — it must land even if the status already raced ahead
   //    (an ultra-fast job's `completed` webhook can beat this write; transitionRun's
-  //    forward-only guard would then drop the mapping on the floor).
+  //    forward-only guard would then drop the mapping on the floor). The same write mirrors
+  //    the capability token hash onto the row: the JIT config item ages out after 30 min but
+  //    the brokered terminate fires at job END, so terminate authorizes off this row.
   await stampMicrovmId({
     repoId: req.repoId,
     runId: req.runId,
     jobId: req.jobId,
     microvmId,
+    hookTokenHash: hashHookToken(hookToken),
   }).catch((err) => {
     console.error(JSON.stringify({ msg: 'microvmId stamp failed', error: errMsg(err) }));
   });

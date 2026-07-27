@@ -347,7 +347,9 @@ The VM does **not** read the run row and does **not** hold `lambda:TerminateMicr
 invokes the hook broker λ with a per-run capability token and the broker performs the
 readback + terminate inside the control plane. The readback *mechanism* of this ADR is
 unchanged and still authoritative (Provision's unconditional `stampMicrovmId` remains the
-id channel) — only the principal that executes it moved. Both revisit triggers are
+id channel, and that same write now also carries the run's capability-token hash, so the
+brokered terminate is authorized off the row with no TTL rather than the 30-min JIT item) —
+only the principal that executes it moved. Both revisit triggers are
 therefore discharged for the exec role: DynamoDB read is gone entirely, and
 `TerminateMicrovm` is region-scoped on a control-plane role whose target id is chosen by
 our code, not by workflow code. **Still open**: re-scope the broker's `TerminateMicrovm` to
@@ -421,14 +423,20 @@ no VM-level ARNs or tags (ADR-015), so `TerminateMicrovm` cannot be resource-sco
 control-plane **hook broker λ** (`lca-<env>-hook-broker`, `src/hook/`) performs both
 operations on the VM's behalf:
 1. Provision mints a 32-byte per-run **capability token** at launch, stores only its
-   SHA-256 on the JIT config item (`hookTokenHash`), and passes the plaintext to the VM in
+   SHA-256 on the JIT config item (`hookTokenHash`) **and mirrors the same hash onto the
+   durable run row** when it stamps `microvmId`, then passes the plaintext to the VM in
    the run-hook payload — which already had to carry the ref and stays well under the 4 KB
    cap (ADR-015). The payload's `table` field is replaced by `broker` + `token`.
 2. The in-VM hook invokes the broker with `{action, ref, token}`. `action=jitconfig`
    returns that run's stashed config; `action=terminate` reads that run's `microvmId` and
    terminates it. The item key is derived **from the token-bound ref**, never from
    free-form caller input, and a bad token / unknown ref get the identical `unauthorized`
-   response so a VM can't probe which refs exist.
+   response so a VM can't probe which refs exist. The two actions authorize against
+   **different items on purpose**: `jitconfig` off the JIT config item (claimed seconds
+   after boot, 30-min TTL), `terminate` off the run row (no TTL until the run is terminal),
+   because self-terminate fires at job **end** — up to the Reaper's 2 h lifetime cap. Pinning
+   terminate to the TTL'd item would silently lose self-terminate for every job over 30 min
+   and regress ADR-019 back to Reaper-only reaping.
 3. The exec role is cut to exactly two things: its own log group (ADR-016) and
    `lambda:InvokeFunction` on the single broker function ARN. No DynamoDB. No
    `TerminateMicrovm`.
@@ -445,18 +453,29 @@ reason to be reachable off-account); leaving read table-wide and only fixing ter
 (leaves the harvesting primitive intact for the next privileged operation added).
 **Consequences**: One extra Lambda invoke on the boot path (~50 ms, off the critical
 latency budget since the hook ACKs `/run` after it) and one more function to deploy. The
-broker is now the single audited chokepoint for microVM→control-plane calls, so future
+broker is capped at 20 reserved concurrent executions: its only callers are untrusted VMs
+(one call at boot, one at job end), so a pathological VM fleet must not be able to drain the
+account's unreserved concurrency pool out from under the control plane. The broker is now
+the single audited chokepoint for microVM→control-plane calls, so future
 run-hook needs (status reporting, artifact hand-off) extend it rather than re-widening the
-exec role. The token is a bearer secret inside the VM: it authorizes only that run's own
-config + self-terminate, expires with the JIT config item's 30-min TTL, and the hook redacts
-it from logs — but workflow code CAN read it from the payload, so it must never be reused
-for anything broader than "my own run". Residual risk: the broker's own
-`lambda:TerminateMicrovm` is still region-scoped (`Resource: "*"`) — unchanged from ADR-019
-and unavoidable until the API ships VM-level ARNs — but it is no longer reachable by
+exec role. The token hash now lives on two items (JIT config + run row) — one write each,
+both already happening — because their lifetimes differ; the run row is authoritative for
+terminate. The token is a bearer secret inside the VM: it authorizes only that run's own
+config + self-terminate, and the hook redacts it from logs — but workflow code CAN read it
+from the payload, so it must never be reused for anything broader than "my own run". Note
+it outlives the JIT config item's 30-min TTL for the terminate action specifically (bounded
+by the run row's terminal-state TTL and by the VM's own lifetime — the run it can terminate
+is the run that holds it, so replay after job end is a no-op). Residual risk: the broker's
+own `lambda:TerminateMicrovm` is still region-scoped (`Resource: "*"`) — unchanged from
+ADR-019 and unavoidable until the API ships VM-level ARNs — but it is no longer reachable by
 untrusted code, and the id it acts on comes from our own run store.
 **Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
 `LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM
 control actions, and an `InvokeFunction` pinned to the broker ARN — so a future
 `grantReadData(microvmExecRole)` fails the build. `test/hook-broker.test.mjs` pins the
 token hashing/compare and the ref→key derivation (rejecting other entities, `RUN#…#RUN`,
-wildcards, and non-numeric ids).
+wildcards, and non-numeric ids). `test/hook-broker-handler.test.mjs` pins the λ's
+authorization decisions: which item authorizes which action (including terminate succeeding
+with the JIT item already aged out), that a wrong token never reaches `TerminateMicrovm`,
+that unknown-ref and bad-token responses are byte-identical, and that malformed requests are
+rejected before any store access.

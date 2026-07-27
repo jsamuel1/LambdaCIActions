@@ -179,6 +179,10 @@ export class ControlStack extends Stack {
       handler: 'handler',
       timeout: Duration.seconds(30),
       memorySize: 256,
+      // Its only callers are microVMs running untrusted code, one call each at boot and at
+      // job end. Cap the concurrency so a pathological/malicious VM fleet can't drain the
+      // account's unreserved pool out from under the control plane.
+      reservedConcurrentExecutions: 20,
       logGroup: hookBrokerLogGroup,
       bundling,
       environment: {

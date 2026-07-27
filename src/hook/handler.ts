@@ -1,11 +1,7 @@
 import { LambdaClient } from '@aws-sdk/client-lambda';
 import { getJitConfigByRef, getRunFieldsByKey } from '../shared/run-store.js';
 import { terminateMicroVM } from '../shared/microvm.js';
-import {
-  hookTokenMatches,
-  keysFromRef,
-  parseHookRequest,
-} from './broker-core.js';
+import { hookTokenMatches, keysFromRef, parseHookRequest } from './broker-core.js';
 
 /**
  * Hook broker λ (ADR-021) — the control-plane mediator for microVM run-hook operations.
@@ -25,6 +21,14 @@ import {
  * the authority granted to a VM is exactly one run partition. The `microvmId` never leaves
  * the control plane — the VM cannot learn even its own id, let alone anyone else's.
  *
+ * Token lifetime differs by action ON PURPOSE. `jitconfig` is authorized against the JIT
+ * config item, which carries a 30-minute TTL (it is only ever claimed seconds after boot).
+ * `terminate` fires at job END — potentially hours later, up to the Reaper's 2h cap — so it
+ * is authorized against the hash mirrored on the durable run row by `stampMicrovmId`. If
+ * terminate had to read the TTL'd item, every job longer than 30 min would fail
+ * authorization and fall back to Reaper-only reaping (~5 min of idle billing), silently
+ * regressing ADR-019.
+ *
  * Env: TABLE_NAME.
  */
 
@@ -43,57 +47,81 @@ export interface HookBrokerResult {
   error?: string;
 }
 
-export async function handler(event: unknown): Promise<HookBrokerResult> {
-  let parsed;
-  try {
-    parsed = parseHookRequest(event);
-  } catch (err) {
-    // Never echo the caller's payload — it comes from inside an untrusted VM.
-    console.warn(JSON.stringify({ msg: 'hook broker rejected request', error: errMsg(err) }));
-    return { ok: false, error: 'bad request' };
-  }
-  const { action, ref, token } = parsed;
-
-  const item = await getJitConfigByRef(ref);
-  if (!item || !hookTokenMatches(token, item.hookTokenHash)) {
-    // Same response for "no such run" and "wrong token": a VM must not be able to probe
-    // which run refs exist.
-    console.warn(JSON.stringify({ msg: 'hook broker denied', action, ref }));
-    return { ok: false, error: 'unauthorized' };
-  }
-
-  if (action === 'jitconfig') {
-    return {
-      ok: true,
-      jitConfig: item.jitConfig,
-      runId: item.runId,
-      jobId: item.jobId,
-      repoFullName: item.repoFullName,
-      labels: item.labels,
-    };
-  }
-
-  // action === 'terminate' — self-terminate on behalf of the caller's own run only.
-  const { pk, runSk } = keysFromRef(ref);
-  const row = await getRunFieldsByKey(pk, runSk);
-  const microvmId = row?.microvmId;
-  if (!microvmId) {
-    // Provision stamps the id seconds after launch; if it's absent the Reaper backstops.
-    console.log(JSON.stringify({ msg: 'no microvmId on run row; Reaper will backstop', pk }));
-    return { ok: true, terminated: false };
-  }
-  try {
-    await terminateMicroVM(lambda, microvmId);
-    console.log(JSON.stringify({ msg: 'self-terminate brokered', pk, microvmId }));
-    return { ok: true, terminated: true };
-  } catch (err) {
-    // An already-gone VM is success from the caller's point of view.
-    console.warn(
-      JSON.stringify({ msg: 'brokered terminate failed', pk, microvmId, error: errMsg(err) }),
-    );
-    return { ok: true, terminated: false };
-  }
+/** AWS-facing seam, injected so the authorization logic is testable without AWS. */
+export interface BrokerDeps {
+  getJitConfigByRef: typeof getJitConfigByRef;
+  getRunFieldsByKey: typeof getRunFieldsByKey;
+  terminate: (microvmId: string) => Promise<void>;
 }
+
+const defaultDeps: BrokerDeps = {
+  getJitConfigByRef,
+  getRunFieldsByKey,
+  terminate: (microvmId) => terminateMicroVM(lambda, microvmId),
+};
+
+export function createHandler(deps: BrokerDeps = defaultDeps) {
+  return async function handle(event: unknown): Promise<HookBrokerResult> {
+    let parsed;
+    try {
+      parsed = parseHookRequest(event);
+    } catch (err) {
+      // Never echo the caller's payload — it comes from inside an untrusted VM.
+      console.warn(JSON.stringify({ msg: 'hook broker rejected request', error: errMsg(err) }));
+      return { ok: false, error: 'bad request' };
+    }
+    const { action, ref, token } = parsed;
+    const { pk, runSk } = keysFromRef(ref);
+
+    if (action === 'jitconfig') {
+      const item = await deps.getJitConfigByRef(ref);
+      if (!item || !hookTokenMatches(token, item.hookTokenHash)) return denied(action, ref);
+      return {
+        ok: true,
+        jitConfig: item.jitConfig,
+        runId: item.runId,
+        jobId: item.jobId,
+        repoFullName: item.repoFullName,
+        labels: item.labels,
+      };
+    }
+
+    // action === 'terminate' — self-terminate on behalf of the caller's own run only.
+    // Authorized off the DURABLE run row: the JIT config item's 30-min TTL is shorter than
+    // a legitimate job, and this fires at job end (ADR-020 consequences).
+    const row = await deps.getRunFieldsByKey(pk, runSk);
+    if (!row || !hookTokenMatches(token, row.hookTokenHash)) return denied(action, ref);
+
+    const microvmId = row.microvmId;
+    if (!microvmId) {
+      // Provision stamps the id seconds after launch; if it's absent the Reaper backstops.
+      console.log(JSON.stringify({ msg: 'no microvmId on run row; Reaper will backstop', pk }));
+      return { ok: true, terminated: false };
+    }
+    try {
+      await deps.terminate(microvmId);
+      console.log(JSON.stringify({ msg: 'self-terminate brokered', pk, microvmId }));
+      return { ok: true, terminated: true };
+    } catch (err) {
+      // An already-gone VM is success from the caller's point of view.
+      console.warn(
+        JSON.stringify({ msg: 'brokered terminate failed', pk, microvmId, error: errMsg(err) }),
+      );
+      return { ok: true, terminated: false };
+    }
+  };
+}
+
+/**
+ * Same response for "no such run" and "wrong token": a VM must not be able to probe which
+ * run refs exist.
+ */
+function denied(action: string, ref: string): HookBrokerResult {
+  console.warn(JSON.stringify({ msg: 'hook broker denied', action, ref }));
+  return { ok: false, error: 'unauthorized' };
+}
+
+export const handler = createHandler();
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
