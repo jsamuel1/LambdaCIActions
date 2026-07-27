@@ -146,3 +146,17 @@ test('merged multi-status views stay newest-first after filtering', () => {
     [3, 1],
   );
 });
+
+test('a foreign run and a missing run are indistinguishable (404, no existence oracle)', async () => {
+  // Run detail/logs can only check the grant AFTER the row read; a 403 there would tell an
+  // authenticated foreign operator that the guessed run id triple exists.
+  const { gateRunRecord } = await import('../dist/src/mgmt/handler.js');
+  const foreign = gateRunRecord(session, run(1, 99));
+  const missing = gateRunRecord(session, undefined);
+  assert.ok('reply' in foreign && 'reply' in missing);
+  assert.equal(foreign.reply.statusCode, 404);
+  assert.equal(missing.reply.statusCode, 404);
+  assert.deepEqual(foreign.reply.body, missing.reply.body, 'bodies must not differ either');
+  const mine = gateRunRecord(session, run(1, 11));
+  assert.ok('record' in mine);
+});

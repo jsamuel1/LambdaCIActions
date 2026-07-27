@@ -132,7 +132,14 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   SecureString, created out-of-band per ADR-008).
 - Authorization is a single predicate, `canAdminInstallation`, applied at two choke points
   (repo resolution, run resolution) plus list filtering. GitHub's own access decision is
-  the source of truth; the platform never interprets org roles.
+  the source of truth; the platform never interprets org roles. Run resolution can only
+  check the grant AFTER reading the row, so a foreign run answers **404 (identical to
+  missing)** — not 403 — to avoid an existence oracle on guessed run ids.
+- A user with **zero installations** still gets a session (with an empty grant list) so the
+  Setup screen is reachable for first-run onboarding — the empty list authorizes nothing:
+  every repo/run route answers 403, every list is empty, and `/api/health` (whose counts
+  are platform-wide) is explicitly denied. Installing the App and re-logging-in picks up
+  the grant.
 - Cognito is **not** used in v1 (ADR-022 rationale).
 - Secrets are shown as **presence/health only** ("webhook secret: set ✓") — never values.
   The API reads presence via `ssm:DescribeParameters`, which cannot return a value, and the

@@ -21,6 +21,17 @@ const payload = {
   ],
 };
 
+test('an empty-grant session round-trips and authorizes nothing', () => {
+  // Minted by the OAuth callback when GitHub returns zero installations, so a first-run
+  // operator can reach the Setup screen instead of looping on the login prompt. It must
+  // stay a valid session that grants NO installation.
+  const token = encodeSession({ login: 'newbie', installations: [] }, SECRET);
+  const decoded = decodeSession(token, SECRET);
+  assert.equal(decoded.login, 'newbie');
+  assert.deepEqual(decoded.installations, []);
+  assert.equal(canAdminInstallation(decoded, 111), false);
+});
+
 test('round-trips a session', () => {
   const token = encodeSession(payload, SECRET);
   const decoded = decodeSession(token, SECRET);

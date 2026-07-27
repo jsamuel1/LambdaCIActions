@@ -252,12 +252,22 @@ async function handleCallback(
     listUserInstallations(userToken),
   ]);
   if (installs.length === 0) {
-    // Authenticated but authorized for nothing — send them to the install flow.
+    // Authenticated but authorized for nothing — send them to the install flow. A session
+    // IS minted (with an empty installation list) or the Setup screen would be unreachable:
+    // without a cookie `/api/me` answers 401 and the SPA renders the login prompt again,
+    // trapping a first-run operator (who has not installed the App yet — the M4 exit
+    // criterion starts there) in a login loop. An empty grant list authorizes nothing:
+    // `canAdminInstallation` is false for every id, so all repo/run routes answer 403 and
+    // every list is empty. Re-login after installing picks up the new grant.
+    const empty = encodeSession({ login: user.login, installations: [] }, secret);
     return {
       statusCode: 302,
       raw: '',
       headers: { Location: `${PUBLIC_ORIGIN}/#/setup?reason=no-installations` },
-      cookies: [serializeCookie(OAUTH_STATE_COOKIE, '', { clear: true })],
+      cookies: [
+        serializeCookie(SESSION_COOKIE, empty, { maxAgeSeconds: SESSION_TTL_SECONDS }),
+        serializeCookie(OAUTH_STATE_COOKIE, '', { clear: true }),
+      ],
     };
   }
   const token = encodeSession({ login: user.login, installations: installs }, secret);
@@ -515,6 +525,11 @@ async function listRunsRoute(
  * documented as such in spec 04.
  */
 async function healthRoute(session: SessionPayload): Promise<Reply> {
+  // The counts below are deliberately platform-wide (unfilterable by design), so this is
+  // the one route a ZERO-grant session (minted at callback time so Setup is reachable)
+  // must not see — any GitHub user can complete the OAuth dance; only operators with at
+  // least one installation grant get aggregate platform data.
+  if (session.installations.length === 0) return problem(403, 'no installations');
   const counts = {} as Record<RunStatus, number>;
   let exact = true;
   await Promise.all(
@@ -591,7 +606,14 @@ async function authorizeRepo(
   return { record };
 }
 
-/** Resolve a run row and check the session administers its installation. */
+/**
+ * Resolve a run row and check the session administers its installation.
+ *
+ * Unlike `authorizeRepo` (which checks the grant BEFORE any lookup), the grant here is
+ * only checkable after reading the row — so a denial answers **404, not 403**: a 403 on a
+ * guessed `{repoId}/{runId}/{jobId}` triple would confirm to a foreign (but authenticated)
+ * operator that another tenant's run exists. Deny + not-found must be indistinguishable.
+ */
 async function authorizeRun(
   session: SessionPayload,
   match: RouteMatch,
@@ -600,9 +622,21 @@ async function authorizeRun(
   const runId = asPositiveInt(match.params.runId);
   const jobId = asPositiveInt(match.params.jobId);
   if (!repoId || !runId || !jobId) return { reply: problem(400, 'repoId/runId/jobId must be numeric') };
-  const record = await getRun(repoId, runId, jobId);
+  return gateRunRecord(session, await getRun(repoId, runId, jobId));
+}
+
+/**
+ * The pure deny/allow decision for a fetched run row (exported for tests): absent and
+ * foreign rows are indistinguishable — both 404 — so run identifiers cannot be probed.
+ */
+export function gateRunRecord(
+  session: SessionPayload,
+  record: RunRecord | undefined,
+): { record: RunRecord } | { reply: Reply } {
   if (!record) return { reply: problem(404, 'run not found') };
-  if (!canAdminInstallation(session, record.installationId)) return { reply: problem(403, 'forbidden') };
+  if (!canAdminInstallation(session, record.installationId)) {
+    return { reply: problem(404, 'run not found') };
+  }
   return { record };
 }
 
