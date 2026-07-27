@@ -487,10 +487,10 @@ Reaper-backstop instead; (b) a malformed broker response is parsed through a wra
 raises a content-free error, because the `jitconfig` body carries the run's single-use
 registration credential and `JSON.parse`'s own message quotes a slice of its input — logging
 that raw would put credential bytes in the run's CloudWatch stream, which outlives the VM.
-Note
-it outlives the JIT config item's 30-min TTL for the terminate action specifically (bounded
-by the run row's terminal-state TTL and by the VM's own lifetime — the run it can terminate
-is the run that holds it, so replay after job end is a no-op). Residual risk: the broker's
+Note the token has no expiry of its own: for `terminate` it outlives the JIT config item's
+30-min TTL by design (bounded instead by the run row's terminal-state TTL and by the VM's
+own lifetime — the run it can terminate is the run that holds it, so replay after job end is
+a no-op). Residual risk: the broker's
 own `lambda:TerminateMicrovm` is still region-scoped (`Resource: "*"`) — unchanged from
 ADR-019 and unavoidable until the API ships VM-level ARNs — but it is no longer reachable by
 untrusted code, and the id it acts on comes from our own run store.

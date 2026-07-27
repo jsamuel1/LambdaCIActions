@@ -235,18 +235,13 @@ export async function stampMicrovmId(input: {
   microvmId: string;
   hookTokenHash?: string;
 }): Promise<boolean> {
-  const setParts = ['microvmId = :mid'];
-  const values: Record<string, unknown> = { ':mid': input.microvmId };
-  if (input.hookTokenHash) {
-    setParts.push('hookTokenHash = :hth');
-    values[':hth'] = input.hookTokenHash;
-  }
+  const { updateExpression, values } = buildStampUpdate(input.microvmId, input.hookTokenHash);
   try {
     await requireDoc().send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: runPk(input.repoId, input.runId, input.jobId), sk: RUN_SK },
-        UpdateExpression: `SET ${setParts.join(', ')}`,
+        UpdateExpression: updateExpression,
         ConditionExpression: 'attribute_exists(pk)',
         ExpressionAttributeValues: values,
       }),
@@ -256,6 +251,26 @@ export async function stampMicrovmId(input: {
     if (isConditionalFailed(err)) return false; // row missing — nothing to stamp
     throw err;
   }
+}
+
+/**
+ * Build the stamp write's update expression (pure, so the ADR-020 mirror is unit-testable).
+ * `hookTokenHash` is optional and must be OMITTED from the expression when absent rather
+ * than written as undefined: a plain `SET hookTokenHash = :hth` with no value is a DynamoDB
+ * validation error, and writing an empty value would strand the brokered terminate on a
+ * hash that can never match (silently regressing ADR-019 to Reaper-only reaping).
+ */
+export function buildStampUpdate(
+  microvmId: string,
+  hookTokenHash?: string,
+): { updateExpression: string; values: Record<string, unknown> } {
+  const setParts = ['microvmId = :mid'];
+  const values: Record<string, unknown> = { ':mid': microvmId };
+  if (hookTokenHash) {
+    setParts.push('hookTokenHash = :hth');
+    values[':hth'] = hookTokenHash;
+  }
+  return { updateExpression: `SET ${setParts.join(', ')}`, values };
 }
 
 /**

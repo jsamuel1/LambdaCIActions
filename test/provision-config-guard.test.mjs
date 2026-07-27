@@ -39,3 +39,33 @@ test('the payload broker name comes from the guarded value, not a bare env read'
   const envReads = src.match(/process\.env\.HOOK_BROKER_NAME/g) ?? [];
   assert.equal(envReads.length, 1, 'HOOK_BROKER_NAME should be read exactly once');
 });
+
+// ADR-020: the two brokered actions authorize against different items, so the SAME hash has
+// to reach both — the JIT config item (jitconfig, TTL'd) and the run row (terminate, durable).
+// Mint once, hash once, write the hash twice, and hand the PLAINTEXT only to the VM payload.
+test('one token is minted per run and its hash is written to both items', () => {
+  const mint = src.match(/const hookToken = randomBytes\(32\)\.toString\('base64url'\);/g) ?? [];
+  assert.equal(mint.length, 1, 'exactly one token mint per provisioned run');
+  const hashes = src.match(/hashHookToken\(/g) ?? [];
+  assert.equal(hashes.length, 1, 'hash the token once, reuse the value');
+
+  const stash = src.indexOf('await putJitConfig(');
+  const stamp = src.indexOf('await stampMicrovmId({');
+  const stashArgs = src.slice(stash, src.indexOf('});', stash));
+  const stampArgs = src.slice(stamp, src.indexOf('})', stamp));
+  assert.match(stashArgs, /hookTokenHash,/, 'JIT config item must carry the hash (jitconfig)');
+  assert.match(stampArgs, /hookTokenHash,/, 'run row must mirror the hash (terminate)');
+});
+
+test('the plaintext token is never persisted, only shipped in the launch payload', () => {
+  const plaintextUses = src.match(/\bhookToken\b(?!Hash)/g) ?? [];
+  // mint + hash input + payload field = 3; anything more risks a write to the store.
+  assert.equal(plaintextUses.length, 3, `unexpected hookToken uses: ${plaintextUses.length}`);
+  assert.match(src, /token: hookToken,/);
+  const stash = src.indexOf('await putJitConfig(');
+  assert.doesNotMatch(
+    src.slice(stash, src.indexOf('});', stash)),
+    /\bhookToken\b(?!Hash)/,
+    'the plaintext token must never be stored on the JIT config item',
+  );
+});

@@ -254,7 +254,6 @@ function sleepSync(ms) {
   }
 }
 
-
 // Fetch the stashed JIT config through the hook broker (ADR-015 by-reference payload,
 // ADR-021 brokered access). The VM has no DynamoDB permission at all — the broker validates
 // the capability token and returns the config for THIS run only.
