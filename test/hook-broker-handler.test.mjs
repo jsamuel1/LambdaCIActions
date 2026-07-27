@@ -97,11 +97,56 @@ test('terminate with a wrong token never reaches TerminateMicrovm', async () => 
   assert.deepEqual(d.calls.terminated, []);
 });
 
-test('a run row with no token hash authorizes nothing', async () => {
-  const d = deps({ row: { microvmId: 'mvm-123', status: 'running' } });
+test('a run row with no token hash defers to a retry, authorized off the live JIT item', async () => {
+  // Provision writes microvmId + hookTokenHash in ONE post-launch stamp, so an ultra-fast
+  // job can hit terminate before the row has either. A terminal `unauthorized` here would
+  // be unrecoverable (the hook does not retry auth failures) and would silently regress
+  // ADR-019 self-terminate to Reaper-only reaping.
+  const d = deps({ jit: validJit, row: { status: 'running' } });
   const res = await createHandler(d.impl)({ action: 'terminate', ref: REF, token: TOKEN });
+  assert.deepEqual(res, { ok: true, terminated: false });
+  assert.deepEqual(d.calls.terminated, []);
+  assert.deepEqual(d.calls.jitRefs, [REF]);
+});
+
+test('a missing run row also defers to a retry when the capability is valid', async () => {
+  const d = deps({ jit: validJit, row: undefined });
+  const res = await createHandler(d.impl)({ action: 'terminate', ref: REF, token: TOKEN });
+  assert.deepEqual(res, { ok: true, terminated: false });
+  assert.deepEqual(d.calls.terminated, []);
+});
+
+test('an unstamped row with a bad token is still unauthorized', async () => {
+  const d = deps({ jit: validJit, row: { status: 'running' } });
+  const res = await createHandler(d.impl)({ action: 'terminate', ref: REF, token: OTHER_TOKEN });
   assert.deepEqual(res, { ok: false, error: 'unauthorized' });
   assert.deepEqual(d.calls.terminated, []);
+});
+
+test('an unstamped row with no live JIT item is unauthorized (post-TTL, unforgeable)', async () => {
+  const d = deps({ jit: undefined, row: { status: 'running' } });
+  const res = await createHandler(d.impl)({ action: 'terminate', ref: REF, token: TOKEN });
+  assert.deepEqual(res, { ok: false, error: 'unauthorized' });
+});
+
+test('the retry after the stamp lands terminates exactly once', async () => {
+  // Same VM, same token: first call pre-stamp (defer), second call post-stamp (terminate).
+  const state = { row: { status: 'running' } };
+  const terminated = [];
+  const impl = {
+    getJitConfigByRef: async () => validJit,
+    getRunFieldsByKey: async () => state.row,
+    terminate: async (id) => {
+      terminated.push(id);
+    },
+  };
+  const handle = createHandler(impl);
+  const first = await handle({ action: 'terminate', ref: REF, token: TOKEN });
+  assert.deepEqual(first, { ok: true, terminated: false });
+  state.row = { status: 'running', microvmId: 'mvm-123', hookTokenHash: hashHookToken(TOKEN) };
+  const second = await handle({ action: 'terminate', ref: REF, token: TOKEN });
+  assert.deepEqual(second, { ok: true, terminated: true });
+  assert.deepEqual(terminated, ['mvm-123']);
 });
 
 test('an unstamped microvmId defers to the Reaper instead of failing', async () => {

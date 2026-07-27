@@ -436,7 +436,11 @@ operations on the VM's behalf:
    after boot, 30-min TTL), `terminate` off the run row (no TTL until the run is terminal),
    because self-terminate fires at job **end** — up to the Reaper's 2 h lifetime cap. Pinning
    terminate to the TTL'd item would silently lose self-terminate for every job over 30 min
-   and regress ADR-019 back to Reaper-only reaping.
+   and regress ADR-019 back to Reaper-only reaping. The opposite race — a job finishing
+   *before* Provision's post-launch stamp writes `microvmId` + the hash — falls back to the
+   still-live JIT item to authorize, and answers `{ok:true, terminated:false}` so the hook's
+   bounded retry can reach the stamped row; an invalid capability still gets the identical
+   terminal `unauthorized`.
 3. The exec role is cut to exactly two things: its own log group (ADR-016) and
    `lambda:InvokeFunction` on the single broker function ARN. No DynamoDB. No
    `TerminateMicrovm`.
@@ -484,6 +488,7 @@ control actions, and an `InvokeFunction` pinned to the broker ARN — so a futur
 token hashing/compare and the ref→key derivation (rejecting other entities, `RUN#…#RUN`,
 wildcards, and non-numeric ids). `test/hook-broker-handler.test.mjs` pins the λ's
 authorization decisions: which item authorizes which action (including terminate succeeding
-with the JIT item already aged out), that a wrong token never reaches `TerminateMicrovm`,
+with the JIT item already aged out, and the pre-stamp race deferring to a retry rather than
+a terminal denial), that a wrong token never reaches `TerminateMicrovm`,
 that unknown-ref and bad-token responses are byte-identical, and that malformed requests are
 rejected before any store access.

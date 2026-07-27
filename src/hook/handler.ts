@@ -27,7 +27,9 @@ import { hookTokenMatches, keysFromRef, parseHookRequest } from './broker-core.j
  * is authorized against the hash mirrored on the durable run row by `stampMicrovmId`. If
  * terminate had to read the TTL'd item, every job longer than 30 min would fail
  * authorization and fall back to Reaper-only reaping (~5 min of idle billing), silently
- * regressing ADR-019.
+ * regressing ADR-019. The mirror-image race (an ultra-fast job finishing BEFORE Provision's
+ * post-launch stamp) falls back to the JIT item so the caller gets a retryable
+ * `terminated: false` instead of a terminal `unauthorized`.
  *
  * Env: TABLE_NAME.
  */
@@ -90,11 +92,25 @@ export function createHandler(deps: BrokerDeps = defaultDeps) {
     // Authorized off the DURABLE run row: the JIT config item's 30-min TTL is shorter than
     // a legitimate job, and this fires at job end (ADR-020 consequences).
     const row = await deps.getRunFieldsByKey(pk, runSk);
-    if (!row || !hookTokenMatches(token, row.hookTokenHash)) return denied(action, ref);
+    if (!row || !row.hookTokenHash) {
+      // Provision writes microvmId + the token hash in ONE post-launch stamp, so "row has
+      // no hash" means the stamp hasn't landed yet — an ultra-fast job can finish first.
+      // Falling straight to `unauthorized` would be terminal for the caller (the hook does
+      // not retry auth failures — they can't fix themselves), silently regressing ADR-019
+      // to Reaper-only reaping. Authorize the retry against the JIT config item instead
+      // (same token, still live seconds after boot) and report "nothing to terminate yet"
+      // so the hook's bounded retry can reach the stamped row. A caller with no valid
+      // capability still gets the byte-identical `unauthorized`.
+      const jit = await deps.getJitConfigByRef(ref);
+      if (!jit || !hookTokenMatches(token, jit.hookTokenHash)) return denied(action, ref);
+      console.log(JSON.stringify({ msg: 'run row not stamped yet; caller may retry', pk }));
+      return { ok: true, terminated: false };
+    }
+    if (!hookTokenMatches(token, row.hookTokenHash)) return denied(action, ref);
 
     const microvmId = row.microvmId;
     if (!microvmId) {
-      // Provision stamps the id seconds after launch; if it's absent the Reaper backstops.
+      // Stamped hash but no id shouldn't happen (one write); Reaper backstops if it does.
       console.log(JSON.stringify({ msg: 'no microvmId on run row; Reaper will backstop', pk }));
       return { ok: true, terminated: false };
     }
