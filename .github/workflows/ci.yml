@@ -1,15 +1,16 @@
 name: CI
 
-# Dogfooding note:
-# Today these jobs run on GitHub-hosted `ubuntu-latest`. Once the LambdaCIActions
-# platform is live (ROADMAP M1+), flip `runs-on` to our own microVM runners:
+# Self-hosted dogfooding (ROADMAP M1+): every job in this repo runs on our own
+# LambdaCIActions microVM runners via spec 03 label mode:
 #
 #   runs-on: [self-hosted, lambda-ci]           # base flavor
 #   runs-on: [self-hosted, lambda-ci-node]      # node flavor
+#   runs-on: [self-hosted, lambda-ci-docker]    # docker flavor
 #
-# That is the single-line change spec 03 (label mode) is built around — this repo
-# should be the first consumer of its own CI. Until M1 lands we stay on
-# ubuntu-latest so CI is green from day one. See docs/specs/03-workflow-ingestion.md.
+# This repo is the first consumer of its own CI — no GitHub-hosted runners, so CI
+# is unaffected by GitHub Actions minutes/billing. If the platform is down, jobs
+# queue rather than falling back (deliberate: a silent fallback would hide outages).
+# See docs/specs/03-workflow-ingestion.md.
 
 on:
   push:
@@ -22,7 +23,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: [self-hosted, lambda-ci-node]   # dogfood: node flavor microVM (was ubuntu-latest)
+    runs-on: [self-hosted, lambda-ci-node]   # dogfood: node flavor microVM
     steps:
       - uses: actions/checkout@v4
 
@@ -30,30 +31,30 @@ jobs:
         with:
           node-version: '22'
 
-      # Repo is package.json-less until real code lands (M1). Guard every step so
-      # CI is meaningful now (script smoke test) and auto-upgrades once code exists.
-      - name: Install dependencies (if package.json present)
-        run: |
-          if [ -f package.json ]; then npm ci || npm install; else echo "no package.json yet — skipping"; fi
+      - name: Install dependencies
+        run: npm ci
 
       - name: Lint (if configured)
         run: |
-          if [ -f package.json ] && npm run | grep -q '^  lint'; then npm run lint; else echo "no lint script — skipping"; fi
+          if npm run | grep -q '^  lint'; then npm run lint; else echo "no lint script — skipping"; fi
 
-      - name: Build (if configured)
-        run: |
-          if [ -f package.json ] && npm run | grep -q '^  build'; then npm run build; else echo "no build script — skipping"; fi
+      - name: Build
+        run: npm run build
 
-      - name: Test (if configured)
-        run: |
-          if [ -f package.json ] && npm run | grep -q '^  test'; then npm test; else echo "no test script — skipping"; fi
+      - name: Test
+        run: npm test
+
+      # Guard: `cdk synth` must work WITHOUT a deploy-target pin (ADR-018) — the
+      # credential-less CI path stays exempt so the build gate never needs an account.
+      - name: Synth (no .env.local — ADR-018 CI exemption)
+        run: npx cdk synth -q
 
       # Always-on smoke test: the bootstrap script must parse + render its manifest.
       - name: Smoke-test GitHub App manifest generator
         run: node scripts/create-github-app.mjs --dry-run --env ci
 
   docs-check:
-    runs-on: ubuntu-latest      # TODO(M1): → [self-hosted, lambda-ci]
+    runs-on: [self-hosted, lambda-ci]   # dogfood: base flavor microVM
     steps:
       - uses: actions/checkout@v4
       - name: Ensure design docs exist
