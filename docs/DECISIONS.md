@@ -462,12 +462,18 @@ reason to be reachable off-account); leaving read table-wide and only fixing ter
 (leaves the harvesting primitive intact for the next privileged operation added).
 **Consequences**: One extra Lambda invoke on the boot path (~50 ms) — and it is *on* the
 critical path, because `/run` cannot ACK until the JIT config is resolved and Lambda gates
-traffic to the VM until that ACK. That makes the guest-side call bounded on purpose: a
-15 s per-invoke wall clock (the AWS CLI otherwise blocks `spawnSync` forever if the guest's
-network is broken, which would strand the VM with no ACK and no retry) and exponential
-backoff across attempts, since the reserved-concurrency cap below can legitimately throttle
-a launch burst and flat retries would all land in the same throttle window. Terminate gets a
-larger attempt budget than the boot fetch (no ACK deadline behind it). And one more function
+traffic to the VM until that ACK. That makes the guest-side call bounded on purpose, and the
+boot call bounded *twice*: the image declares `microvmHooks.run` with
+`runTimeoutInSeconds: 30`, so the whole boot retry budget (invokes + backoff) has to fit
+inside that deadline — a bigger budget cannot help, because the platform abandons `/run`
+while the hook is still sleeping between attempts and the VM strands for the Reaper with the
+job unstarted. Boot therefore uses a 6 s per-invoke bound × 3 attempts + 2 s/4 s backoff
+(24 s worst case); terminate keeps a 15 s per-invoke bound and a larger attempt budget (no
+platform deadline behind it). The bound exists at all because the AWS CLI otherwise blocks
+`spawnSync` forever if the guest's network is broken, which would strand the VM with no ACK
+and no retry; the backoff is exponential across attempts, since the reserved-concurrency cap
+below can legitimately throttle a launch burst and flat retries would all land in the same
+throttle window. And one more function
 to deploy. The
 broker is capped at 20 reserved concurrent executions: its only callers are untrusted VMs
 (one call at boot, one at job end), so a pathological VM fleet must not be able to drain the
@@ -532,6 +538,9 @@ for a Lambda *function* error too (broker timeout, DDB throttle, cold-start cras
 `{errorMessage, errorType}` rather than the broker's own `{ok:false, error}`. The hook only
 stops retrying on the latter — a deliberate refusal can't fix itself, whereas treating a
 transient control-plane blip as terminal would fail the job at boot or silently drop
-self-terminate back to Reaper-only reaping. `test/run-hook.test.mjs` pins both classes and
-the token-off-argv payload handling, and
-`test/provision-config-guard.test.mjs` pins the guard-before-mint ordering above.
+self-terminate back to Reaper-only reaping. `test/run-hook.test.mjs` pins both classes, the
+token-off-argv payload handling, and that the boot budget stays under the image's declared
+`runTimeoutInSeconds`; `test/provision-config-guard.test.mjs` pins the guard-before-mint
+ordering above. The token hash mirrored onto the run row is a control-plane verifier for a
+bearer secret, so it is declared on `RunRecord` as such and must never be serialized into a
+management-API response or the UI (AGENTS.md).

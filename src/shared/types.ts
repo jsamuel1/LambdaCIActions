@@ -174,6 +174,14 @@ export interface RunRecord {
   status: RunStatus;
   flavor?: string;
   microvmId?: string;
+  /**
+   * SHA-256 of the run's hook capability token (ADR-020), mirrored here by `stampMicrovmId`
+   * because the brokered self-terminate fires at job end, after the JIT config item carrying
+   * the same hash has TTL'd away. Control-plane only: it is the verifier for a bearer
+   * secret, so it must never be serialized into a management-API response or the UI
+   * (AGENTS.md — no secret values in the UI/API).
+   */
+  hookTokenHash?: string;
   labels: string[];
   /** Reason string for failed / timed_out. */
   reason?: string;

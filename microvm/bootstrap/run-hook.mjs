@@ -109,6 +109,18 @@ function selfTerminate(reason) {
 // flush and paying idle minutes.
 const BROKER_CALL_TIMEOUT_MS = 15000;
 
+// The BOOT fetch gets a tighter bound than that, because it runs inside a platform deadline:
+// the image declares `microvmHooks.run` with `runTimeoutInSeconds: 30` (scripts/build-images.mjs),
+// and this call is synchronous INSIDE the `/run` request — the ACK cannot be sent until it
+// returns. A budget larger than the hook timeout is self-defeating: the platform gives up on
+// `/run` while the hook is still retrying, so the extra attempts can never help and the VM is
+// stranded for the Reaper anyway. Worst case here is
+//   3 × 6 s invoke + 2 s + 4 s backoff = 24 s < 30 s,
+// leaving headroom for the request/JSON handling around it. Terminate keeps the larger budget:
+// it fires after the job, with no platform deadline behind it.
+const BOOT_CALL_TIMEOUT_MS = 6000;
+const BOOT_CALL_ATTEMPTS = 3;
+
 // Invoke the hook broker λ via the baked-in AWS CLI (no npm deps in the image). The VM's
 // execution role grants exactly one action — lambda:InvokeFunction on this function ARN.
 // Retries cover the razor-thin window where Provision hasn't stamped microvmId yet AND the
@@ -117,7 +129,7 @@ const BROKER_CALL_TIMEOUT_MS = 15000;
 // backoff is exponential (2s, 4s, 8s…) rather than flat — flat retries all land inside the
 // same throttle window and fail the job at boot. Boot uses fewer attempts than terminate:
 // `/run` cannot ACK until the fetch returns, and terminate has no such deadline.
-function callBroker(action, attempts = 3, delayMs = 2000) {
+function callBroker(action, attempts = 3, delayMs = 2000, callTimeoutMs = BROKER_CALL_TIMEOUT_MS) {
   if (!runCtx?.ref || !runCtx?.broker || !runCtx?.token) {
     log('broker call skipped: no broker context', { action });
     return null;
@@ -158,7 +170,7 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
     const r = spawnSync('aws', args, {
       encoding: 'utf8',
       maxBuffer: 8 * 1024 * 1024,
-      timeout: BROKER_CALL_TIMEOUT_MS,
+      timeout: callTimeoutMs,
       killSignal: 'SIGKILL',
     });
     if (r.status !== 0) {
@@ -282,7 +294,7 @@ function sleepSync(ms) {
 // ADR-021 brokered access). The VM has no DynamoDB permission at all — the broker validates
 // the capability token and returns the config for THIS run only.
 function fetchJitConfig() {
-  const res = callBroker('jitconfig');
+  const res = callBroker('jitconfig', BOOT_CALL_ATTEMPTS, 2000, BOOT_CALL_TIMEOUT_MS);
   if (!res || res.ok !== true) {
     throw new Error(`broker jitconfig failed: ${res?.error ?? 'invoke failed'}`);
   }

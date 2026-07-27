@@ -177,13 +177,41 @@ test('every broker invoke is wall-clock bounded and hard-killed', () => {
   // The bound has to be ON the spawnSync that runs the CLI, with SIGKILL so a CLI ignoring
   // SIGTERM can't outlive it.
   const spawn = src.slice(src.indexOf("spawnSync('aws', args"), src.indexOf('if (r.status !== 0)'));
-  assert.match(spawn, /timeout: BROKER_CALL_TIMEOUT_MS/);
+  assert.match(spawn, /timeout: callTimeoutMs/);
   assert.match(spawn, /killSignal: 'SIGKILL'/);
   // A timeout/spawn failure sets `error` with a null status, so the failure log must report it
   // (otherwise the diagnostic line is empty for exactly this class).
   const at = src.indexOf("log('broker invoke failed'");
   const failLog = src.slice(at, at + 400);
   assert.match(failLog, /error: r\.error \? safeErr\(r\.error\) : undefined/);
+});
+
+// The BOOT fetch runs synchronously inside the `/run` request, and the platform abandons that
+// hook after `runTimeoutInSeconds` (declared by the image build). A retry budget bigger than
+// that deadline can never help: the platform has already given up while the hook is still
+// sleeping between attempts, so the VM strands for the Reaper with the job unstarted. Keep the
+// whole boot budget (invokes + backoff) under the declared hook timeout.
+test('the boot fetch budget fits inside the platform /run hook timeout', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  const build = fs.readFileSync(new URL('../scripts/build-images.mjs', import.meta.url), 'utf8');
+  const hookTimeoutS = Number(build.match(/runTimeoutInSeconds: (\d+)/)[1]);
+  assert.ok(hookTimeoutS > 0, 'no runTimeoutInSeconds declared for the run hook');
+
+  const bootMs = Number(src.match(/const BOOT_CALL_TIMEOUT_MS = (\d+);/)[1]);
+  const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
+  const delayMs = Number(src.match(/function callBroker\(action, attempts = \d+, delayMs = (\d+)/)[1]);
+  // Attempt i>0 sleeps delayMs * 2**(i-1) before its invoke (exponential backoff).
+  let worstMs = bootAttempts * bootMs;
+  for (let i = 1; i < bootAttempts; i++) worstMs += delayMs * 2 ** (i - 1);
+  assert.ok(
+    worstMs < hookTimeoutS * 1000,
+    `boot budget ${worstMs}ms exceeds the ${hookTimeoutS}s /run hook timeout`,
+  );
+  // And the boot path must actually use that tighter bound, not the default.
+  assert.match(src, /callBroker\('jitconfig', BOOT_CALL_ATTEMPTS, \d+, BOOT_CALL_TIMEOUT_MS\)/);
 });
 
 // The broker's reserved-concurrency cap (20) exists to stop an untrusted VM fleet draining
@@ -197,8 +225,11 @@ test('broker retries back off exponentially, with a bigger budget for terminate'
   );
   assert.match(src, /sleepSync\(delayMs \* 2 \*\* \(i - 1\)\)/);
   // Terminate has no `/run` ACK deadline behind it and must survive both the post-launch
-  // stamp race and a throttle burst, so it asks for more attempts than the default.
-  const attempts = Number(src.match(/function callBroker\(action, attempts = (\d+)/)[1]);
+  // stamp race and a throttle burst, so it asks for more attempts than the boot fetch.
+  const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
   const terminateAttempts = Number(src.match(/callBroker\('terminate', (\d+)\)/)[1]);
-  assert.ok(terminateAttempts > attempts, `terminate budget ${terminateAttempts} <= default ${attempts}`);
+  assert.ok(
+    terminateAttempts > bootAttempts,
+    `terminate budget ${terminateAttempts} <= boot ${bootAttempts}`,
+  );
 });
