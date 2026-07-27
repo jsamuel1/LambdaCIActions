@@ -41,6 +41,7 @@ merge`); base branch is always `main`.
 - Runtime: **arm64** (microVMs are Graviton-only — no x86_64).
 - Secrets: **SSM SecureString**, created out-of-band, only referenced by CDK. **Never** commit secrets or write them to code/CFN.
 - Deploy is **phased**: infra → build images → orchestrator (image ARNs must exist first). See `docs/specs/05-infrastructure.md`.
+- **Deploy-target pin (ADR-018):** deploy-touching commands (cdk deploy/diff, `build:images`, `app:create`) REQUIRE a gitignored `.env.local` (copy `.env.local.example`) pinning `LCA_DEPLOY_ACCOUNT` + `LCA_DEPLOY_REGION`; they verify the ambient credentials actually resolve to that account and refuse on mismatch. Credential-less `cdk synth` and `--dry-run` are exempt.
 - **Toolchain floor:** the compute plane uses the `lambda-microvms` service (API `2025-09-09`, GA 2026-06-22) — a separate namespace from `aws lambda`. Requires **AWS CLI ≥ 2.35.17** and **boto3/botocore ≥ 1.43.44**; older tooling (incl. the AL2023 `awscli-2` dnf package) can't see the API and the deploy fails at image-build. Verify with `aws lambda-microvms help`. Full matrix + install steps in `docs/specs/05-infrastructure.md` § Toolchain prerequisites.
 
 ## Hard rules

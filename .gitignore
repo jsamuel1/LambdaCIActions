@@ -10,6 +10,7 @@ cdk.out/
 # env & secrets — never commit
 .env
 .env.*
+!.env.local.example
 *.pem
 *.key
 

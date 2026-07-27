@@ -52,10 +52,31 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 const ENV = args.env || 'dev';
-const REGION = args.region || null;
+let REGION = args.region || null;
 const ONLY_FLAVOR = args.flavor || null;
 const DRY_RUN = Boolean(args['dry-run']);
 const SSM_PREFIX = `/lca/${ENV}`;
+
+// Deploy-target pin (ADR-018): refuse to touch AWS unless .env.local pins the account +
+// region AND the ambient credentials actually resolve to that account. Dry runs exempt.
+// The guard is TypeScript (lib/deploy-env.ts) so the CDK app shares it — hence dist/.
+async function guardDeployTarget() {
+  if (DRY_RUN) return;
+  let mod;
+  try {
+    mod = await import(path.join(REPO_ROOT, 'dist', 'lib', 'deploy-env.js'));
+  } catch {
+    console.error('ERROR: dist/lib/deploy-env.js not found — run `npm run build` first.');
+    process.exit(1);
+  }
+  try {
+    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION });
+    REGION = target.region; // pin wins; all aws() calls get --region <pin>
+  } catch (e) {
+    console.error(`ERROR: ${e.message}`);
+    process.exit(1);
+  }
+}
 
 function aws(cliArgs, { capture = true } = {}) {
   const full = REGION ? [...cliArgs, '--region', REGION] : cliArgs;
@@ -258,8 +279,7 @@ function discoverBaseImageArn() {
 }
 
 function main() {
-  const flavors = loadFlavors();
-  console.log(`Building ${flavors.length} flavor(s) for env=${ENV}${DRY_RUN ? ' (dry-run)' : ''}`);
+  const flavors = loadFlavors();  console.log(`Building ${flavors.length} flavor(s) for env=${ENV}${DRY_RUN ? ' (dry-run)' : ''}`);
 
   const bucket = DRY_RUN ? '<image-code-bucket>' : ssmGet(`${SSM_PREFIX}/config/image-code-bucket`);
   const buildRoleArn = DRY_RUN
@@ -285,4 +305,5 @@ function main() {
   console.log('\nNext: deploy the orchestrator (cdk deploy LCA-Control-<env>).');
 }
 
+await guardDeployTarget();
 main();

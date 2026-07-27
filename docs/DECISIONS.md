@@ -267,3 +267,33 @@ compat `block` is advisory routing, not a security boundary.
 never match — they route label-only. The claim gate adds one DDB Query per claimed
 webhook (single-digit ms, small partitions). Manual "re-scan" (spec 03) needs only an SQS
 send to the discovery queue — the M4 UI can reuse the same message shape.
+
+## ADR-018 — Deploy-target pin: `.env.local` required for all deploy-touching commands
+
+**Status**: accepted
+**Context**: `bin/lca.ts` resolved the deploy account from ambient credentials
+(`CDK_DEFAULT_ACCOUNT`) and the deploy scripts from whatever `AWS_PROFILE`/default chain
+the shell happened to carry. Nothing pinned the intended target, so a shell pointed at
+the wrong account would silently deploy stacks, build images, or write GitHub App
+SecureStrings into it. With multiple Isengard accounts on the same workstation this is a
+live footgun, and it also left "which account is dev?" undiscoverable from the repo.
+**Decision**: A gitignored **`.env.local`** at the repo root (template:
+`.env.local.example`) pins `LCA_DEPLOY_ACCOUNT` (12-digit) + `LCA_DEPLOY_REGION`, with
+optional `AWS_PROFILE`. A shared guard (`lib/deploy-env.ts`, zero npm deps) is enforced
+by every deploy-touching entry point:
+- **CDK app** (`bin/lca.ts`): if credentials are present (`CDK_DEFAULT_ACCOUNT` set) or
+  `.env.local` exists, the pin is mandatory and must match the ambient account; stacks
+  get `env = { account: pin, region: pin }`. Credential-less synth (the CI gate, fresh
+  worktrees) proceeds unpinned — it cannot deploy anything.
+- **`scripts/build-images.mjs` / `scripts/create-github-app.mjs`**: refuse to start
+  without a valid pin AND an STS caller-identity match; `--dry-run` is exempt (no AWS
+  calls). Any explicit `--region`/`-c region` must equal the pinned region.
+**Why**: comparing the pin against the *actual* resolved identity (not just exporting a
+profile) catches every mis-targeting mode: wrong profile, stale credentials, env-var
+overrides. Keeping the guard dependency-free preserves the scripts' zero-npm-dep
+convention, and one TS module shared via `dist/` avoids two divergent implementations.
+**Consequences**: first deploy on a fresh clone requires `cp .env.local.example
+.env.local` + editing two values (deliberate one-time friction). Dev/prod account
+separation (M5) becomes trivial: each checkout/env pins its own account. Numbering note:
+an unmerged branch (`kermes/task-fiery-butterfly`) also claims "ADR-018" for run-row
+readback termination — if that branch lands, it renumbers to ADR-019.
