@@ -85,7 +85,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
-| `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (paginated) | ✅ |
+| `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
 | `GET /api/health` | Dashboard aggregates + stuck-run detection | ✅ |
 | `GET /api/settings` | Env identity + SSM parameter **presence** | ✅ |
@@ -97,9 +97,23 @@ Every `/api/*` route requires a session; repo-scoped routes additionally require
 `?installation=<id>` and check the session's grant for it.
 
 Responses are JSON; log endpoints paginate via CloudWatch tokens (no log bodies in Dynamo).
+CloudWatch stops issuing `nextToken` once a filter is caught up, so the log endpoint also
+accepts `since=<epoch-ms>` — the client's tail watermark (newest event it holds, +1 ms).
+`nextToken` wins when both are sent; a resumed tail that returns nothing is *caught up*, not
+`pending`. `pending: true` means the run has no `microvmId`, the log group does not exist, or
+a cold first page found no stream (confirmed with one `DescribeLogStreams`).
+
 Run-list pagination uses an opaque cursor (base64url of the DynamoDB `LastEvaluatedKey`);
 the unfiltered multi-status view returns `nextCursor: null` — narrow by repo or status to
-page deeper (ADR-023).
+page deeper (ADR-023). Because the run indexes are not keyed by installation, authorization
+is a **post-query filter**, so filtered endpoints walk up to 5 index pages per request to
+fill a page of visible rows; `nextCursor` is null only when the index is exhausted
+(`src/mgmt/paging.ts`, `test/mgmt-authz-paging.test.mjs`).
+
+`GET /api/health` counts are **platform-wide** (the status index is not per-installation),
+while `stuck` and every run list are filtered to the session's installations. Counts follow
+`LastEvaluatedKey` for up to 10 pages and set `countsExact: false` when that budget is spent,
+so a large history reads as a labelled lower bound rather than a wrong total.
 
 ## Auth
 
@@ -127,7 +141,9 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - v1 is **polling** (ADR-026): 3 s on Run detail, 5 s on Dashboard/Runs, **paused while the
   tab is hidden**. No WebSocket/SSE — Phase 3.
 - Log viewer tails the per-env run log group (`/aws/lambda/microvms/runs/lca-<env>`,
-  ADR-016) filtered to the run's `microvmId` (ADR-019), following CloudWatch's `nextToken`.
+  ADR-016) filtered to the run's `microvmId` (ADR-019), following CloudWatch's `nextToken`
+  while one is issued and its own `since` watermark afterwards (see the API notes above —
+  re-sending a spent token would replay the same page forever).
 
 ## Tech choices
 
@@ -138,6 +154,11 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   ~165 KB and avoids a framework dependency. Cloudscape remains an option if the surface grows.
 - **Hosting**: private S3 bucket (OAC) + CloudFront, with the API attached to the **same
   distribution** as `/api/*` and `/auth/*` behaviors (ADR-024) — first-party cookie, no CORS.
+  The distribution defines **no custom error responses**: they are distribution-wide, so an
+  SPA fallback rewrite would also turn the API's 403/404 into `200` + HTML. Hash routing
+  makes the fallback unnecessary. The app shell is served with a `self`-only CSP
+  (`frame-ancestors 'none'`), HSTS, `nosniff`, and `Referrer-Policy: same-origin`
+  (`test/web-stack.test.mjs`).
 - **API**: API Gateway (HTTP API) + one Lambda (TypeScript, arm64, Node 22), same toolchain
   as the orchestrator.
 - **State**: DynamoDB (shared single table) + GSI2 for per-repo run history (ADR-023).
@@ -146,7 +167,8 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 ## Non-functional
 
 - **Read latency**: every read is a keyed `GetItem` or an index `Query` — no table scans.
-  Dashboard counts use `Select: COUNT` on GSI1; run history uses GSI2 (ADR-023).
+  Dashboard counts use `Select: COUNT` on GSI1 (paged, bounded); run history uses GSI2
+  (ADR-023).
 - **No secret exposure**: presence via `DescribeParameters`; the λ holds no IAM grant for
   secret paths beyond its own OAuth/session credentials (ADR-025).
 - **Least privilege**: read-mostly. `dynamodb:UpdateItem` is the only write (no

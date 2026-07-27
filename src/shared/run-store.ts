@@ -375,18 +375,36 @@ export async function listRunsByStatusPaged(
   };
 }
 
-/** Count rows in a status without materializing them (dashboard aggregates). */
-export async function countRunsByStatus(status: RunStatus): Promise<number> {
-  const res = await requireDoc().send(
-    new QueryCommand({
-      TableName: TABLE,
-      IndexName: 'gsi1',
-      KeyConditionExpression: 'gsi1pk = :gpk',
-      ExpressionAttributeValues: { ':gpk': `RUNSTATUS#${status}` },
-      Select: 'COUNT',
-    }),
-  );
-  return res.Count ?? 0;
+/**
+ * Count rows in a status without materializing them (dashboard aggregates).
+ *
+ * A single `Select: COUNT` query only counts what fits in one 1 MB scan pass, so a status
+ * with a long history would silently under-report. We follow `LastEvaluatedKey` up to a
+ * bounded number of pages; `exact: false` tells the caller the number is a floor.
+ */
+export async function countRunsByStatus(
+  status: RunStatus,
+  opts: { maxPages?: number } = {},
+): Promise<{ count: number; exact: boolean }> {
+  const maxPages = opts.maxPages ?? 10;
+  let count = 0;
+  let startKey: Record<string, unknown> | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const res = await requireDoc().send(
+      new QueryCommand({
+        TableName: TABLE,
+        IndexName: 'gsi1',
+        KeyConditionExpression: 'gsi1pk = :gpk',
+        ExpressionAttributeValues: { ':gpk': `RUNSTATUS#${status}` },
+        Select: 'COUNT',
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    count += res.Count ?? 0;
+    startKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
+    if (!startKey) return { count, exact: true };
+  }
+  return { count, exact: false };
 }
 
 /** Read one run row (Run detail screen). */

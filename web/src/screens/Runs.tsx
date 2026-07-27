@@ -1,11 +1,17 @@
-import { useState } from 'react';
-import { api, type RunStatus } from '../api.js';
+import { useEffect, useState } from 'react';
+import { api, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
 import { ErrorBox, Loading, StatusBadge, formatCost, formatDuration, formatTime } from '../components.js';
 
 const STATUSES: RunStatus[] = ['queued', 'provisioning', 'running', 'completed', 'failed', 'timed_out'];
+const PAGE = 50;
 
-/** Runs — filterable run history (spec 04). Polls every 5 s so live runs advance in place. */
+/**
+ * Runs — filterable run history (spec 04). The head page polls every 5 s so live runs advance
+ * in place; "Load older" walks the API's opaque cursor (ADR-021) and appends, so history is
+ * not capped at one page. Deeper paging requires a repo or status filter — the unfiltered
+ * merged view has no coherent cursor, so the button is hidden there.
+ */
 export function Runs({
   repoFilter,
   navigate,
@@ -15,12 +21,53 @@ export function Runs({
 }): JSX.Element {
   const [status, setStatus] = useState<RunStatus | ''>('');
   const runs = useApi(
-    () => api.runs({ repo: repoFilter, status: status || undefined, limit: 50 }),
+    () => api.runs({ repo: repoFilter, status: status || undefined, limit: PAGE }),
     [repoFilter, status],
     5000,
   );
+  const [older, setOlder] = useState<Run[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreErr, setMoreErr] = useState<string | undefined>(undefined);
+
+  // A filter change invalidates every appended page and its cursor.
+  useEffect(() => {
+    setOlder([]);
+    setCursor(null);
+    setMoreErr(undefined);
+  }, [repoFilter, status]);
 
   if (runs.error) return <ErrorBox message={runs.error} />;
+
+  const headCursor = runs.data?.nextCursor ?? null;
+  const nextCursor = cursor ?? headCursor;
+  const seen = new Set<string>();
+  const rows = [...(runs.data?.runs ?? []), ...older].filter((r) => {
+    const key = `${r.repoId}-${r.runId}-${r.jobId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  async function loadOlder(): Promise<void> {
+    if (!nextCursor) return;
+    setLoadingMore(true);
+    setMoreErr(undefined);
+    try {
+      const page = await api.runs({
+        repo: repoFilter,
+        status: status || undefined,
+        limit: PAGE,
+        cursor: nextCursor,
+      });
+      setOlder((prev) => [...prev, ...page.runs]);
+      setCursor(page.nextCursor);
+    } catch (e) {
+      setMoreErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   return (
     <div className="stack">
@@ -64,7 +111,7 @@ export function Runs({
               </tr>
             </thead>
             <tbody>
-              {runs.data.runs.map((r) => (
+              {rows.map((r) => (
                 <tr
                   key={`${r.repoId}-${r.runId}-${r.jobId}`}
                   style={{ cursor: 'pointer' }}
@@ -83,7 +130,7 @@ export function Runs({
                   <td>{formatTime(r.createdAt)}</td>
                 </tr>
               ))}
-              {!runs.data.runs.length && (
+              {!rows.length && (
                 <tr>
                   <td colSpan={7} className="muted">
                     No runs match this filter.
@@ -92,6 +139,15 @@ export function Runs({
               )}
             </tbody>
           </table>
+        )}
+        {moreErr && <p className="error">{moreErr}</p>}
+        {nextCursor && (
+          <div className="row">
+            <button onClick={() => void loadOlder()} disabled={loadingMore}>
+              {loadingMore ? 'Loading…' : 'Load older'}
+            </button>
+            <span className="muted">{rows.length} shown</span>
+          </div>
         )}
       </div>
     </div>

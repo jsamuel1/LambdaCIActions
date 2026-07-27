@@ -37,6 +37,13 @@ export interface FetchLogsInput {
   microvmId?: string;
   limit?: number;
   nextToken?: string;
+  /**
+   * Tail watermark (epoch ms). Used when there is no `nextToken` to resume from: CloudWatch
+   * omits `nextToken` once a filter is caught up, so re-sending the previous token would
+   * replay the same events. The client instead asks for "everything after the newest event
+   * I already have".
+   */
+  startTime?: number;
 }
 
 /** Max events per page. Keeps a single API response comfortably small. */
@@ -46,6 +53,11 @@ let cached: CloudWatchLogsClient | undefined;
 function client(): CloudWatchLogsClient {
   cached ??= new CloudWatchLogsClient({});
   return cached;
+}
+
+/** Test hook: inject a stub client (kept out of the Lambda's hot path). */
+export function _setClient(stub: Pick<CloudWatchLogsClient, 'send'> | undefined): void {
+  cached = stub as CloudWatchLogsClient | undefined;
 }
 
 /**
@@ -64,18 +76,28 @@ export async function fetchRunLogs(input: FetchLogsInput): Promise<LogPage> {
         logGroupName: input.logGroupName,
         logStreamNamePrefix: input.microvmId,
         limit: input.limit ?? DEFAULT_LIMIT,
-        nextToken: input.nextToken,
+        // A token already encodes the window it was issued for — mixing in startTime would
+        // contradict it, so the two are mutually exclusive.
+        ...(input.nextToken
+          ? { nextToken: input.nextToken }
+          : input.startTime !== undefined
+            ? { startTime: input.startTime }
+            : {}),
       }),
     );
-    return {
-      events: (res.events ?? []).map((e) => ({
-        timestamp: e.timestamp ?? 0,
-        message: e.message ?? '',
-        stream: e.logStreamName ?? '',
-      })),
-      nextToken: res.nextToken,
-      pending: false,
-    };
+    const events = (res.events ?? []).map((e) => ({
+      timestamp: e.timestamp ?? 0,
+      message: e.message ?? '',
+      stream: e.logStreamName ?? '',
+    }));
+    // A cold first page (no token, no watermark, nothing returned) is ambiguous: the VM may
+    // not have written yet, or the stream may be gone. One DescribeLogStreams resolves it so
+    // the UI can say "waiting for logs" honestly instead of showing an empty pane forever.
+    const pending =
+      events.length === 0 && !input.nextToken && input.startTime === undefined
+        ? !(await hasLogStream(input.logGroupName, input.microvmId))
+        : false;
+    return { events, nextToken: res.nextToken, pending };
   } catch (err) {
     if ((err as { name?: string }).name === 'ResourceNotFoundException') {
       return { events: [], pending: true };
@@ -86,8 +108,7 @@ export async function fetchRunLogs(input: FetchLogsInput): Promise<LogPage> {
 
 /**
  * Whether any stream exists for a microVM — used to distinguish "no logs yet" from
- * "logs expired". Cheap (one DescribeLogStreams with a prefix); only called when a page
- * comes back empty.
+ * "logs expired". Cheap (one DescribeLogStreams with a prefix).
  */
 export async function hasLogStream(logGroupName: string, microvmId: string): Promise<boolean> {
   try {

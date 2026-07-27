@@ -28,7 +28,13 @@ export interface WebStackProps extends StackProps {
  *   - the OAuth redirect URI is a stable console URL.
  *
  * The bucket is never public; CloudFront reaches it through Origin Access Control.
- * SPA deep links (`/runs/123`) 404 at S3, so 403/404 are rewritten to `/index.html`.
+ *
+ * NOTE on SPA fallback: CloudFront custom error responses are DISTRIBUTION-wide — they
+ * apply to every behavior, including `/api/*`. Rewriting 403/404 → `/index.html` would
+ * therefore turn the management API's `403 forbidden` and `404 not found` into `200` with
+ * an HTML body, breaking the API contract (and masking authorization denials). The console
+ * is hash-routed (`#/runs/1/2/3`, ADR-022) so every real URL path is `/` — no fallback is
+ * needed, and none is configured.
  *
  * The asset deployment is skipped when `web/dist` is absent so a credential-less
  * `cdk synth` (the CI gate) works on a fresh clone that hasn't built the SPA yet.
@@ -65,6 +71,40 @@ export class WebStack extends Stack {
       originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
     };
 
+    // Security headers for the app shell. CSP is `self`-only: the SPA loads no third-party
+    // script/style/font and calls only the same-origin API (ADR-022), so a strict policy
+    // costs nothing and blocks injected-script + clickjacking classes outright.
+    const securityHeaders = new cloudfront.ResponseHeadersPolicy(this, 'ConsoleSecurityHeaders', {
+      responseHeadersPolicyName: `lca-${envName}-console-security`,
+      securityHeadersBehavior: {
+        contentSecurityPolicy: {
+          contentSecurityPolicy: [
+            "default-src 'none'",
+            "script-src 'self'",
+            "style-src 'self'",
+            "img-src 'self' data:",
+            "font-src 'self'",
+            "connect-src 'self'",
+            "form-action 'self'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+          ].join('; '),
+          override: true,
+        },
+        contentTypeOptions: { override: true },
+        frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true },
+        referrerPolicy: {
+          referrerPolicy: cloudfront.HeadersReferrerPolicy.SAME_ORIGIN,
+          override: true,
+        },
+        strictTransportSecurity: {
+          accessControlMaxAge: Duration.days(365),
+          includeSubdomains: true,
+          override: true,
+        },
+      },
+    });
+
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: `LambdaCIActions console (${envName})`,
       defaultRootObject: 'index.html',
@@ -73,16 +113,14 @@ export class WebStack extends Stack {
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+        responseHeadersPolicy: securityHeaders,
       },
       additionalBehaviors: {
         '/api/*': apiBehavior,
         '/auth/*': apiBehavior,
       },
-      errorResponses: [
-        // SPA routing: unknown paths fall through to the app shell.
-        { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html', ttl: Duration.minutes(5) },
-        { httpStatus: 404, responseHttpStatus: 200, responsePagePath: '/index.html', ttl: Duration.minutes(5) },
-      ],
+      // No `errorResponses`: see the class doc — a distribution-wide rewrite would corrupt
+      // the API's 403/404 responses.
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
     });
 

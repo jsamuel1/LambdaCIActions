@@ -32,7 +32,17 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   if (res.status === 401) throw new UnauthorizedError();
   const text = await res.text();
-  const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  // The API always answers JSON, but an edge/proxy error page might not — don't turn that
+  // into an unhelpful SyntaxError.
+  let body: Record<string, unknown> = {};
+  if (text) {
+    try {
+      body = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`);
+      throw new ApiError(res.status, 'unexpected non-JSON response');
+    }
+  }
   if (!res.ok) {
     throw new ApiError(res.status, String(body.error ?? `HTTP ${res.status}`), body.details);
   }
@@ -115,6 +125,8 @@ export interface Health {
   errorRate: number;
   stuck: Run[];
   generatedAt: string;
+  /** False when a status count hit the paging budget and is a floor, not a total. */
+  countsExact?: boolean;
 }
 
 export interface Flavor {
@@ -169,20 +181,34 @@ export const api = {
       `/api/repos/${repoId}/flavor-map?installation=${installationId}`,
       { method: 'PUT', body: JSON.stringify({ flavorMap }) },
     ),
-  runs: (query: { repo?: number; status?: RunStatus; limit?: number } = {}) => {
+  runs: (query: { repo?: number; status?: RunStatus; limit?: number; cursor?: string } = {}) => {
     const p = new URLSearchParams();
     if (query.repo !== undefined) p.set('repo', String(query.repo));
     if (query.status) p.set('status', query.status);
     if (query.limit) p.set('limit', String(query.limit));
+    if (query.cursor) p.set('cursor', query.cursor);
     const qs = p.toString();
     return request<{ runs: Run[]; nextCursor: string | null }>(`/api/runs${qs ? `?${qs}` : ''}`);
   },
   run: (repoId: number, runId: number, jobId: number) =>
     request<{ run: Run }>(`/api/runs/${repoId}/${runId}/${jobId}`),
-  runLogs: (repoId: number, runId: number, jobId: number, nextToken?: string) =>
-    request<LogPage>(
-      `/api/runs/${repoId}/${runId}/${jobId}/logs${nextToken ? `?nextToken=${encodeURIComponent(nextToken)}` : ''}`,
-    ),
+  /**
+   * One page of a run's logs. Pass `nextToken` while CloudWatch keeps issuing one; once it
+   * stops (caught up), pass `since` = newest event timestamp + 1 ms so the tail resumes
+   * instead of replaying the last page.
+   */
+  runLogs: (
+    repoId: number,
+    runId: number,
+    jobId: number,
+    opts: { nextToken?: string; since?: number } = {},
+  ) => {
+    const p = new URLSearchParams();
+    if (opts.nextToken) p.set('nextToken', opts.nextToken);
+    else if (opts.since !== undefined) p.set('since', String(opts.since));
+    const qs = p.toString();
+    return request<LogPage>(`/api/runs/${repoId}/${runId}/${jobId}/logs${qs ? `?${qs}` : ''}`);
+  },
   flavors: () => request<{ flavors: Flavor[] }>('/api/flavors'),
   health: () => request<Health>('/api/health'),
   settings: () => request<Settings>('/api/settings'),

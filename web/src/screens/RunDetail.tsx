@@ -24,6 +24,8 @@ export function RunDetail({
   const [logErr, setLogErr] = useState<string | undefined>(undefined);
   const [tailing, setTailing] = useState(true);
   const tokenRef = useRef<string | undefined>(undefined);
+  /** Newest event timestamp already rendered — the tail watermark when tokens run out. */
+  const sinceRef = useRef<number | undefined>(undefined);
   const preRef = useRef<HTMLPreElement | null>(null);
 
   const status = run.data?.run.status;
@@ -33,21 +35,28 @@ export function RunDetail({
   useEffect(() => {
     setPages([]);
     tokenRef.current = undefined;
+    sinceRef.current = undefined;
   }, [repoId, runId, jobId]);
 
   useEffect(() => {
     let cancelled = false;
     async function pull(): Promise<void> {
       try {
-        const page = await api.runLogs(repoId, runId, jobId, tokenRef.current);
+        const page = await api.runLogs(repoId, runId, jobId, {
+          nextToken: tokenRef.current,
+          since: sinceRef.current,
+        });
         if (cancelled) return;
         setLogErr(undefined);
         if (page.events.length) {
           setPages((prev) => [...prev, page]);
+          const newest = page.events.reduce((max, e) => (e.timestamp > max ? e.timestamp : max), 0);
+          if (newest) sinceRef.current = newest + 1;
           if (preRef.current) preRef.current.scrollTop = preRef.current.scrollHeight;
         }
-        // CloudWatch returns a stable token when caught up; keep it to resume the tail.
-        tokenRef.current = page.nextToken ?? tokenRef.current;
+        // CloudWatch drops the token once caught up; from then on the watermark drives the
+        // tail (re-sending a stale token would replay the same page forever).
+        tokenRef.current = page.nextToken ?? undefined;
       } catch (e) {
         if (!cancelled) setLogErr(e instanceof Error ? e.message : String(e));
       }
@@ -74,7 +83,7 @@ export function RunDetail({
   if (!run.data) return <Loading what="run" />;
   const r = run.data.run;
   const events = pages.flatMap((p) => p.events);
-  const pending = pages.length > 0 && pages.every((p) => p.pending);
+  const pending = events.length === 0 && (pages.length === 0 || pages[pages.length - 1].pending);
 
   return (
     <div className="stack">

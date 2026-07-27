@@ -32,7 +32,8 @@ import {
   toWorkflowView,
   type SettingsView,
 } from './views.js';
-import { parseLimit, validateFlavorMap, validateRepoPatch } from './validate.js';
+import { parseLimit, parseEpochMs, validateFlavorMap, validateRepoPatch } from './validate.js';
+import { collectVisible } from './paging.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -161,6 +162,9 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     if (route.id === 'authLogin') return toResult(await handleLogin());
     if (route.id === 'authCallback') return toResult(await handleCallback(event, cookies));
     if (route.id === 'authLogout') {
+      // Logout clears the cookie only; it is intentionally session-agnostic (works on an
+      // already-expired session). `SameSite=Lax` blocks cross-site POSTs, so a forced
+      // logout cannot be triggered from another origin.
       return toResult(
         json(200, { ok: true }, { cookies: [serializeCookie(SESSION_COOKIE, '', { clear: true })] }),
       );
@@ -417,11 +421,16 @@ async function route_(
     case 'getRunLogs': {
       const run = await authorizeRun(session, match);
       if ('reply' in run) return run.reply;
+      const since = asEpochMs(q.since);
       const page = await fetchRunLogs({
         logGroupName: RUN_LOG_GROUP,
         microvmId: run.record.microvmId,
         limit: parseLimit(q.limit, 200, 1000),
         nextToken: q.nextToken,
+        // `since` is the client's tail watermark: the newest event timestamp it already
+        // holds, +1 ms. Used when CloudWatch stopped issuing tokens (caught up) so the tail
+        // resumes instead of replaying the page (see src/mgmt/logs.ts).
+        startTime: q.nextToken ? undefined : since,
       });
       return json(200, {
         logGroup: RUN_LOG_GROUP,
@@ -436,7 +445,7 @@ async function route_(
       return json(200, { flavors: buildFlavorViews(await imageAvailability()) });
 
     case 'health':
-      return healthRoute();
+      return healthRoute(session);
 
     case 'settings':
       return settingsRoute();
@@ -450,50 +459,78 @@ async function route_(
  * Runs list. With `repo=<repoId>` it uses the repo/time index (ADR-023); with
  * `status=<status>` the status index; unfiltered it merges the active statuses (the
  * dashboard's "what's happening now" view) — never a table scan.
+ *
+ * Authorization is a post-query filter (the indexes are not keyed by installation), so a
+ * page can come back shorter than `limit`. We keep paging until the page is full or the
+ * index is exhausted — otherwise an operator with one of several installations would see a
+ * near-empty list plus a cursor, which reads as "no runs".
  */
 async function listRunsRoute(
   session: SessionPayload,
   q: Record<string, string | undefined>,
 ): Promise<Reply> {
   const limit = parseLimit(q.limit);
+  const visible = (runs: RunRecord[]): RunRecord[] =>
+    runs.filter((r) => canAdminInstallation(session, r.installationId));
+
   if (q.repo !== undefined) {
     const repoId = asPositiveInt(q.repo);
     if (!repoId) return problem(400, 'repo must be a numeric repo id');
-    const page = await listRunsByRepo(repoId, { limit, cursor: q.cursor });
-    const visible = page.runs.filter((r) => canAdminInstallation(session, r.installationId));
-    return json(200, { runs: visible.map(toRunView), nextCursor: page.nextCursor ?? null });
+    const page = await collectVisible(
+      (cursor) => listRunsByRepo(repoId, { limit, cursor }),
+      visible,
+      limit,
+      q.cursor,
+    );
+    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
   }
   if (q.status !== undefined) {
     if (!ALL_STATUSES.includes(q.status as RunStatus)) {
       return problem(400, `status must be one of ${ALL_STATUSES.join(', ')}`);
     }
-    const page = await listRunsByStatusPaged(q.status as RunStatus, { limit, cursor: q.cursor });
-    const visible = page.runs.filter((r) => canAdminInstallation(session, r.installationId));
-    return json(200, { runs: visible.map(toRunView), nextCursor: page.nextCursor ?? null });
+    const status = q.status as RunStatus;
+    const page = await collectVisible(
+      (cursor) => listRunsByStatusPaged(status, { limit, cursor }),
+      visible,
+      limit,
+      q.cursor,
+    );
+    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
   }
   const pages = await Promise.all(
     ALL_STATUSES.map((s) => listRunsByStatusPaged(s, { limit })),
   );
-  const merged = sortRunsNewestFirst(pages.flatMap((p) => p.runs))
-    .filter((r) => canAdminInstallation(session, r.installationId))
-    .slice(0, limit);
+  const merged = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs))).slice(0, limit);
   // A merged multi-index view has no single coherent cursor — the client narrows by
   // status or repo to paginate deeper.
   return json(200, { runs: merged.map(toRunView), nextCursor: null });
 }
 
-async function healthRoute(): Promise<Reply> {
+/**
+ * Dashboard health. Counts are per-status index counts; `active` sampling is bounded.
+ *
+ * The counts are platform-wide (the status index is not keyed by installation) while every
+ * run LIST is installation-filtered. `stuck` is filtered to the session's grants so no run
+ * identity leaks across tenants — the aggregate numbers are deliberately platform-level and
+ * documented as such in spec 04.
+ */
+async function healthRoute(session: SessionPayload): Promise<Reply> {
   const counts = {} as Record<RunStatus, number>;
+  let exact = true;
   await Promise.all(
     ALL_STATUSES.map(async (s) => {
-      counts[s] = await countRunsByStatus(s);
+      const res = await countRunsByStatus(s);
+      counts[s] = res.count;
+      if (!res.exact) exact = false;
     }),
   );
   const activePages = await Promise.all(
     ACTIVE_STATUSES.map((s) => listRunsByStatusPaged(s, { limit: 100 })),
   );
-  const active: RunRecord[] = activePages.flatMap((p) => p.runs);
-  return json(200, buildHealth(counts, active));
+  const active: RunRecord[] = activePages
+    .flatMap((p) => p.runs)
+    .filter((r) => canAdminInstallation(session, r.installationId));
+  return json(200, { ...buildHealth(counts, active), countsExact: exact });
 }
 
 /**
@@ -571,4 +608,9 @@ async function authorizeRun(
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Epoch-ms query param (log tail watermark); undefined when absent or malformed. */
+function asEpochMs(raw: string | undefined): number | undefined {
+  return parseEpochMs(raw);
 }

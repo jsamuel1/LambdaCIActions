@@ -612,9 +612,16 @@ transition); a scan with a filter expression (cost + latency scale with total hi
 storing a per-repo run counter (write contention on the hot path).
 **Consequences**: one more index to pay for on every run insert (single write, PAY_PER_REQUEST).
 The merged unfiltered view has no coherent cursor, so its `nextCursor` is always null — the
-UI narrows to paginate, which matches how operators actually drill in. `test/run-store-gsi2.test.mjs`
-pins the "gsi2sk is createdAt" invariant so a future transition change can't silently break
-history ordering.
+UI narrows to paginate, which matches how operators actually drill in. Because neither index
+is keyed by installation, authorization is a post-query filter: a filtered list walks up to
+5 index pages per request to fill a page of visible rows (`src/mgmt/paging.ts`) so an
+operator whose installation is a minority of platform traffic doesn't see "no runs" next to a
+cursor. Dashboard `Select: COUNT` queries page `LastEvaluatedKey` up to 10 times and report
+`countsExact: false` when that budget is spent — a single COUNT query only counts one 1 MB
+pass, which would silently under-report a long history.
+`test/run-store-gsi2.test.mjs` pins the "gsi2sk is createdAt" invariant so a future
+transition change can't silently break history ordering; `test/mgmt-authz-paging.test.mjs`
+pins the visibility-paging contract.
 
 ## ADR-024 — One CloudFront distribution fronts both the SPA and the management API (M4)
 **Status**: Accepted (v1)
@@ -625,8 +632,13 @@ CORS with credentials, and the OAuth redirect URI points at a different host tha
 **Decision**: **one distribution, two behaviors.** Default behavior → private S3 bucket via
 Origin Access Control (bucket is never public); `/api/*` and `/auth/*` → the HTTP API
 origin with `CACHING_DISABLED` + `ALL_VIEWER_EXCEPT_HOST_HEADER` (cookies and query
-strings forwarded, nothing cached). SPA deep links are handled by 403/404 → `/index.html`,
-and the app itself uses hash routing so in-app navigation never round-trips.
+strings forwarded, nothing cached). SPA deep links do **not** need a CloudFront error
+rewrite: the app is hash-routed (`#/runs/1/2/3`), so every real request path is `/`. We
+deliberately configure **no** `errorResponses` — custom error responses are
+distribution-wide, so a 403/404 → `/index.html` rewrite would also rewrite the management
+API's `403 forbidden` / `404 not found` into `200` + HTML, breaking the API contract and
+masking authorization denials. The shell also carries a `self`-only CSP + HSTS +
+`frame-ancestors 'none'` via a response-headers policy on the S3 behavior.
 **Why**: same-origin makes the session a first-party cookie, removes CORS entirely, and
 gives OAuth a single stable callback URL (`https://<domain>/auth/callback`). It also puts
 the API behind CloudFront's TLS + edge termination for free.
@@ -677,5 +689,9 @@ API would require the control plane to know about connected UI clients, coupling
 path to the management plane for a cosmetic gain.
 **Consequences**: idle open tabs cost DynamoDB reads; the visibility pause bounds that to
 tabs a human is actually looking at, and the aggregate queries are `Select: COUNT` or
-`Limit`-bounded index queries (never scans). Phase 3 already lists WebSocket live updates —
-this ADR is the explicit "not yet", not a rejection.
+`Limit`-bounded index queries (never scans). The log tail follows CloudWatch's `nextToken`
+only while one is issued — the filter stops returning a token once caught up, so the client
+then advances a `since` watermark (newest event held, +1 ms). Re-sending a spent token, as
+the first implementation did, replays the same page indefinitely; `test/mgmt-logs.test.mjs`
+pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
+WebSocket live updates — this ADR is the explicit "not yet", not a rejection.

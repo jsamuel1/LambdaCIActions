@@ -43,6 +43,15 @@ export function Dashboard({
         <Stat label="Error rate" value={`${Math.round(h.errorRate * 100)}%`} />
         <Stat label="Repos enabled" value={enabled} />
       </div>
+      {h.countsExact === false && (
+        <p className="muted">
+          Run counts are a lower bound — history in at least one status exceeds the count paging
+          budget.
+        </p>
+      )}
+      <p className="muted">
+        Counts are platform-wide; run lists and stuck runs are scoped to your installations.
+      </p>
 
       {h.stuck.length > 0 && (
         <div className="card">

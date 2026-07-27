@@ -100,3 +100,15 @@ export function parseLimit(raw: string | undefined, def = 50, max = 200): number
   if (!Number.isSafeInteger(n) || n <= 0) return def;
   return Math.min(n, max);
 }
+
+/**
+ * Parse an epoch-milliseconds query param (the log viewer's tail watermark). Returns
+ * undefined for anything non-numeric or out of range so a bogus value falls back to "whole
+ * stream" rather than reaching CloudWatch as garbage.
+ */
+export function parseEpochMs(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  if (!/^\d{1,15}$/.test(raw)) return undefined;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+}
