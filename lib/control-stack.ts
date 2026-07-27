@@ -145,8 +145,23 @@ export class ControlStack extends Stack {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       description: 'Execution role stamped on LambdaCIActions microVMs (reads JIT config from DDB)',
     });
-    // Read-only on the run table so the /run hook can fetch its JIT config item.
+    // Read-only on the run table so the /run hook can fetch its JIT config item — and, at
+    // job end, read its own microvmId back off the run row for self-terminate (ADR-019).
     table.grantReadData(microvmExecRole);
+    // Self-terminate (ADR-019): the hook calls terminate-microvm on ITSELF at job end so
+    // the VM dies instantly instead of idling until the Reaper sweep (~5 min of billing).
+    // The GA API has no VM-level resource ARNs/tags (ADR-015), so scope to the region —
+    // this role only ever lives inside our own VMs.
+    microvmExecRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'SelfTerminate',
+        actions: ['lambda:TerminateMicrovm'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:RequestedRegion': this.region },
+        },
+      }),
+    );
     // Runtime logs: the VM writes run-hook + runner output to the per-run log group
     // Provision passes at launch (ADR-016).
     microvmExecRole.addToPolicy(

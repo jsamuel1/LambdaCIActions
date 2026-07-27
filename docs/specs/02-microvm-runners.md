@@ -47,7 +47,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | Flavor | Label | Base | vCPU/Mem | Contents |
 |---|---|---|---|---|
 | `base` | `lambda-ci` | Ubuntu arm64 + runner agent | 2 / 4 GB | git, curl, common toolchain |
-| `docker` | `lambda-ci-docker` | base + dockerd (DinD) | 4 / 8 GB | Docker daemon, buildx. **Privileged** — built with `additionalOsCapabilities=ALL` + root entrypoint (ADR-019) |
+| `docker` | `lambda-ci-docker` | base + dockerd (DinD) | 4 / 8 GB | Docker daemon, buildx. **Privileged** — built with `additionalOsCapabilities=ALL` + root entrypoint (ADR-020) |
 | `node` | `lambda-ci-node` | base + Node LTS + pnpm | 2 / 4 GB | Node, package managers |
 | `custom-*` | per-repo | per-repo Dockerfile | configurable | repo-specified |
 
@@ -87,17 +87,22 @@ Provision λ passes the JIT config + job metadata as the `--run-hook-payload` JS
 delivers it to `POST /run` after the snapshot boots.
 
 ```
-POST /run   { jitConfig, runId, jobId, repoFullName, labels }   (≤16 KB payload)
-  ├─ parse payload; validate required fields
+POST /run   { ref, region, table }        (≤ 4 KB payload — JIT config by reference, ADR-016)
+  ├─ resolve ref → { jitConfig, runId, jobId, … } via DynamoDB get-item (exec role)
   ├─ (flavor pre-run hook, if present: ${RUNNER_DIR}/pre-run.sh — docker flavor starts dockerd)
   ├─ cd /opt/actions-runner
   ├─ ./run.sh --jitconfig <jitConfig>     # runs exactly ONE job, then exits
   │    (when the entrypoint is root: setpriv --reuid/--regid/--init-groups runner)
   ├─ return 200 quickly so Lambda un-gates traffic; run the job in the background
-  └─ on agent exit → call `terminate-microvm` (self-terminate); Reaper backstops orphans
+  └─ on agent exit → read own microvmId back off the run row (Provision stamped it
+     post-launch, ADR-019) → `terminate-microvm` (self-terminate); Reaper backstops
 
 POST /terminate   # fires pre-teardown; best-effort final status report
 ```
+
+- There is **no in-guest id source** for the VM's own `microvmId` (no metadata file, no
+  env var — verified from live runs, ADR-019). Self-terminate therefore reads the id
+  back from the run row using the same `{ref, region, table}` pointer as the JIT fetch.
 
 - JIT config is **single-use** (see [01](01-github-app.md)); it arrives in the payload,
   never in surviving env/user-data, and nothing long-lived lands on disk.
@@ -108,7 +113,7 @@ POST /terminate   # fires pre-teardown; best-effort final status report
   with `setpriv`. That flavor is the only one built with `additionalOsCapabilities=ALL`
   and the only one whose entrypoint stays root — a default microVM has an empty capability
   set, a read-only `/sys` and no writable cgroup hierarchy, so a rootful daemon cannot
-  start, and in-guest `sudo` can never escalate (`NoNewPrivs: 1`). See **ADR-019** and
+  start, and in-guest `sudo` can never escalate (`NoNewPrivs: 1`). See **ADR-020** and
   `docs/VERIFY-M3.md`. Cold `dockerd` init measures ~40 s on 4 vCPU Graviton.
 
 ## Provisioning lifecycle
@@ -120,8 +125,9 @@ receive msg {installation_id, repo_id, run_id, job_id, labels}
   ├─ dedupe on (repo_id, run_id, job_id)            # idempotency
   ├─ resolve flavor  → image ARN                     # FlavorMap + flavors.json
   ├─ mint installation token → JIT config            # GitHub App (01)
-  ├─ run-microvm(--image-identifier <ARN>,           # tag: lca:run=<run_id>
-  │              --run-hook-payload <JSON jit+meta>)  # ≤16 KB (ADR-012)
+  ├─ run-microvm(--image-identifier <ARN>,           # no VM tags on GA API (ADR-015)
+  │              --run-hook-payload <JSON ref>)        # ≤ 4 KB — by reference (ADR-016)
+  ├─ stamp Run.microvmId (unconditional, ADR-019)     # hook readback + Reaper correlation
   ├─ write Run: status=provisioning → running
   └─ on launch error → throw → SQS retry → DLQ; Run=failed(reason)
 ```
@@ -132,7 +138,7 @@ Transitions written to DynamoDB `Run` rows for the UI.
 ## Reaping & timeouts
 
 - **Per-runner cap**: `MAX_RUNNER_LIFETIME` (default well under 8h) enforced by the runner itself and by the Reaper.
-- **Reaper λ** (EventBridge schedule): lists microVMs tagged `lca:run=*`; terminates any past cap; closes `Run` rows with no live microVM (`timed_out`/`orphaned`).
+- **Reaper λ** (EventBridge schedule): lists live microVMs (no tags on the GA API — correlates by the run store's persisted `microvmId`, ADR-015); terminates any past cap; closes `Run` rows with no live microVM (`timed_out`/`orphaned`). Backstop only — the primary teardown is the hook's self-terminate (ADR-019).
 - **Stuck-queue signal**: `Run` in `provisioning` beyond threshold ⇒ UI health warning (likely a quota wall — see [05](05-infrastructure.md)).
 
 ## Caching & pre-warming

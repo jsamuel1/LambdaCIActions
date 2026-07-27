@@ -217,6 +217,36 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
 }
 
 /**
+ * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/017). Separate from
+ * transitionRun because the mapping must be recorded even if the status already advanced
+ * (e.g. an ultra-fast job whose `completed` webhook beat the `running` transition) — the
+ * microVM /run hook reads this back at job end to self-terminate, and the Reaper
+ * correlates live VMs against it. Only requires the row to exist.
+ */
+export async function stampMicrovmId(input: {
+  repoId: number;
+  runId: number;
+  jobId: number;
+  microvmId: string;
+}): Promise<boolean> {
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: runPk(input.repoId, input.runId, input.jobId), sk: RUN_SK },
+        UpdateExpression: 'SET microvmId = :mid',
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeValues: { ':mid': input.microvmId },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if (isConditionalFailed(err)) return false; // row missing — nothing to stamp
+    throw err;
+  }
+}
+
+/**
  * List runs currently in a non-terminal status, for the Reaper's reconciliation sweep.
  * Uses GSI1 (status index) so it never scans the table.
  */

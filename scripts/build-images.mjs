@@ -180,7 +180,7 @@ function buildFlavor(flavor, ctx) {
     JSON.stringify({ cloudWatch: { logGroup: `/aws/lambda/microvms/lca-${ENV}-${flavor.name}` } }),
   ];
 
-  // Extra OS capabilities for the guest (ADR-019). Default microVMs boot with an empty
+  // Extra OS capabilities for the guest (ADR-020). Default microVMs boot with an empty
   // capability set, a read-only /sys and no writable cgroup hierarchy, so a rootful Docker
   // daemon cannot start ("failed to start daemon: Devices cgroup isn't mounted"). Flavors
   // that declare `osCapabilities` in the catalog get them here; only ALL is supported today.

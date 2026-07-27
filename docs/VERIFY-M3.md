@@ -7,7 +7,7 @@
 
 Verified against the live `dev` deployment on **2026-07-27**. Getting there required fixing
 one real platform defect in the `docker` flavor (see [Defect found](#defect-found-docker-flavor-could-never-start-dockerd)
-and **ADR-019**) — the routing logic itself was correct on first run.
+and **ADR-020**) — the routing logic itself was correct on first run.
 
 ---
 
@@ -17,10 +17,10 @@ and **ADR-019**) — the routing logic itself was correct on first run.
 |---|---|
 | Account / region | `863638663908` / `us-west-2` (pinned via `.env.local`, ADR-018) |
 | Stacks | `LCA-Image-dev`, `LCA-Data-dev`, `LCA-Control-dev` |
-| Source | `main` @ `945aa0e` + the ADR-019 fix on this branch |
+| Source | `main` @ `945aa0e` + the docker-flavor fix (ADR-020) on this branch |
 | Toolchain | AWS CLI **2.36.8** (`aws lambda-microvms` present — the floor is ≥ 2.35.17) |
 | Control plane | `lca-dev-ingest`, `lca-dev-discovery`, `lca-dev-provision`, `lca-dev-reaper` |
-| Images | `lca-dev-base`, `lca-dev-node`, `lca-dev-docker` (all rebuilt from this tree) |
+| Images | headline run: `lca-dev-base` v9.0, `lca-dev-node` v8.0, `lca-dev-docker` v8.0; confirming re-run on `lca-dev-docker` v9.0 (all built from this tree) |
 | GitHub App | `lambdaciactions-dev` (app id `4292494`, installation `146431062`) |
 | Webhook | `https://w061napnkg.execute-api.us-west-2.amazonaws.com/webhook` |
 
@@ -100,30 +100,37 @@ job logs:
 
 ### 5. Boot latency + per-job cost
 
-Measured from the same run (`/aws/lambda/lca-dev-provision` + the guest log group
-`/aws/lambda/microvms/runs/lca-dev`):
+Measured from the same run, correlating `/aws/lambda/lca-dev-provision` (`microVM launched`
+→ the `RunMicrovm` return), the guest log group `/aws/lambda/microvms/runs/lca-dev`
+(`job starting`, `job finished`) and the GitHub job start/complete timestamps:
 
 | Phase | base | node | docker |
 |---|---|---|---|
-| `RunMicrovm` call → `/run` hook delivered (**boot**) | ~1.4 s | ~1.2 s | ~1.4 s |
+| `RunMicrovm` returns → `/run` hook fires in-guest (**boot + hook delivery**) | 2.7 s | 2.8 s | 15.5 s |
 | `/run` → runner agent picks up the job | ~6 s | ~6 s | ~55 s¹ |
-| Job wall-clock (agent start → conclusion) | ~19 s | ~24 s | ~100 s |
-| microVM total billed lifetime (launch → self-terminate) | ~19 s | ~24 s | ~96 s |
+| GitHub job wall-clock (start → conclusion) | 6 s | 10 s | 24 s |
+| `RunMicrovm` → agent exit (**useful VM lifetime**) | 15 s | 20 s | 95 s |
 
 ¹ the `docker` flavor's pre-run hook starts `dockerd` before handing over to the agent;
-cold daemon init measured **32–39 s** across runs on 4 vCPU Graviton (see the caveat below).
+cold daemon init measured **39 s** on this run and **32 s** on the confirming re-run, on
+4 vCPU Graviton (see the caveat below). Its larger boot figure is the same effect — the
+4 vCPU / 8 GB snapshot is bigger.
 
 Per-job cost at the reference Graviton rate (2 vCPU / 4 GB ≈ **$0.0044/min**, 4 vCPU / 8 GB
-≈ **$0.0088/min**), billed per second:
+≈ **$0.0088/min**), billed per second. **These are useful-lifetime figures and therefore a
+floor, not the bill for this run**: the images under test predate the run-row readback
+self-terminate (ADR-019, landed on `main` after these images were built), so each VM idled
+until the Reaper's ≤5-minute sweep — add up to ~$0.022 (2/4) / ~$0.044 (4/8) per job until
+the images are rebuilt.
 
-| Flavor | Lifetime | Rate | Cost |
+| Flavor | Useful lifetime | Rate | Cost floor |
 |---|---|---|---|
-| `base` (2/4) | 19 s | $0.0044/min | ≈ **$0.0014** |
-| `node` (2/4) | 24 s | $0.0044/min | ≈ **$0.0018** |
-| `docker` (4/8) | 96 s | $0.0088/min | ≈ **$0.0141** |
+| `base` (2/4) | 15 s | $0.0044/min | ≈ **$0.0011** |
+| `node` (2/4) | 20 s | $0.0044/min | ≈ **$0.0015** |
+| `docker` (4/8) | 95 s | $0.0088/min | ≈ **$0.0139** |
 
-Boot latency is consistent with the M1 measurement — snapshot boot is ~1–1.5 s and is not
-the dominant term; agent handshake and (for `docker`) daemon init are.
+Snapshot boot is not the dominant term for the small flavors (single-digit seconds to the
+in-guest hook); agent handshake and (for `docker`) daemon init are.
 
 ## Defect found: docker flavor could never start dockerd
 
@@ -144,7 +151,7 @@ in-guest constraints, each established by probe jobs on real microVMs:
    escape hatch: the same mount denial applies and `dockerd-rootless.sh` isn't shipped by
    the Docker apt packages.
 
-**Fix (ADR-019)** — scoped to the one flavor that asks for Docker:
+**Fix (ADR-020)** — scoped to the one flavor that asks for Docker:
 
 - build the `docker` image with the GA API's `--additional-os-capabilities ALL` (declared
   per flavor as `osCapabilities` in `microvm/flavors.json`, forwarded by
@@ -158,7 +165,9 @@ in-guest constraints, each established by probe jobs on real microVMs:
 After the fix the same unchanged fixture went green: `cgroup=0::/ controllers=cpuset cpu io
 memory hugetlb pids` → `dockerd ready in 39s: 29.6.2` → `docker run arm64v8/alpine` →
 `aarch64`. `base` and `node` remain unprivileged (`USER runner`, no extra capabilities);
-`test/image-content.test.mjs` pins that asymmetry.
+`test/image-content.test.mjs` pins that asymmetry. Confirmed on the control plane:
+`get-microvm-image-version` reports `additionalOsCapabilities: ["ALL"]` for `lca-dev-docker`
+v8.0/v9.0 and `null` for `lca-dev-base` v9.0 / `lca-dev-node` v8.0.
 
 A confirming re-run on the exact image built from this branch
 ([`30245239270`](https://github.com/jsamuel1/lca-m3-verify/actions/runs/30245239270)) was
@@ -171,15 +180,17 @@ green on all three jobs (`dockerd ready in 32s`).
   daemon isn't killed. Pre-warming containerd into the snapshot is a Phase-3 item
   (alongside the warm pool, ADR-006).
 - **`microvmId` self-discovery still fails in-guest.** `{"msg":"microvm id discovery
-  failed", … envKeys:[AWS_LAMBDA_MICROVM_IMAGE_*]}` → the run-hook falls back to
-  `{"msg":"no microvm id available; relying on Reaper"}`, so VMs are swept within ~5 min
-  instead of self-terminating instantly. The run-row readback fix for this exists on the
-  unmerged `kermes/task-fiery-butterfly` branch; the cost figures above use launch→job-end
-  and therefore *understate* today's actual billed lifetime.
-- **`transitions` is empty on the run records** (`transitions: 0`) even though status
-  advances `queued → provisioning → running → completed`. Terminal status and flavor are
-  correct; the per-transition audit list isn't being appended. Worth a look in M4 when the
-  UI starts reading run history.
+  failed", … envKeys:[AWS_LAMBDA_MICROVM_IMAGE_*]}` → the run-hook fell back to
+  `{"msg":"no microvm id available; relying on Reaper"}` on every VM in both runs, so they
+  were swept within ~5 min instead of self-terminating instantly. This is **already fixed on
+  `main`** by the run-row readback (ADR-019, commit `05cb7cd`), now merged into this branch —
+  but the images under test were built from the pre-merge tree, so the fix only takes effect
+  after the next `build:images`. The cost figures above are useful-lifetime floors and
+  understate this run's actual billed lifetime accordingly.
+- **No per-transition audit history on run rows.** `RunRecord` (`src/shared/types.ts`) has
+  no `transitions` field — each write overwrites `status`/`updatedAt` in place, so only the
+  latest state survives (terminal status, flavor and `microvmId` are all correct). Not a
+  defect against any current spec; it becomes work in M4 when the UI wants run history.
 
 ## Reproducing
 
