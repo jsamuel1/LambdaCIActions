@@ -229,8 +229,9 @@ Also: `RunMicrovm` requires `lambda:PassNetworkConnector` on the aws-managed con
 run↔VM mapping (ADR-015), so it is the natural side-store, and the TTL bounds JIT-config
 exposure. The exec role gives the VM a scoped identity (narrowed to broker-invoke-only by
 ADR-020).
-**Consequences**: The microVM image and the control plane now share a contract (table
-name + ref format) delivered via the payload. Rotating the hook-path prefix is AWS's
+**Consequences**: The microVM image and the control plane now share a contract (the ref
+format, and — per ADR-020 — the broker name + capability token) delivered via the payload.
+Rotating the hook-path prefix is AWS's
 call — the server tolerates both shapes. Terminal-state JIT items age out via TTL; a
 failed launch leaves an orphaned JITCONFIG item that TTLs away harmlessly.
 
@@ -459,8 +460,15 @@ role (a role create/delete per job — quota-bound, slow on the hot path, and
 URL (equivalent trust model, but adds a public-internet edge for an operation that has no
 reason to be reachable off-account); leaving read table-wide and only fixing terminate
 (leaves the harvesting primitive intact for the next privileged operation added).
-**Consequences**: One extra Lambda invoke on the boot path (~50 ms, off the critical
-latency budget since the hook ACKs `/run` after it) and one more function to deploy. The
+**Consequences**: One extra Lambda invoke on the boot path (~50 ms) — and it is *on* the
+critical path, because `/run` cannot ACK until the JIT config is resolved and Lambda gates
+traffic to the VM until that ACK. That makes the guest-side call bounded on purpose: a
+15 s per-invoke wall clock (the AWS CLI otherwise blocks `spawnSync` forever if the guest's
+network is broken, which would strand the VM with no ACK and no retry) and exponential
+backoff across attempts, since the reserved-concurrency cap below can legitimately throttle
+a launch burst and flat retries would all land in the same throttle window. Terminate gets a
+larger attempt budget than the boot fetch (no ACK deadline behind it). And one more function
+to deploy. The
 broker is capped at 20 reserved concurrent executions: its only callers are untrusted VMs
 (one call at boot, one at job end), so a pathological VM fleet must not be able to drain the
 account's unreserved concurrency pool out from under the control plane. The broker is now

@@ -133,7 +133,7 @@ test('selfTerminate survives a broker call that throws', () => {
     'utf8',
   );
   const body = src.slice(src.indexOf('function selfTerminate('), src.indexOf('function callBroker('));
-  assert.match(body, /try \{\s*res = callBroker\('terminate'\);/);
+  assert.match(body, /try \{\s*(?:\/\/[^\n]*\n\s*)*res = callBroker\('terminate'(?:, \d+)?\);/);
   assert.match(body, /brokered terminate threw; Reaper will backstop/);
   // The scratch-dir setup inside callBroker is likewise guarded (a workflow can fill the
   // disk or clobber TMPDIR before the terminate call runs).
@@ -158,4 +158,47 @@ test('a malformed broker response never leaks its body into the log', () => {
     },
   );
   assert.deepEqual(parseBrokerResponse('{"ok":true}'), { ok: true });
+});
+
+// `aws lambda invoke` is spawned SYNCHRONOUSLY from the hook. With no timeout, a CLI that
+// hangs (broken guest DNS/network after a workflow has messed with it, stalled endpoint)
+// blocks forever: the retry loop can never fire, `/run` never ACKs — and Lambda gates traffic
+// to the VM until it does, so the VM is stranded until the Reaper — and at job end the hook
+// process hangs past the job, losing the /terminate log flush and paying idle minutes.
+test('every broker invoke is wall-clock bounded and hard-killed', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  const timeout = src.match(/const BROKER_CALL_TIMEOUT_MS = (\d+);/);
+  assert.ok(timeout, 'no per-invoke timeout constant');
+  const ms = Number(timeout[1]);
+  assert.ok(ms > 0 && ms <= 30000, `implausible invoke timeout: ${ms}ms`);
+  // The bound has to be ON the spawnSync that runs the CLI, with SIGKILL so a CLI ignoring
+  // SIGTERM can't outlive it.
+  const spawn = src.slice(src.indexOf("spawnSync('aws', args"), src.indexOf('if (r.status !== 0)'));
+  assert.match(spawn, /timeout: BROKER_CALL_TIMEOUT_MS/);
+  assert.match(spawn, /killSignal: 'SIGKILL'/);
+  // A timeout/spawn failure sets `error` with a null status, so the failure log must report it
+  // (otherwise the diagnostic line is empty for exactly this class).
+  const at = src.indexOf("log('broker invoke failed'");
+  const failLog = src.slice(at, at + 400);
+  assert.match(failLog, /error: r\.error \? safeErr\(r\.error\) : undefined/);
+});
+
+// The broker's reserved-concurrency cap (20) exists to stop an untrusted VM fleet draining
+// the account pool — but it also means a launch burst can legitimately get
+// TooManyRequestsException. Flat retries would all land inside the same throttle window and
+// fail the job at boot, so the backoff must grow.
+test('broker retries back off exponentially, with a bigger budget for terminate', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.match(src, /sleepSync\(delayMs \* 2 \*\* \(i - 1\)\)/);
+  // Terminate has no `/run` ACK deadline behind it and must survive both the post-launch
+  // stamp race and a throttle burst, so it asks for more attempts than the default.
+  const attempts = Number(src.match(/function callBroker\(action, attempts = (\d+)/)[1]);
+  const terminateAttempts = Number(src.match(/callBroker\('terminate', (\d+)\)/)[1]);
+  assert.ok(terminateAttempts > attempts, `terminate budget ${terminateAttempts} <= default ${attempts}`);
 });

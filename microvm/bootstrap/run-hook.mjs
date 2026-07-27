@@ -86,7 +86,9 @@ function selfTerminate(reason) {
   // backstops".
   let res = null;
   try {
-    res = callBroker('terminate');
+    // More attempts than the boot fetch: this call has no `/run` ACK deadline behind it, and
+    // it must survive both the post-launch stamp race and a broker throttle burst.
+    res = callBroker('terminate', 4);
   } catch (err) {
     log('brokered terminate threw; Reaper will backstop', { error: safeErr(err) });
     return;
@@ -98,9 +100,23 @@ function selfTerminate(reason) {
   if (res.terminated === false) log('broker had no VM to terminate; Reaper will backstop', {});
 }
 
+// Hard wall-clock bound on one `aws lambda invoke`. The broker λ's own timeout is 30 s but it
+// does at most two GetItems plus a terminate, so a call this slow is the CLI hanging (DNS /
+// metadata / endpoint stall inside a guest whose network a workflow may have mangled) — not a
+// slow broker. Without a bound, spawnSync waits forever: the retry loop below can never fire,
+// `/run` never ACKs (Lambda gates traffic to the VM until it does, so the VM is stranded until
+// the Reaper) and self-terminate hangs the hook process past the job, losing the final log
+// flush and paying idle minutes.
+const BROKER_CALL_TIMEOUT_MS = 15000;
+
 // Invoke the hook broker λ via the baked-in AWS CLI (no npm deps in the image). The VM's
 // execution role grants exactly one action — lambda:InvokeFunction on this function ARN.
-// Retries cover the razor-thin window where Provision hasn't stamped microvmId yet.
+// Retries cover the razor-thin window where Provision hasn't stamped microvmId yet AND the
+// broker's reserved-concurrency throttle: the cap that stops an untrusted VM fleet draining
+// the account pool also means a launch burst can get `TooManyRequestsException`, so the
+// backoff is exponential (2s, 4s, 8s…) rather than flat — flat retries all land inside the
+// same throttle window and fail the job at boot. Boot uses fewer attempts than terminate:
+// `/run` cannot ACK until the fetch returns, and terminate has no such deadline.
 function callBroker(action, attempts = 3, delayMs = 2000) {
   if (!runCtx?.ref || !runCtx?.broker || !runCtx?.token) {
     log('broker call skipped: no broker context', { action });
@@ -108,7 +124,7 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
   }
   const payload = JSON.stringify({ action, ref: runCtx.ref, token: runCtx.token });
   for (let i = 0; i < attempts; i++) {
-    if (i > 0) sleepSync(delayMs);
+    if (i > 0) sleepSync(delayMs * 2 ** (i - 1));
     // `aws lambda invoke` can only write its response to a FILE, and the jitconfig response
     // carries the run's single-use GitHub registration credential. Keep it out of shared
     // /tmp: owner-only dir (mkdtemp is 0700), unlinked + removed in the same call, before
@@ -139,14 +155,22 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
       outFile,
     ];
     if (runCtx.region) args.push('--region', runCtx.region);
-    const r = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const r = spawnSync('aws', args, {
+      encoding: 'utf8',
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: BROKER_CALL_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
     if (r.status !== 0) {
       // The CLI echoes offending parameter values on validation errors; the payload now
       // travels by file, but redact anyway — a future arg or an echoed file body must not
-      // put the capability token in the run's log stream.
+      // put the capability token in the run's log stream. A timeout/spawn failure surfaces
+      // as `r.error` with a null status, so report that too or the line is empty.
       log('broker invoke failed', {
         action,
         attempt: i + 1,
+        status: r.status,
+        error: r.error ? safeErr(r.error) : undefined,
         stderr: redact(r.stderr || '').slice(0, 512),
       });
       cleanup(outDir);
