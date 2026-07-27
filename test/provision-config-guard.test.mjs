@@ -24,12 +24,16 @@ test('the broker-name guard runs before the JIT config is minted', () => {
   const mint = src.indexOf('await generateJitConfig(');
   const stash = src.indexOf('await putJitConfig(');
   const launch = src.indexOf('await launchMicroVM(');
+  const transition = src.indexOf('await transitionRun(');
 
   assert.ok(guard > 0, 'HOOK_BROKER_NAME guard not found');
   assert.ok(mint > 0 && stash > 0 && launch > 0, 'provision steps not found');
   assert.ok(guard < mint, 'guard must precede generateJitConfig (single-use credential)');
   assert.ok(guard < stash, 'guard must precede putJitConfig');
   assert.ok(guard < launch, 'guard must precede launchMicroVM');
+  // Also ahead of the queued→provisioning transition: a config fault should not consume the
+  // run's forward-only status budget (a retry after the transition can no longer re-advance).
+  assert.ok(guard < transition, 'guard must precede the queued→provisioning transition');
 });
 
 test('the payload broker name comes from the guarded value, not a bare env read', () => {

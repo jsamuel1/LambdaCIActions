@@ -502,8 +502,9 @@ same change window as the `LCA-Control` deploy, with no in-flight jobs. Mid-wind
 to start (the hook 400s `/run`) rather than running with weakened IAM; the Reaper reaps the
 stranded VM and GitHub re-queues on the next push. Provision fails the message *before*
 minting a JIT config if `HOOK_BROKER_NAME` is unset (the guard is the first thing
-`provisionOne` does after the idempotency transition, so a misconfigured deploy DLQs without
-ever burning a single-use credential). `test/run-hook.test.mjs` pins the VM-side
+`provisionOne` does after parsing the message — ahead of even the queued→provisioning
+idempotency transition, so a misconfigured deploy DLQs without ever burning a single-use
+credential or moving run state). `test/run-hook.test.mjs` pins the VM-side
 payload/ref contract, but only image rebuild ships it.
 **Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
 `LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM
