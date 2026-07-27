@@ -25,6 +25,7 @@
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 
 const PORT = parseInt(process.env.RUN_HOOK_PORT || '8080', 10);
 const RUNNER_DIR = process.env.RUNNER_DIR || '/opt/actions-runner';
@@ -97,7 +98,12 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
   const payload = JSON.stringify({ action, ref: runCtx.ref, token: runCtx.token });
   for (let i = 0; i < attempts; i++) {
     if (i > 0) sleepSync(delayMs);
-    const outFile = `/tmp/broker-${action}-${i}.json`;
+    // `aws lambda invoke` can only write its response to a FILE, and the jitconfig response
+    // carries the run's single-use GitHub registration credential. Keep it out of shared
+    // /tmp: owner-only dir (mkdtemp is 0700), unlinked + removed in the same call, before
+    // any workflow code runs. Nothing long-lived lands on disk (spec 02 / ADR-003).
+    const outDir = fs.mkdtempSync(`${os.tmpdir()}/lca-broker-`);
+    const outFile = `${outDir}/response.json`;
     const args = [
       'lambda', 'invoke',
       '--function-name', runCtx.broker,
@@ -108,7 +114,14 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
     if (runCtx.region) args.push('--region', runCtx.region);
     const r = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     if (r.status !== 0) {
-      log('broker invoke failed', { action, attempt: i + 1, stderr: (r.stderr || '').slice(0, 512) });
+      // The CLI echoes the offending parameter value on validation errors, and the payload
+      // holds the capability token — redact before this reaches the run's log stream.
+      log('broker invoke failed', {
+        action,
+        attempt: i + 1,
+        stderr: redact(r.stderr || '').slice(0, 512),
+      });
+      cleanup(outDir);
       continue;
     }
     let body;
@@ -118,7 +131,7 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
       log('broker response unreadable', { action, attempt: i + 1, error: err.message });
       continue;
     } finally {
-      try { fs.unlinkSync(outFile); } catch { /* best-effort */ }
+      cleanup(outDir);
     }
     if (body?.ok !== true) {
       log('broker denied request', { action, attempt: i + 1, error: body?.error });
@@ -140,6 +153,14 @@ export function runRowKeyFromRef(ref) {
   return { pk, sk: 'RUN' };
 }
 
+// Remove a broker response scratch dir (and the credential-bearing file in it).
+function cleanup(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  }
+}
 
 // Blocking sleep — fine here: broker retries happen either before the job starts or after
 // it finishes, with nothing else pending.
@@ -296,7 +317,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       jobStarted = true;
-      runCtx = { ref: ptr.ref, region: ptr.region, broker: ptr.broker, token: ptr.token };
       // ACK fast so Lambda un-gates traffic; run the job in the background.
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');

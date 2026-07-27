@@ -115,18 +115,24 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   //    self-terminate, WITHOUT holding table-wide DDB read or region-wide
   //    TerminateMicrovm itself.
   const hookToken = randomBytes(32).toString('base64url');
+  const hookTokenHash = hashHookToken(hookToken);
+  // Fail BEFORE minting a single-use JIT config / launching: an unset broker name would
+  // launch a VM whose /run hook 400s on the missing pointer field, burning the JIT config
+  // and stranding the VM until the Reaper. Failing here lets SQS retry, then DLQ.
+  const brokerName = process.env.HOOK_BROKER_NAME;
+  if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-020 brokered run hook)');
   const ref = await putJitConfig(req.repoId, {
     jitConfig,
     runId: req.runId,
     jobId: req.jobId,
     repoFullName: req.repoFullName,
     labels: req.labels,
-    hookTokenHash: hashHookToken(hookToken),
+    hookTokenHash,
   });
   const payload: RunHookPayload = {
     ref,
     region: process.env.AWS_REGION ?? 'us-west-2',
-    broker: process.env.HOOK_BROKER_NAME ?? '',
+    broker: brokerName,
     token: hookToken,
   };
 
@@ -167,7 +173,7 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     runId: req.runId,
     jobId: req.jobId,
     microvmId,
-    hookTokenHash: hashHookToken(hookToken),
+    hookTokenHash,
   }).catch((err) => {
     console.error(JSON.stringify({ msg: 'microvmId stamp failed', error: errMsg(err) }));
   });

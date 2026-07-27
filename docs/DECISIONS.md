@@ -466,7 +466,11 @@ exec role. The token hash now lives on two items (JIT config + run row) — one 
 both already happening — because their lifetimes differ; the run row is authoritative for
 terminate. The token is a bearer secret inside the VM: it authorizes only that run's own
 config + self-terminate, and the hook redacts it from logs — but workflow code CAN read it
-from the payload, so it must never be reused for anything broader than "my own run". Note
+from the payload, so it must never be reused for anything broader than "my own run". The
+broker is reached with `aws lambda invoke`, which can only write its response to a file, so
+the hook writes it into a fresh owner-only `mkdtemp` dir and deletes the dir in the same
+call — the `jitconfig` response carries the run's single-use registration credential and
+must not sit in world-readable `/tmp` once workflow code is running. Note
 it outlives the JIT config item's 30-min TTL for the terminate action specifically (bounded
 by the run row's terminal-state TTL and by the VM's own lifetime — the run it can terminate
 is the run that holds it, so replay after job end is a no-op). Residual risk: the broker's
@@ -479,7 +483,9 @@ rejects the new payload (`missing ref/broker/token`) and a new image rejects the
 the two sides must move together: rebuild the flavor images (`npm run build:images`) in the
 same change window as the `LCA-Control` deploy, with no in-flight jobs. Mid-window jobs fail
 to start (the hook 400s `/run`) rather than running with weakened IAM; the Reaper reaps the
-stranded VM and GitHub re-queues on the next push. `test/run-hook.test.mjs` pins the
+stranded VM and GitHub re-queues on the next push. Provision fails the message *before*
+minting a JIT config if `HOOK_BROKER_NAME` is unset, so a misconfigured deploy DLQs instead
+of burning single-use credentials on VMs that can't start. `test/run-hook.test.mjs` pins the
 VM-side payload/ref contract, but only image rebuild ships it.
 **Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
 `LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM

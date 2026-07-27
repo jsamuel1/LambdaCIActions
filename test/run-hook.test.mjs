@@ -56,3 +56,15 @@ test('redact leaves token-free payloads intact', () => {
   const raw = JSON.stringify({ ref: 'RUN#1#2#3#JITCONFIG', broker: 'b' });
   assert.equal(redact(raw), raw);
 });
+
+// `aws lambda invoke` echoes the offending --payload back on validation errors, so the
+// broker-invoke failure log is a second token egress path (into the run's CloudWatch
+// stream) — it goes through redact too.
+test('redact scrubs the token out of AWS CLI error echoes', () => {
+  const cliStderr =
+    'Parameter validation failed:\nInvalid value for parameter Payload: ' +
+    '{"action":"terminate","ref":"RUN#1#2#3#JITCONFIG","token":"SUPERSECRET"}';
+  const out = redact(cliStderr);
+  assert.doesNotMatch(out, /SUPERSECRET/);
+  assert.match(out, /RUN#1#2#3#JITCONFIG/);
+});
