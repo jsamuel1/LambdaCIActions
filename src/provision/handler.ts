@@ -63,6 +63,13 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 async function provisionOne(record: SQSRecord): Promise<void> {
   const req = JSON.parse(record.body) as ProvisionRequest;
 
+  // Config guard FIRST, before anything irreversible (ADR-020). An unset broker name would
+  // launch a VM whose /run hook 400s on the missing pointer field, stranding it until the
+  // Reaper — and, worse, it would already have consumed a single-use GitHub JIT config.
+  // Fail here (before the mint) so SQS retries and then DLQs with nothing burnt.
+  const brokerName = process.env.HOOK_BROKER_NAME;
+  if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-020 brokered run hook)');
+
   // Idempotency guard (spec 05): move queued→provisioning. A duplicate delivery whose run
   // already advanced (running/terminal) is rejected by the forward-only guard — skip the
   // launch so we never double-provision a microVM for the same job.
@@ -116,11 +123,6 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   //    TerminateMicrovm itself.
   const hookToken = randomBytes(32).toString('base64url');
   const hookTokenHash = hashHookToken(hookToken);
-  // Fail BEFORE minting a single-use JIT config / launching: an unset broker name would
-  // launch a VM whose /run hook 400s on the missing pointer field, burning the JIT config
-  // and stranding the VM until the Reaper. Failing here lets SQS retry, then DLQ.
-  const brokerName = process.env.HOOK_BROKER_NAME;
-  if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-020 brokered run hook)');
   const ref = await putJitConfig(req.repoId, {
     jitConfig,
     runId: req.runId,

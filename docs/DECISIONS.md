@@ -484,9 +484,10 @@ the two sides must move together: rebuild the flavor images (`npm run build:imag
 same change window as the `LCA-Control` deploy, with no in-flight jobs. Mid-window jobs fail
 to start (the hook 400s `/run`) rather than running with weakened IAM; the Reaper reaps the
 stranded VM and GitHub re-queues on the next push. Provision fails the message *before*
-minting a JIT config if `HOOK_BROKER_NAME` is unset, so a misconfigured deploy DLQs instead
-of burning single-use credentials on VMs that can't start. `test/run-hook.test.mjs` pins the
-VM-side payload/ref contract, but only image rebuild ships it.
+minting a JIT config if `HOOK_BROKER_NAME` is unset (the guard is the first thing
+`provisionOne` does after the idempotency transition, so a misconfigured deploy DLQs without
+ever burning a single-use credential). `test/run-hook.test.mjs` pins the VM-side
+payload/ref contract, but only image rebuild ships it.
 **Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
 `LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM
 control actions, and an `InvokeFunction` pinned to the broker ARN — so a future
@@ -498,3 +499,11 @@ with the JIT item already aged out, and the pre-stamp race deferring to a retry 
 a terminal denial), that a wrong token never reaches `TerminateMicrovm`,
 that unknown-ref and bad-token responses are byte-identical, and that malformed requests are
 rejected before any store access.
+
+The VM-side retry classification is part of the contract: `aws lambda invoke` exits **0**
+for a Lambda *function* error too (broker timeout, DDB throttle, cold-start crash), writing
+`{errorMessage, errorType}` rather than the broker's own `{ok:false, error}`. The hook only
+stops retrying on the latter — a deliberate refusal can't fix itself, whereas treating a
+transient control-plane blip as terminal would fail the job at boot or silently drop
+self-terminate back to Reaper-only reaping. `test/run-hook.test.mjs` pins both classes, and
+`test/provision-config-guard.test.mjs` pins the guard-before-mint ordering above.

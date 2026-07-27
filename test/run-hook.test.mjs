@@ -3,7 +3,7 @@
 // against the run store's jitConfigRef/runPk so the two sides can't drift silently.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runRowKeyFromRef, redact } from '../microvm/bootstrap/run-hook.mjs';
+import { runRowKeyFromRef, redact, isBrokerRefusal, safeErr } from '../microvm/bootstrap/run-hook.mjs';
 import { runPk, RUN_SK, jitConfigRef } from '../dist/src/shared/run-store.js';
 
 test('runRowKeyFromRef inverts jitConfigRef back to the run row key', () => {
@@ -67,4 +67,42 @@ test('redact scrubs the token out of AWS CLI error echoes', () => {
   const out = redact(cliStderr);
   assert.doesNotMatch(out, /SUPERSECRET/);
   assert.match(out, /RUN#1#2#3#JITCONFIG/);
+});
+
+// `aws lambda invoke` exits 0 for a Lambda FUNCTION error too (broker timeout, DDB throttle,
+// cold-start crash) and writes `{errorMessage, errorType}` instead of the broker's own
+// `{ok:false,error}`. Treating that as a refusal would abandon the boot fetch / drop
+// self-terminate to Reaper-only on a transient control-plane blip, so only a real refusal
+// stops the retry loop.
+test('only the broker own refusal is terminal; function errors stay retryable', () => {
+  assert.equal(isBrokerRefusal({ ok: false, error: 'unauthorized' }), true);
+  assert.equal(isBrokerRefusal({ ok: false, error: 'bad request' }), true);
+
+  for (const transient of [
+    { errorMessage: 'Task timed out after 30.00 seconds', errorType: 'Sandbox.Timedout' },
+    { errorMessage: 'ProvisionedThroughputExceededException', errorType: 'Error' },
+    {},
+    null,
+    undefined,
+    { ok: false }, // non-ok with no structured error is not a decodable refusal
+    { ok: false, error: { code: 'x' } }, // nor a non-string one
+  ]) {
+    assert.equal(
+      isBrokerRefusal(transient),
+      false,
+      `must stay retryable: ${JSON.stringify(transient)}`,
+    );
+  }
+});
+
+test('safeErr renders a function error bounded and token-free', () => {
+  assert.equal(safeErr({ errorType: 'Sandbox.Timedout' }), 'Sandbox.Timedout');
+  assert.equal(safeErr({ errorMessage: 'boom' }), 'boom');
+  assert.equal(safeErr({}), 'unexpected broker response');
+  assert.equal(safeErr(null), 'unexpected broker response');
+  assert.ok(safeErr({ errorMessage: 'z'.repeat(9000) }).length <= 200);
+  assert.doesNotMatch(
+    safeErr({ errorMessage: 'crash echoing {"token":"SUPERSECRET"}' }),
+    /SUPERSECRET/,
+  );
 });

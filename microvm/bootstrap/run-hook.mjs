@@ -134,8 +134,20 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
       cleanup(outDir);
     }
     if (body?.ok !== true) {
-      log('broker denied request', { action, attempt: i + 1, error: body?.error });
-      return body ?? null; // an auth failure won't fix itself — don't burn retries
+      // Distinguish the broker's OWN structured refusal (`{ok:false, error}` — bad request /
+      // unauthorized, which cannot fix itself) from a Lambda-level function error, which
+      // `aws lambda invoke` reports with exit status 0 and an `{errorMessage, errorType}`
+      // body (broker timeout, DDB throttle, cold-start crash). Retrying the former is
+      // pointless; NOT retrying the latter would fail the whole job on a transient control-
+      // plane blip, or silently drop self-terminate back to Reaper-only reaping.
+      const brokerRefusal = isBrokerRefusal(body);
+      log(brokerRefusal ? 'broker denied request' : 'broker invoke errored', {
+        action,
+        attempt: i + 1,
+        error: brokerRefusal ? body.error : safeErr(body),
+      });
+      if (brokerRefusal) return body; // an auth failure won't fix itself — don't burn retries
+      continue;
     }
     // For terminate, an ok:true with terminated:false means "id not stamped yet" — retry.
     if (action === 'terminate' && body.terminated === false && i + 1 < attempts) continue;
@@ -160,6 +172,24 @@ function cleanup(dir) {
   } catch {
     /* best-effort */
   }
+}
+
+// Render a Lambda function-error body for the log without echoing an unbounded blob (and
+// never the payload, which holds the capability token).
+export function safeErr(body) {
+  const msg = body?.errorType || body?.errorMessage || 'unexpected broker response';
+  return redact(String(msg)).slice(0, 200);
+}
+
+/**
+ * True when a non-ok broker response is the broker's OWN deliberate refusal, i.e. terminal
+ * for this VM. `aws lambda invoke` exits 0 for a Lambda FUNCTION error too (timeout, DDB
+ * throttle, crash) and writes `{errorMessage, errorType}` — that IS retryable, so it must
+ * not be mistaken for `unauthorized`. Exported pure so the classification is pinned by
+ * tests without spawning the CLI.
+ */
+export function isBrokerRefusal(body) {
+  return body?.ok === false && typeof body?.error === 'string';
 }
 
 // Blocking sleep — fine here: broker retries happen either before the job starts or after
