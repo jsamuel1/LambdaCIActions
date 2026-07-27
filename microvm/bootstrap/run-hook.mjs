@@ -79,7 +79,18 @@ function readBody(req) {
 // and terminates that VM. A VM therefore cannot target anyone else's VM.
 function selfTerminate(reason) {
   log('self-terminate requested', { reason });
-  const res = callBroker('terminate');
+  // selfTerminate runs from the runner agent's `exit`/`error` handlers, i.e. OUTSIDE any
+  // request scope: an exception thrown here is an uncaught exception that kills the hook
+  // process. That is strictly worse than a missed terminate (the Reaper still reaps, but a
+  // crashed hook also loses the final log flush), so treat every failure as "Reaper
+  // backstops".
+  let res = null;
+  try {
+    res = callBroker('terminate');
+  } catch (err) {
+    log('brokered terminate threw; Reaper will backstop', { error: safeErr(err) });
+    return;
+  }
   if (!res || res.ok !== true) {
     log('brokered terminate failed; Reaper will backstop', { error: res?.error ?? 'invoke failed' });
     return;
@@ -102,17 +113,29 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
     // carries the run's single-use GitHub registration credential. Keep it out of shared
     // /tmp: owner-only dir (mkdtemp is 0700), unlinked + removed in the same call, before
     // any workflow code runs. Nothing long-lived lands on disk (spec 02 / ADR-003).
-    const outDir = fs.mkdtempSync(`${os.tmpdir()}/lca-broker-`);
-    const outFile = `${outDir}/response.json`;
-    // The token must NOT ride on argv: `/proc/<pid>/cmdline` is world-readable in the guest,
-    // and the terminate call fires AFTER workflow code has run (it can leave a background
-    // poller behind). Hand the payload to the CLI through a file in the same owner-only dir.
-    const payloadFile = `${outDir}/payload.json`;
-    fs.writeFileSync(payloadFile, payload, { mode: 0o600 });
+    //
+    // Every filesystem step here can fail for reasons outside our control (a workflow that
+    // filled the disk, a read-only or missing TMPDIR): a raw throw would propagate out of
+    // selfTerminate's exit handler and kill the hook, so treat it as one failed attempt.
+    let outDir;
+    let outFile;
+    try {
+      outDir = fs.mkdtempSync(`${os.tmpdir()}/lca-broker-`);
+      outFile = `${outDir}/response.json`;
+      // The token must NOT ride on argv: `/proc/<pid>/cmdline` is world-readable in the
+      // guest, and the terminate call fires AFTER workflow code has run (it can leave a
+      // background poller behind). Hand the payload to the CLI through a file in the same
+      // owner-only dir.
+      fs.writeFileSync(`${outDir}/payload.json`, payload, { mode: 0o600 });
+    } catch (err) {
+      log('broker scratch dir unavailable', { action, attempt: i + 1, error: safeErr(err) });
+      if (outDir) cleanup(outDir);
+      continue;
+    }
     const args = [
       'lambda', 'invoke',
       '--function-name', runCtx.broker,
-      '--payload', `fileb://${payloadFile}`,
+      '--payload', `fileb://${outDir}/payload.json`,
       outFile,
     ];
     if (runCtx.region) args.push('--region', runCtx.region);
@@ -131,9 +154,14 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
     }
     let body;
     try {
-      body = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+      body = parseBrokerResponse(fs.readFileSync(outFile, 'utf8'));
     } catch (err) {
-      log('broker response unreadable', { action, attempt: i + 1, error: err.message });
+      // NEVER log the parse error verbatim: a `jitconfig` response body holds the run's
+      // single-use registration credential, and Node's JSON errors quote a slice of the
+      // offending input (`Unexpected token 'x', "<content>" is not valid JSON`). A
+      // truncated response would therefore print credential bytes into the run's log
+      // stream, which outlives the VM. parseBrokerResponse yields a content-free reason.
+      log('broker response unreadable', { action, attempt: i + 1, error: safeErr(err) });
       continue;
     } finally {
       cleanup(outDir);
@@ -179,11 +207,30 @@ function cleanup(dir) {
   }
 }
 
-// Render a Lambda function-error body for the log without echoing an unbounded blob (and
-// never the payload, which holds the capability token).
+// Render a Lambda function-error body (or a thrown Error) for the log without echoing an
+// unbounded blob, and never the payload/response content — those carry the capability token
+// and the single-use registration credential respectively.
 export function safeErr(body) {
-  const msg = body?.errorType || body?.errorMessage || 'unexpected broker response';
+  const msg =
+    body instanceof Error
+      ? body.message
+      : body?.errorType || body?.errorMessage || 'unexpected broker response';
   return redact(String(msg)).slice(0, 200);
+}
+
+/**
+ * Parse a broker response file. Throws a CONTENT-FREE error on malformed JSON: the raw body
+ * is credential-bearing (the `jitconfig` response carries the run's single-use GitHub
+ * registration token) and Node's own JSON.parse messages quote a slice of their input, so
+ * that message must never reach the run's log stream. Exported pure so the redaction
+ * property is pinned by tests.
+ */
+export function parseBrokerResponse(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(`broker response is not valid JSON (${Buffer.byteLength(String(raw))} bytes)`);
+  }
 }
 
 /**

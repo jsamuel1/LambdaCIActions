@@ -477,7 +477,17 @@ call — the `jitconfig` response carries the run's single-use registration cred
 must not sit in world-readable `/tmp` once workflow code is running. The request goes to the
 CLI the same way (`--payload fileb://…` in that dir, mode 0600) rather than as an argv value:
 `/proc/<pid>/cmdline` is world-readable in the guest and the terminate invoke fires *after*
-workflow code has run, so an argv-borne token would be readable by a leftover process. Note
+workflow code has run, so an argv-borne token would be readable by a leftover process. Two
+failure-path properties follow from where the guest hook calls the broker from and what the
+broker returns: (a) `selfTerminate` runs in the runner agent's `exit`/`error` handler, i.e.
+outside any request scope, so the broker call and its scratch-dir setup are wrapped — a throw
+there would be an uncaught exception that kills the hook process, losing the `/terminate`
+final log flush on top of the missed terminate, and every failure must degrade to
+Reaper-backstop instead; (b) a malformed broker response is parsed through a wrapper that
+raises a content-free error, because the `jitconfig` body carries the run's single-use
+registration credential and `JSON.parse`'s own message quotes a slice of its input — logging
+that raw would put credential bytes in the run's CloudWatch stream, which outlives the VM.
+Note
 it outlives the JIT config item's 30-min TTL for the terminate action specifically (bounded
 by the run row's terminal-state TTL and by the VM's own lifetime — the run it can terminate
 is the run that holds it, so replay after job end is a no-op). Residual risk: the broker's

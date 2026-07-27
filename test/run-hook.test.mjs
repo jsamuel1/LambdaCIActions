@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { runRowKeyFromRef, redact, isBrokerRefusal, safeErr } from '../microvm/bootstrap/run-hook.mjs';
+import { runRowKeyFromRef, redact, isBrokerRefusal, safeErr, parseBrokerResponse } from '../microvm/bootstrap/run-hook.mjs';
 import { runPk, RUN_SK, jitConfigRef } from '../dist/src/shared/run-store.js';
 
 test('runRowKeyFromRef inverts jitConfigRef back to the run row key', () => {
@@ -117,9 +117,45 @@ test('the broker payload never rides on argv', () => {
     new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
     'utf8',
   );
-  assert.match(src, /'--payload', `fileb:\/\/\$\{payloadFile\}`/);
+  assert.match(src, /'--payload', `fileb:\/\/\$\{outDir\}\/payload\.json`/);
   assert.doesNotMatch(src, /'--payload',\s*payload\b/);
   // Written owner-only, into the same dir that is rm -rf'd in the same call.
-  assert.match(src, /writeFileSync\(payloadFile, payload, \{ mode: 0o600 \}\)/);
-  assert.match(src, /const payloadFile = `\$\{outDir\}\/payload\.json`/);
+  assert.match(src, /writeFileSync\(`\$\{outDir\}\/payload\.json`, payload, \{ mode: 0o600 \}\)/);
+});
+
+// selfTerminate is called from the runner agent's `exit`/`error` handlers, outside any
+// request scope, so anything it throws is an UNCAUGHT exception that kills the hook process
+// (losing the /terminate final log flush on top of the missed terminate). Every failure path
+// must degrade to "Reaper backstops" instead.
+test('selfTerminate survives a broker call that throws', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  const body = src.slice(src.indexOf('function selfTerminate('), src.indexOf('function callBroker('));
+  assert.match(body, /try \{\s*res = callBroker\('terminate'\);/);
+  assert.match(body, /brokered terminate threw; Reaper will backstop/);
+  // The scratch-dir setup inside callBroker is likewise guarded (a workflow can fill the
+  // disk or clobber TMPDIR before the terminate call runs).
+  assert.match(src, /broker scratch dir unavailable/);
+});
+
+// The `jitconfig` response body carries the run's SINGLE-USE GitHub registration credential.
+// Node's JSON.parse error messages quote a slice of their input, so logging a raw parse
+// failure would print credential bytes into the run's CloudWatch stream (which outlives the
+// VM). The parse must fail with a content-free reason.
+test('a malformed broker response never leaks its body into the log', () => {
+  const credentialish = '{"jitConfig":"eyJ0b2tlbiI6IkFCQ0RTRUNSRVQifQ==","runId":1';
+  assert.throws(
+    () => parseBrokerResponse(credentialish),
+    (err) => {
+      assert.doesNotMatch(err.message, /ABCDSECRET/);
+      assert.doesNotMatch(err.message, /jitConfig/);
+      assert.match(err.message, /not valid JSON \(\d+ bytes\)/);
+      // And the rendering that actually reaches the log line is bounded + token-redacted.
+      assert.doesNotMatch(safeErr(err), /ABCDSECRET/);
+      return true;
+    },
+  );
+  assert.deepEqual(parseBrokerResponse('{"ok":true}'), { ok: true });
 });
