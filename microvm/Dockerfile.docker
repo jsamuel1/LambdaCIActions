@@ -21,8 +21,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Common toolchain + the runner agent's runtime deps. Node is needed both for the
 # run-hook server and for the GitHub Actions runner's node-based actions.
+# `util-linux` provides setpriv, which run-hook.mjs uses to drop root → runner (sudo cannot
+# escalate in-guest: the microVM kernel sets no_new_privs).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq unzip tar gzip sudo \
+      ca-certificates curl git jq unzip tar gzip sudo util-linux \
       libicu70 lsb-release awscli \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
@@ -54,19 +56,25 @@ RUN mkdir -p ${RUNNER_DIR} \
 # launches the runner agent for exactly one job, then self-terminates.
 COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
 
-# The runner must NOT run as root (agent refuses); create an unprivileged user that owns
-# the runner dir, can sudo for job steps that need it, and is in the docker group so it
-# can drive the Docker daemon.
+# Per-flavor pre-run hook: the snapshot has no init, so dockerd must be started per job
+# (run-hook.mjs executes ${RUNNER_DIR}/pre-run.sh before the runner agent).
+COPY bootstrap/pre-run.docker.sh ${RUNNER_DIR}/pre-run.sh
+RUN chmod 0755 ${RUNNER_DIR}/pre-run.sh
+
+# The runner must NOT run as root (the agent refuses), but dockerd MUST be root and `sudo`
+# cannot escalate in-guest (the microVM kernel sets no_new_privs). So the entrypoint stays
+# root: pre-run.sh starts dockerd, then run-hook.mjs uses setpriv to drop to `runner` for
+# the agent. `runner` is in the docker group so job steps reach the socket.
 RUN useradd -m -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
     && groupadd -f docker \
     && usermod -aG docker runner \
     && chown -R runner:runner ${RUNNER_DIR}
 
-USER runner
+# NOTE: no `USER runner` here (unlike base/node) — see above.
 WORKDIR ${RUNNER_DIR}
 
 EXPOSE 8080
-# Entrypoint is the run-hook server; it blocks until /run then supervises the single job.
-# (The run-hook is responsible for starting dockerd before the job runs — see spec 02.)
+# Entrypoint is the run-hook server (as root); pre-run.sh starts dockerd, then the runner
+# agent is dropped to the `runner` user — see spec 02.
 ENTRYPOINT ["node", "/opt/actions-runner/run-hook.mjs"]

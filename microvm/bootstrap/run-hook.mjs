@@ -26,6 +26,7 @@ import fs from 'node:fs';
 
 const PORT = parseInt(process.env.RUN_HOOK_PORT || '8080', 10);
 const RUNNER_DIR = process.env.RUNNER_DIR || '/opt/actions-runner';
+const RUNNER_USER = process.env.RUNNER_USER || 'runner';
 const MAX_PAYLOAD_BYTES = 4096; // GA lambda-microvms run-hook payload hard cap (ADR-015)
 
 let jobStarted = false; // guard: this microVM runs exactly one job
@@ -126,9 +127,15 @@ function fetchJitConfig({ ref, region, table }) {
 
 function runJob(payload) {
   const { jitConfig, runId, jobId, repoFullName } = payload;
-  log('job starting', { runId, jobId, repoFullName });
+  const asRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  log('job starting', { runId, jobId, repoFullName, asRoot });
 
-  // Optional per-flavor pre-hook (e.g. DinD starts dockerd). No-op if absent.
+  // Optional per-flavor pre-hook (e.g. the docker flavor starts dockerd). No-op if absent.
+  //
+  // The guest runs with the kernel's `no_new_privs` flag set, so `sudo` inside the microVM
+  // can NEVER escalate ("sudo: The "no new privileges" flag is set"). Any flavor whose
+  // pre-hook needs root therefore runs its entrypoint AS root and we drop privileges for
+  // the runner agent below (the agent refuses to run as root).
   const preHook = `${RUNNER_DIR}/pre-run.sh`;
   if (fs.existsSync(preHook)) {
     const pr = spawnSync('bash', [preHook], { stdio: 'inherit' });
@@ -136,9 +143,30 @@ function runJob(payload) {
   }
 
   // run.sh --jitconfig runs EXACTLY ONE job then exits (JIT runners auto-remove).
-  const child = spawn('./run.sh', ['--jitconfig', jitConfig], {
+  // When the entrypoint is root, drop to RUNNER_USER — downward privilege changes are
+  // allowed under no_new_privs. --init-groups keeps the supplementary groups (e.g. docker).
+  const [cmd, args] = asRoot
+    ? [
+        'setpriv',
+        [
+          '--reuid',
+          RUNNER_USER,
+          '--regid',
+          RUNNER_USER,
+          '--init-groups',
+          './run.sh',
+          '--jitconfig',
+          jitConfig,
+        ],
+      ]
+    : ['./run.sh', ['--jitconfig', jitConfig]];
+
+  const child = spawn(cmd, args, {
     cwd: RUNNER_DIR,
     stdio: 'inherit',
+    env: asRoot
+      ? { ...process.env, HOME: `/home/${RUNNER_USER}`, USER: RUNNER_USER, LOGNAME: RUNNER_USER }
+      : process.env,
   });
 
   child.on('exit', (code, signal) => {
