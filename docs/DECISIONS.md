@@ -491,7 +491,14 @@ call — the `jitconfig` response carries the run's single-use registration cred
 must not sit in world-readable `/tmp` once workflow code is running. The request goes to the
 CLI the same way (`--payload fileb://…` in that dir, mode 0600) rather than as an argv value:
 `/proc/<pid>/cmdline` is world-readable in the guest and the terminate invoke fires *after*
-workflow code has run, so an argv-borne token would be readable by a leftover process. Two
+workflow code has run, so an argv-borne token would be readable by a leftover process. The
+**control plane** holds the same plaintext (it builds the launch payload), so its error paths
+are the symmetrical egress route: an SDK validation/serialization failure echoes the offending
+request value back ("Value '…' at 'runHookPayload' failed to satisfy constraint"), and
+Provision writes launch failures into the run row's `reason` — durable for 90 days and
+surfaced by the management API/UI, which must never carry secret values (AGENTS.md). The launch
+error is therefore scrubbed (`src/shared/redact.ts`) before it is persisted *and* before it is
+rethrown for the batch handler's log line. Two
 failure-path properties follow from where the guest hook calls the broker from and what the
 broker returns: (a) `selfTerminate` runs in the runner agent's `exit`/`error` handler, i.e.
 outside any request scope, so the broker call and its scratch-dir setup are wrapped — a throw
@@ -541,6 +548,8 @@ transient control-plane blip as terminal would fail the job at boot or silently 
 self-terminate back to Reaper-only reaping. `test/run-hook.test.mjs` pins both classes, the
 token-off-argv payload handling, and that the boot budget stays under the image's declared
 `runTimeoutInSeconds`; `test/provision-config-guard.test.mjs` pins the guard-before-mint
-ordering above. The token hash mirrored onto the run row is a control-plane verifier for a
+ordering above, and `test/provision-redaction.test.mjs` pins the control-plane side: a
+payload-echoing SDK error loses the token, and the redaction happens before both sinks (the
+persisted `reason` and the rethrow). The token hash mirrored onto the run row is a control-plane verifier for a
 bearer secret, so it is declared on `RunRecord` as such and must never be serialized into a
 management-API response or the UI (AGENTS.md).

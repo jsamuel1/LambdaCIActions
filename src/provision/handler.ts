@@ -6,6 +6,7 @@ import { generateJitConfig } from '../shared/github-app.js';
 import { launchMicroVM } from '../shared/microvm.js';
 import { transitionRun, putJitConfig, stampMicrovmId } from '../shared/run-store.js';
 import { hashHookToken } from '../hook/broker-core.js';
+import { redactSecret } from '../shared/redact.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
@@ -152,15 +153,23 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   } catch (err) {
     // Launch failed — record the failure so the run isn't a ghost, then rethrow so SQS
     // retries → DLQ after maxReceiveCount.
+    //
+    // REDACT FIRST (ADR-020): `payload` carries the plaintext capability token, and an SDK
+    // validation/serialization error echoes the offending request value back ("Value '…' at
+    // 'runHookPayload' failed to satisfy constraint"). Unscrubbed, that string lands in the
+    // run row's `reason` — durable for 90 days and surfaced by the management API/UI — and in
+    // the batch handler's log line, i.e. exactly the leak the guest-side redaction closes on
+    // the other end of the same secret.
+    const safeReason = redactSecret(errMsg(err), hookToken);
     await transitionRun({
       repoId: req.repoId,
       runId: req.runId,
       jobId: req.jobId,
       to: 'failed',
       flavor,
-      reason: `launch failed: ${errMsg(err)}`,
+      reason: `launch failed: ${safeReason}`,
     }).catch(() => {});
-    throw err;
+    throw new Error(`launch failed: ${safeReason}`);
   }
 
   // 4. stamp the run↔VM mapping FIRST and unconditionally (ADR-019): the hook broker reads

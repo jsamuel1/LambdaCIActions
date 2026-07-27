@@ -63,9 +63,14 @@ test('one token is minted per run and its hash is written to both items', () => 
 
 test('the plaintext token is never persisted, only shipped in the launch payload', () => {
   const plaintextUses = src.match(/\bhookToken\b(?!Hash)/g) ?? [];
-  // mint + hash input + payload field = 3; anything more risks a write to the store.
-  assert.equal(plaintextUses.length, 3, `unexpected hookToken uses: ${plaintextUses.length}`);
+  // mint + hash input + payload field + the launch-failure redaction input = 4; anything
+  // more risks a write to the store.
+  assert.equal(plaintextUses.length, 4, `unexpected hookToken uses: ${plaintextUses.length}`);
   assert.match(src, /token: hookToken,/);
+  // The 4th use must be exactly the redaction of the launch error (ADR-020): the control
+  // plane holds the plaintext, and an SDK error echoes the payload back into the run row's
+  // `reason`. See test/provision-redaction.test.mjs.
+  assert.match(src, /redactSecret\(errMsg\(err\), hookToken\)/);
   const stash = src.indexOf('await putJitConfig(');
   assert.doesNotMatch(
     src.slice(stash, src.indexOf('});', stash)),
