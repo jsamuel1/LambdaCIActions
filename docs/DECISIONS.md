@@ -443,7 +443,11 @@ operations on the VM's behalf:
    terminal `unauthorized`.
 3. The exec role is cut to exactly two things: its own log group (ADR-016) and
    `lambda:InvokeFunction` on the single broker function ARN. No DynamoDB. No
-   `TerminateMicrovm`.
+   `TerminateMicrovm`. The broker's own table access is `dynamodb:GetItem` on the table ARN
+   only — deliberately **not** `grantReadData`, which would add Query/Scan/BatchGetItem plus
+   `/index/*`: the broker is the one role untrusted code can reach (indirectly), so it must
+   not itself hold the table-wide enumeration this ADR exists to remove. It reads two items
+   by primary key and never queries an index.
 **Why**: This converts an unscopable ambient permission into a **capability**: the authority
 a VM holds is now a function of a secret it was individually issued, which is exactly the
 per-VM scoping IAM couldn't express. It also removes `microvmId` from the compute plane
@@ -470,7 +474,10 @@ from the payload, so it must never be reused for anything broader than "my own r
 broker is reached with `aws lambda invoke`, which can only write its response to a file, so
 the hook writes it into a fresh owner-only `mkdtemp` dir and deletes the dir in the same
 call — the `jitconfig` response carries the run's single-use registration credential and
-must not sit in world-readable `/tmp` once workflow code is running. Note
+must not sit in world-readable `/tmp` once workflow code is running. The request goes to the
+CLI the same way (`--payload fileb://…` in that dir, mode 0600) rather than as an argv value:
+`/proc/<pid>/cmdline` is world-readable in the guest and the terminate invoke fires *after*
+workflow code has run, so an argv-borne token would be readable by a leftover process. Note
 it outlives the JIT config item's 30-min TTL for the terminate action specifically (bounded
 by the run row's terminal-state TTL and by the VM's own lifetime — the run it can terminate
 is the run that holds it, so replay after job end is a no-op). Residual risk: the broker's
@@ -491,7 +498,8 @@ payload/ref contract, but only image rebuild ships it.
 **Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
 `LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM
 control actions, and an `InvokeFunction` pinned to the broker ARN — so a future
-`grantReadData(microvmExecRole)` fails the build. `test/hook-broker.test.mjs` pins the
+`grantReadData(microvmExecRole)` fails the build — and that the broker's own DynamoDB access
+is `GetItem` on the table with no index reach. `test/hook-broker.test.mjs` pins the
 token hashing/compare and the ref→key derivation (rejecting other entities, `RUN#…#RUN`,
 wildcards, and non-numeric ids). `test/hook-broker-handler.test.mjs` pins the λ's
 authorization decisions: which item authorizes which action (including terminate succeeding
@@ -505,5 +513,6 @@ for a Lambda *function* error too (broker timeout, DDB throttle, cold-start cras
 `{errorMessage, errorType}` rather than the broker's own `{ok:false, error}`. The hook only
 stops retrying on the latter — a deliberate refusal can't fix itself, whereas treating a
 transient control-plane blip as terminal would fail the job at boot or silently drop
-self-terminate back to Reaper-only reaping. `test/run-hook.test.mjs` pins both classes, and
+self-terminate back to Reaper-only reaping. `test/run-hook.test.mjs` pins both classes and
+the token-off-argv payload handling, and
 `test/provision-config-guard.test.mjs` pins the guard-before-mint ordering above.

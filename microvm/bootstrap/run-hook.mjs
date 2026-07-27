@@ -104,18 +104,23 @@ function callBroker(action, attempts = 3, delayMs = 2000) {
     // any workflow code runs. Nothing long-lived lands on disk (spec 02 / ADR-003).
     const outDir = fs.mkdtempSync(`${os.tmpdir()}/lca-broker-`);
     const outFile = `${outDir}/response.json`;
+    // The token must NOT ride on argv: `/proc/<pid>/cmdline` is world-readable in the guest,
+    // and the terminate call fires AFTER workflow code has run (it can leave a background
+    // poller behind). Hand the payload to the CLI through a file in the same owner-only dir.
+    const payloadFile = `${outDir}/payload.json`;
+    fs.writeFileSync(payloadFile, payload, { mode: 0o600 });
     const args = [
       'lambda', 'invoke',
       '--function-name', runCtx.broker,
-      '--cli-binary-format', 'raw-in-base64-out',
-      '--payload', payload,
+      '--payload', `fileb://${payloadFile}`,
       outFile,
     ];
     if (runCtx.region) args.push('--region', runCtx.region);
     const r = spawnSync('aws', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     if (r.status !== 0) {
-      // The CLI echoes the offending parameter value on validation errors, and the payload
-      // holds the capability token — redact before this reaches the run's log stream.
+      // The CLI echoes offending parameter values on validation errors; the payload now
+      // travels by file, but redact anyway — a future arg or an echoed file body must not
+      // put the capability token in the run's log stream.
       log('broker invoke failed', {
         action,
         attempt: i + 1,

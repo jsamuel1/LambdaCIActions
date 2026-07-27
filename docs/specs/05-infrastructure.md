@@ -118,7 +118,7 @@ Least privilege per Lambda:
 | Ingest | read webhook secret; `sqs:SendMessage`; `dynamodb:PutItem/UpdateItem` (installations, runs) |
 | Provision | read app-pem + image ARNs; mint GitHub tokens (network egress); launch/terminate **tagged** microVMs; write runs |
 | Reaper | list live microVMs + terminate orphans (by run-store `microvmId`); update run rows |
-| Hook broker | read the run table; `lambda:TerminateMicrovm` (region-scoped). Called ONLY by microVMs, token-gated to the caller's own run; 20 reserved concurrent executions (ADR-021) |
+| Hook broker | `dynamodb:GetItem` on the run table (no Query/Scan, no index); `lambda:TerminateMicrovm` (region-scoped). Called ONLY by microVMs, token-gated to the caller's own run; 20 reserved concurrent executions (ADR-021) |
 | microVM exec role | its own log group; `lambda:InvokeFunction` on the hook broker ARN. **Nothing else** — no DynamoDB, no microVM control (ADR-021) |
 | Mgmt API | read all plane tables; write **config** entities only; **no** token minting, **no** microVM launch |
 | Image build | `s3:*` on code bucket; microVM image build APIs |

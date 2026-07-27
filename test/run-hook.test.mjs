@@ -3,6 +3,7 @@
 // against the run store's jitConfigRef/runPk so the two sides can't drift silently.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { runRowKeyFromRef, redact, isBrokerRefusal, safeErr } from '../microvm/bootstrap/run-hook.mjs';
 import { runPk, RUN_SK, jitConfigRef } from '../dist/src/shared/run-store.js';
 
@@ -105,4 +106,20 @@ test('safeErr renders a function error bounded and token-free', () => {
     safeErr({ errorMessage: 'crash echoing {"token":"SUPERSECRET"}' }),
     /SUPERSECRET/,
   );
+});
+
+// The capability token must never appear in a process argument: `/proc/<pid>/cmdline` is
+// world-readable inside the guest, and the terminate invoke happens AFTER workflow code has
+// run (a leftover background process could poll for it). The CLI payload therefore travels
+// as `fileb://` out of the owner-only mkdtemp dir, not as `--payload <json>`.
+test('the broker payload never rides on argv', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.match(src, /'--payload', `fileb:\/\/\$\{payloadFile\}`/);
+  assert.doesNotMatch(src, /'--payload',\s*payload\b/);
+  // Written owner-only, into the same dir that is rm -rf'd in the same call.
+  assert.match(src, /writeFileSync\(payloadFile, payload, \{ mode: 0o600 \}\)/);
+  assert.match(src, /const payloadFile = `\$\{outDir\}\/payload\.json`/);
 });

@@ -77,8 +77,32 @@ test('microVM exec role holds only broker invoke + its own log group', () => {
 
 test('TerminateMicrovm lives on the broker role, region-scoped', () => {
   const template = synth();
-  const brokerRoleId = Object.entries(template.findResources('AWS::IAM::Role')).find(
-    ([id]) => id.startsWith('HookBrokerFnServiceRole'),
+  const stmts = brokerStatements(template);
+  const term = stmts.find((s) => actionsOf(s).includes('lambda:TerminateMicrovm'));
+  assert.ok(term, 'broker must be able to terminate the caller VM');
+  assert.deepEqual(term.Condition, {
+    StringEquals: { 'aws:RequestedRegion': 'us-west-2' },
+  });
+});
+
+// The broker is the one role an untrusted VM can reach (indirectly, via InvokeFunction), so
+// it must not itself hold table-wide enumeration. It does exactly two GetItems by primary
+// key — `grantReadData` would re-introduce Query/Scan/BatchGetItem + `/index/*`, i.e. the
+// harvesting primitive ADR-020 removed, one hop further out.
+test('broker DynamoDB access is GetItem on the table only', () => {
+  const stmts = brokerStatements(synth());
+  const ddb = stmts.flatMap(actionsOf).filter((a) => typeof a === 'string' && a.startsWith('dynamodb:'));
+  assert.deepEqual(ddb, ['dynamodb:GetItem'], `broker ddb actions: ${ddb.join(', ')}`);
+
+  const read = stmts.find((s) => actionsOf(s).includes('dynamodb:GetItem'));
+  const resources = JSON.stringify(read.Resource);
+  assert.doesNotMatch(resources, /index/, `broker must not reach GSIs, got ${resources}`);
+});
+
+/** All inline policy statements attached to the hook broker's role. */
+function brokerStatements(template) {
+  const brokerRoleId = Object.entries(template.findResources('AWS::IAM::Role')).find(([id]) =>
+    id.startsWith('HookBrokerFnServiceRole'),
   )?.[0];
   assert.ok(brokerRoleId, 'hook broker role not found');
 
@@ -89,9 +113,6 @@ test('TerminateMicrovm lives on the broker role, region-scoped', () => {
     );
     if (attached) stmts.push(...(policy.Properties.PolicyDocument.Statement ?? []));
   }
-  const term = stmts.find((s) => actionsOf(s).includes('lambda:TerminateMicrovm'));
-  assert.ok(term, 'broker must be able to terminate the caller VM');
-  assert.deepEqual(term.Condition, {
-    StringEquals: { 'aws:RequestedRegion': 'us-west-2' },
-  });
-});
+  return stmts;
+}
+

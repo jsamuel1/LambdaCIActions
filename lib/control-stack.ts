@@ -189,8 +189,18 @@ export class ControlStack extends Stack {
         TABLE_NAME: table.tableName,
       },
     });
-    // Reads the JIT config item (token hash + config) and the run row's microvmId.
-    table.grantReadData(hookBroker);
+    // Reads exactly two items by primary key — the JIT config item (token hash + config) and
+    // the run row (token hash + microvmId). NOT `grantReadData`: that hands out Query/Scan/
+    // BatchGetItem/stream reads plus `/index/*`, i.e. table-wide enumeration on the one role
+    // an untrusted VM can reach (indirectly) — the exact shape ADR-020 exists to remove. The
+    // broker never queries and never touches an index, so grant GetItem on the table only.
+    hookBroker.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadOwnRunItems',
+        actions: ['dynamodb:GetItem'],
+        resources: [table.tableArn],
+      }),
+    );
     // Terminates the caller's own VM on its behalf. Still region-scoped only — the GA API
     // has no VM-level ARNs (ADR-015) — but this authority now lives in the control plane,
     // where the target id is chosen by us, not by untrusted in-VM code.
