@@ -1,4 +1,4 @@
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { SSMClient, GetParameterCommand, DescribeParametersCommand } from '@aws-sdk/client-ssm';
 
 /**
  * Thin SSM Parameter Store reader with a per-container cache. Lambdas get path-scoped
@@ -30,4 +30,20 @@ export async function getParam(name: string, ttlMs = TTL_MS): Promise<string> {
 /** Reset the cache — test hook. */
 export function _clearCache(): void {
   cache.clear();
+}
+
+/**
+ * Whether a parameter exists — WITHOUT reading its value. Used by the management API's
+ * settings screen, which reports secret **presence/health only** (spec 04 hard rule).
+ * Uses DescribeParameters (a metadata API) so the Mgmt λ never needs `GetParameter` on
+ * secret paths at all, and a bug there cannot leak a SecureString.
+ */
+export async function paramExists(name: string): Promise<boolean> {
+  const res = await client.send(
+    new DescribeParametersCommand({
+      ParameterFilters: [{ Key: 'Name', Option: 'Equals', Values: [name] }],
+      MaxResults: 1,
+    }),
+  );
+  return (res.Parameters ?? []).length > 0;
 }

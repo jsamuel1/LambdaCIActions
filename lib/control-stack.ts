@@ -44,6 +44,10 @@ export interface ControlStackProps extends StackProps {
  * Secrets are referenced by SSM path (ADR-008); this stack never creates them.
  */
 export class ControlStack extends Stack {
+  /** Discovery queue coordinates, consumed by MgmtStack's manual re-scan endpoint (M4). */
+  public readonly discoveryQueueUrl: string;
+  public readonly discoveryQueueArn: string;
+
   constructor(scope: Construct, id: string, props: ControlStackProps) {
     super(scope, id, props);
 
@@ -83,6 +87,8 @@ export class ControlStack extends Stack {
       visibilityTimeout: Duration.seconds(360), // headroom over the Discovery λ timeout
       deadLetterQueue: { queue: discoveryDlq, maxReceiveCount: 3 },
     });
+    this.discoveryQueueUrl = discoveryQueue.queueUrl;
+    this.discoveryQueueArn = discoveryQueue.queueArn;
 
     // ---- Ingest λ ----
     const bundling = {

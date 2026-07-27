@@ -5,6 +5,7 @@ node_modules/
 # build / cdk
 dist/
 cdk.out/
+web/dist/
 *.tsbuildinfo
 
 # env & secrets — never commit

@@ -74,6 +74,19 @@ export function statusGsiKeys(status: RunStatus, updatedAt: string): {
   return { gsi1pk: `RUNSTATUS#${status}`, gsi1sk: updatedAt };
 }
 
+/**
+ * GSI2 (repo/time) keys — the M4 run-history index (ADR-023). Written ONCE at row
+ * creation and never touched by transitions, because both components are immutable
+ * (`repoId`, `createdAt`). That keeps every status write a single SET with no extra
+ * index churn while giving the UI a per-repo, newest-first run history without a scan.
+ */
+export function repoGsiKeys(repoId: number, createdAt: string): {
+  gsi2pk: string;
+  gsi2sk: string;
+} {
+  return { gsi2pk: `REPORUNS#${repoId}`, gsi2sk: createdAt };
+}
+
 /** Build the full item for a freshly-queued run. Pure — used by tests + the writer. */
 export function buildQueuedItem(
   input: Pick<
@@ -87,6 +100,7 @@ export function buildQueuedItem(
     pk: runPk(input.repoId, input.runId, input.jobId),
     sk: RUN_SK,
     ...statusGsiKeys('queued', iso),
+    ...repoGsiKeys(input.repoId, iso),
     entity: 'RUN',
     status: 'queued' satisfies RunStatus,
     repoId: input.repoId,
@@ -288,6 +302,106 @@ export async function listRunsByStatus(status: RunStatus, limit = 100): Promise<
     }),
   );
   return (res.Items ?? []) as unknown as RunRecord[];
+}
+
+/** An opaque, caller-supplied pagination cursor (base64url of a DynamoDB LastEvaluatedKey). */
+export function encodeCursor(key: Record<string, unknown> | undefined): string | undefined {
+  if (!key) return undefined;
+  return Buffer.from(JSON.stringify(key)).toString('base64url');
+}
+
+export function decodeCursor(cursor: string | undefined): Record<string, unknown> | undefined {
+  if (!cursor) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined; // malformed cursor → start from the top rather than 500
+  }
+}
+
+export interface RunPage {
+  runs: RunRecord[];
+  nextCursor?: string;
+}
+
+/**
+ * Paginated per-repo run history, newest first, via GSI2 (ADR-023). Used by the M4 Runs
+ * screen when a repo filter is applied and by Repo detail.
+ */
+export async function listRunsByRepo(
+  repoId: number,
+  opts: { limit?: number; cursor?: string } = {},
+): Promise<RunPage> {
+  const res = await requireDoc().send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'gsi2',
+      KeyConditionExpression: 'gsi2pk = :gpk',
+      ExpressionAttributeValues: { ':gpk': `REPORUNS#${repoId}` },
+      ScanIndexForward: false, // newest first
+      Limit: opts.limit ?? 50,
+      ExclusiveStartKey: decodeCursor(opts.cursor),
+    }),
+  );
+  return {
+    runs: (res.Items ?? []) as unknown as RunRecord[],
+    nextCursor: encodeCursor(res.LastEvaluatedKey),
+  };
+}
+
+/**
+ * Paginated run list for a single status, newest first, via GSI1.
+ * (The unfiltered "recent runs" view is a bounded fan-out over statuses — see mgmt/store.)
+ */
+export async function listRunsByStatusPaged(
+  status: RunStatus,
+  opts: { limit?: number; cursor?: string } = {},
+): Promise<RunPage> {
+  const res = await requireDoc().send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'gsi1',
+      KeyConditionExpression: 'gsi1pk = :gpk',
+      ExpressionAttributeValues: { ':gpk': `RUNSTATUS#${status}` },
+      ScanIndexForward: false,
+      Limit: opts.limit ?? 50,
+      ExclusiveStartKey: decodeCursor(opts.cursor),
+    }),
+  );
+  return {
+    runs: (res.Items ?? []) as unknown as RunRecord[],
+    nextCursor: encodeCursor(res.LastEvaluatedKey),
+  };
+}
+
+/** Count rows in a status without materializing them (dashboard aggregates). */
+export async function countRunsByStatus(status: RunStatus): Promise<number> {
+  const res = await requireDoc().send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'gsi1',
+      KeyConditionExpression: 'gsi1pk = :gpk',
+      ExpressionAttributeValues: { ':gpk': `RUNSTATUS#${status}` },
+      Select: 'COUNT',
+    }),
+  );
+  return res.Count ?? 0;
+}
+
+/** Read one run row (Run detail screen). */
+export async function getRun(
+  repoId: number,
+  runId: number,
+  jobId: number,
+): Promise<RunRecord | undefined> {
+  const res = await requireDoc().send(
+    new GetCommand({
+      TableName: TABLE,
+      Key: { pk: runPk(repoId, runId, jobId), sk: RUN_SK },
+    }),
+  );
+  return res.Item as unknown as RunRecord | undefined;
 }
 
 function isConditionalFailed(err: unknown): boolean {

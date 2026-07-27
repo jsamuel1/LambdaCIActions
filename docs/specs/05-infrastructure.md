@@ -63,11 +63,11 @@ CDK v2 (TypeScript). Split so the compute plane can be built before the control 
 | Stack | Contains | Notes |
 |---|---|---|
 | `ImageStack` | microVM code bucket, image build role, (image ARNs via build script) | Deploy first; images built out-of-band |
-| `ControlStack` | API GW `/webhook`, Ingest λ, SQS + DLQ, Provision λ, Hook broker λ, Reaper λ + schedule | Depends on image ARNs in config |
-| `DataStack` | DynamoDB table(s) + GSIs | Shared by all planes |
-| `MgmtStack` | API GW `/api/*`, Mgmt API λ, (optional WS API) | Management plane |
-| `WebStack` | S3 bucket, CloudFront dist, OAI/OAC | Hosts the SPA |
-| `AuthStack` | GitHub OAuth config, optional Cognito user pool | Referenced by Mgmt + Web |
+| `ControlStack` | API GW `/webhook`, Ingest λ, SQS + DLQ, Provision λ, Discovery λ, Hook broker λ, Reaper λ + schedule | Depends on image ARNs in config |
+| `DataStack` | DynamoDB table + GSI1 (status/time) + GSI2 (repo/time, ADR-023) | Shared by all planes |
+| `MgmtStack` | HTTP API `/api/*` + `/auth/*`, Mgmt API λ | Management plane (M4). IAM boundary per ADR-025 |
+| `WebStack` | S3 (OAC, private) + CloudFront; API attached as `/api/*` + `/auth/*` behaviors | Hosts the SPA; single origin per ADR-024 |
+| ~~`AuthStack`~~ | — | **Dropped**: auth is GitHub OAuth + a signed session cookie, no Cognito user pool (ADR-022). The only resource it would own is the session secret — an out-of-band SecureString. |
 
 Cross-stack refs kept minimal; config values (image ARNs, table names) flow via SSM
 parameters rather than hard CFN exports where possible, to decouple deploy ordering.
@@ -79,15 +79,22 @@ only *referenced* by CDK.
 
 | Param | Type | Contents |
 |---|---|---|
-| `/lca/github/app-pem` | SecureString | GitHub App private key |
-| `/lca/github/webhook-secret` | SecureString | HMAC secret |
-| `/lca/github/oauth-client-secret` | SecureString | UI OAuth client secret |
-| `/lca/github/app-id` | String | App ID |
-| `/lca/config/image-arn-<flavor>` | String | Published by build script |
-| `/lca/config/runner-labels` | String | Claimed labels |
+| `/lca/<env>/github/app-pem` | SecureString | GitHub App private key |
+| `/lca/<env>/github/webhook-secret` | SecureString | HMAC secret |
+| `/lca/<env>/github/client-id` | String | OAuth client id (console login) |
+| `/lca/<env>/github/client-secret` | SecureString | OAuth client secret (console login) |
+| `/lca/<env>/mgmt/session-secret` | SecureString | Console session cookie signing key (ADR-022) |
+| `/lca/<env>/github/app-id` | String | App ID |
+| `/lca/<env>/config/image-arn-<flavor>` | String | Published by build script |
+| `/lca/<env>/config/runner-labels` | String | Claimed labels |
+| `/lca/<env>/config/table-name` | String | Published by `DataStack` |
 
-Setup script (`scripts/bootstrap-secrets.ts`) creates the SecureStrings interactively;
-CDK grants specific Lambdas `ssm:GetParameter` on specific paths only.
+`scripts/create-github-app.mjs` writes the GitHub App credentials (app id, PEM, webhook
+secret, OAuth client id/secret) after the App Manifest flow; the console session secret is
+created manually (see [DEPLOY-M4](../DEPLOY-M4.md) phase 0). CDK grants specific Lambdas
+`ssm:GetParameter` on specific paths only — and the Mgmt λ gets **no** grant on the App PEM
+or webhook secret; it checks their presence with `ssm:DescribeParameters`, which returns
+metadata only (ADR-025).
 
 ## Phased deployment
 
@@ -102,12 +109,18 @@ Same three-step shape as the reference, generalized:
                           (per flavor: stage Dockerfile.<flavor>, zip microvm/,
                            upload, build, snapshot, poll, prune, write image ARN → SSM)
 
-3. deploy orchestrator  →  cdk deploy ControlStack MgmtStack WebStack AuthStack
-                          (now image ARNs exist in SSM; Ingest/Provision/Reaper λ,
-                           API GWs, SPA, auth all come up)
+3. deploy orchestrator  →  cdk deploy ControlStack MgmtStack WebStack
+                          (now image ARNs exist in SSM; Ingest/Provision/Discovery/Reaper λ,
+                           API GWs, and the console all come up)
+
+4. console origin pass  →  npm run build:web
+                          cdk deploy MgmtStack -c publicOrigin=https://<cloudfront-domain>
+                          (the management API can't know its own public origin until the
+                           distribution exists — two-pass by design, ADR-024)
 ```
 
-Re-running step 2 rebuilds images (e.g. patch day); step 3 is idempotent.
+Re-running step 2 rebuilds images (e.g. patch day); steps 3–4 are idempotent. Full console
+runbook: [DEPLOY-M4](../DEPLOY-M4.md).
 
 ## IAM posture
 
@@ -120,7 +133,7 @@ Least privilege per Lambda:
 | Reaper | list live microVMs + terminate orphans (by run-store `microvmId`); update run rows |
 | Hook broker | `dynamodb:GetItem` on the run table (no Query/Scan, no index); `lambda:TerminateMicrovm` (region-scoped). Called ONLY by microVMs, token-gated to the caller's own run; 20 reserved concurrent executions (ADR-021) |
 | microVM exec role | its own log group; `lambda:InvokeFunction` on the hook broker ARN. **Nothing else** — no DynamoDB, no microVM control (ADR-021) |
-| Mgmt API | read all plane tables; write **config** entities only; **no** token minting, **no** microVM launch |
+| Mgmt API | read the shared table + run log group; `dynamodb:UpdateItem` (config only — no Put/Delete); `sqs:SendMessage` on the discovery queue; read ONLY its own OAuth/session secrets; `ssm:DescribeParameters` for presence checks. **No** token minting, **no** microVM launch/terminate, **no** `iam:PassRole`, **no** access to the App PEM (ADR-025, asserted in `test/mgmt-stack.test.mjs`) |
 | Image build | `s3:*` on code bucket; microVM image build APIs |
 
 microVM launch/terminate IAM is scoped to account/region (`aws:RequestedRegion`), NOT by
@@ -145,7 +158,10 @@ template, so re-widening the role fails the build.
 
 ## Observability
 
-- **Logs**: each runner → its own CloudWatch log stream; Lambdas → standard log groups. UI reads runner logs via `log_ref`.
+- **Logs**: each runner → its own CloudWatch log stream inside the per-env run log group
+  (`/aws/lambda/microvms/runs/lca-<env>`, ADR-016); Lambdas → standard log groups. The
+  console's log viewer reads that group filtered by the run's `microvmId` (ADR-019) — log
+  bodies never land in DynamoDB.
 - **Metrics**: emit `RunsQueued`, `RunsRunning`, `ProvisionLatency`, `BootLatency`, `JobDuration`, `ProvisionFailures`, `QuotaThrottles` (custom CW metrics).
 - **Alarms**: DLQ depth > 0; `QuotaThrottles > 0`; stuck-`provisioning` age; provision error rate.
 - **Tracing**: X-Ray across API GW → Lambda → SQS for the hot path.

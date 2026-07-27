@@ -41,6 +41,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Console SPA (M4): esbuild bundle. Must build before synth so WebStack's asset
+      # deployment is exercised rather than silently skipped.
+      - name: Build console SPA
+        run: npm run build:web
+
       - name: Test
         run: npm test
 

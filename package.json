@@ -9,8 +9,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:web": "node scripts/build-web.mjs",
+    "watch:web": "node scripts/build-web.mjs --watch",
+    "typecheck:web": "tsc -p web/tsconfig.json",
     "watch": "tsc -w -p tsconfig.json",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test": "npm run build && npm run typecheck:web && node --test test/*.test.mjs",
     "test:fast": "node --test test/manifest.test.mjs",
     "synth": "npm run build && cdk synth",
     "cdk": "cdk",
@@ -24,12 +27,15 @@
   "devDependencies": {
     "@types/aws-lambda": "^8.10.140",
     "@types/node": "^20.14.0",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
     "aws-cdk": "^2.150.0",
     "esbuild": "^0.23.0",
     "typescript": "^5.5.0"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.1085.0",
+    "@aws-sdk/client-cloudwatch-logs": "3.699.0",
     "@aws-sdk/client-dynamodb": "^3.1085.0",
     "@aws-sdk/client-lambda": "^3.1086.0",
     "@aws-sdk/client-lambda-microvms": "^3.1085.0",
@@ -38,7 +44,9 @@
     "@aws-sdk/lib-dynamodb": "^3.1085.0",
     "aws-cdk-lib": "^2.150.0",
     "constructs": "^10.3.0",
-    "js-yaml": "5.2.1"
+    "js-yaml": "5.2.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   },
   "license": "UNLICENSED"
 }

@@ -3,8 +3,9 @@ import {
   DynamoDBDocumentClient,
   UpdateCommand,
   GetCommand,
+  QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
-import type { InstallationRecord, RepoRecord, RepoRef } from './types.js';
+import type { InstallationRecord, RepoRecord, RepoRef, RepoMode } from './types.js';
 
 /**
  * Installation store (spec 01 \u00a7 Installation lifecycle, ADR-009). Upserts installation +
@@ -31,6 +32,14 @@ export function repoSk(repoId: number): string {
   return `REPO#${repoId}`;
 }
 
+/**
+ * GSI1 keys for installation rows (M4). GSI1 is otherwise the run status/time index; the
+ * management UI needs to ENUMERATE installations, and a single fixed partition
+ * (`INSTALLS`) sorted by account login gives that without a table scan. Installations are
+ * few (one per GitHub org/user that installed the App), so one partition is fine.
+ */
+export const INSTALLS_GSI1PK = 'INSTALLS';
+
 function requireDoc(): DynamoDBDocumentClient {
   if (!doc || !TABLE) {
     throw new Error('install-store not configured: TABLE_NAME env + DynamoDB SDK required');
@@ -55,7 +64,8 @@ export async function upsertInstallation(input: {
       Key: { pk: installPk(input.installationId), sk: INSTALL_SK },
       UpdateExpression:
         'SET entity = :e, installationId = :iid, accountLogin = :login, accountId = :aid, ' +
-        'suspended = :susp, deleted = :del, updatedAt = :now, createdAt = if_not_exists(createdAt, :now)',
+        'suspended = :susp, deleted = :del, updatedAt = :now, createdAt = if_not_exists(createdAt, :now), ' +
+        'gsi1pk = :gpk, gsi1sk = :login',
       ExpressionAttributeValues: {
         ':e': 'INSTALL',
         ':iid': input.installationId,
@@ -64,6 +74,7 @@ export async function upsertInstallation(input: {
         ':susp': input.suspended ?? false,
         ':del': input.deleted ?? false,
         ':now': iso,
+        ':gpk': INSTALLS_GSI1PK,
       },
     }),
   );
@@ -164,4 +175,96 @@ export async function getRepo(
     }),
   );
   return res.Item as unknown as RepoRecord | undefined;
+}
+
+// ---- M4 management reads / config writes -----------------------------------
+
+/**
+ * Enumerate every installation (management UI). Uses the GSI1 `INSTALLS` partition, so no
+ * table scan. Includes soft-deleted/suspended rows — the UI shows their state.
+ */
+export async function listInstallations(): Promise<InstallationRecord[]> {
+  const res = await requireDoc().send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'gsi1',
+      KeyConditionExpression: 'gsi1pk = :gpk',
+      ExpressionAttributeValues: { ':gpk': INSTALLS_GSI1PK },
+    }),
+  );
+  return (res.Items ?? []) as unknown as InstallationRecord[];
+}
+
+/** List the repos granted to one installation (Repos screen). */
+export async function listRepos(installationId: number): Promise<RepoRecord[]> {
+  const res = await requireDoc().send(
+    new QueryCommand({
+      TableName: TABLE,
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :repo)',
+      ExpressionAttributeValues: { ':pk': installPk(installationId), ':repo': 'REPO#' },
+    }),
+  );
+  return (res.Items ?? []) as unknown as RepoRecord[];
+}
+
+/** Config fields an operator may change from the UI (spec 04 `PATCH /api/repos/{id}`). */
+export interface RepoConfigPatch {
+  enabled?: boolean;
+  mode?: RepoMode;
+  defaultFlavor?: string;
+  flavorMap?: Record<string, string>;
+}
+
+/**
+ * Apply an operator config patch to a repo row, recording the actor + timestamp
+ * (spec 04 § Non-functional → auditability). Returns the updated row, or undefined when
+ * the repo row doesn't exist (the caller answers 404 rather than creating config for a
+ * repo the App was never granted).
+ */
+export async function patchRepoConfig(
+  installationId: number,
+  repoId: number,
+  patch: RepoConfigPatch,
+  actor: string,
+): Promise<RepoRecord | undefined> {
+  const iso = new Date().toISOString();
+  const sets = ['updatedAt = :now', 'updatedBy = :actor'];
+  const values: Record<string, unknown> = { ':now': iso, ':actor': actor };
+
+  if (patch.enabled !== undefined) {
+    sets.push('enabled = :enabled');
+    values[':enabled'] = patch.enabled;
+  }
+  if (patch.mode !== undefined) {
+    sets.push('#mode = :mode');
+    values[':mode'] = patch.mode;
+  }
+  if (patch.defaultFlavor !== undefined) {
+    sets.push('defaultFlavor = :df');
+    values[':df'] = patch.defaultFlavor;
+  }
+  if (patch.flavorMap !== undefined) {
+    sets.push('flavorMap = :fm');
+    values[':fm'] = patch.flavorMap;
+  }
+
+  try {
+    const res = await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(installationId), sk: repoSk(repoId) },
+        UpdateExpression: `SET ${sets.join(', ')}`,
+        ConditionExpression: 'attribute_exists(pk)',
+        ...(patch.mode !== undefined
+          ? { ExpressionAttributeNames: { '#mode': 'mode' } }
+          : {}),
+        ExpressionAttributeValues: values,
+        ReturnValues: 'ALL_NEW',
+      }),
+    );
+    return res.Attributes as unknown as RepoRecord | undefined;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return undefined;
+    throw err;
+  }
 }
