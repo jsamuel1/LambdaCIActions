@@ -9,6 +9,7 @@ import {
   keysFromRef,
   parseHookRequest,
   isRunRef,
+  safeForLog,
 } from '../dist/src/hook/broker-core.js';
 import { runPk, RUN_SK, JITCONFIG_SK, jitConfigRef } from '../dist/src/shared/run-store.js';
 
@@ -71,4 +72,33 @@ test('parseHookRequest accepts only known actions on well-formed refs', () => {
 test('isRunRef matches the ref shape the run store emits', () => {
   assert.ok(isRunRef(jitConfigRef(1234567, 890, 1)));
   assert.equal(isRunRef(`${runPk(1, 2, 3)}#${RUN_SK}`), false);
+});
+
+// The rejection message is logged by the broker λ, and its input comes from untrusted
+// workflow code. An unbounded echo would let a VM write arbitrary content — including
+// forged JSON log records — into the control plane's log group.
+test('a rejected action is not echoed verbatim into the broker log', () => {
+  const ref = jitConfigRef(1, 2, 3);
+  const nasty = `x\n{"msg":"self-terminate brokered","pk":"RUN#9#9#9"}\n${'A'.repeat(5000)}`;
+  assert.throws(
+    () => parseHookRequest({ action: nasty, ref, token: TOKEN }),
+    (err) => {
+      assert.doesNotMatch(err.message, /\n/, 'no newline → no forged log record');
+      assert.ok(err.message.length < 120, `message too long: ${err.message.length}`);
+      return true;
+    },
+  );
+  // Non-string actions must not stringify into the message either.
+  assert.throws(
+    () => parseHookRequest({ action: { toString: () => 'x'.repeat(500) }, ref, token: TOKEN }),
+    /unsupported action: object/,
+  );
+});
+
+test('safeForLog caps length and drops control characters', () => {
+  assert.equal(safeForLog('jitconfig'), 'jitconfig');
+  assert.equal(safeForLog('a\nb\tc'), 'a.b.c');
+  assert.equal(safeForLog('y'.repeat(100)).length, 41); // 40 + ellipsis
+  assert.equal(safeForLog(undefined), 'undefined');
+  assert.equal(safeForLog(42), 'number');
 });

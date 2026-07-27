@@ -43,8 +43,14 @@ function log(msg, extra) {
 }
 
 // The capability token is a bearer secret (ADR-021) — never log a payload verbatim.
+// The platform may deliver the pointer JSON-in-JSON (`{"runHookPayload":"{\"token\":…}"}`),
+// so the ESCAPED form has to be redacted too — the two diagnostic log lines below fire on
+// exactly the malformed/wrapped payloads where that shape shows up, and a leaked token
+// lands in the run's CloudWatch stream, which long outlives the VM.
 export function redact(raw) {
-  return String(raw).replace(/("token"\s*:\s*")[^"]*(")/g, '$1<redacted>$2');
+  return String(raw)
+    .replace(/("token"\s*:\s*")[^"]*(")/g, '$1<redacted>$2')
+    .replace(/(\\+"token\\+"\s*:\s*\\+")(?:[^\\"]|\\.)*?(\\+")/g, '$1<redacted>$2');
 }
 
 function readBody(req) {

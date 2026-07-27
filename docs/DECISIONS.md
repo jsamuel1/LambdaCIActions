@@ -469,6 +469,14 @@ is the run that holds it, so replay after job end is a no-op). Residual risk: th
 own `lambda:TerminateMicrovm` is still region-scoped (`Resource: "*"`) — unchanged from
 ADR-019 and unavoidable until the API ships VM-level ARNs — but it is no longer reachable by
 untrusted code, and the id it acts on comes from our own run store.
+**Rollout**: this is a **breaking change to the run-hook payload contract** — `table` is
+replaced by `broker` + `token`, and the in-VM hook is *baked into the image*. An old image
+rejects the new payload (`missing ref/broker/token`) and a new image rejects the old one, so
+the two sides must move together: rebuild the flavor images (`npm run build:images`) in the
+same change window as the `LCA-Control` deploy, with no in-flight jobs. Mid-window jobs fail
+to start (the hook 400s `/run`) rather than running with weakened IAM; the Reaper reaps the
+stranded VM and GitHub re-queues on the next push. `test/run-hook.test.mjs` pins the
+VM-side payload/ref contract, but only image rebuild ships it.
 **Verification**: `test/exec-role-iam.test.mjs` asserts against the synthesized
 `LCA-Control` template that the exec role holds **zero** `dynamodb:*`, **zero** microVM
 control actions, and an `InvokeFunction` pinned to the broker ARN — so a future

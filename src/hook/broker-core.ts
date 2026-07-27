@@ -68,7 +68,10 @@ export function parseHookRequest(raw: unknown): ParsedHookRequest {
   const req = (raw ?? {}) as HookBrokerRequest;
   const action = req.action;
   if (!action || !(HOOK_ACTIONS as readonly string[]).includes(action)) {
-    throw new Error(`unsupported action: ${String(action)}`);
+    // The caller is untrusted workflow code and this message is logged by the λ, so quote
+    // only a short, sanitized slice — an unbounded echo would let a VM write arbitrary
+    // content (or forged JSON log lines) into the control plane's log group.
+    throw new Error(`unsupported action: ${safeForLog(action)}`);
   }
   if (typeof req.ref !== 'string' || !isRunRef(req.ref)) {
     throw new Error('malformed ref');
@@ -82,4 +85,14 @@ export function parseHookRequest(raw: unknown): ParsedHookRequest {
 /** `RUN#<repoId>#<runId>#<jobId>#JITCONFIG` with numeric ids and no extra segments. */
 export function isRunRef(ref: string): boolean {
   return new RegExp(`^RUN#\\d+#\\d+#\\d+#${JITCONFIG_SK}$`).test(ref);
+}
+
+/**
+ * Render a caller-supplied value safe to put in a control-plane log line: printable ASCII
+ * only (no newlines → no forged log records) and hard-capped in length.
+ */
+export function safeForLog(value: unknown, max = 40): string {
+  const s = typeof value === 'string' ? value : typeof value;
+  const clean = s.replace(/[^\x20-\x7e]/g, '.');
+  return clean.length > max ? `${clean.slice(0, max)}…` : clean;
 }
