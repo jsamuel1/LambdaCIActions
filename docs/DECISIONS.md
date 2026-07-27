@@ -514,7 +514,16 @@ own lifetime — the run it can terminate is the run that holds it, so replay af
 a no-op). Residual risk: the broker's
 own `lambda:TerminateMicrovm` is still region-scoped (`Resource: "*"`) — unchanged from
 ADR-019 and unavoidable until the API ships VM-level ARNs — but it is no longer reachable by
-untrusted code, and the id it acts on comes from our own run store.
+untrusted code, and the id it acts on comes from our own run store. Second residual risk: the
+reserved-concurrency cap is protection *and* a shared resource. Its callers are untrusted, so a
+VM that hammers the broker in a loop can occupy the 20 slots and throttle other tenants' boot
+fetches; the guest's bounded exponential backoff absorbs a normal launch burst, but a sustained
+abuser turns "can't kill your job" into "can delay your job's start" — a weaker but still
+cross-tenant availability effect. It is accepted for the same reason ADR-019's was (availability
+only, no data access) and is bounded by the boot budget: a starved `/run` fails that job, not
+the control plane. Revisit before mutually-distrusting tenants or public-fork PR runs: the fix
+is per-run/per-installation rate limiting in the broker (the token already identifies the run),
+not a bigger cap.
 **Rollout**: this is a **breaking change to the run-hook payload contract** — `table` is
 replaced by `broker` + `token`, and the in-VM hook is *baked into the image*. An old image
 rejects the new payload (`missing ref/broker/token`) and a new image rejects the old one, so
