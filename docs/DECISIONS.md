@@ -294,6 +294,53 @@ overrides. Keeping the guard dependency-free preserves the scripts' zero-npm-dep
 convention, and one TS module shared via `dist/` avoids two divergent implementations.
 **Consequences**: first deploy on a fresh clone requires `cp .env.local.example
 .env.local` + editing two values (deliberate one-time friction). Dev/prod account
-separation (M5) becomes trivial: each checkout/env pins its own account. Numbering note:
-an unmerged branch (`kermes/task-fiery-butterfly`) also claims "ADR-018" for run-row
-readback termination — if that branch lands, it renumbers to ADR-019.
+separation (M5) becomes trivial: each checkout/env pins its own account.
+
+## ADR-019 — Self-terminate via run-row readback (no in-guest microVM id source) (M3)
+**Status**: Accepted (v1) · amends [ADR-016](#adr-016) (teardown path)
+**Context**: The `/run` hook is supposed to call `terminate-microvm` on ITSELF at job end
+so the VM dies instantly. That requires the VM's own `microvmId` — and live runs show the
+guest has **no way to discover it**: `/run/microvm/id`, `/etc/microvm-id`, and
+`/proc/device-tree/microvm-id` don't exist, and the environment carries only
+`AWS_LAMBDA_MICROVM_IMAGE_{ARN,VERSION,NAME}` (image identity, not VM identity). Result:
+every job fell through to "no microvm id available; relying on Reaper" and idled until
+the 5-minute Reaper sweep — ~5 min of dead billing per job (≈ \$0.022 at 2 vCPU/4 GB) and
+slower quota release. Passing the id INTO the launch payload is a chicken/egg: the id
+doesn't exist until `RunMicrovm` returns, after the payload is fixed.
+**Decision**: **Run-row readback.** Provision already persists the run↔VM mapping
+(ADR-015); make that write the id channel:
+1. Provision stamps `RunRecord.microvmId` via a dedicated `stampMicrovmId` write that is
+   **unconditional** (only `attribute_exists(pk)`) and happens BEFORE the
+   `running` transition — the forward-only status guard must never drop the mapping when
+   an ultra-fast job's `completed` webhook wins the race.
+2. At job end the hook derives the run-row key from the JIT config ref it already holds
+   (`RUN#…#JITCONFIG` → pk `RUN#…`, sk `RUN`), reads `microvmId` back with the baked-in
+   AWS CLI (short retry for the write race), and calls `terminate-microvm` on itself.
+3. The microVM exec role gains `lambda:TerminateMicrovm` scoped to the region (the GA API
+   has no VM-level resource ARNs/tags to scope tighter — ADR-015); the Reaper stays as
+   the backstop for crashed hooks / lost writes.
+**Why**: The readback needs no new infrastructure (table + exec-role read grant already
+exist), no API the platform doesn't offer, and no payload change. Alternatives rejected:
+writing the id to the JITCONFIG item (second write path for the same fact — the run row
+IS the mapping per ADR-015); shortening the Reaper sweep (still pays idle minutes, just
+fewer); per-VM endpoint hostname parsing (endpoint shape is undocumented/unstable and the
+hook never sees its own endpoint).
+**Consequences**: **Accepted cross-tenant risk.** The grant is region-scoped, not
+VM-scoped, so *anything* executing inside a microVM can terminate *any* microVM in the
+account/region. The role lives inside VMs that run **untrusted workflow code** — a
+malicious or compromised PR in any onboarded repo can enumerate nothing (no `List*`
+granted) but can kill another tenant's in-flight job given its id, i.e. a cross-tenant
+denial-of-service primitive. Accepted for now because (a) the GA `lambda-microvms` API
+exposes no VM-level resource ARNs or tags to scope against (ADR-015), (b) the blast
+radius is bounded to job availability — no data access, since each VM is its own VM with
+its own single-use JIT credentials — and (c) the alternative (Reaper-only) costs ~5 min
+of idle billing on every job. **Known amplifier**: the exec role's run-table grant is
+`grantReadData` (table-wide `GetItem`/`Query`/`Scan`, pre-dating this ADR), so a VM can
+read other runs' rows and harvest their `microvmId` — target ids are therefore
+discoverable from inside a VM, and the table-wide read is itself worth tightening to the
+VM's own `RUN#…` partition independently of this decision. **Revisit triggers**: re-scope
+`TerminateMicrovm` to VM-level ARNs the moment the API supports them; narrow the run-table
+read to the VM's own run row; re-evaluate both before onboarding mutually-distrusting
+tenants or enabling public-fork PR runs. If the readback misses (row gone, DDB outage),
+behavior degrades exactly to the old Reaper-only path. `test/run-hook.test.mjs` pins the
+ref→run-row key derivation against the run store so the two sides can't drift.
