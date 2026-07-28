@@ -8,7 +8,7 @@ const PAGE = 50;
 
 /**
  * Runs — filterable run history (spec 04). The head page polls every 5 s so live runs advance
- * in place; "Load older" walks the API's opaque cursor (ADR-021) and appends, so history is
+ * in place; "Load older" walks the API's opaque cursor (ADR-023) and appends, so history is
  * not capped at one page. Deeper paging requires a repo or status filter — the unfiltered
  * merged view has no coherent cursor, so the button is hidden there.
  */

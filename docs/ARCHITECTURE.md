@@ -51,8 +51,8 @@ Owns operator-facing state and UX. A web UI + management API backed by DynamoDB:
 installed orgs/repos, discovered workflows, flavor mappings, and a run history/log view.
 Read-mostly; writes are config (flavor overrides, repo enable/disable). Implemented in M4 —
 see [spec 04](specs/04-web-ui.md); the plane's IAM boundary (no compute, no secret values,
-no Put/Delete on the table) is pinned by [ADR-025](DECISIONS.md#adr-023), and the console +
-API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-022)).
+no Put/Delete on the table) is pinned by [ADR-025](DECISIONS.md#adr-025), and the console +
+API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-024)).
 
 ```
 ┌── Control plane ─────────┐   ┌── Compute plane ──────────┐   ┌── Management plane ──────┐

@@ -697,9 +697,9 @@ pins the token/watermark precedence and the `pending` semantics. Phase 3 already
 WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
 
 ## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
-**Status**: Accepted (v1) · follows [ADR-023](#adr-023)
+**Status**: Accepted (v1) · follows [ADR-025](#adr-025)
 **Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
-`defaultFlavor`. ADR-023 deliberately restricts the Mgmt λ to config writes — it cannot
+`defaultFlavor`. ADR-025 deliberately restricts the Mgmt λ to config writes — it cannot
 touch the hot path. That leaves an obvious gap: writing config is not the same as *honoring*
 it. As first implemented, `enabled=false` / `mode='off'` and `defaultFlavor` were persisted
 and rendered, but no control-plane code read them, so the console's Disable button and

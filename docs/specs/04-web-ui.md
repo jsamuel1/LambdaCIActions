@@ -3,10 +3,10 @@
 Status: **Implemented (M4)** · Plane: Management
 
 > Implemented by `src/mgmt/**` (API), `web/**` (console), `lib/mgmt-stack.ts` +
-> `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-020) (auth),
-> [ADR-023](../DECISIONS.md#adr-021) (run-history index), [ADR-024](../DECISIONS.md#adr-022)
-> (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-023) (mgmt IAM boundary),
-> [ADR-026](../DECISIONS.md#adr-024) (polling), [ADR-027](../DECISIONS.md#adr-025) (where
+> `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-022) (auth),
+> [ADR-023](../DECISIONS.md#adr-023) (run-history index), [ADR-024](../DECISIONS.md#adr-024)
+> (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-025) (mgmt IAM boundary),
+> [ADR-026](../DECISIONS.md#adr-026) (polling), [ADR-027](../DECISIONS.md#adr-027) (where
 > console config is enforced). Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
 
 The operator console: install/manage the GitHub App, see which repos + workflows are

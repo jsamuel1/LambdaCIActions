@@ -5,9 +5,9 @@ Brings up the **management plane** (ROADMAP M4): `LCA-Mgmt-<env>` (management AP
 [DEPLOY-M1](DEPLOY-M1.md) — the console reads the same DynamoDB table and the run log
 group the compute plane already writes.
 
-Design: [spec 04](specs/04-web-ui.md) · [ADR-022](DECISIONS.md#adr-020) (auth) ·
-[ADR-024](DECISIONS.md#adr-022) (single CloudFront origin) ·
-[ADR-025](DECISIONS.md#adr-023) (IAM boundary).
+Design: [spec 04](specs/04-web-ui.md) · [ADR-022](DECISIONS.md#adr-022) (auth) ·
+[ADR-024](DECISIONS.md#adr-024) (single CloudFront origin) ·
+[ADR-025](DECISIONS.md#adr-025) (IAM boundary).
 
 ## Phase -1 — deploy-target pin (ADR-018)
 
