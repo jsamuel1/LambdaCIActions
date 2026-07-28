@@ -220,23 +220,30 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
  * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/017). Separate from
  * transitionRun because the mapping must be recorded even if the status already advanced
  * (e.g. an ultra-fast job whose `completed` webhook beat the `running` transition) — the
- * microVM /run hook reads this back at job end to self-terminate, and the Reaper
- * correlates live VMs against it. Only requires the row to exist.
+ * hook broker reads this back at job end to self-terminate on the VM's behalf, and the
+ * Reaper correlates live VMs against it. Only requires the row to exist.
+ *
+ * Also mirrors the run's hook capability token hash (ADR-020) onto the row. The JIT config
+ * item carrying the same hash ages out after 30 min (JITCONFIG_TTL_SECONDS), but a job may
+ * legitimately run for hours (Reaper's cap is 2h), and self-terminate fires at job END — so
+ * the durable run row, not the short-lived JIT item, has to be what authorizes `terminate`.
  */
 export async function stampMicrovmId(input: {
   repoId: number;
   runId: number;
   jobId: number;
   microvmId: string;
+  hookTokenHash?: string;
 }): Promise<boolean> {
+  const { updateExpression, values } = buildStampUpdate(input.microvmId, input.hookTokenHash);
   try {
     await requireDoc().send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: runPk(input.repoId, input.runId, input.jobId), sk: RUN_SK },
-        UpdateExpression: 'SET microvmId = :mid',
+        UpdateExpression: updateExpression,
         ConditionExpression: 'attribute_exists(pk)',
-        ExpressionAttributeValues: { ':mid': input.microvmId },
+        ExpressionAttributeValues: values,
       }),
     );
     return true;
@@ -244,6 +251,26 @@ export async function stampMicrovmId(input: {
     if (isConditionalFailed(err)) return false; // row missing — nothing to stamp
     throw err;
   }
+}
+
+/**
+ * Build the stamp write's update expression (pure, so the ADR-020 mirror is unit-testable).
+ * `hookTokenHash` is optional and must be OMITTED from the expression when absent rather
+ * than written as undefined: a plain `SET hookTokenHash = :hth` with no value is a DynamoDB
+ * validation error, and writing an empty value would strand the brokered terminate on a
+ * hash that can never match (silently regressing ADR-019 to Reaper-only reaping).
+ */
+export function buildStampUpdate(
+  microvmId: string,
+  hookTokenHash?: string,
+): { updateExpression: string; values: Record<string, unknown> } {
+  const setParts = ['microvmId = :mid'];
+  const values: Record<string, unknown> = { ':mid': microvmId };
+  if (hookTokenHash) {
+    setParts.push('hookTokenHash = :hth');
+    values[':hth'] = hookTokenHash;
+  }
+  return { updateExpression: `SET ${setParts.join(', ')}`, values };
 }
 
 /**
@@ -271,7 +298,7 @@ function isConditionalFailed(err: unknown): boolean {
   );
 }
 
-// ---- JIT config side-store (ADR-015: run-hook payload cap is 4 KB) ---------
+// ---- JIT config side-store (ADR-016: run-hook payload cap is 4 KB) ---------
 // The GA lambda-microvms `runHookPayload` hard cap is 4096 bytes, but a GitHub
 // encoded_jit_config alone is ~4 KB — it does not fit inline. So Provision stashes the
 // JIT config (+ minimal metadata) here, keyed by an opaque ref, and passes ONLY the ref
@@ -289,6 +316,13 @@ export interface JitConfigPayload {
   jobId: number;
   repoFullName: string;
   labels: string[];
+  /**
+   * SHA-256 of the per-run hook capability token (ADR-021). Only the hash is stored; the
+   * plaintext is handed to the microVM in its launch payload and never persisted. The hook
+   * broker compares a presented token against this to authorize jitconfig/terminate on
+   * THIS run only.
+   */
+  hookTokenHash?: string;
 }
 
 /** The opaque reference handed to the microVM (small; fits the 4 KB payload trivially). */
@@ -315,6 +349,7 @@ export async function putJitConfig(
         jobId: payload.jobId,
         repoFullName: payload.repoFullName,
         labels: payload.labels,
+        ...(payload.hookTokenHash ? { hookTokenHash: payload.hookTokenHash } : {}),
         ttl: Math.floor(now.getTime() / 1000) + JITCONFIG_TTL_SECONDS,
       },
     }),
@@ -339,5 +374,31 @@ export async function getJitConfigByRef(ref: string): Promise<JitConfigPayload |
     jobId: i.jobId as number,
     repoFullName: i.repoFullName as string,
     labels: (i.labels as string[]) ?? [],
+    hookTokenHash: i.hookTokenHash as string | undefined,
+  };
+}
+
+/**
+ * Read the `microvmId` off a run row addressed by its EXPLICIT key (ADR-021). Used by the
+ * hook broker, which derives the key from the caller's capability-token-bound ref rather
+ * than from caller-supplied ids, so a microVM can never address another run's row.
+ */
+export async function getRunFieldsByKey(
+  pk: string,
+  sk: string = RUN_SK,
+): Promise<{ microvmId?: string; status?: RunStatus; hookTokenHash?: string } | undefined> {
+  const res = await requireDoc().send(
+    new GetCommand({
+      TableName: TABLE,
+      Key: { pk, sk },
+      ProjectionExpression: 'microvmId, hookTokenHash, #s',
+      ExpressionAttributeNames: { '#s': 'status' },
+    }),
+  );
+  if (!res.Item) return undefined;
+  return {
+    microvmId: res.Item.microvmId as string | undefined,
+    status: res.Item.status as RunStatus | undefined,
+    hookTokenHash: res.Item.hookTokenHash as string | undefined,
   };
 }

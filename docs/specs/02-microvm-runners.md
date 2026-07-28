@@ -87,22 +87,25 @@ Provision λ passes the JIT config + job metadata as the `--run-hook-payload` JS
 delivers it to `POST /run` after the snapshot boots.
 
 ```
-POST /run   { ref, region, table }        (≤ 4 KB payload — JIT config by reference, ADR-016)
-  ├─ resolve ref → { jitConfig, runId, jobId, … } via DynamoDB get-item (exec role)
+POST /run   { ref, region, broker, token }  (≤ 4 KB payload — JIT config by reference, ADR-016)
+  ├─ resolve ref → { jitConfig, runId, jobId, … } by invoking the hook broker λ with the
+  │  run's capability token (ADR-021 — the VM holds no DynamoDB permission)
   ├─ (flavor pre-run hook, if present: ${RUNNER_DIR}/pre-run.sh — docker flavor starts dockerd)
   ├─ cd /opt/actions-runner
   ├─ ./run.sh --jitconfig <jitConfig>     # runs exactly ONE job, then exits
   │    (when the entrypoint is root: setpriv --reuid/--regid/--init-groups runner)
   ├─ return 200 quickly so Lambda un-gates traffic; run the job in the background
-  └─ on agent exit → read own microvmId back off the run row (Provision stamped it
-     post-launch, ADR-019) → `terminate-microvm` (self-terminate); Reaper backstops
+  └─ on agent exit → ask the broker to terminate this VM; the broker reads `microvmId`
+     off the run row (Provision stamped it post-launch, ADR-019) and calls
+     `terminate-microvm`; Reaper backstops
 
 POST /terminate   # fires pre-teardown; best-effort final status report
 ```
 
 - There is **no in-guest id source** for the VM's own `microvmId` (no metadata file, no
-  env var — verified from live runs, ADR-019). Self-terminate therefore reads the id
-  back from the run row using the same `{ref, region, table}` pointer as the JIT fetch.
+  env var — verified from live runs, ADR-019). Self-terminate therefore goes through the
+  hook broker, which reads the id off the run row keyed by the same `ref` the VM's
+  capability token is bound to (ADR-021). The VM never sees any `microvmId`.
 
 - JIT config is **single-use** (see [01](01-github-app.md)); it arrives in the payload,
   never in surviving env/user-data, and nothing long-lived lands on disk.

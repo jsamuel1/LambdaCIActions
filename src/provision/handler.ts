@@ -1,9 +1,12 @@
 import { LambdaClient } from '@aws-sdk/client-lambda';
+import { randomBytes } from 'node:crypto';
 import type { SQSEvent, SQSBatchResponse, SQSRecord } from 'aws-lambda';
 import { getParam } from '../shared/ssm.js';
 import { generateJitConfig } from '../shared/github-app.js';
 import { launchMicroVM } from '../shared/microvm.js';
 import { transitionRun, putJitConfig, stampMicrovmId } from '../shared/run-store.js';
+import { hashHookToken } from '../hook/broker-core.js';
+import { redactSecret } from '../shared/redact.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
@@ -26,7 +29,7 @@ import { resolveFlavor, type ResolveOptions } from './flavor.js';
  * (visibility timeout) and, after maxReceiveCount, routes to the DLQ. We use partial batch
  * responses so one poison message doesn't fail its whole batch.
  *
- * Env: APP_ID_PARAM, APP_PEM_PARAM, IMAGE_ARN_PARAM_PREFIX, TABLE_NAME,
+ * Env: APP_ID_PARAM, APP_PEM_PARAM, IMAGE_ARN_PARAM_PREFIX, TABLE_NAME, HOOK_BROKER_NAME,
  *      [RUNNER_ROLE_ARN].
  */
 
@@ -60,6 +63,13 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 
 async function provisionOne(record: SQSRecord): Promise<void> {
   const req = JSON.parse(record.body) as ProvisionRequest;
+
+  // Config guard FIRST, before anything irreversible (ADR-020). An unset broker name would
+  // launch a VM whose /run hook 400s on the missing pointer field, stranding it until the
+  // Reaper — and, worse, it would already have consumed a single-use GitHub JIT config.
+  // Fail here (before the mint) so SQS retries and then DLQs with nothing burnt.
+  const brokerName = process.env.HOOK_BROKER_NAME;
+  if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-020 brokered run hook)');
 
   // Idempotency guard (spec 05): move queued→provisioning. A duplicate delivery whose run
   // already advanced (running/terminal) is rejected by the forward-only guard — skip the
@@ -107,18 +117,26 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   });
 
   // 3. stash the JIT config in DynamoDB (the 4 KB run-hook payload can't hold it inline,
-  //    ADR-015) and build the small reference payload the /run hook will resolve.
+  //    ADR-016) together with the HASH of a freshly minted per-run capability token
+  //    (ADR-021). The plaintext token goes only to the VM, in its launch payload: it is
+  //    what lets the VM ask the hook broker for its own JIT config and its own
+  //    self-terminate, WITHOUT holding table-wide DDB read or region-wide
+  //    TerminateMicrovm itself.
+  const hookToken = randomBytes(32).toString('base64url');
+  const hookTokenHash = hashHookToken(hookToken);
   const ref = await putJitConfig(req.repoId, {
     jitConfig,
     runId: req.runId,
     jobId: req.jobId,
     repoFullName: req.repoFullName,
     labels: req.labels,
+    hookTokenHash,
   });
   const payload: RunHookPayload = {
     ref,
     region: process.env.AWS_REGION ?? 'us-west-2',
-    table: process.env.TABLE_NAME ?? '',
+    broker: brokerName,
+    token: hookToken,
   };
 
   let microvmId: string;
@@ -135,27 +153,38 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   } catch (err) {
     // Launch failed — record the failure so the run isn't a ghost, then rethrow so SQS
     // retries → DLQ after maxReceiveCount.
+    //
+    // REDACT FIRST (ADR-020): `payload` carries the plaintext capability token, and an SDK
+    // validation/serialization error echoes the offending request value back ("Value '…' at
+    // 'runHookPayload' failed to satisfy constraint"). Unscrubbed, that string lands in the
+    // run row's `reason` — durable for 90 days and surfaced by the management API/UI — and in
+    // the batch handler's log line, i.e. exactly the leak the guest-side redaction closes on
+    // the other end of the same secret.
+    const safeReason = redactSecret(errMsg(err), hookToken);
     await transitionRun({
       repoId: req.repoId,
       runId: req.runId,
       jobId: req.jobId,
       to: 'failed',
       flavor,
-      reason: `launch failed: ${errMsg(err)}`,
+      reason: `launch failed: ${safeReason}`,
     }).catch(() => {});
-    throw err;
+    throw new Error(`launch failed: ${safeReason}`);
   }
 
-  // 4. stamp the run↔VM mapping FIRST and unconditionally (ADR-019): the /run hook reads
-  //    `microvmId` back off this row at job end to self-terminate, and the Reaper
-  //    correlates against it — it must land even if the status already raced ahead (an
-  //    ultra-fast job's `completed` webhook can beat this write; transitionRun's
-  //    forward-only guard would then drop the mapping on the floor).
+  // 4. stamp the run↔VM mapping FIRST and unconditionally (ADR-019): the hook broker reads
+  //    `microvmId` off this row to self-terminate on the VM's behalf (ADR-021), and the
+  //    Reaper correlates against it — it must land even if the status already raced ahead
+  //    (an ultra-fast job's `completed` webhook can beat this write; transitionRun's
+  //    forward-only guard would then drop the mapping on the floor). The same write mirrors
+  //    the capability token hash onto the row: the JIT config item ages out after 30 min but
+  //    the brokered terminate fires at job END, so terminate authorizes off this row.
   await stampMicrovmId({
     repoId: req.repoId,
     runId: req.runId,
     jobId: req.jobId,
     microvmId,
+    hookTokenHash,
   }).catch((err) => {
     console.error(JSON.stringify({ msg: 'microvmId stamp failed', error: errMsg(err) }));
   });

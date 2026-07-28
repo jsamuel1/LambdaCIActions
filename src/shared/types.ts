@@ -105,14 +105,34 @@ export interface DiscoveryRequest {
 /**
  * The JSON we hand to `run-microvm --run-hook-payload` (delivered to /run). HARD cap 4096
  * bytes (GA lambda-microvms). The JIT config alone exceeds this, so it is NOT inlined — we
- * pass only a small reference; the /run hook fetches the config from DynamoDB (ADR-015).
+ * pass only a small reference; the /run hook resolves it through the hook broker λ, which is
+ * the only AWS surface the VM can reach (ADR-016 by-reference payload, ADR-020 brokered
+ * access).
  */
 export interface RunHookPayload {
   /** DynamoDB ref to the stashed JIT config (see run-store jitConfigRef). */
   ref: string;
-  /** AWS region + table so the in-microVM hook can construct a DynamoDB client. */
+  /** AWS region so the in-microVM hook can reach the broker. */
   region: string;
-  table: string;
+  /**
+   * Hook broker function name/ARN the VM invokes for its JIT config + self-terminate
+   * (ADR-021). The VM has NO direct DynamoDB or TerminateMicrovm permission.
+   */
+  broker: string;
+  /**
+   * Per-run capability token (plaintext, VM-only). The broker authorizes actions on this
+   * run by comparing its SHA-256 against the hash stored on the JIT config item.
+   */
+  token: string;
+}
+
+/** What a microVM asks the hook broker λ to do on its own run (ADR-021). */
+export interface HookBrokerRequest {
+  action: 'jitconfig' | 'terminate';
+  /** The run's JIT config ref — the ONLY partition this request can touch. */
+  ref: string;
+  /** Per-run capability token issued at launch. */
+  token: string;
 }
 
 /** GitHub App credentials read from SSM. */
@@ -156,6 +176,14 @@ export interface RunRecord {
   status: RunStatus;
   flavor?: string;
   microvmId?: string;
+  /**
+   * SHA-256 of the run's hook capability token (ADR-020), mirrored here by `stampMicrovmId`
+   * because the brokered self-terminate fires at job end, after the JIT config item carrying
+   * the same hash has TTL'd away. Control-plane only: it is the verifier for a bearer
+   * secret, so it must never be serialized into a management-API response or the UI
+   * (AGENTS.md — no secret values in the UI/API).
+   */
+  hookTokenHash?: string;
   labels: string[];
   /** Reason string for failed / timed_out. */
   reason?: string;

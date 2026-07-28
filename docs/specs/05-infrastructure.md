@@ -63,7 +63,7 @@ CDK v2 (TypeScript). Split so the compute plane can be built before the control 
 | Stack | Contains | Notes |
 |---|---|---|
 | `ImageStack` | microVM code bucket, image build role, (image ARNs via build script) | Deploy first; images built out-of-band |
-| `ControlStack` | API GW `/webhook`, Ingest λ, SQS + DLQ, Provision λ, Reaper λ + schedule | Depends on image ARNs in config |
+| `ControlStack` | API GW `/webhook`, Ingest λ, SQS + DLQ, Provision λ, Hook broker λ, Reaper λ + schedule | Depends on image ARNs in config |
 | `DataStack` | DynamoDB table(s) + GSIs | Shared by all planes |
 | `MgmtStack` | API GW `/api/*`, Mgmt API λ, (optional WS API) | Management plane |
 | `WebStack` | S3 bucket, CloudFront dist, OAI/OAC | Hosts the SPA |
@@ -116,8 +116,10 @@ Least privilege per Lambda:
 | Lambda | Allowed |
 |---|---|
 | Ingest | read webhook secret; `sqs:SendMessage`; `dynamodb:PutItem/UpdateItem` (installations, runs) |
-| Provision | read app-pem + image ARNs; mint GitHub tokens (network egress); launch/terminate **tagged** microVMs; write runs |
+| Provision | read app-pem + image ARNs; mint GitHub tokens (network egress); launch/terminate microVMs (region-scoped — the GA API can't tag VMs, ADR-015); write runs |
 | Reaper | list live microVMs + terminate orphans (by run-store `microvmId`); update run rows |
+| Hook broker | `dynamodb:GetItem` on the run table (no Query/Scan, no index); `lambda:TerminateMicrovm` (region-scoped). Called ONLY by microVMs, token-gated to the caller's own run; 20 reserved concurrent executions (ADR-021) |
+| microVM exec role | its own log group; `lambda:InvokeFunction` on the hook broker ARN. **Nothing else** — no DynamoDB, no microVM control (ADR-021) |
 | Mgmt API | read all plane tables; write **config** entities only; **no** token minting, **no** microVM launch |
 | Image build | `s3:*` on code bucket; microVM image build APIs |
 
@@ -125,6 +127,14 @@ microVM launch/terminate IAM is scoped to account/region (`aws:RequestedRegion`)
 VM tag — the GA `lambda-microvms` API doesn't support tagging a VM (see ADR-015). Runtime
 isolation comes from the dedicated per-env execution role + the run store as the
 authoritative run↔VM mapping.
+
+The microVM execution role is the sharpest edge here — it is stamped on VMs running
+**untrusted workflow code**. Per **ADR-021** it holds no ambient authority: its DynamoDB
+read and its `lambda:TerminateMicrovm` were removed and replaced by a single
+`lambda:InvokeFunction` on the hook broker λ, which performs both operations against the
+caller's OWN run only (authorized by a per-run capability token; the DDB key is derived from
+the token-bound ref). `test/exec-role-iam.test.mjs` asserts this against the synthesized
+template, so re-widening the role fails the build.
 
 ## Networking
 

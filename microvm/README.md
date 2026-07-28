@@ -24,12 +24,14 @@ Lambda microVMs do **not** use user-data + `run.sh`. Instead:
 2. `run-microvm --image-identifier <ARN> --run-hook-payload <JSON>` launches a VM.
 3. After the snapshot boots, Lambda delivers the payload to `POST /run` on the image's
    HTTP hook server (`:8080`). Traffic is gated until `/run` returns 200.
-4. `run-hook.mjs` parses the `{ ref, region, table }` pointer, fetches the JIT config
-   from DynamoDB by ref (ADR-016), ACKs 200, and runs `./run.sh --jitconfig <jitConfig>`
+4. `run-hook.mjs` parses the `{ ref, region, broker, token }` pointer, fetches the JIT
+   config by invoking the **hook broker λ** with its per-run capability token (ADR-021 — the
+   VM has no DynamoDB permission), ACKs 200, and runs `./run.sh --jitconfig <jitConfig>`
    in the background — **exactly one job**.
-5. On agent exit, the hook reads its own `microvmId` back off the run row (Provision
-   stamps it post-launch — there is no in-guest id source, ADR-019) and calls
-   `terminate-microvm` to self-destruct. The Reaper λ backstops orphans (spec 02).
+5. On agent exit, the hook asks the broker to terminate this VM. The broker reads the run
+   row's `microvmId` (Provision stamps it post-launch — there is no in-guest id source,
+   ADR-019) and calls `terminate-microvm`; the VM itself never holds that permission and
+   never learns any VM id (ADR-021). The Reaper λ backstops orphans (spec 02).
 
 The `--run-hook-payload` is capped at **4 KB** (ADR-016); the JIT config is passed by
 reference, never inline.
