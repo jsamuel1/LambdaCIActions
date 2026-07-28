@@ -1,4 +1,4 @@
-import type { WorkflowJobEvent, ProvisionRequest } from '../shared/types.js';
+import type { WorkflowJobEvent, ProvisionRequest, RepoRecord } from '../shared/types.js';
 
 /**
  * Decide whether a `workflow_job` event is one LambdaCIActions should provision a runner
@@ -19,6 +19,21 @@ export function shouldClaim(
   const jobLabels = (event.workflow_job?.labels ?? []).map((l) => l.toLowerCase());
   const claims = claimedLabels.map((l) => l.toLowerCase());
   return jobLabels.some((l) => claims.includes(l));
+}
+
+/**
+ * Whether the repo's stored config opts OUT of LambdaCIActions (spec 04 Repos screen,
+ * ADR-027). The console writes `enabled` / `mode` on the repo row; this is the control-plane
+ * enforcement point for them — without it the UI's Disable button would be cosmetic.
+ *
+ * Opt-out iff `enabled === false` (explicit disable, or `installation_repositories.removed`)
+ * or `mode === 'off'`. A MISSING repo row is NOT an opt-out: rows predating M4 (and any
+ * lookup failure the caller swallows) must fail OPEN so a config read can never stop a
+ * labeled job (spec 03 § routing).
+ */
+export function isRepoOptedOut(repo: RepoRecord | undefined): boolean {
+  if (!repo) return false;
+  return repo.enabled === false || repo.mode === 'off';
 }
 
 /** Project a claimed webhook event into the SQS provisioning message. */

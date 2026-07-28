@@ -2,8 +2,8 @@
 // CDK app entrypoint for LambdaCIActions.
 //
 // M1 scope (see docs/ROADMAP.md): ImageStack (compute-plane image build infra) +
-// ControlStack (webhook → ingest → SQS → provision → microVM). DataStack / MgmtStack /
-// WebStack / AuthStack land in later milestones.
+// ControlStack (webhook → ingest → SQS → provision → microVM). DataStack lands with M2,
+// MgmtStack + WebStack with M4 (management plane + console).
 //
 // Environment selection: `-c env=dev|prod` (default dev). Account/region are PINNED in
 // `.env.local` (ADR-018, see .env.local.example) — deploys refuse to run against ambient
@@ -16,6 +16,8 @@ import { App } from 'aws-cdk-lib';
 import { ImageStack } from '../lib/image-stack.js';
 import { ControlStack } from '../lib/control-stack.js';
 import { DataStack } from '../lib/data-stack.js';
+import { MgmtStack } from '../lib/mgmt-stack.js';
+import { WebStack } from '../lib/web-stack.js';
 import { loadEnvLocal, validateTarget } from '../lib/deploy-env.js';
 
 const app = new App();
@@ -83,5 +85,35 @@ const controlStack = new ControlStack(app, `LCA-Control-${envName}`, {
 });
 controlStack.addDependency(imageStack);
 controlStack.addDependency(dataStack);
+
+// Phase 4 (M4): management plane. The console API reads the shared table + run logs and
+// enqueues manual re-scans onto the control plane's discovery queue.
+//
+// `publicOrigin` is the console's CloudFront domain, which does not exist until WebStack's
+// first deploy — hence the two-pass bootstrap documented in docs/DEPLOY-M4.md:
+//   1. deploy MgmtStack + WebStack (login disabled: no origin),
+//   2. re-deploy MgmtStack with `-c publicOrigin=https://<domain>`.
+// We refuse to guess an origin because a wrong value is an open-redirect target.
+const publicOrigin = (app.node.tryGetContext('publicOrigin') as string | undefined) ?? undefined;
+const mgmtStack = new MgmtStack(app, `LCA-Mgmt-${envName}`, {
+  env,
+  envName,
+  ssmPrefix,
+  table: dataStack.table,
+  discoveryQueueUrl: controlStack.discoveryQueueUrl,
+  discoveryQueueArn: controlStack.discoveryQueueArn,
+  publicOrigin,
+});
+mgmtStack.addDependency(dataStack);
+mgmtStack.addDependency(controlStack);
+
+// Phase 4 (M4): console hosting. Fronts BOTH the SPA bundle and the management API on one
+// CloudFront distribution so the session cookie stays first-party (ADR-024).
+const webStack = new WebStack(app, `LCA-Web-${envName}`, {
+  env,
+  envName,
+  apiHost: mgmtStack.apiEndpointHost,
+});
+webStack.addDependency(mgmtStack);
 
 app.synth();

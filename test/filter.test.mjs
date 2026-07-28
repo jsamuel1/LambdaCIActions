@@ -69,3 +69,26 @@ test('workflowName defaults to null when the webhook omits it', () => {
 test('dedupe key is stable and combines repo/run/job', () => {
   assert.equal(dedupeKey(99, 7, 42), '99:7:42');
 });
+
+// --- Repo opt-out gate (console `enabled` / `mode`, M4 review fix) -------------
+// The management API only WRITES repo config; Ingest is the enforcement point. Without
+// this, the console's Disable button and `mode: off` were cosmetic.
+import { isRepoOptedOut } from '../dist/src/ingest/filter.js';
+
+test('a repo disabled from the console is opted out', () => {
+  assert.equal(isRepoOptedOut({ enabled: false, mode: 'label' }), true);
+});
+
+test('mode=off opts a repo out even while enabled', () => {
+  assert.equal(isRepoOptedOut({ enabled: true, mode: 'off' }), true);
+});
+
+test('an enabled repo in label/adopt mode is claimed', () => {
+  assert.equal(isRepoOptedOut({ enabled: true, mode: 'label' }), false);
+  assert.equal(isRepoOptedOut({ enabled: true, mode: 'adopt' }), false);
+  assert.equal(isRepoOptedOut({ enabled: true }), false, 'absent mode ⇒ label default');
+});
+
+test('a missing repo row fails OPEN (pre-M4 rows must still run)', () => {
+  assert.equal(isRepoOptedOut(undefined), false);
+});

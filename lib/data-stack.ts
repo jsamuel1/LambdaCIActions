@@ -43,11 +43,22 @@ export class DataStack extends Stack {
       removalPolicy: envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
     });
 
-    // GSI1 — status/time index. Sparse: only rows that set gsi1pk/gsi1sk (run rows) appear.
+    // GSI1 — status/time index. Sparse: only rows that set gsi1pk/gsi1sk appear (run rows,
+    // plus installation rows which use `gsi1pk=INSTALLS` so the UI can enumerate them).
     this.table.addGlobalSecondaryIndex({
       indexName: 'gsi1',
       partitionKey: { name: 'gsi1pk', type: ddb.AttributeType.STRING },
       sortKey: { name: 'gsi1sk', type: ddb.AttributeType.STRING },
+      projectionType: ddb.ProjectionType.ALL,
+    });
+
+    // GSI2 — repo/time index (ADR-023), the M4 run-history read path:
+    // GSI2PK=`REPORUNS#<repoId>`, GSI2SK=`<createdAt ISO>`. Both components are immutable,
+    // so run transitions never rewrite this index. Sparse: run rows only.
+    this.table.addGlobalSecondaryIndex({
+      indexName: 'gsi2',
+      partitionKey: { name: 'gsi2pk', type: ddb.AttributeType.STRING },
+      sortKey: { name: 'gsi2sk', type: ddb.AttributeType.STRING },
       projectionType: ddb.ProjectionType.ALL,
     });
 

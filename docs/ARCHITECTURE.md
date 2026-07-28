@@ -49,7 +49,10 @@ tracks the runner until it self-terminates. Enforces max lifetime + reaping.
 ### 3. Management plane
 Owns operator-facing state and UX. A web UI + management API backed by DynamoDB:
 installed orgs/repos, discovered workflows, flavor mappings, and a run history/log view.
-Read-mostly; writes are config (flavor overrides, repo enable/disable).
+Read-mostly; writes are config (flavor overrides, repo enable/disable). Implemented in M4 —
+see [spec 04](specs/04-web-ui.md); the plane's IAM boundary (no compute, no secret values,
+no Put/Delete on the table) is pinned by [ADR-025](DECISIONS.md#adr-023), and the console +
+API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-022)).
 
 ```
 ┌── Control plane ─────────┐   ┌── Compute plane ──────────┐   ┌── Management plane ──────┐
@@ -73,10 +76,10 @@ Read-mostly; writes are config (flavor overrides, repo enable/disable).
 | Hook broker λ | Lambda | Only AWS surface a runner microVM can call: hands back that run's JIT config and terminates that run's VM, capability-token gated (ADR-020) |
 | Reaper λ | Lambda (EventBridge schedule) | Kill microVMs exceeding max lifetime; reconcile orphans |
 | Image builder | Lambda + code bucket | Build/snapshot flavor images; publish image ARNs |
-| Mgmt API λ | Lambda | CRUD over repos/workflows/flavors; run history/logs |
+| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config only (ADR-025) |
 | Config + run store | DynamoDB | Installations, repos, workflows, flavor maps, run records |
-| Web UI | S3 + CloudFront (SPA) | Operator console |
-| Auth | GitHub OAuth (+ optional Cognito) | UI login scoped to installations the user can admin |
+| Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024) |
+| Auth | GitHub OAuth + signed session cookie | UI login scoped to installations the user can admin (ADR-022) |
 | Secrets | SSM Parameter Store (SecureString) | App private key, webhook secret, OAuth client secret |
 
 ## Request flows

@@ -68,6 +68,8 @@ docs/
   ARCHITECTURE.md          System design: planes, request flow, data model
   DECISIONS.md             Architecture Decision Records (ADRs)
   ROADMAP.md               Phased delivery milestones
+  DEPLOY-M1.md             Runbook: control + compute plane bootstrap
+  DEPLOY-M4.md             Runbook: console + management API
   specs/
     01-github-app.md       GitHub App registration, auth, webhooks, JIT runners
     02-microvm-runners.md  Image build, flavors, lifecycle, snapshots
@@ -75,20 +77,24 @@ docs/
     04-web-ui.md           Management console + management API
     05-infrastructure.md   CDK stacks, secrets, deploy phases
 bin/        CDK app entrypoint (lca.ts)
-lib/        CDK stacks (image-stack.ts, control-stack.ts)
-src/        Lambda source (ingest/, provision/, shared/)
+lib/        CDK stacks (image-, data-, control-, mgmt-, web-stack.ts)
+src/        Lambda source (ingest/, discover/, provision/, reaper/, mgmt/, shared/)
+web/        Console SPA (React + TypeScript, esbuild → web/dist)
 microvm/    microVM image Dockerfiles + run-hook lifecycle server
-scripts/    build/deploy helpers (create-github-app, build-images)
+scripts/    build/deploy helpers (create-github-app, build-images, build-web)
 test/       unit tests (node --test)
 ```
 
 ## Status
 
-**M1 in progress** — the spike (one microVM runs one job) is implemented: `ImageStack` +
-`ControlStack`, the Ingest → SQS → Provision hot path, and the `base` microVM image with
-its run-hook lifecycle server. See [docs/DEPLOY-M1.md](docs/DEPLOY-M1.md) to deploy and
-[docs/ROADMAP.md](docs/ROADMAP.md) for the full plan. Specs 01–05 + ADRs remain the design
-source of truth.
+**M1–M4 implemented.** The hot path (webhook → Ingest → SQS → Provision → microVM →
+self-terminate), the Reaper + run store, flavors + workflow ingestion, and now the
+**operator console**: `MgmtStack` (management API) + `WebStack` (React SPA on S3 +
+CloudFront) with GitHub OAuth login, repo/workflow management, run history, and a
+CloudWatch log viewer. Deploy the console with
+[docs/DEPLOY-M4.md](docs/DEPLOY-M4.md); the platform bootstrap is
+[docs/DEPLOY-M1.md](docs/DEPLOY-M1.md). M5 (drop-in `adopt` mode + polish) is next — see
+[docs/ROADMAP.md](docs/ROADMAP.md). Specs 01–05 + ADRs remain the design source of truth.
 
 ## License
 

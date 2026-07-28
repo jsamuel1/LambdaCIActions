@@ -138,6 +138,81 @@ export function _clearTokenCache(): void {
   tokenCache.clear();
 }
 
+// ---- operator OAuth (spec 04 § Auth, M4) ------------------------------------
+
+/** GitHub's OAuth authorize endpoint (web flow). */
+export const OAUTH_AUTHORIZE_URL = 'https://github.com/login/oauth/authorize';
+const OAUTH_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+
+/**
+ * Exchange an OAuth `code` for a **user** access token (spec 04 § Auth). The token is used
+ * once — to identify the operator and enumerate the installations they may administer —
+ * and is then discarded; it is never persisted or put in the session cookie (ADR-022).
+ */
+export async function exchangeOauthCode(params: {
+  clientId: string;
+  clientSecret: string;
+  code: string;
+  redirectUri: string;
+}): Promise<string> {
+  const res = await fetch(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': UA,
+    },
+    body: JSON.stringify({
+      client_id: params.clientId,
+      client_secret: params.clientSecret,
+      code: params.code,
+      redirect_uri: params.redirectUri,
+    }),
+  });
+  const text = await res.text();
+  let body: { access_token?: string; error?: string; error_description?: string };
+  try {
+    body = JSON.parse(text) as typeof body;
+  } catch {
+    throw new Error(`GitHub OAuth token exchange returned non-JSON (HTTP ${res.status})`);
+  }
+  if (!body.access_token) {
+    throw new Error(
+      `GitHub OAuth token exchange failed: ${body.error ?? `HTTP ${res.status}`}` +
+        (body.error_description ? ` — ${body.error_description}` : ''),
+    );
+  }
+  return body.access_token;
+}
+
+/** The authenticated operator's GitHub login. */
+export async function getOauthUser(userToken: string): Promise<{ login: string; id: number }> {
+  const { body } = await githubJson<{ login: string; id: number }>('/user', {
+    token: userToken,
+    tokenType: 'Bearer',
+  });
+  return { login: body.login, id: body.id };
+}
+
+/**
+ * Installations of THIS App that the user can see (`GET /user/installations`).
+ *
+ * Authorization for the whole management API derives from this list: GitHub only returns
+ * installations on accounts/repos the user has access to, so we never have to interpret
+ * org roles ourselves. Filtered to admin-capable accounts by GitHub's own semantics.
+ */
+export async function listUserInstallations(
+  userToken: string,
+): Promise<{ installationId: number; accountLogin: string }[]> {
+  const { body } = await githubJson<{
+    installations?: { id: number; account?: { login?: string } }[];
+  }>('/user/installations?per_page=100', { token: userToken, tokenType: 'Bearer' });
+  return (body.installations ?? []).map((i) => ({
+    installationId: i.id,
+    accountLogin: i.account?.login ?? '',
+  }));
+}
+
 // ---- workflow discovery (spec 03 § Discovery) -------------------------------
 
 /** A workflow file listed under `.github/workflows` (subset of the contents API shape). */

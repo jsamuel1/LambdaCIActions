@@ -210,17 +210,29 @@ export interface InstallationRecord {
   updatedAt: string;
 }
 
+/**
+ * Onboarding mode for a repo (spec 03). `label` = workflows opt in with explicit LCA
+ * labels (v1 default). `adopt` = standard-label mapping, M5. `off` = never claim.
+ */
+export type RepoMode = 'label' | 'adopt' | 'off';
+
 /** A repo granted to an installation. `enabled=false` ⇒ we stop claiming its jobs. */
 export interface RepoRecord {
   installationId: number;
   repoId: number;
   repoFullName: string;
   enabled: boolean;
+  /** Onboarding mode; absent ⇒ `label` (the v1 default). Set from the M4 UI. */
+  mode?: RepoMode;
+  /** Operator-chosen fallback flavor for this repo; absent ⇒ catalog default (`base`). */
+  defaultFlavor?: string;
   /**
    * Per-repo explicit `label → flavor` override map (spec 03 routing step 1). Set via
    * the management UI (M4); consumed by Provision when resolving a job's flavor.
    */
   flavorMap?: Record<string, string>;
+  /** GitHub login of the operator who last changed config (M4 audit, spec 04). */
+  updatedBy?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,0 +1,116 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1e222b;
+  --line: #2a2f3a;
+  --fg: #e6e8ec;
+  --muted: #9aa3b2;
+  --accent: #4f8cff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --risk: #f0883e;
+  --block: #f85149;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.shell { display: flex; min-height: 100vh; }
+
+nav.side {
+  width: 200px;
+  flex: 0 0 200px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 16px 0;
+}
+nav.side .brand { padding: 0 16px 16px; font-weight: 700; letter-spacing: 0.2px; }
+nav.side a {
+  display: block;
+  padding: 8px 16px;
+  color: var(--muted);
+  border-left: 2px solid transparent;
+}
+nav.side a.active { color: var(--fg); background: var(--panel-2); border-left-color: var(--accent); }
+
+main { flex: 1; padding: 24px 28px; min-width: 0; }
+
+header.page { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+header.page h1 { font-size: 20px; margin: 0; }
+header.page .spacer { flex: 1; }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.stat .n { font-size: 26px; font-weight: 700; }
+.stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+tbody tr:hover { background: var(--panel-2); }
+
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  font-size: 12px; border: 1px solid var(--line); background: var(--panel-2);
+}
+.badge.ok, .badge.completed { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.badge.warn { color: var(--warn); }
+.badge.risk { color: var(--risk); }
+.badge.block, .badge.failed, .badge.timed_out { color: var(--block); }
+.badge.running, .badge.provisioning { color: var(--accent); }
+.badge.queued { color: var(--muted); }
+
+button, select, input[type="text"] {
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 10px; font-size: 13px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.muted { color: var(--muted); }
+.error { color: var(--block); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.stack { display: flex; flex-direction: column; gap: 14px; }
+
+/*
+ * Layout helpers. These exist as CLASSES rather than inline `style={{...}}` attributes
+ * because the console is served with a `self`-only CSP (ADR-022) and no `'unsafe-inline'`
+ * in `style-src` — a browser drops inline style attributes outright, so any layout
+ * expressed that way would silently disappear in production while working in dev.
+ */
+.tight { margin: 0; }
+.spacer { flex: 1; }
+.clickable { cursor: pointer; }
+.gap-top { margin-top: 10px; }
+.workflow { margin-bottom: 18px; }
+
+pre.logs {
+  background: #0b0d12;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+  max-height: 60vh;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.logs .ts { color: var(--muted); }
+
+.login { display: grid; place-items: center; min-height: 100vh; }
+.login .card { text-align: center; max-width: 380px; }

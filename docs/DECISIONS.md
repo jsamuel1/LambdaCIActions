@@ -561,3 +561,168 @@ payload-echoing SDK error loses the token, and the redaction happens before both
 persisted `reason` and the rethrow). The token hash mirrored onto the run row is a control-plane verifier for a
 bearer secret, so it is declared on `RunRecord` as such and must never be serialized into a
 management-API response or the UI (AGENTS.md).
+
+## ADR-022 — Operator auth: GitHub-OAuth-only with a stateless signed session (M4)
+**Status**: Accepted (v1) · resolves [spec 04](specs/04-web-ui.md) OQ-2
+**Context**: The console needs operator login and per-installation authorization. Spec 04
+left two options open: GitHub OAuth alone, or Cognito in front of it for session/token
+management. We also need an authorization source of truth — "may this user administer
+installation X?" — without re-implementing GitHub's org-role semantics.
+**Decision**: **GitHub OAuth web flow only, with a server-signed stateless session.**
+1. `GET /auth/login` redirects to GitHub with a `state` nonce that is BOTH HMAC-signed with
+   the session secret and set as a short-lived `HttpOnly` cookie; `/auth/callback` requires
+   both to agree (CSRF defense on the redirect).
+2. The callback exchanges the code for a **user** token, calls `/user` and
+   `/user/installations`, then **discards the token**.
+3. The session is `base64url(json).base64url(HMAC-SHA256)` — login + the installation list
+   + `iat`/`exp` — in an `HttpOnly; Secure; SameSite=Lax` cookie, TTL 8 h. The signing key
+   is an SSM SecureString (`/lca/<env>/mgmt/session-secret`), created out-of-band (ADR-008).
+4. Authorization is one predicate — `canAdminInstallation(session, id)` — applied at two
+   choke points (`authorizeRepo`, `authorizeRun`); every repo/run read and every config
+   write goes through one of them. List endpoints additionally filter rows by it.
+**Why**: `/user/installations` already encodes GitHub's own access decision, so the
+platform never interprets org roles. Not persisting the user token means a stolen cookie
+cannot be replayed against the GitHub API — the worst case is bounded to this platform's
+own read/config surface. No session table means no extra DynamoDB entity, no eviction
+logic, and a stateless λ. Cognito was rejected for v1: it adds a user pool, a hosted UI,
+and token plumbing to solve a problem (session storage) that 40 lines of HMAC solve, and it
+would still delegate identity to GitHub.
+**Consequences**: revocation is TTL-bounded — losing GitHub access leaves a valid session
+for up to 8 h (accepted: management surface only; no compute or secret access). Rotating
+the session secret invalidates all sessions (that IS the revocation lever). Installation
+grants are frozen at login, so a newly-granted installation needs a re-login to appear.
+Revisit if we need instant revocation or non-GitHub identities.
+
+## ADR-023 — GSI2 repo/time index for run history (M4)
+**Status**: Accepted (v1) · complements [ADR-014](#adr-014)
+**Context**: GSI1 (`RUNSTATUS#<status>` / `updatedAt`) exists for the Reaper's per-status
+sweep. The M4 Runs screen and Repo detail need a different access pattern: "the last N runs
+of THIS repo, newest first, regardless of status." GSI1 can't serve it (status is the
+partition), and a table Scan violates the < 300 ms p95 read target in spec 04.
+**Decision**: add **GSI2** — `gsi2pk = REPORUNS#<repoId>`, `gsi2sk = <createdAt ISO>` —
+written **once** in `buildQueuedItem` and never touched by transitions. The unfiltered
+"recent runs" view is a bounded fan-out: one small query per status merged and sorted in
+the λ. Deep pagination requires narrowing by repo or status, whose cursors are opaque
+base64url of the DynamoDB `LastEvaluatedKey`.
+**Why**: keying the sort on the **immutable** `createdAt` (not `updatedAt`) means a status
+transition rewrites GSI1 only — no double index churn on the hot path, and a run's position
+in history never moves while it executes. Alternatives rejected: a composite
+`REPOSTATUS#<repoId>#<status>` partition (would move rows between partitions on every
+transition); a scan with a filter expression (cost + latency scale with total history);
+storing a per-repo run counter (write contention on the hot path).
+**Consequences**: one more index to pay for on every run insert (single write, PAY_PER_REQUEST).
+The merged unfiltered view has no coherent cursor, so its `nextCursor` is always null — the
+UI narrows to paginate, which matches how operators actually drill in. Because neither index
+is keyed by installation, authorization is a post-query filter: a filtered list walks up to
+5 index pages per request to fill a page of visible rows (`src/mgmt/paging.ts`) so an
+operator whose installation is a minority of platform traffic doesn't see "no runs" next to a
+cursor. Dashboard `Select: COUNT` queries page `LastEvaluatedKey` up to 10 times and report
+`countsExact: false` when that budget is spent — a single COUNT query only counts one 1 MB
+pass, which would silently under-report a long history.
+`test/run-store-gsi2.test.mjs` pins the "gsi2sk is createdAt" invariant so a future
+transition change can't silently break history ordering; `test/mgmt-authz-paging.test.mjs`
+pins the visibility-paging contract.
+
+## ADR-024 — One CloudFront distribution fronts both the SPA and the management API (M4)
+**Status**: Accepted (v1)
+**Context**: The console is an S3-hosted SPA; the management API is an API Gateway HTTP API.
+If the browser talks to two origins, the session cookie becomes cross-site: it needs
+`SameSite=None` (thus third-party-cookie-blocking risk in modern browsers), the API needs
+CORS with credentials, and the OAuth redirect URI points at a different host than the app.
+**Decision**: **one distribution, two behaviors.** Default behavior → private S3 bucket via
+Origin Access Control (bucket is never public); `/api/*` and `/auth/*` → the HTTP API
+origin with `CACHING_DISABLED` + `ALL_VIEWER_EXCEPT_HOST_HEADER` (cookies and query
+strings forwarded, nothing cached). SPA deep links do **not** need a CloudFront error
+rewrite: the app is hash-routed (`#/runs/1/2/3`), so every real request path is `/`. We
+deliberately configure **no** `errorResponses` — custom error responses are
+distribution-wide, so a 403/404 → `/index.html` rewrite would also rewrite the management
+API's `403 forbidden` / `404 not found` into `200` + HTML, breaking the API contract and
+masking authorization denials. The shell also carries a `self`-only CSP + HSTS +
+`frame-ancestors 'none'` via a response-headers policy on the S3 behavior.
+**Why**: same-origin makes the session a first-party cookie, removes CORS entirely, and
+gives OAuth a single stable callback URL (`https://<domain>/auth/callback`). It also puts
+the API behind CloudFront's TLS + edge termination for free.
+**Consequences**: the console domain must exist before the management API knows its own
+public origin, so the first deploy is **two-pass**: deploy `LCA-Web-<env>`, then re-deploy
+`LCA-Mgmt-<env>` with `-c publicOrigin=https://<domain>` (docs/DEPLOY-M4.md). We
+deliberately do NOT default `publicOrigin` to a guess — a wrong value is an open-redirect
+target, so login fails loudly (500) until it is set. Custom domains + ACM are M5.
+
+## ADR-025 — Management-plane IAM: read-mostly, config-write-only, no compute (M4)
+**Status**: Accepted (v1)
+**Context**: The management λ reads across all three planes' data (runs, installations,
+workflow analyses, run logs). The tempting shortcut — `grantReadWriteData` on the table plus
+broad SSM read — would let a console bug (or an authz gap) forge run rows, delete history,
+or return the GitHub App private key. Spec 04 states the boundary; nothing enforced it.
+**Decision**: pin the boundary in IAM **and** assert it in tests:
+- DynamoDB: `grantReadData` + a separate statement granting exactly `dynamodb:UpdateItem`.
+  No `PutItem`/`DeleteItem`/`BatchWriteItem` → cannot forge or destroy run rows.
+- SSM: `GetParameter` on exactly three paths (OAuth client id/secret, session secret).
+  Secret **presence** for the Settings screen comes from `ssm:DescribeParameters`, a
+  metadata API that cannot return a value — so no code path can leak a SecureString.
+- Logs: `FilterLogEvents`/`GetLogEvents`/`DescribeLogStreams` on the per-env run log group
+  only; no `PutLogEvents` to it.
+- SQS: `SendMessage` only, on the discovery queue (manual re-scan) — no receive/delete.
+- **No** `lambda:RunMicrovm`/`TerminateMicrovm`, no `iam:PassRole`, no App PEM access.
+Request bodies are additionally allow-listed field-by-field (`validateRepoPatch` rejects
+unknown fields), so an operator cannot patch a run's status through the config endpoint.
+**Why**: the console is the internet-facing surface of the platform; its blast radius should
+be "change repo config" and nothing more. `test/mgmt-stack.test.mjs` asserts the negative
+grants against the synthesized template, so a future `grantReadWriteData` convenience call
+fails the build rather than silently widening the plane.
+**Consequences**: adding a genuinely new management write (e.g. the M5 rewrite-PR endpoint,
+which needs a GitHub token) requires a deliberate ADR + IAM change, not a one-line grant.
+The `DescribeParameters` statement is `Resource: '*'` because the API has no resource-level
+scoping — acceptable since it returns metadata only.
+
+## ADR-026 — Polling for live run updates in v1 (no WebSocket/SSE) (M4)
+**Status**: Accepted (v1) · resolves [spec 04](specs/04-web-ui.md) OQ-1
+**Context**: Run detail and the dashboard should update while a job executes. Spec 04 listed
+WebSocket (API Gateway), SSE, and polling.
+**Decision**: **polling**. `useApi(fetcher, deps, pollMs)` re-fetches on an interval —
+3 s for run detail, 5 s for dashboard/runs — and **pauses while `document.visibilityState`
+is not `visible`. The log viewer tails CloudWatch by following its `nextToken`.
+**Why**: zero new infrastructure (no WS API, no connection table, no fan-out publisher on
+the control-plane write path), no reconnect/backoff state machine in the SPA, and a CI
+console is a foreground tool watched for seconds-to-minutes — a 3 s lag is invisible. A WS
+API would require the control plane to know about connected UI clients, coupling the hot
+path to the management plane for a cosmetic gain.
+**Consequences**: idle open tabs cost DynamoDB reads; the visibility pause bounds that to
+tabs a human is actually looking at, and the aggregate queries are `Select: COUNT` or
+`Limit`-bounded index queries (never scans). The log tail follows CloudWatch's `nextToken`
+only while one is issued — the filter stops returning a token once caught up, so the client
+then advances a `since` watermark (newest event held, +1 ms). Re-sending a spent token, as
+the first implementation did, replays the same page indefinitely; `test/mgmt-logs.test.mjs`
+pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
+WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
+
+## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
+**Status**: Accepted (v1) · follows [ADR-023](#adr-023)
+**Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
+`defaultFlavor`. ADR-023 deliberately restricts the Mgmt λ to config writes — it cannot
+touch the hot path. That leaves an obvious gap: writing config is not the same as *honoring*
+it. As first implemented, `enabled=false` / `mode='off'` and `defaultFlavor` were persisted
+and rendered, but no control-plane code read them, so the console's Disable button and
+default-flavor selector were cosmetic — the platform kept claiming the repo's jobs and kept
+falling back to `base`.
+**Decision**: the **control plane** enforces console config at the points that already own
+those decisions:
+- **Claim gate** — `src/ingest/handler.ts` reads the repo row before enqueueing a claimed
+  job and drops it when `isRepoOptedOut(repo)` (`enabled === false` or `mode === 'off'`),
+  logging `claimed: false, disabled: true`. This sits AFTER the label filter (so an
+  unlabeled job costs no read) and beside the existing compat gate.
+- **Flavor fallback** — `resolveFlavor` takes `opts.defaultFlavor` from the repo row and
+  uses it instead of catalog `base` when no FlavorMap entry and no explicit LCA label
+  matched. FlavorMap and explicit labels still win; an unknown flavor name is ignored;
+  signal-based upgrade still applies on top.
+**Why**: keeping enforcement in Ingest/Provision preserves the plane boundary — the
+management λ never gains hot-path permissions — and puts each rule where its data already
+lives. Alternatives rejected: having the Mgmt λ mutate the runner-label config (would widen
+its IAM and couple planes); a separate "disabled repos" table (a second source of truth for
+a field the repo row already has).
+**Consequences**: one extra `GetItem` per claimed job. Both gates **fail OPEN** — a missing
+repo row (repos onboarded before M4) or a DynamoDB fault must never stop a labeled job, per
+spec 03 § routing. Consequently a *disabled* repo whose row read fails will still run that
+job; that is the deliberate trade (availability over strictness) and matches the compat
+gate. `mode='adopt'` is not an opt-out — it is treated as `label` until the M5
+standard-label map ships. `test/filter.test.mjs` and `test/flavor.test.mjs` pin both.
