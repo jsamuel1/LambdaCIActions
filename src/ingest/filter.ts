@@ -23,7 +23,7 @@ export function shouldClaim(
 
 /**
  * Whether the repo's stored config opts OUT of LambdaCIActions (spec 04 Repos screen,
- * ADR-025). The console writes `enabled` / `mode` on the repo row; this is the control-plane
+ * ADR-027). The console writes `enabled` / `mode` on the repo row; this is the control-plane
  * enforcement point for them — without it the UI's Disable button would be cosmetic.
  *
  * Opt-out iff `enabled === false` (explicit disable, or `installation_repositories.removed`)

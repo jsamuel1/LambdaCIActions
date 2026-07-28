@@ -696,7 +696,7 @@ the first implementation did, replays the same page indefinitely; `test/mgmt-log
 pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
 WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
 
-## ADR-025 — Console repo config is enforced in Ingest, not the management plane (M4)
+## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
 **Status**: Accepted (v1) · follows [ADR-023](#adr-023)
 **Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
 `defaultFlavor`. ADR-023 deliberately restricts the Mgmt λ to config writes — it cannot

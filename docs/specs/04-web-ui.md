@@ -189,7 +189,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   400, so a run's status/microVM id can't be patched through the config endpoint.
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo
   row and emit a structured log line with the actor and the patch.
-- **Config takes effect in the control plane** (ADR-025): the management λ only writes repo
+- **Config takes effect in the control plane** (ADR-027): the management λ only writes repo
   config. `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
   `defaultFlavor` by `resolveFlavor`'s fallback. Both fail open, so a config read fault
   cannot stop a labeled job.

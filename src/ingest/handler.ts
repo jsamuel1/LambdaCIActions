@@ -137,7 +137,7 @@ async function handleWorkflowJob(
     return json(202, { ok: true, claimed: false });
   }
 
-  // Repo opt-out gate (spec 04 Repos screen / ADR-025): the console's `enabled=false` and
+  // Repo opt-out gate (spec 04 Repos screen / ADR-027): the console's `enabled=false` and
   // `mode='off'` are enforced HERE — the management plane only writes config. Fails OPEN:
   // a missing row (pre-M4 repos) or a DDB fault must never stop a labeled job.
   try {

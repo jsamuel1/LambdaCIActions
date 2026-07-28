@@ -106,7 +106,7 @@ Resolution order (first match wins):
 The Ingest λ ([01](01-github-app.md)) only *claims* a `workflow_job` if routing says
 `eligible` for that job's labels. Non-eligible jobs are ignored (GitHub-hosted still runs them).
 
-**Repo opt-out** (ADR-025): before enqueueing a claimed job, Ingest reads the repo row and
+**Repo opt-out** (ADR-027): before enqueueing a claimed job, Ingest reads the repo row and
 drops the job when the console has set `enabled=false` or `mode='off'`. The management plane
 only writes that config — this is where it takes effect. The check fails **open**: a missing
 repo row (pre-M4 onboarding) or a DynamoDB fault never blocks a labeled job.
