@@ -1,5 +1,5 @@
 /**
- * Control-plane secret redaction (ADR-020).
+ * Control-plane secret redaction (ADR-021).
  *
  * The run-hook capability token is a bearer secret: it authorizes that run's JIT config
  * fetch and self-terminate. The in-VM hook already redacts it from guest logs, but the

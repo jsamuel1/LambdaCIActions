@@ -1,4 +1,4 @@
-// The control plane holds the plaintext run-hook capability token (ADR-020) — it builds the
+// The control plane holds the plaintext run-hook capability token (ADR-021) — it builds the
 // launch payload — so its own error paths are a token egress route, symmetrical to the
 // guest-side redaction in run-hook.mjs. An SDK validation/serialization failure echoes the
 // offending request value ("Value '…' at 'runHookPayload' failed to satisfy constraint"), and

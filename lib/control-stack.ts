@@ -198,7 +198,7 @@ export class ControlStack extends Stack {
     // Reads exactly two items by primary key — the JIT config item (token hash + config) and
     // the run row (token hash + microvmId). NOT `grantReadData`: that hands out Query/Scan/
     // BatchGetItem/stream reads plus `/index/*`, i.e. table-wide enumeration on the one role
-    // an untrusted VM can reach (indirectly) — the exact shape ADR-020 exists to remove. The
+    // an untrusted VM can reach (indirectly) — the exact shape ADR-021 exists to remove. The
     // broker never queries and never touches an index, so grant GetItem on the table only.
     hookBroker.addToRolePolicy(
       new iam.PolicyStatement({

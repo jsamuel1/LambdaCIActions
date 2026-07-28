@@ -26,7 +26,7 @@ test('importing run-hook.mjs does not bind the port', () => {
   });
 });
 
-// The capability token (ADR-020) is a bearer secret. The two payload-diagnostic log lines
+// The capability token (ADR-021) is a bearer secret. The two payload-diagnostic log lines
 // in /run echo the raw body, and the platform delivers the pointer BOTH bare and wrapped
 // (`{runHookPayload: "<json string>"}`), so redact must handle the escaped form too —
 // otherwise the token lands in the run's CloudWatch stream, which outlives the VM.

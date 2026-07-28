@@ -1,4 +1,4 @@
-// Behavioural tests for the hook broker handler's authorization wiring (ADR-020). The pure
+// Behavioural tests for the hook broker handler's authorization wiring (ADR-021). The pure
 // token/key helpers are covered in hook-broker.test.mjs; this pins the decisions the λ makes
 // with them: which item authorizes which action, that a VM can only ever touch its own run
 // partition, and that "no such run" and "wrong token" are indistinguishable.
