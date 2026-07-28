@@ -38,7 +38,7 @@ Multiple runner types + workflow awareness.
 - 🎯 **verified** — A repo with docker + node jobs routes each to the right flavor with no YAML edits beyond adding LCA labels. Evidence: [`docs/VERIFY-M3.md`](VERIFY-M3.md) (`jsamuel1/lca-m3-verify` run `30244719785`, all three jobs green on `base`/`node`/`docker` microVMs). Verification found + fixed one platform defect: the `docker` flavor could never start `dockerd` (ADR-020).
 
 ## M4 — Web UI & Management API
-Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md), ADR-022..024, [DEPLOY-M4](DEPLOY-M4.md).
+Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md), ADR-022..027, [DEPLOY-M4](DEPLOY-M4.md).
 - `MgmtStack` API + `WebStack` SPA + GitHub OAuth.
 - Screens: Setup, Dashboard, Repos, Repo/Workflow detail, Runs, Run detail (logs), Flavors, Settings.
 - Run history (GSI2, ADR-023) + CloudWatch log viewer; live status via polling (ADR-026).

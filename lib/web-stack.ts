@@ -33,7 +33,7 @@ export interface WebStackProps extends StackProps {
  * apply to every behavior, including `/api/*`. Rewriting 403/404 → `/index.html` would
  * therefore turn the management API's `403 forbidden` and `404 not found` into `200` with
  * an HTML body, breaking the API contract (and masking authorization denials). The console
- * is hash-routed (`#/runs/1/2/3`, ADR-022) so every real URL path is `/` — no fallback is
+ * is hash-routed (`#/runs/1/2/3`, ADR-024) so every real URL path is `/` — no fallback is
  * needed, and none is configured.
  *
  * The asset deployment is skipped when `web/dist` is absent so a credential-less
@@ -72,7 +72,7 @@ export class WebStack extends Stack {
     };
 
     // Security headers for the app shell. CSP is `self`-only: the SPA loads no third-party
-    // script/style/font and calls only the same-origin API (ADR-022), so a strict policy
+    // script/style/font and calls only the same-origin API (ADR-024), so a strict policy
     // costs nothing and blocks injected-script + clickjacking classes outright.
     const securityHeaders = new cloudfront.ResponseHeadersPolicy(this, 'ConsoleSecurityHeaders', {
       responseHeadersPolicyName: `lca-${envName}-console-security`,

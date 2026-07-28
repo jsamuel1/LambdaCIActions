@@ -1,4 +1,4 @@
-// WebStack posture tests (spec 04 § Tech choices, ADR-022 — M4 review fixes).
+// WebStack posture tests (spec 04 § Tech choices, ADR-024 — M4 review fixes).
 //
 // Two invariants are easy to break by "helpfully" re-adding a CloudFront convenience:
 //   1. custom error responses are DISTRIBUTION-wide, so an SPA 403/404 → /index.html rewrite
@@ -36,7 +36,7 @@ test('no custom error responses — they would corrupt the API 403/404 contract'
   assert.equal(
     cfg.CustomErrorResponses,
     undefined,
-    'custom error responses apply to /api/* too — they must stay off (ADR-022)',
+    'custom error responses apply to /api/* too — they must stay off (ADR-024)',
   );
 });
 
