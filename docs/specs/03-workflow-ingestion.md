@@ -95,7 +95,14 @@ Resolution order (first match wins):
 2. **Explicit LCA label** — `lambda-ci`, `lambda-ci-docker`, `lambda-ci-node`,
    `lambda-ci-python`, `lambda-ci-java`, `lambda-ci-go`, `lambda-ci-rust` → that flavor.
    The **most specific** (longest) matching label wins, so `[self-hosted, lambda-ci,
-   lambda-ci-java]` routes to `java`, not `base`.
+   lambda-ci-java]` routes to `java`, not `base`. Labels of **equal** specificity break the
+   tie by **flavor name ascending** — the expanded set has several same-length labels
+   (`lambda-ci-python`/`-docker` are both 16 chars; `-node`/`-java`/`-rust` all 14), and
+   without an explicit rule the winner would fall out of the order of entries in
+   `flavors.json`. That also lands the safer side of the one collision that matters:
+   `[lambda-ci-python, lambda-ci-docker]` → `docker`, where a job's docker steps work,
+   rather than `python`, where they would fail on a missing daemon. The resolution reason
+   records the ambiguity.
 3. **Adopt-mode standard-label map** (if adopt enabled for the repo):
    | GitHub label | Default flavor |
    |---|---|

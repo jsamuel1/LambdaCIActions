@@ -1026,7 +1026,15 @@ instead of downloading. Deliberately **excluded**:
 Each new flavor declares a capability equal to its name (`python`, `java`, `go`, `rust`),
 keeps the unprivileged `USER runner` entrypoint and **no** `osCapabilities` (only `docker`
 gets `ALL`, per ADR-020), and pins toolchain versions rather than tracking `latest` so a
-rebuild is reproducible. Baked environment variables follow what each action actually does:
+rebuild is reproducible. Expanding the set also forced the label-precedence rule to become
+explicit: "most specific wins" was unambiguous while the catalog held one label per length,
+but `lambda-ci-python`/`lambda-ci-docker` are both 16 characters and `-node`/`-java`/`-rust`
+all 14, so a pure length sort left those ties to `Array#sort` stability — i.e. to the order of
+entries in `flavors.json`, where reordering the catalog would silently re-route live jobs.
+Equal-specificity ties now break by **flavor name ascending**, which is catalog-order
+independent and puts the one collision that matters on its safe side (`python`+`docker` →
+`docker`: a present daemon, rather than docker steps failing on a missing socket the labels
+said should work). Baked environment variables follow what each action actually does:
 `JAVA_HOME` is baked (setup-java `exportVariable`s it, so the action always wins), `GOROOT` is
 deliberately **not** (setup-go sets it only for Go < 1.9, so a baked value would override a
 job's chosen toolchain and pair its binary with the baked stdlib), and rust's `RUSTUP_HOME` +

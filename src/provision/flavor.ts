@@ -8,7 +8,9 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
  *   2. Explicit LCA label                   — `lambda-ci`, `lambda-ci-node`, `lambda-ci-docker`,
  *                                             `lambda-ci-python`, `lambda-ci-java`,
  *                                             `lambda-ci-go`, `lambda-ci-rust`
- *                                             (most-specific label wins).
+ *                                             (most-specific label wins; equally specific
+ *                                             labels break the tie by flavor name — see
+ *                                             `explicitLabelMatch`).
  *   3. Signal-based upgrade                 — if the job needs a capability the resolved flavor
  *                                             lacks (e.g. Docker), upgrade to the smallest flavor
  *                                             that provides it.
@@ -108,6 +110,42 @@ function byName(name: string): FlavorDef | undefined {
   return FLAVORS.find((f) => f.name === name);
 }
 
+/**
+ * Resolve the winning catalog flavor for a job's (lower-cased) `runs-on` labels.
+ *
+ * "Most specific wins" was a length comparison while the catalog held exactly one
+ * `lambda-ci-<name>` label per length. With the expanded standard set (ADR-039) that is no
+ * longer true: `lambda-ci-python` and `lambda-ci-docker` are both 16 characters, and
+ * `lambda-ci-node`/`-java`/`-rust` are all 14. A pure length sort leaves those ties to
+ * `Array#sort` stability, i.e. to the ORDER OF ENTRIES IN `flavors.json` — so
+ * `runs-on: [self-hosted, lambda-ci-python, lambda-ci-docker]` routed to `python` only
+ * because `python` happens to be listed before `docker`, and reordering the catalog (or
+ * inserting a flavor) would silently re-route live jobs.
+ *
+ * So the tie-break is explicit and catalog-order-independent: longest label first, then
+ * flavor NAME ascending. That also lands the safer side of the one collision that matters
+ * today — a job labelled both `lambda-ci-python` and `lambda-ci-docker` gets `docker`, where
+ * a missing daemon fails loudly at the first `docker` step, rather than `python`, where the
+ * job's docker steps die with a socket error the labels said should work.
+ *
+ * Returns the match plus every equally specific label that also matched, so the caller can
+ * record the ambiguity in the resolution reason instead of hiding it.
+ */
+function explicitLabelMatch(
+  lower: string[],
+): { def: FlavorDef; ambiguousWith: string[] } | undefined {
+  const matches = FLAVORS.filter((f) => lower.includes(f.label.toLowerCase())).sort(
+    (a, b) => b.label.length - a.label.length || a.name.localeCompare(b.name),
+  );
+  if (matches.length === 0) return undefined;
+  const [def] = matches;
+  const ambiguousWith = matches
+    .slice(1)
+    .filter((f) => f.label.length === def.label.length)
+    .map((f) => f.label);
+  return { def, ambiguousWith };
+}
+
 /** Smallest (by vcpu, then memory) flavor that advertises the given capability. */
 function smallestWithCapability(cap: string): FlavorDef | undefined {
   return [...FLAVORS]
@@ -154,13 +192,20 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     }
   }
 
-  // 2. Explicit LCA label — prefer the most specific (longest) matching label.
-  const explicit = [...FLAVORS]
-    .sort((a, b) => b.label.length - a.label.length)
-    .find((f) => lower.includes(f.label.toLowerCase()));
+  // 2. Explicit LCA label — prefer the most specific (longest) matching label, breaking
+  //    equal-length ties by flavor name so the outcome never depends on catalog order.
+  const explicit = explicitLabelMatch(lower);
   if (explicit) {
+    const ambiguity = explicit.ambiguousWith.length
+      ? ` (equally specific label(s) ${explicit.ambiguousWith
+          .map((l) => `'${l}'`)
+          .join(', ')} also present; resolved by flavor name)`
+      : '';
     return applySignalUpgrade(
-      { flavor: explicit.name, reason: `explicit LCA label '${explicit.label}'` },
+      {
+        flavor: explicit.def.name,
+        reason: `explicit LCA label '${explicit.def.label}'${ambiguity}`,
+      },
       opts.signals,
     );
   }

@@ -57,16 +57,43 @@ test('every ADR heading number is defined exactly once', () => {
   assert.ok(nums.length > 0, 'no ADR headings found — has DECISIONS.md moved?');
 });
 
+/**
+ * Line indices (0-based) inside DECISIONS.md that belong to an explicit **ADR numbering
+ * note** blockquote — the one place that deliberately discusses numbers owned by OTHER
+ * branches (the renumbering rationale), which are not defined here by definition.
+ *
+ * Scoped to that note rather than "any blockquote in DECISIONS.md": blockquoted
+ * `**Amended by [ADR-0NN](#adr-0nn)**` cross-references are an existing convention in this
+ * file, and a blanket blockquote skip would silently exempt them from the check — disarming
+ * the guard exactly where ADR cross-references are densest.
+ */
+function numberingNoteLines(text) {
+  const lines = text.split('\n');
+  const exempt = new Set();
+  let inNote = false;
+  lines.forEach((line, i) => {
+    const isQuote = /^\s*>/.test(line);
+    if (!isQuote) {
+      inNote = false;
+      return;
+    }
+    if (/ADR numbering note/i.test(line)) inNote = true;
+    if (inNote) exempt.add(i);
+  });
+  return exempt;
+}
+
 test('every ADR-NNN citation in the repo resolves to a real ADR', () => {
   const defined = new Set(definedAdrs());
+  const decisionsRel = path.join('docs', 'DECISIONS.md');
   const stale = [];
   for (const file of walk(REPO_ROOT)) {
     const rel = path.relative(REPO_ROOT, file);
-    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    const text = fs.readFileSync(file, 'utf8');
+    const lines = text.split('\n');
+    const exempt = rel === decisionsRel ? numberingNoteLines(text) : new Set();
     lines.forEach((line, i) => {
-      // DECISIONS.md's own blockquote notes deliberately discuss numbers held by OTHER
-      // branches (the renumbering rationale), which are not defined here by definition.
-      if (rel === path.join('docs', 'DECISIONS.md') && /^\s*>/.test(line)) return;
+      if (exempt.has(i)) return;
       for (const m of line.matchAll(/ADR-(\d{3})/g)) {
         if (!defined.has(m[1])) stale.push(`${rel}:${i + 1}: ADR-${m[1]} — ${line.trim()}`);
       }
@@ -78,4 +105,26 @@ test('every ADR-NNN citation in the repo resolves to a real ADR', () => {
     `citations point at ADRs that do not exist in docs/DECISIONS.md ` +
       `(renumbered or typo'd):\n  ${stale.join('\n  ')}`,
   );
+});
+
+test('the numbering-note exemption does not extend to other blockquotes', () => {
+  // The exemption is a deliberate hole; prove it is the SHAPE of hole intended. A blockquoted
+  // amendment cross-reference elsewhere in the file must still be checked, or a renumbering
+  // sweep could leave a stale citation in the densest cross-reference region of the repo.
+  //
+  // The fixture builds its citations at runtime: this test file is itself scanned by the
+  // guard above, so a literal `ADR-<undefined-number>` here would (correctly) fail it.
+  const cite = (n) => `ADR-${n}`;
+  const text = [
+    `## ${cite('001')} — thing`,
+    `> **ADR numbering note.** vacating ${cite('999')} claimed by another branch.`,
+    `> still the same note, mentioning ${cite('998')}.`,
+    '',
+    `> **Amended by ${cite('997')}** — an ordinary blockquoted cross-reference.`,
+  ].join('\n');
+  const exempt = numberingNoteLines(text);
+  assert.ok(exempt.has(1), 'the numbering-note line itself is exempt');
+  assert.ok(exempt.has(2), 'continuation lines of the same note are exempt');
+  assert.ok(!exempt.has(4), 'an unrelated blockquote must NOT be exempt');
+  assert.ok(!exempt.has(0), 'headings are never exempt');
 });

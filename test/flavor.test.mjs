@@ -50,6 +50,61 @@ test('a language label is more specific than bare lambda-ci', () => {
   assert.equal(resolveFlavor(['lambda-ci', 'lambda-ci-java']).flavor, 'java');
 });
 
+// --- Equal-specificity label ties must NOT depend on catalog order ---
+
+test('equal-length label ties resolve by flavor name, not flavors.json order', () => {
+  // `lambda-ci-python` and `lambda-ci-docker` are both 16 chars; `-node`/`-java`/`-rust` are
+  // all 14. A pure length sort leaves these to Array#sort stability — i.e. to the order of
+  // entries in flavors.json — so reordering the catalog would silently re-route live jobs.
+  // Pin the deterministic rule: longest label, then flavor NAME ascending.
+  for (const labels of [
+    ['self-hosted', 'lambda-ci-python', 'lambda-ci-docker'],
+    ['self-hosted', 'lambda-ci-docker', 'lambda-ci-python'],
+  ]) {
+    const r = resolveFlavor(labels);
+    assert.equal(r.flavor, 'docker', `${labels.join(',')} → docker ('docker' < 'python')`);
+    // ...and the ambiguity is recorded rather than hidden.
+    assert.match(r.reason, /equally specific/);
+    assert.match(r.reason, /lambda-ci-python/);
+  }
+  // The 14-char trio: 'java' < 'node' < 'rust'.
+  assert.equal(resolveFlavor(['lambda-ci-node', 'lambda-ci-java']).flavor, 'java');
+  assert.equal(resolveFlavor(['lambda-ci-rust', 'lambda-ci-node']).flavor, 'node');
+  assert.equal(resolveFlavor(['lambda-ci-rust', 'lambda-ci-java', 'lambda-ci-node']).flavor, 'java');
+});
+
+test('a docker tie resolves to the flavor that HAS the daemon', () => {
+  // The safety half of the tie-break: a job labelled for both python and docker must get the
+  // daemon-capable flavor. Routing it to `python` would fail its docker steps with a socket
+  // error the labels said should work.
+  const r = resolveFlavor(['self-hosted', 'lambda-ci-python', 'lambda-ci-docker']);
+  const def = allFlavors().find((f) => f.name === r.flavor);
+  assert.ok(def.capabilities.includes('docker'), 'the tie winner must be docker-capable');
+});
+
+test('an unambiguous single label records no ambiguity note', () => {
+  assert.doesNotMatch(resolveFlavor(['lambda-ci-python']).reason, /equally specific/);
+});
+
+test('resolution is independent of catalog ordering', () => {
+  // Directly assert the property the tie-break exists for: every equal-length label group
+  // must have exactly one winner determined by name, so shuffling flavors.json cannot change
+  // any routing decision.
+  const byLength = new Map();
+  for (const f of allFlavors()) {
+    const k = f.label.length;
+    byLength.set(k, [...(byLength.get(k) ?? []), f]);
+  }
+  for (const [len, group] of byLength) {
+    if (group.length < 2) continue;
+    const expected = [...group].sort((a, b) => a.name.localeCompare(b.name))[0].name;
+    // Present every label in the group, in both orders.
+    const labels = group.map((f) => f.label);
+    assert.equal(resolveFlavor(labels).flavor, expected, `len ${len} forward`);
+    assert.equal(resolveFlavor([...labels].reverse()).flavor, expected, `len ${len} reversed`);
+  }
+});
+
 test('every catalog flavor is reachable from its own label', () => {
   // Guards against a catalog entry whose label is a prefix-collision casualty.
   for (const f of allFlavors()) {
