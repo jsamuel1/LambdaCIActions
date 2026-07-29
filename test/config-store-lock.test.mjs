@@ -67,6 +67,38 @@ test('the accepted-delivery heartbeat stays unconditional (it is authenticated)'
   assert.equal(i.sent[0].ConditionExpression, undefined);
 });
 
+// `at` is a DynamoDB RESERVED WORD (as is `action`), so an audit write that names it
+// literally fails with a ValidationException. Both call sites swallow audit failures on
+// purpose (an audit write must never fail an operator action), which makes the breakage
+// silent: "Recent platform changes" would simply always be empty. Assert every attribute
+// name in the update expression is aliased.
+test('the audit write aliases every reserved attribute name', async () => {
+  const i = intercept();
+  try {
+    await store.appendAudit({
+      at: '2026-07-29T00:00:00.000Z',
+      actor: 'alice',
+      action: 'runner-labels-change',
+      detail: 'from [a] to [b]',
+      nonce: 'fixed',
+    });
+  } finally {
+    i.restore();
+  }
+  const input = i.sent[0];
+  assert.equal(input.Key.sk, '2026-07-29T00:00:00.000Z#fixed');
+  for (const reserved of ['action', 'at']) {
+    assert.match(
+      input.UpdateExpression,
+      new RegExp(`#${reserved} = :${reserved}\\b`),
+      `"${reserved}" is a DynamoDB reserved word and must be aliased`,
+    );
+    assert.equal(input.ExpressionAttributeNames[`#${reserved}`], reserved);
+  }
+  // A bare `<reserved> =` anywhere in the expression is the bug this test exists to catch.
+  assert.doesNotMatch(input.UpdateExpression, /(^|[\s,])(at|action) =/);
+});
+
 test('the config lock is acquired only when free or expired', async () => {
   const i = intercept();
   let ok;

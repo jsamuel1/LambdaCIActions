@@ -155,8 +155,13 @@ export async function appendAudit(rec: AuditRecord & { nonce?: string }): Promis
     new UpdateCommand({
       TableName: TABLE,
       Key: { pk: AUDIT_PK, sk: `${rec.at}#${nonce}` },
-      UpdateExpression: 'SET entity = :e, actor = :actor, #action = :action, detail = :detail, at = :at',
-      ExpressionAttributeNames: { '#action': 'action' },
+      // `action` AND `at` are both DynamoDB reserved words, so both need aliases. An
+      // unaliased `at = :at` makes every audit write fail with a ValidationException — and
+      // because audit writes are best-effort (`.catch` at both call sites) the failure is
+      // silent: the trail would simply always be empty. Pinned by test/config-store-lock.test.mjs.
+      UpdateExpression:
+        'SET entity = :e, actor = :actor, #action = :action, detail = :detail, #at = :at',
+      ExpressionAttributeNames: { '#action': 'action', '#at': 'at' },
       ExpressionAttributeValues: {
         ':e': 'CONFIG_AUDIT',
         ':actor': rec.actor,

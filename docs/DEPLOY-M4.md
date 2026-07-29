@@ -31,6 +31,26 @@ aws ssm put-parameter \
 Rotating this parameter invalidates every active console session — that is the revocation
 lever (ADR-022).
 
+Also create the **platform-admin allow-list** (ADR-029). Platform settings changes (re-link
+the GitHub App, change runner labels, test webhook delivery) require membership in it, and it
+**fails closed**: until it exists, Settings is read-only and the API answers 403 naming the
+parameter. It is a plain `String` — a list of GitHub logins is not a secret:
+
+```sh
+aws ssm put-parameter \
+  --name "/lca/<env>/config/platform-admins" \
+  --type String \
+  --value "your-github-login,another-operator" \
+  --region "$LCA_DEPLOY_REGION"
+```
+
+Revocation is a parameter edit — the management λ reads it uncached, so it takes effect on the
+next request.
+
+The claimed runner labels (`/lca/<env>/config/runner-labels`) are created by the M1–M3 deploy.
+Once the allow-list above is in place they can be changed from the Settings screen instead of
+by hand.
+
 The OAuth client id/secret are already in SSM if you bootstrapped with
 `npm run app:create` (`/lca/<env>/github/client-id`, `client-secret`). Verify:
 
@@ -86,7 +106,8 @@ The callback URL must match exactly — GitHub rejects mismatches.
 ## Phase 5 — verify (M4 exit criterion)
 
 1. Open `https://<console-domain>` → "Sign in with GitHub" → authorize.
-2. **Setup** lists your installation(s) and shows all required parameters present.
+2. **Setup** lists your installation(s) and shows platform readiness as *App verified /
+   labels claimed / webhook state* rather than a parameter checklist.
 3. **Repos** lists the repos granted to the installation. Enable one.
 4. **Repo detail** shows parsed workflows with per-job `runs-on → flavor` and compat
    findings. If empty, hit **Re-scan** (enqueues a Discovery scan) and reload after ~30 s.
@@ -95,8 +116,17 @@ The callback URL must match exactly — GitHub rejects mismatches.
 6. On **Run detail**, the log pane tails the runner output from
    `/aws/lambda/microvms/runs/lca-<env>`. "No log stream yet" is expected until the
    microVM boots.
-7. **Settings** shows every secret as `set` — and no values (by construction: the API
-   reads presence via `DescribeParameters`).
+7. **Settings** shows the environment's linkage with evidence, not a list of SSM paths
+   (spec 04 § Settings): the GitHub App verified live via `GET /app` (name + app id), its
+   installations, the effective runner labels, and webhook health backed by a real
+   last-received delivery. No values are returned by construction — credential presence is
+   probed with `DescribeParameters` and demoted to the collapsed **Diagnostics** section.
+8. If you are in the `platform-admins` list (Phase 0), the mutating actions are enabled:
+   **Re-link App…** (write-only credential intake, verified against GitHub before anything is
+   written, with a rollback button), label editing behind a mandatory **Preview impact**, and
+   **Test delivery** (asks GitHub to re-deliver its most recent delivery — the "last received"
+   timestamp advancing is the proof the round-trip landed). Without the allow-list every
+   action is hidden and the API answers 403.
 
 ## Rollback / teardown
 
@@ -119,6 +149,8 @@ only — the hot path (webhook → ingest → provision) keeps running.
 | Workflows empty | Discovery hasn't scanned yet | **Re-scan**, or push to `.github/workflows/**` |
 | Logs always "pending" | run has no `microvmId` (never launched) | Check the Provision λ logs + DLQ |
 | 403 on every API call | session's installation grants are stale | Sign out and back in (grants are frozen at login, ADR-022) |
+| Settings actions hidden / 403 "no platform administrators are configured" | `/lca/<env>/config/platform-admins` unset (fails closed, ADR-029) | Create it (Phase 0), then reload |
+| Every delivery 401s after a relink | GitHub still signs with the old webhook secret (`hookSynced: false`) | Set the webhook secret on the App at GitHub by hand, or roll back from Settings |
 
 ### Pre-M4 rows are invisible until re-written
 
