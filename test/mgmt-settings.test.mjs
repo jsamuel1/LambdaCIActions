@@ -1,4 +1,4 @@
-// Settings surface tests (spec 04 § Settings, ADR-033).
+// Settings surface tests (spec 04 § Settings, ADR-034).
 //
 // Three things are load-bearing here and each is asserted against behavior, not prose:
 //   1. runner-label validation — a bad label set silently breaks claiming for every repo,
@@ -588,7 +588,7 @@ test('broker redeliver accepts an optional positive delivery id', () => {
   assert.throws(() => parseAppcfgRequest({ action: 'redeliver', actor: 'a', deliveryId: 0 }), /positive/);
 });
 
-// ---- cross-tenant scoping of the settings payload (ADR-034) ----------------
+// ---- cross-tenant scoping of the settings payload (ADR-035) ----------------
 
 const SETTINGS_FIXTURE = {
   envName: 'dev',

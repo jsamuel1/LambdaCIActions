@@ -31,7 +31,7 @@ aws ssm put-parameter \
 Rotating this parameter invalidates every active console session — that is the revocation
 lever (ADR-022).
 
-Also create the **platform-admin allow-list** (ADR-034). Platform settings changes (re-link
+Also create the **platform-admin allow-list** (ADR-035). Platform settings changes (re-link
 the GitHub App, change runner labels, test webhook delivery) require membership in it, and it
 **fails closed**: until it exists, Settings is read-only and the API answers 403 naming the
 parameter. It is a plain `String` — a list of GitHub logins is not a secret:
@@ -149,7 +149,7 @@ only — the hot path (webhook → ingest → provision) keeps running.
 | Workflows empty | Discovery hasn't scanned yet | **Re-scan**, or push to `.github/workflows/**` |
 | Logs always "pending" | run has no `microvmId` (never launched) | Check the Provision λ logs + DLQ |
 | 403 on every API call | session's installation grants are stale | Sign out and back in (grants are frozen at login, ADR-022) |
-| Settings actions hidden / 403 "no platform administrators are configured" | `/lca/<env>/config/platform-admins` unset (fails closed, ADR-034) | Create it (Phase 0), then reload |
+| Settings actions hidden / 403 "no platform administrators are configured" | `/lca/<env>/config/platform-admins` unset (fails closed, ADR-035) | Create it (Phase 0), then reload |
 | Every delivery 401s after a relink | GitHub still signs with the old webhook secret (`hookSynced: false`) | Set the webhook secret on the App at GitHub by hand, or roll back from Settings |
 
 ### Pre-M4 rows are invisible until re-written

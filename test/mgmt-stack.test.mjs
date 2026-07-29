@@ -30,7 +30,7 @@ function synth() {
   return Template.fromStack(mgmt);
 }
 
-/** ControlStack template — home of the App-config broker (ADR-033). */
+/** ControlStack template — home of the App-config broker (ADR-034). */
 function synthControl() {
   const app = new App();
   const env = { account: '123456789012', region: 'us-west-2' };
@@ -118,7 +118,7 @@ test('mgmt λ GetParameter is scoped to its own auth secrets — never the App P
   assert.equal(joined.includes('parameter/lca/test/*'), false, 'wildcard param read');
 });
 
-test('mgmt λ holds NO ssm:PutParameter — config writes go through the broker (ADR-033)', () => {
+test('mgmt λ holds NO ssm:PutParameter — config writes go through the broker (ADR-034)', () => {
   const actions = allActions(synth());
   for (const forbidden of ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:GetParameters']) {
     assert.equal(actions.includes(forbidden), false, `granted ${forbidden}`);
@@ -202,7 +202,7 @@ test('the run table exposes the M4 repo/time index (ADR-023)', () => {
   });
 });
 
-// ---- App-config broker posture (ADR-033) -----------------------------------
+// ---- App-config broker posture (ADR-034) -----------------------------------
 //
 // The broker is the ONE place in the platform with `ssm:PutParameter` on secret paths. Its
 // blast radius is therefore asserted explicitly: exactly the credential + label parameters,

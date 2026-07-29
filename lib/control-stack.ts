@@ -48,7 +48,7 @@ export class ControlStack extends Stack {
   public readonly discoveryQueueUrl: string;
   public readonly discoveryQueueArn: string;
   /**
-   * App-config broker coordinates (ADR-033). The Mgmt λ invokes this to verify/relink the
+   * App-config broker coordinates (ADR-034). The Mgmt λ invokes this to verify/relink the
    * GitHub App and write platform config — the console λ itself holds neither the App PEM nor
    * any `ssm:PutParameter` grant.
    */
@@ -455,7 +455,7 @@ export class ControlStack extends Stack {
     });
     this.webhookUrl = `${httpApi.apiEndpoint}/webhook`;
 
-    // ---- App-config broker λ (ADR-033) ----
+    // ---- App-config broker λ (ADR-034) ----
     // The management plane needs to prove the GitHub App linkage (App JWT → GET /app,
     // /app/hook/deliveries) and to re-link the environment to a rotated App. Both need the
     // App PEM, and the relink needs PutParameter on SecureString credential paths — authority
@@ -513,7 +513,7 @@ export class ControlStack extends Stack {
       }),
     );
     // The ONLY PutParameter grant in the platform, scoped to the exact credential + config
-    // paths a relink/label change replaces (ADR-033 blast radius). Note what is absent:
+    // paths a relink/label change replaces (ADR-034 blast radius). Note what is absent:
     // `/mgmt/session-secret` (forging it would forge operator sessions), the image ARNs, and
     // any wildcard over the prefix.
     //

@@ -24,7 +24,7 @@ import {
 } from './broker-core.js';
 
 /**
- * GitHub App config broker λ (ADR-033) — control plane.
+ * GitHub App config broker λ (ADR-034) — control plane.
  *
  * The Settings screen needs two things the management λ deliberately cannot do:
  *
@@ -60,7 +60,7 @@ const RUNNER_LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
  * (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll from cache.
  *
  * Cached in TWO places, because a per-container cache alone does not bound the spend: any
- * authenticated session may read `GET /api/settings` (ADR-034), and concurrent reads scale the
+ * authenticated session may read `GET /api/settings` (ADR-035), and concurrent reads scale the
  * broker out to fresh containers whose in-memory caches are all cold. The shared `CONFIG#STATUS`
  * row makes the bound platform-wide; the in-memory copy avoids a DynamoDB read per poll.
  */
@@ -487,14 +487,7 @@ async function relinkAction(
     };
   }
 
-  // 4. The App slug is convenience metadata (install URLs), written only AFTER the credential
-  //    set is verified: writing it earlier would leave a rolled-back environment advertising
-  //    the slug of an App whose credentials are no longer stored.
-  await deps
-    .putParam(`${SSM_PREFIX}/github/app-slug`, identity.slug, { secure: false })
-    .catch(() => 0);
-
-  // 5. Synchronize GitHub's own hook config with what we just stored. Without this, a rotated
+  // 4. Synchronize GitHub's own hook config with what we just stored. Without this, a rotated
   //    webhook secret makes GitHub sign with the old value and every delivery fails its HMAC
   //    check — the environment goes silent while every credential badge reads green.
   let hookSynced = false;
@@ -538,6 +531,16 @@ async function relinkAction(
       ...(hookError ? { hookError } : {}),
     };
   }
+
+  // 5. The App slug is convenience metadata (install URLs), written only once the relink can no
+  //    longer be undone — i.e. AFTER post-write verification AND after the fail-closed
+  //    hook-desync gate above. `app-slug` carries no version in the rollback snapshot, so
+  //    `undoWrites` cannot restore it: writing it any earlier leaves a rolled-back environment
+  //    advertising the slug of an App whose credentials are no longer stored — exactly the
+  //    stale-slug hazard this ordering exists to prevent.
+  await deps
+    .putParam(`${SSM_PREFIX}/github/app-slug`, identity.slug, { secure: false })
+    .catch(() => 0);
 
   await audit(deps, actor, 'github-app-relink', {
     appId: identity.appId,

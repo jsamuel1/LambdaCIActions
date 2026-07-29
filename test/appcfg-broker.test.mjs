@@ -1,4 +1,4 @@
-// Behavioural tests for the App-config broker's write path (ADR-033). The pure request
+// Behavioural tests for the App-config broker's write path (ADR-034). The pure request
 // contract + credential validation live in mgmt-settings.test.mjs; this pins the decisions the
 // λ makes with real (faked) SSM + GitHub seams:
 //
@@ -619,6 +619,44 @@ test('the app-slug is written only after post-write verification succeeds', asyn
   );
 });
 
+test('a hook-desync rollback must not leave the new slug behind either', async () => {
+  // The desync refusal (rotated webhook secret + failed hook PATCH) is a rollback like any
+  // other: every credential parameter goes back to its prior version. `app-slug` carries no
+  // version in that snapshot, so `undoWrites` cannot restore it — which means it must not be
+  // written until the relink is past the fail-closed gate. Written earlier, a refused relink
+  // leaves the environment advertising the slug of an App whose credentials are gone, and the
+  // Setup screen's install URL points at the wrong App.
+  const h = harness({ existing: linkedStore(), hookFails: true });
+  h.store.set(`${PREFIX}/github/app-slug`, { value: 'lca-old', version: 1, history: { 1: 'lca-old' } });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  assert.equal(res.rolledBack, true);
+  assert.equal(
+    h.store.get(`${PREFIX}/github/app-slug`).value,
+    'lca-old',
+    'a refused relink must leave the previous slug in place',
+  );
+  assert.equal(
+    h.calls.puts.includes(`${PREFIX}/github/app-slug`),
+    false,
+    'the slug must not be written before the hook-desync gate',
+  );
+});
+
+test('an accepted hook desync still records the new slug', async () => {
+  // The mirror case: once the operator accepts the desync the relink stands, so the slug MUST
+  // be updated — moving the write later must not skip it on the surviving path.
+  const h = harness({ existing: linkedStore(), hookFails: true });
+  const res = await h.handle({
+    action: 'relink',
+    actor: 'alice',
+    credentials: CREDS,
+    allowHookDesync: true,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(h.store.get(`${PREFIX}/github/app-slug`).value, 'lca-dev');
+});
+
 test('rollback re-points app-slug at the App the restored credentials authenticate as', async () => {
   // `app-slug` is not a credential and carries no version in the rollback snapshot, so
   // restoring versions alone would leave the environment advertising the slug of the App it
@@ -681,7 +719,7 @@ test('an unverifiable rollback leaves the slug alone rather than guessing', asyn
 // ---- shared (cross-container) status cache ---------------------------------
 //
 // The in-memory cache above only bounds ONE container. `GET /api/settings` is readable by any
-// authenticated session (ADR-034) and concurrent reads scale the broker out, so a cold container
+// authenticated session (ADR-035) and concurrent reads scale the broker out, so a cold container
 // must be able to reuse an answer another container already paid four App-JWT calls for.
 
 test('a cold container reuses a warm shared cache row instead of calling GitHub', async () => {

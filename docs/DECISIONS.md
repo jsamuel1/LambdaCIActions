@@ -727,7 +727,7 @@ job; that is the deliberate trade (availability over strictness) and matches the
 gate. `mode='adopt'` is not an opt-out — it is treated as `label` until the M5
 standard-label map ships. `test/filter.test.mjs` and `test/flavor.test.mjs` pin both.
 
-## ADR-033 — Settings shows verified evidence, and platform config writes go through a control-plane broker (M4)
+## ADR-034 — Settings shows verified evidence, and platform config writes go through a control-plane broker (M4)
 **Status**: Accepted (v1) · extends [ADR-025](#adr-025), honors [ADR-027](#adr-027)
 **Context**: the M4 Settings screen listed SSM parameter paths with a present/absent flag.
 That is the wrong abstraction twice over. It leaks an implementation detail an operator should
@@ -848,7 +848,7 @@ Three further consequences of that design, each pinned by a test:
   App-JWT calls and the Settings screen polls it, while the same 5,000 requests/hour budget is
   what Provision spends minting an installation token per job. `status` is therefore cached at
   **two** levels for 30 s (poll interval is 15 s): in-memory per broker container, and — because
-  `GET /api/settings` is readable by ANY authenticated session (ADR-034) and concurrent reads
+  `GET /api/settings` is readable by ANY authenticated session (ADR-035) and concurrent reads
   scale the broker out to containers whose in-memory caches are all cold — in a shared
   `CONFIG#STATUS / LINKAGE` row, so the bound is platform-wide rather than per-container. The row
   holds the already-redacted linkage payload (`assertNoSecrets` runs before the write and again
@@ -905,12 +905,12 @@ Three further consequences of that design, each pinned by a test:
   uses a 30 s TTL (`RUNNER_LABELS_TTL_MS`). Labels are a non-secret `String`, so the cost is one
   extra `GetParameter` per container per 30 s on the webhook path.
 
-## ADR-034 — Platform-wide settings need their own fail-closed allow-list, not installation admin rights (M4)
-**Status**: Accepted (v1) · follows [ADR-022](#adr-022), [ADR-033](#adr-033)
+## ADR-035 — Platform-wide settings need their own fail-closed allow-list, not installation admin rights (M4)
+**Status**: Accepted (v1) · follows [ADR-022](#adr-022), [ADR-034](#adr-034)
 **Context**: every existing authorization decision in the console derives from
 `canAdminInstallation` — GitHub's own answer to "may this person administer this installation"
 (ADR-022). That is the right question for repo config, and it deliberately avoids interpreting
-org roles ourselves. It is the **wrong** question for the ADR-033 mutations. One environment can
+org roles ourselves. It is the **wrong** question for the ADR-034 mutations. One environment can
 host several installations from unrelated accounts; re-pointing the GitHub App credentials or
 changing the claimed runner labels affects **all** of them. Under installation-derived
 authorization, an admin of any one installation could rotate the whole platform's credentials

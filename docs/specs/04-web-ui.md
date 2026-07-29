@@ -126,7 +126,7 @@ so a large history reads as a labelled lower bound rather than a wrong total.
 ## Settings
 
 The Settings screen answers four operator questions with **evidence**, not with SSM parameter
-paths (ADR-033). SSM is an implementation detail: knowing that `/lca/dev/github/app-pem`
+paths (ADR-034). SSM is an implementation detail: knowing that `/lca/dev/github/app-pem`
 exists tells an operator nothing about whether their platform works.
 
 ### 1. GitHub App linkage
@@ -263,7 +263,7 @@ and validation errors never quote a submitted credential.
 
 Critically, **the management λ performs none of this itself.** It holds no App PEM read and no
 `ssm:PutParameter` grant at all; it invokes a control-plane **App-config broker** λ
-(`src/appcfg/`) and can reach nothing else (ADR-033). Secret-read and secret-write authority
+(`src/appcfg/`) and can reach nothing else (ADR-034). Secret-read and secret-write authority
 stay in the control plane, behind one function whose only caller is the console λ.
 
 ### Who may change platform settings
@@ -341,7 +341,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - Secrets are **never** exposed as values. Presence is read via `ssm:DescribeParameters`
   (which cannot return a value) and demoted to a collapsed diagnostics section; the Mgmt λ has
   no IAM permission to read the App PEM or webhook secret at all, and no `ssm:PutParameter`
-  grant of any kind (ADR-025, ADR-033). The relink intake accepts credentials write-only and
+  grant of any kind (ADR-025, ADR-034). The relink intake accepts credentials write-only and
   answers with presence + verification outcome. A `assertNoSecrets` guard
   (`src/shared/redact.ts`) scans every settings/broker payload for secret-shaped content
   (PEM blocks, `ghp_*`/`v1.<40 hex>` tokens) and throws rather than serving it, so a future
@@ -383,7 +383,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   (ADR-023).
 - **No secret exposure**: presence via `DescribeParameters`; the λ holds no IAM grant for
   secret paths beyond its own OAuth/session credentials (ADR-025), no `ssm:PutParameter`, and
-  every settings payload passes the `assertNoSecrets` shape guard (ADR-033).
+  every settings payload passes the `assertNoSecrets` shape guard (ADR-034).
 - **Least privilege**: read-mostly. `dynamodb:UpdateItem` is the only write (no
   Put/Delete), `sqs:SendMessage` only on the discovery queue, `lambda:InvokeFunction` only on
   the App-config broker's exact ARN, log read-only on one group, and **no** microVM
