@@ -512,6 +512,7 @@ async function rollbackAction(
   let verified = false;
   let storedId: string | undefined;
   let storedPem: string | undefined;
+  let slug: string | undefined;
   try {
     [storedId, storedPem] = await Promise.all([
       deps.getParam(APP_ID_PARAM, 0),
@@ -519,9 +520,29 @@ async function rollbackAction(
     ]);
     const identity = await deps.getAppIdentity(storedId, storedPem);
     appId = identity.appId;
+    slug = identity.slug;
     verified = true;
   } catch {
     verified = false;
+  }
+
+  // Re-point `app-slug` at the App the RESTORED credentials authenticate as. It is not part of
+  // the rollback snapshot (it is not a credential and has no version the operator was handed),
+  // so restoring versions alone would leave the environment advertising the slug of the App it
+  // just rolled away from — the same stale-slug hazard the relink path avoids by writing the
+  // slug only after post-write verification. Best-effort and never a rollback failure: the
+  // slug is convenience metadata for install URLs, not part of the auth chain.
+  if (verified && slug) {
+    await deps
+      .putParam(`${SSM_PREFIX}/github/app-slug`, slug, { secure: false })
+      .catch((err) =>
+        console.error(
+          JSON.stringify({
+            msg: 'app-slug restore failed',
+            error: scrubForOperator(errMsg(err)),
+          }),
+        ),
+      );
   }
 
   // Re-synchronize GitHub's hook config with the RESTORED secret. Only attempted when the

@@ -485,6 +485,65 @@ test('the app-slug is written only after post-write verification succeeds', asyn
   );
 });
 
+test('rollback re-points app-slug at the App the restored credentials authenticate as', async () => {
+  // `app-slug` is not a credential and carries no version in the rollback snapshot, so
+  // restoring versions alone would leave the environment advertising the slug of the App it
+  // just rolled away from (the same stale-slug hazard the relink path avoids by ordering).
+  const h = harness({ existing: linkedStore() });
+  h.store.set(`${PREFIX}/github/app-slug`, { value: 'lca-old', version: 1, history: { 1: 'lca-old' } });
+  let call = 0;
+  h.deps.getAppIdentity = async () => {
+    call += 1;
+    // Relink + its post-write re-verify see the NEW App; the post-rollback verify sees the old.
+    const slug = call <= 2 ? 'lca-new' : 'lca-old';
+    return {
+      appId: 424242,
+      name: 'LCA',
+      slug,
+      htmlUrl: '',
+      ownerLogin: 'acme',
+      events: [],
+      permissions: {},
+    };
+  };
+  const handle = createHandler(h.deps);
+  const relink = await handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(relink.ok, true);
+  assert.equal(h.store.get(`${PREFIX}/github/app-slug`).value, 'lca-new');
+
+  const res = await handle({ action: 'rollback', actor: 'alice', restore: relink.replacedVersions });
+  assert.equal(res.ok, true);
+  assert.equal(res.verified, true);
+  assert.equal(
+    h.store.get(`${PREFIX}/github/app-slug`).value,
+    'lca-old',
+    'a rolled-back environment must not keep advertising the relinked App slug',
+  );
+});
+
+test('an unverifiable rollback leaves the slug alone rather than guessing', async () => {
+  const h = harness({ existing: linkedStore() });
+  h.store.set(`${PREFIX}/github/app-slug`, { value: 'lca-old', version: 1, history: { 1: 'lca-old' } });
+  let call = 0;
+  h.deps.getAppIdentity = async () => {
+    call += 1;
+    if (call <= 2) {
+      return { appId: 424242, name: 'LCA', slug: 'lca-new', htmlUrl: '', ownerLogin: 'acme', events: [], permissions: {} };
+    }
+    throw new Error('restored credentials do not authenticate');
+  };
+  const handle = createHandler(h.deps);
+  const relink = await handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  const res = await handle({ action: 'rollback', actor: 'alice', restore: relink.replacedVersions });
+  assert.equal(res.ok, true);
+  assert.equal(res.verified, false);
+  assert.equal(
+    h.store.get(`${PREFIX}/github/app-slug`).value,
+    'lca-new',
+    'with nothing verified there is no authoritative slug to write — verified:false is the signal',
+  );
+});
+
 // ---- shared (cross-container) status cache ---------------------------------
 //
 // The in-memory cache above only bounds ONE container. `GET /api/settings` is readable by any

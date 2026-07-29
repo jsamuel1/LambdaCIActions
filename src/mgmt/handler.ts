@@ -69,6 +69,9 @@ import {
   patchRepoConfig,
 } from '../shared/install-store.js';
 import { appendAudit, getWebhookHeartbeat, listAudit } from '../shared/config-store.js';
+// Ingest's own opt-out predicate, reused so the label-impact preview cannot drift from the
+// control plane's claim decision (spec 04 § Settings).
+import { isRepoOptedOut } from '../ingest/filter.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getParam, paramExists } from '../shared/ssm.js';
 import { assertNoSecrets, scrubForOperator } from '../shared/redact.js';
@@ -898,7 +901,14 @@ async function labelImpact(current: string[], proposed: string[]): Promise<Label
   for (const inst of installs) {
     if (inst.deleted) continue;
     const list = await listRepos(inst.installationId).catch(() => []);
-    for (const r of list) if (r.enabled !== false) repos.push({ repoId: r.repoId, repoFullName: r.repoFullName });
+    // `isRepoOptedOut` (not just `enabled !== false`): Ingest refuses a repo whose `mode` is
+    // `off` as well, so counting its jobs here would claim a label change moves work that the
+    // control plane will keep refusing either way. Reusing Ingest's own predicate keeps the two
+    // in step, exactly as `buildLabelImpact` mirrors `shouldClaim`.
+    for (const r of list) {
+      if (isRepoOptedOut(r)) continue;
+      repos.push({ repoId: r.repoId, repoFullName: r.repoFullName });
+    }
   }
   const truncated = repos.length > MAX_IMPACT_REPOS;
   const scanned = repos.slice(0, MAX_IMPACT_REPOS);

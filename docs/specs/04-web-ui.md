@@ -164,7 +164,17 @@ Because a label change takes effect on the **very next** `workflow_job` delivery
 two-phase: `dryRun: true` returns a **label-impact analysis** — which repos/workflows/jobs
 stop or start being claimed — and the UI requires a preview before Apply. The impact matcher
 mirrors `shouldClaim` exactly (asserted in `test/mgmt-settings.test.mjs`), or the preview would
-lie about whose jobs move. The scan is bounded to 50 repos and reports `truncated`.
+lie about whose jobs move. It mirrors Ingest's *other* two gates as well, for the same reason:
+the scan drops opted-out repos with Ingest's own `isRepoOptedOut` (`enabled === false` **or**
+`mode === 'off'`), and `buildLabelImpact` skips jobs whose stored compat result is
+`eligible: false` — those never move whatever the labels say. A job with no stored analysis IS
+counted, because Ingest fails open there. The scan is bounded to 50 repos and reports
+`truncated`.
+
+"Very next delivery" is enforced, not assumed: Ingest reads the label parameter with a 30 s cache
+TTL (`RUNNER_LABELS_TTL_MS`) rather than `getParam`'s 5-minute default, which would otherwise
+leave a warm container claiming against the previous set for minutes with no signal — an
+unclaimed job just runs on GitHub-hosted.
 
 ### 3. Webhook health
 

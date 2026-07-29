@@ -20,7 +20,9 @@ process.env.RUNNER_LABELS_PARAM = '/lca/test/config/runner-labels';
 process.env.QUEUE_URL = 'https://sqs.test/queue';
 process.env.TABLE_NAME = 'lca-test-table';
 
-const { verifyWithRotation, _resetSecretRecheck } = await import('../dist/src/ingest/handler.js');
+const { verifyWithRotation, _resetSecretRecheck, RUNNER_LABELS_TTL_MS } = await import(
+  '../dist/src/ingest/handler.js'
+);
 
 const OLD_SECRET = 'old-webhook-secret-value';
 const NEW_SECRET = 'new-webhook-secret-value';
@@ -113,4 +115,24 @@ test('an unchanged stored value short-circuits instead of re-verifying', async (
   const ok = await verifyWithRotation(BODY, sign(BODY, 'attacker-secret'), OLD_SECRET, r.read);
   assert.equal(ok, false);
   assert.equal(r.state.calls, 1);
+});
+
+// ---- claimed-label config staleness (same class of defect, no recovery signal) ------------
+//
+// A label change from the Settings screen is presented as taking effect on the very NEXT
+// `workflow_job` delivery — that is exactly what the mandatory impact preview describes. With
+// `getParam`'s 5-minute default TTL a warm container would keep claiming against the PREVIOUS
+// label set, so jobs the operator just stopped claiming would still be provisioned here and jobs
+// they just adopted would still go to GitHub-hosted. Unlike the webhook secret there is no
+// failure signal to trigger a re-read from (an unclaimed job simply runs elsewhere), so the TTL
+// itself is the bound.
+test('the claimed-label read is bounded well below the default SSM cache TTL', () => {
+  assert.ok(
+    RUNNER_LABELS_TTL_MS > 0 && RUNNER_LABELS_TTL_MS <= 60_000,
+    `label config staleness must stay inside a minute, got ${RUNNER_LABELS_TTL_MS}ms`,
+  );
+  assert.ok(
+    RUNNER_LABELS_TTL_MS < 5 * 60 * 1000,
+    'the getParam default (5 min) is far longer than the "next delivery" the UI promises',
+  );
 });

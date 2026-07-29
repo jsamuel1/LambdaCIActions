@@ -510,7 +510,10 @@ export interface LabelImpactJob {
 /**
  * Compute the claim-set delta over stored workflow analyses. Matching mirrors
  * `shouldClaim` exactly (case-insensitive membership of any `runs-on` label) — if these two
- * ever disagree, the preview lies, so the comparison logic is deliberately identical.
+ * ever disagree, the preview lies, so the comparison logic is deliberately identical. Jobs the
+ * control plane would refuse regardless of labels are excluded for the same reason: the caller
+ * drops opted-out repos (`isRepoOptedOut`) and this drops compat-blocked jobs, matching Ingest's
+ * two gates downstream of `shouldClaim`.
  */
 export function buildLabelImpact(
   current: string[],
@@ -526,6 +529,13 @@ export function buildLabelImpact(
   for (const repo of analyses) {
     for (const a of repo.analyses) {
       for (const job of a.parsed?.jobs ?? []) {
+        // Ingest's compat gate refuses a job whose stored analysis says `block`, whatever its
+        // labels (`matchJobAnalysis` → `compat.eligible`). Counting such a job as "newly
+        // claimed" would promise a takeover that never happens; counting it as "no longer
+        // claimed" would blame this change for a job that was already running on
+        // GitHub-hosted. A job with NO stored compat result is claimable (Ingest fails open).
+        const compat = a.compat?.jobs[job.id];
+        if (compat && compat.eligible === false) continue;
         const labels = (job.runs_on ?? []).map((l) => l.toLowerCase());
         const claimedNow = labels.some((l) => cur.has(l));
         const claimedNext = labels.some((l) => next.has(l));

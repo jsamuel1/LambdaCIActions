@@ -46,6 +46,22 @@ const sqs = new SQSClient({});
 
 const WEBHOOK_SECRET_PARAM = process.env.WEBHOOK_SECRET_PARAM!;
 const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM!;
+
+/**
+ * Cache TTL for the claimed-label config, deliberately much shorter than `getParam`'s 5-minute
+ * default (ADR-028).
+ *
+ * A label change from the Settings screen is presented as taking effect on the very NEXT
+ * `workflow_job` delivery — that is what the mandatory impact preview describes, and the whole
+ * point of previewing which jobs move. With the default TTL a warm container would keep claiming
+ * against the PREVIOUS label set for up to 5 minutes: jobs the operator just stopped claiming
+ * would still be provisioned here, and jobs they just adopted would still go to GitHub-hosted,
+ * with nothing on the screen saying so. Unlike the webhook secret there is no recovery signal to
+ * trigger a re-read from (an unclaimed job simply runs elsewhere), so the bound has to be the TTL
+ * itself. Labels are a non-secret String, so the cost is one extra `GetParameter` per container
+ * per 30 s on the webhook path.
+ */
+export const RUNNER_LABELS_TTL_MS = 30_000;
 const QUEUE_URL = process.env.QUEUE_URL!;
 const DISCOVERY_QUEUE_URL = process.env.DISCOVERY_QUEUE_URL;
 
@@ -218,7 +234,7 @@ async function handleWorkflowJob(
     return json(202, { ok: true, status: wf.action });
   }
 
-  const claimedLabels = (await getParam(RUNNER_LABELS_PARAM))
+  const claimedLabels = (await getParam(RUNNER_LABELS_PARAM, RUNNER_LABELS_TTL_MS))
     .split(',')
     .map((l) => l.trim())
     .filter(Boolean);

@@ -864,7 +864,27 @@ Three further consequences of that design, each pinned by a test:
   path's hook sync exists to prevent. Rollback re-pushes the restored secret and reports
   `hookSynced`. Relatedly, the non-atomic `app-slug` write happens only AFTER post-write
   verification passes, so a rolled-back environment does not keep advertising the slug of an App
-  whose credentials are no longer stored.
+  whose credentials are no longer stored — and rollback re-points `app-slug` at the App the
+  *restored* credentials authenticate as, since the slug is not a credential and therefore carries
+  no version in the operator's rollback snapshot. That re-point is best-effort and skipped when
+  the restored credentials do not verify (`verified: false` is already the signal that the
+  rollback is incomplete; there is no authoritative slug to write).
+- **The label-impact preview must mirror ALL of Ingest's claim gates, not just `shouldClaim`.**
+  Ingest applies two further refusals downstream of the label match: the repo opt-out
+  (`isRepoOptedOut` — `enabled === false` **or** `mode === 'off'`) and the compat gate (a job
+  whose stored analysis is `eligible: false` is left to GitHub-hosted whatever its labels). A
+  preview that ignores them over-reports movement — promising a takeover of jobs the control
+  plane will keep refusing — which defeats the whole point of requiring a preview before Apply.
+  The scan therefore reuses Ingest's own `isRepoOptedOut` predicate rather than an inlined
+  `enabled !== false`, and `buildLabelImpact` skips ineligible jobs while still counting jobs with
+  no stored analysis (Ingest fails open there).
+- **A label change also has an Ingest cache window.** `getParam`'s 5-minute default would leave a
+  warm container claiming against the PREVIOUS label set for minutes after the write, while the
+  UI says the change takes effect on the next `workflow_job` delivery. Unlike the webhook secret
+  there is no failure signal to trigger a re-read from — an unclaimed job simply runs on
+  GitHub-hosted and nothing reports it — so the bound is the TTL itself: the claimed-label read
+  uses a 30 s TTL (`RUNNER_LABELS_TTL_MS`). Labels are a non-secret `String`, so the cost is one
+  extra `GetParameter` per container per 30 s on the webhook path.
 
 ## ADR-029 — Platform-wide settings need their own fail-closed allow-list, not installation admin rights (M4)
 **Status**: Accepted (v1) · follows [ADR-022](#adr-022), [ADR-028](#adr-028)

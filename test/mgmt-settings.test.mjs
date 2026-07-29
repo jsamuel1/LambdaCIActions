@@ -38,7 +38,7 @@ import {
   validateAppCredentials,
   validateVersionSnapshot,
 } from '../dist/src/appcfg/broker-core.js';
-import { shouldClaim } from '../dist/src/ingest/filter.js';
+import { isRepoOptedOut, shouldClaim } from '../dist/src/ingest/filter.js';
 
 // ---- runner labels ---------------------------------------------------------
 
@@ -150,6 +150,64 @@ test('unchanged jobs appear in neither impact list', () => {
   assert.equal(impact.losing.length, 0);
   assert.equal(impact.gaining.length, 0);
   assert.deepEqual(impact.added, ['lca-docker']);
+});
+
+// Ingest applies TWO further gates after `shouldClaim` — the repo opt-out
+// (`isRepoOptedOut`, enforced by the caller's scan) and the compat gate (a job whose stored
+// analysis is ineligible is left to GitHub-hosted whatever its labels). A preview that ignores
+// them promises movement that never happens, which is precisely what the mandatory
+// preview-before-apply flow exists to prevent.
+test('a compat-blocked job is excluded from the impact preview (Ingest would refuse it anyway)', () => {
+  const blocked = analysis('ci.yml', [job('build', ['lca-base']), job('win', ['ubuntu-latest'])]);
+  blocked.compat = {
+    level: 'block',
+    jobs: { win: { level: 'block', eligible: false, messages: [] } },
+  };
+  const impact = buildLabelImpact(['lca-base'], ['ubuntu-latest'], [
+    { repoId: 1, repoFullName: 'a/b', analyses: [blocked] },
+  ]);
+  assert.deepEqual(
+    impact.losing.map((j) => j.jobId),
+    ['build'],
+    'an eligible job that loses its label is still reported',
+  );
+  assert.equal(
+    impact.gaining.length,
+    0,
+    'a compat-blocked job must not be advertised as newly claimed — Ingest refuses it',
+  );
+});
+
+test('a job with an eligible compat result is still counted', () => {
+  const ok = analysis('ci.yml', [job('build', ['ubuntu-latest'])]);
+  ok.compat = { level: 'warn', jobs: { build: { level: 'warn', eligible: true, messages: [] } } };
+  const impact = buildLabelImpact(['lca-base'], ['ubuntu-latest'], [
+    { repoId: 1, repoFullName: 'a/b', analyses: [ok] },
+  ]);
+  assert.deepEqual(
+    impact.gaining.map((j) => j.jobId),
+    ['build'],
+  );
+});
+
+test('a job with NO stored compat result is counted (Ingest fails open)', () => {
+  const impact = buildLabelImpact(['lca-base'], ['ubuntu-latest'], [
+    { repoId: 1, repoFullName: 'a/b', analyses: [analysis('ci.yml', [job('build', ['ubuntu-latest'])])] },
+  ]);
+  assert.deepEqual(
+    impact.gaining.map((j) => j.jobId),
+    ['build'],
+    'a missing analysis must not hide a job from the preview — Ingest would claim it',
+  );
+});
+
+test('the impact scan drops the same repos Ingest refuses (mode off, not just disabled)', () => {
+  // The scan filter and Ingest's gate must be the SAME predicate, or a `mode: 'off'` repo's
+  // jobs appear in the preview while the control plane keeps refusing them.
+  assert.equal(isRepoOptedOut({ enabled: true, mode: 'off' }), true);
+  assert.equal(isRepoOptedOut({ enabled: false }), true);
+  assert.equal(isRepoOptedOut({ enabled: true, mode: 'label' }), false);
+  assert.equal(isRepoOptedOut(undefined), false, 'a missing row fails open');
 });
 
 test('hostedLabelsIn flags claimed GitHub-hosted names', () => {
