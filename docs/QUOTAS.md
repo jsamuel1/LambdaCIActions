@@ -100,7 +100,7 @@ is a knob, not a bug.
 | Installation token | ~60 min | Cached until 5 min before expiry (`src/shared/github-app.ts`). |
 | App JWT | 10 min max | We mint 9 min. |
 | REST rate limit | 5,000 req/hr per installation | Discovery is the heaviest consumer (one fetch per workflow file). |
-| REST **mutating** rate limit | ~500 points/min per installation (a POST costs 5) | `generate-jitconfig` is a POST, so ~100 mints/min. Adopt mode makes this reachable — a whole workflow's jobs mint at once. GitHub refuses with **403**, which Provision classifies transient so the job waits instead of failing (ADR-030). |
+| REST **secondary** rate limits | 900 points/min per endpoint (a POST costs 5, so ≈180 mints/min) **and** 80 content-creating req/min / 500 per hour | `generate-jitconfig` is a POST, so both apply — the hourly content-creation cap binds at 500 jobs/hour whatever the rate, which a busy org reaches. Adopt mode makes it reachable sooner: a whole workflow's jobs mint at once. GitHub refuses with **403**, which Provision classifies transient so the job waits instead of failing (ADR-030). GitHub says these limits change without notice and some endpoints have undisclosed costs — treat the numbers as indicative and the 403 as authoritative. |
 | JIT config | single use | By design (ADR-003) — one config per job, consumed at boot. |
 | Reserved runner labels | see ADR-030 | GitHub may reject hosted-label names (`ubuntu-latest`) at registration. This is the open verification item for adopt mode. |
 | Webhook delivery timeout | 10 s | Why Ingest acks fast and does real work async. |

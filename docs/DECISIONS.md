@@ -1006,15 +1006,22 @@ backstops a run that never recovers. **Adopt mode must not be advertised as GA u
 adopt-mode job has been observed green end to end**; the M5 exit criterion is what closes this.
 `test/adopt.test.mjs` and `test/jit-labels.test.mjs` pin the behaviour either way.
 **Sixth-review fix**: a **rate-limit 403 is transient**, not permanent. `generate-jitconfig`
-is a POST, so it spends the installation's *mutating* REST budget (~500 points/min; a POST
-costs 5, i.e. ~100 mints/min) and GitHub refuses with **403**, not 429 — for both the primary
-limit and the secondary/abuse limit. The blanket "non-429 4xx is permanent" rule therefore
+is a POST, so GitHub's **secondary** rate limits meter it and GitHub refuses with **403**, not
+429 — for both the primary limit and the secondary/abuse limit. The blanket "non-429 4xx is permanent" rule therefore
 stamped a merely throttled job terminal `failed` with "rejected by GitHub", and because
 `failed` is terminal the redelivered message's `queued→provisioning` guard refuses to advance
 the row — so the SQS retry that would have succeeded never reached the mint, and a developer's
 job needed a manual re-run. Adopt mode is exactly what makes the burst reachable: claiming by
 standard label mints a whole workflow's jobs at once, and Provision's reserved concurrency
-(10 dev / 25 prod) sits above GitHub's ceiling. The classification now matches on the response
+(10 dev / 25 prod) can outrun GitHub's per-minute ceiling. Two published secondary limits apply
+(GitHub docs, "Rate limits for the REST API"): **900 points/minute** per endpoint with a POST
+costing **5 points** (≈180 mints/min), and a separate **content-creation** cap of **80/minute
+and 500/hour**. The hourly one is the one concurrency cannot buy its way out of — it binds at
+500 minting jobs in an hour whatever the rate, which RUNBOOK now says explicitly so the
+"lower `provisionConcurrency`" remedy is not applied to a volume limit it cannot fix. GitHub
+states the secondary limits change without notice and that some endpoints carry undisclosed
+costs, so the numbers are indicative and the classification matches the refusal, not a budget
+calculation. The classification now matches on the response
 **body**, not the bare status, because 403 is also how GitHub reports a revoked installation or
 a missing permission — which is genuinely permanent and must keep naming the fix rather than
 retrying into the DLQ. `test/jit-labels.test.mjs` pins both halves.

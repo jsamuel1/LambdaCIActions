@@ -129,12 +129,18 @@ export interface MintFailureClassification {
 /**
  * GitHub rate-limit language in a 403 body.
  *
- * `generate-jitconfig` is a POST, so it spends the **mutating** REST budget (~500 points per
- * minute per installation), and GitHub answers a rate-limit refusal with **403**, not 429 —
- * both the primary limit ("API rate limit exceeded") and the secondary one ("exceeded a
- * secondary rate limit"). Adopt mode is what makes that burst reachable: claiming a repo by
- * standard label means a whole workflow's jobs mint at once, and Provision's reserved
- * concurrency (10 dev / 25 prod) is well above the ~100 mints/minute the budget allows.
+ * `generate-jitconfig` is a POST, so it is metered by GitHub's **secondary** rate limits, and
+ * GitHub answers a rate-limit refusal with **403**, not 429 — both the primary limit ("API
+ * rate limit exceeded") and the secondary one ("exceeded a secondary rate limit"). Two
+ * PUBLISHED secondary limits bite here (GitHub docs, "Rate limits for the REST API"): a POST
+ * costs **5 points** against a **900 points/minute** per-endpoint budget (≈180 mints/min), and
+ * **content-creating** requests are separately capped at **80/minute and 500/hour**. Adopt mode
+ * is what makes those reachable: claiming a repo by standard label means a whole workflow's
+ * jobs mint at once, and Provision's reserved concurrency (10 dev / 25 prod) can outrun the
+ * per-minute ceiling — while the hourly one needs only 500 jobs in an hour, whatever the rate.
+ * GitHub states the secondary limits are subject to change without notice and that some
+ * endpoints carry undisclosed costs, which is why classification below matches the REFUSAL
+ * rather than trying to predict the budget.
  *
  * Matching the BODY, not the bare status, is deliberate. A 403 is also how GitHub reports a
  * revoked installation or an App missing a permission, which is genuinely permanent — reading

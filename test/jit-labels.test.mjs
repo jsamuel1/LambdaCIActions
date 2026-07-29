@@ -91,8 +91,9 @@ test('a network error with no status is treated as transient', () => {
 });
 
 test('a rate-limit 403 is transient — GitHub reports mint throttling as 403, not 429', () => {
-  // `generate-jitconfig` is a POST, so it spends the MUTATING REST budget (~500 points/min per
-  // installation) and a refusal arrives as 403. Adopt mode makes that burst reachable: a whole
+  // `generate-jitconfig` is a POST, so GitHub's SECONDARY rate limits meter it (900 points/min
+  // per endpoint at 5 points per POST, plus a separate 80/min + 500/hour content-creation cap)
+  // and a refusal arrives as 403. Adopt mode makes that burst reachable: a whole
   // workflow's jobs mint at once. Classifying it permanent stamped the run terminal `failed`,
   // and because `failed` is terminal the redelivered message's queued→provisioning guard
   // refuses to advance the row — so the SQS retry that would have succeeded never reaches the
