@@ -34,6 +34,7 @@ import {
 } from './views.js';
 import { parseLimit, parseEpochMs, validateFlavorMap, validateRepoPatch } from './validate.js';
 import { collectVisible } from './paging.js';
+import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -486,13 +487,32 @@ async function listRunsRoute(
   if (q.repo !== undefined) {
     const repoId = asPositiveInt(q.repo);
     if (!repoId) return problem(400, 'repo must be a numeric repo id');
+    if (q.status !== undefined && !ALL_STATUSES.includes(q.status as RunStatus)) {
+      return problem(400, `status must be one of ${ALL_STATUSES.join(', ')}`);
+    }
+    // `repo` wins the index choice (GSI2 repo/time), but a `status` sent alongside it is
+    // honoured as a post-query predicate rather than ignored: the console can set both, and
+    // silently dropping one would show every status under a "failed" filter.
+    const status = q.status as RunStatus | undefined;
     const page = await collectVisible(
       (cursor) => listRunsByRepo(repoId, { limit, cursor }),
-      visible,
+      (runs) => visible(runs).filter((r) => status === undefined || r.status === status),
       limit,
       q.cursor,
     );
-    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
+    // `complete` reports whether rows were DROPPED from this response, not whether the index
+    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-029).
+    // `collectVisible` never slices, so an unfiltered repo page loses nothing: every visible
+    // row the query returned is here, and a run's remaining jobs are reachable through
+    // `nextCursor`. Reporting `nextCursor === undefined` here instead would make a
+    // repo-filtered window PERMANENTLY partial: the head page always has an open cursor while
+    // history remains, and the client ANDs every page's flag, so walking to the end could
+    // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
+    return json(200, {
+      runs: page.runs.map(toRunView),
+      nextCursor: page.nextCursor ?? null,
+      complete: repoResponseComplete(status !== undefined),
+    });
   }
   if (q.status !== undefined) {
     if (!ALL_STATUSES.includes(q.status as RunStatus)) {
@@ -505,15 +525,37 @@ async function listRunsRoute(
       limit,
       q.cursor,
     );
-    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
+    // A status-filtered page holds only the jobs IN that status, so a run folded from it is
+    // partial by construction however far the cursor got.
+    return json(200, {
+      runs: page.runs.map(toRunView),
+      nextCursor: page.nextCursor ?? null,
+      complete: false,
+    });
   }
   const pages = await Promise.all(
     ALL_STATUSES.map((s) => listRunsByStatusPaged(s, { limit })),
   );
-  const merged = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs))).slice(0, limit);
+  const visibleRuns = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs)));
+  const merged = visibleRuns.slice(0, limit);
   // A merged multi-index view has no single coherent cursor — the client narrows by
   // status or repo to paginate deeper.
-  return json(200, { runs: merged.map(toRunView), nextCursor: null });
+  //
+  // `complete` tells the client whether any job row was dropped on the way out. This view
+  // hands back no cursor, so the client cannot recover a dropped row by paging — the flag
+  // carries the whole verdict here. It is decided HERE because only this code sees the raw
+  // per-status pages: truncation must be judged before the visibility filter, since a page
+  // filled with another tenant's rows looks short while this operator's sibling jobs sit
+  // unread past the boundary (ADR-029).
+  return json(200, {
+    runs: merged.map(toRunView),
+    nextCursor: null,
+    complete: mergedResponseComplete({
+      anyIndexTruncated: pages.some((p) => p.nextCursor !== undefined),
+      visibleRows: visibleRuns.length,
+      returnedRows: merged.length,
+    }),
+  });
 }
 
 /**
