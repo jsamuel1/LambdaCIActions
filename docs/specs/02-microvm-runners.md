@@ -102,6 +102,15 @@ POST /run   { ref, region, broker, token }  (≤ 4 KB payload — JIT config by 
 POST /terminate   # fires pre-teardown; best-effort final status report
 ```
 
+- The image declares `microvmHooks.run` with **`runTimeoutInSeconds: 120`** and the hook's
+  boot broker call is bounded at **20 s per invoke × 3 attempts** (2 s/4 s backoff, 66 s worst
+  case), so the retry budget still fits the deadline with room for another full-length
+  attempt. Both numbers are sized for a **cold `aws` CLI** in a snapshot-resumed guest, which
+  is the dominant cost — not the broker ([ADR-028](../DECISIONS.md); the original 6 s/30 s
+  pair left zero retry margin in live measurement). The `ready` **image** hook pre-warms the
+  CLI before the snapshot is captured, so a healthy boot resolves on attempt 1 and the raised
+  bound is unused headroom. Every attempt logs its measured `ms`.
+
 - There is **no in-guest id source** for the VM's own `microvmId` (no metadata file, no
   env var — verified from live runs, ADR-019). Self-terminate therefore goes through the
   hook broker, which reads the id off the run row keyed by the same `ref` the VM's

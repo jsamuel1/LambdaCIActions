@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { runRowKeyFromRef, redact, isBrokerRefusal, safeErr, parseBrokerResponse } from '../microvm/bootstrap/run-hook.mjs';
+import { runRowKeyFromRef, redact, isBrokerRefusal, safeErr, parseBrokerResponse, prewarmAwsCli } from '../microvm/bootstrap/run-hook.mjs';
 import { runPk, RUN_SK, jitConfigRef } from '../dist/src/shared/run-store.js';
 
 test('runRowKeyFromRef inverts jitConfigRef back to the run row key', () => {
@@ -199,6 +199,8 @@ test('the boot fetch budget fits inside the platform /run hook timeout', () => {
   const build = fs.readFileSync(new URL('../scripts/build-images.mjs', import.meta.url), 'utf8');
   const hookTimeoutS = Number(build.match(/runTimeoutInSeconds: (\d+)/)[1]);
   assert.ok(hookTimeoutS > 0, 'no runTimeoutInSeconds declared for the run hook');
+  // Service constraint on microvmHooks.runTimeoutInSeconds (lambda-microvms 2025-09-09).
+  assert.ok(hookTimeoutS <= 600, `runTimeoutInSeconds ${hookTimeoutS}s exceeds the 600s API max`);
 
   const bootMs = Number(src.match(/const BOOT_CALL_TIMEOUT_MS = (\d+);/)[1]);
   const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
@@ -212,6 +214,106 @@ test('the boot fetch budget fits inside the platform /run hook timeout', () => {
   );
   // And the boot path must actually use that tighter bound, not the default.
   assert.match(src, /callBroker\('jitconfig', BOOT_CALL_ATTEMPTS, \d+, BOOT_CALL_TIMEOUT_MS\)/);
+});
+
+// The reason the above invariant is not sufficient on its own: the ORIGINAL budget satisfied it
+// (24 s < 30 s) and still shipped a boot path with no retry margin. The 2026-07-28 dev deploy
+// verification measured a COLD `aws` CLI in a snapshot-resumed guest exceeding the 6 s
+// per-invoke bound on attempts 1 AND 2 of every boot, so the job only started because the LAST
+// attempt landed — one more slow attempt would have blown the platform deadline, leaving `/run`
+// un-ACKed, traffic gated and the VM stranded until the Reaper. So pin the margin itself: after
+// the whole retry budget is spent, at least one further full-length invoke must still fit
+// inside the hook deadline.
+test('the boot budget leaves room for one more full-length attempt (no zero-margin boot)', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  const build = fs.readFileSync(new URL('../scripts/build-images.mjs', import.meta.url), 'utf8');
+  const hookTimeoutMs = Number(build.match(/runTimeoutInSeconds: (\d+)/)[1]) * 1000;
+  const bootMs = Number(src.match(/const BOOT_CALL_TIMEOUT_MS = (\d+);/)[1]);
+  const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
+  const delayMs = Number(src.match(/function callBroker\(action, attempts = \d+, delayMs = (\d+)/)[1]);
+
+  let worstMs = bootAttempts * bootMs;
+  for (let i = 1; i < bootAttempts; i++) worstMs += delayMs * 2 ** (i - 1);
+  const nextBackoffMs = delayMs * 2 ** (bootAttempts - 1);
+  assert.ok(
+    worstMs + nextBackoffMs + bootMs <= hookTimeoutMs,
+    `boot budget ${worstMs}ms leaves no room for another ${bootMs}ms attempt inside ${hookTimeoutMs}ms`,
+  );
+  // The per-invoke bound must also exceed the MEASURED cold-CLI cost with headroom. Observed
+  // in-guest: >6 s, consistently. 15 s is the floor that makes a cold call a non-event.
+  assert.ok(bootMs >= 15000, `per-invoke boot bound ${bootMs}ms is under the measured cold-CLI cost`);
+});
+
+// Every attempt's duration is logged — including the SUCCESSFUL one, which is the number that
+// actually validates the budget (a healthy boot must clear attempt 1 well inside the bound, and
+// a regressed pre-warm shows up as a slow success, not a failure). The 6 s budget was defensible
+// only because nobody had measured the real cold-call cost; the fix is worthless if the next
+// person has to guess again.
+test('broker invoke attempts log their measured duration', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.match(src, /const startedAt = Date\.now\(\);/);
+  assert.match(src, /const ms = Date\.now\(\) - startedAt;/);
+  for (const line of ['broker invoke failed', 'broker invoke ok']) {
+    const at = src.indexOf(`log('${line}'`);
+    assert.ok(at > 0, `no ${line} log line`);
+    assert.match(src.slice(at, at + 200), /\bms,?/, `${line} must carry the attempt duration`);
+  }
+  // The success line must not echo the response body — it holds the run's registration token.
+  const okAt = src.indexOf("log('broker invoke ok'");
+  const okLine = src.slice(okAt, src.indexOf('\n', okAt));
+  assert.doesNotMatch(okLine, /body/, 'the success log must not include the broker response');
+});
+
+// The cold cost is paid at BUILD time, not boot time: the `ready` image hook is the last thing
+// to run before the snapshot is captured, so a CLI warmed there is warm in every booted VM.
+// The pre-warm must be credential-free and egress-free (the build guest has neither the run's
+// execution role nor a reason to reach AWS), and must never fail the ready hook — a non-200
+// there fails the whole image build with "Ready hook check failed".
+test('the ready hook pre-warms the AWS CLI without credentials or egress', () => {
+  const src = fs.readFileSync(
+    new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
+    'utf8',
+  );
+  const ready = src.slice(src.indexOf("if (path === '/ready')"), src.indexOf("if (req.method === 'POST' && path === '/run')"));
+  assert.match(ready, /prewarmAwsCli\(\)/, 'the ready hook must pre-warm the CLI');
+  assert.match(ready, /\{"ready":true\}/);
+  // Best-effort: a throwing warmup must not turn into a non-200 (that fails the image build).
+  assert.match(ready, /try \{[\s\S]*prewarmAwsCli\(\)[\s\S]*\} catch/);
+
+  const fn = src.slice(src.indexOf('export function prewarmAwsCli'), src.indexOf('// Fetch the stashed JIT config'));
+  assert.match(fn, /--no-sign-request/, 'must not need credentials');
+  assert.match(fn, /--endpoint-url/, 'must target a local endpoint, not a real AWS one');
+  assert.match(fn, /AWS_EC2_METADATA_DISABLED/, 'must not hang on an IMDS probe');
+  assert.match(fn, /timeout: PREWARM_TIMEOUT_MS/, 'a hung warmup must not eat the ready budget');
+  const endpoint = src.match(/const PREWARM_ENDPOINT = '([^']+)'/)[1];
+  assert.match(endpoint, /^http:\/\/127\.0\.0\.1:/, `prewarm endpoint ${endpoint} is not loopback`);
+});
+
+// The warmup runs on a real spawn in the guest; here, inject a fake so the invariants are
+// checked without a CLI: it spawns `aws`, reports the measured duration, and is idempotent
+// (the ready hook can be probed more than once during a build).
+test('prewarmAwsCli spawns the CLI once and reports its duration', () => {
+  const calls = [];
+  const fake = (cmd, args) => {
+    calls.push({ cmd, args });
+    return { status: 255, error: undefined }; // connect failure — the EXPECTED outcome
+  };
+  const first = prewarmAwsCli(fake);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, 'aws');
+  assert.deepEqual(calls[0].args.slice(0, 2), ['lambda', 'invoke']);
+  assert.equal(first.ran, true, 'a non-zero exit still warms the CLI');
+  assert.equal(typeof first.ms, 'number');
+  // Idempotent: a second ready probe must not re-pay the cost.
+  const second = prewarmAwsCli(fake);
+  assert.equal(calls.length, 1);
+  assert.equal(second.skipped, true);
 });
 
 // The broker's reserved-concurrency cap (20) exists to stop an untrusted VM fleet draining

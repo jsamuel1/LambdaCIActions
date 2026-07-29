@@ -405,7 +405,8 @@ root entrypoint scoped to docker-capable flavors, no `sudo`, bounded readiness w
 
 ## ADR-021 — microVMs hold no ambient AWS authority: brokered run-hook operations (M3)
 **Status**: Accepted (v1) · supersedes the IAM half of [ADR-019](#adr-019) · amends
-[ADR-016](#adr-016) (payload-by-reference access path)
+[ADR-016](#adr-016) (payload-by-reference access path) · boot budget amended by
+[ADR-028](#adr-028)
 **Context**: The microVM execution role (`lca-<env>-microvm-exec`) is stamped on VMs that
 execute **untrusted workflow code**, and carried two grants that couldn't be scoped where
 they were:
@@ -463,12 +464,14 @@ reason to be reachable off-account); leaving read table-wide and only fixing ter
 **Consequences**: One extra Lambda invoke on the boot path (~50 ms) — and it is *on* the
 critical path, because `/run` cannot ACK until the JIT config is resolved and Lambda gates
 traffic to the VM until that ACK. That makes the guest-side call bounded on purpose, and the
-boot call bounded *twice*: the image declares `microvmHooks.run` with
-`runTimeoutInSeconds: 30`, so the whole boot retry budget (invokes + backoff) has to fit
+boot call bounded *twice*: the image declares `microvmHooks.run` with a
+`runTimeoutInSeconds`, so the whole boot retry budget (invokes + backoff) has to fit
 inside that deadline — a bigger budget cannot help, because the platform abandons `/run`
 while the hook is still sleeping between attempts and the VM strands for the Reaper with the
-job unstarted. Boot therefore uses a 6 s per-invoke bound × 3 attempts + 2 s/4 s backoff
-(24 s worst case); terminate keeps a 15 s per-invoke bound and a larger attempt budget (no
+job unstarted. Boot therefore uses a per-invoke bound × 3 attempts with 2 s/4 s backoff
+(originally 6 s/24 s — **resized in [ADR-028](#adr-028)** after live measurement showed the
+cost is the cold `aws` CLI, not the broker); terminate keeps a 15 s per-invoke bound and a
+larger attempt budget (no
 platform deadline behind it). The bound exists at all because the AWS CLI otherwise blocks
 `spawnSync` forever if the guest's network is broken, which would strand the VM with no ACK
 and no retry; the backoff is exponential across attempts, since the reserved-concurrency cap
@@ -726,3 +729,78 @@ spec 03 § routing. Consequently a *disabled* repo whose row read fails will sti
 job; that is the deliberate trade (availability over strictness) and matches the compat
 gate. `mode='adopt'` is not an opt-out — it is treated as `label` until the M5
 standard-label map ships. `test/filter.test.mjs` and `test/flavor.test.mjs` pin both.
+
+## ADR-028 — The boot broker budget is sized for a cold AWS CLI, and the CLI is warmed pre-snapshot (M4)
+**Status**: Accepted (v1) · amends the boot-budget half of [ADR-021](#adr-021)
+**Context**: ADR-021 put a bounded, retried `aws lambda invoke` on the boot critical path:
+`/run` cannot ACK until the JIT config is resolved, and the platform abandons the hook after
+the image's declared `microvmHooks.runTimeoutInSeconds`. That budget was sized off the
+**broker's** latency (~50 ms of DynamoDB work) — 6 s per invoke × 3 attempts + 2 s/4 s
+backoff = 24 s against a 30 s hook timeout.
+
+The cost model was wrong. The dominant term is the **cold `aws` CLI** in a freshly
+snapshot-resumed guest — Python interpreter start, botocore service-model load, endpoint
+resolution — not the broker. The 2026-07-28 dev verification (run `30407823249`, see the
+deploy-verification record) shows attempts 1 **and** 2 failing identically on **all three**
+flavors:
+
+```json
+{"msg":"broker invoke failed","action":"jitconfig","attempt":1,"status":null,"error":"spawnSync aws ETIMEDOUT","stderr":""}
+```
+
+Every job still ran — attempt 3 succeeded each time — so this was latent, not breaking. But
+it means the boot path had **zero retry margin**: ~22 s of the 30 s deadline consumed to
+obtain one success. One further slow attempt exhausts the hook deadline, `/run` never ACKs,
+Lambda keeps traffic gated, and the VM is stranded until the Reaper: a failed job plus paid
+idle time. A cold-start blip or a throttled broker turns that into intermittent boot failures.
+
+**Decision**: fix the cost and the budget, and pin the margin.
+1. **Warm the CLI pre-snapshot.** `run-hook.mjs` exports `prewarmAwsCli()`, called from the
+   `ready` **image** hook — which runs during `create/update-microvm-image`, *before* the
+   snapshot is captured, so the snapshot carries the warm state and a booted VM's first
+   broker call is not the guest's first CLI invocation. The warmup is credential-free and
+   egress-free: `--no-sign-request` against a **closed loopback port**
+   (`http://127.0.0.1:1`) with IMDS disabled, which forces the whole import/model-load/
+   endpoint path and then fails to connect. A non-zero exit is the expected outcome; only the
+   elapsed time is interesting, and it is logged. It is best-effort and wrapped — a non-200
+   from `/ready` fails the entire image build ("Ready hook check failed").
+2. **Resize the budget for a cold call anyway**, because a pre-warm can regress silently (a
+   base-image change, a CLI upgrade, a rebuilt snapshot) and the guest must not depend on it:
+   per-invoke bound **6 s → 20 s**, and the image's `runTimeoutInSeconds` **30 s → 120 s**
+   (service constraint is 1–600 s). Worst case is now `3 × 20 s + 2 s + 4 s = 66 s`, which
+   leaves room for a **further full-length attempt** inside the deadline.
+3. **Measure, don't assume.** Every broker attempt logs its own `ms` — on success (`broker
+   invoke ok`, action/attempt/duration only, never the response body) as well as on failure, so
+   a healthy boot proves attempt 1 clears the bound and a regressed pre-warm shows up as a slow
+   success rather than silence. The next
+   verification reads the real cold-call duration out of the run's log stream instead of
+   re-deriving it from a timeout.
+4. **Pin it in tests.** `test/run-hook.test.mjs` keeps the original "budget < hook timeout"
+   invariant (which the 6 s budget satisfied while still having no margin) and adds: budget +
+   one more full-length attempt ≤ hook timeout, a floor on the per-invoke bound above the
+   measured cold cost, the presence of per-attempt duration logging, and the pre-warm's
+   credential-free/loopback/bounded properties.
+
+**Why**: the two halves cover each other. The pre-warm removes the latency, so the raised
+bound is dead headroom on a healthy boot rather than added boot time; the raised bound means a
+*failed or regressed* pre-warm degrades to a slower boot instead of a stranded VM. Pinning the
+*margin* rather than just the budget is the part that would have caught this: the shipped 6 s
+budget passed the pre-existing invariant.
+
+Alternatives rejected: **raising only the timeouts** (leaves ~20 s of cold-CLI latency on
+every boot, and every boot one blip from the wall); **only pre-warming** (a silent regression
+puts us straight back to a no-margin budget); **replacing the CLI with a hand-rolled signed
+HTTPS call from Node** — it removes the startup cost entirely, but it means implementing SigV4
+plus credential-provider-chain resolution in an image that deliberately carries **no npm
+deps**, and re-deriving the two security properties the current file-based handling already
+gives us (the capability token stays off `argv`, and the credential-bearing response stays out
+of shared `/tmp`). That is a large, security-sensitive surface for a latency win the pre-warm
+already delivers; revisit only if the CLI's cold cost becomes structural.
+
+**Consequences**: a wedged boot now occupies its VM for up to 120 s instead of 30 s before the
+platform gives up — bounded, and small against the Reaper's 2 h lifetime cap that actually
+bounds paid idle time. Deploy-touching: the new hook timeout and the pre-warm both live in the
+**image**, so they need an image rebuild (`npm run build:images`) and the ADR-021 skew-window
+discipline in `docs/DEPLOY-M1.md`. The pre-warm adds one CLI invocation to each image build.
+Boot logs gain an `aws cli prewarm` line and an `ms` field per broker attempt; neither carries
+payload content (the capability token and the JIT config stay redacted per ADR-021).
