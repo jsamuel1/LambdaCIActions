@@ -23,7 +23,7 @@ Self-hosted runners on EC2/ECS mean idle cost, patching, and warm-pool managemen
 - **Ephemeral, single-use runners** — a fresh isolated microVM per job, self-terminating. No shared state, no idle compute.
 - **Fast boot** from a pre-built snapshot image (seconds, not minutes).
 - **Your account, your region, your VPC** — cut E2E latency to private APIs; reach private resources; apply egress filtering.
-- **Per-second billing** on Graviton (2 vCPU / 4 GB ≈ \$0.0044/min) — competitive with, and often cheaper than, GitHub-hosted for many short jobs.
+- **Per-second billing** on Graviton (a ≈ 2 vCPU / 4 GB shape ≈ \$0.0044/min) — competitive with, and often cheaper than, GitHub-hosted for many short jobs. That shape is a *reference point for the rate*, not a request: the microVM API accepts a memory floor only (`--resources minimumMemoryInMiB`) and exposes no vCPU knob, so every derived cost is an estimate — see [ADR-038](docs/DECISIONS.md#adr-038).
 - **Strong tenant isolation** — unlike shared Lambda, each microVM is its own VM.
 
 Tradeoffs (see [ARCHITECTURE](docs/ARCHITECTURE.md)): **arm64 only** (Graviton 3/4, no x86_64),

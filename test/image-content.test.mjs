@@ -408,17 +408,36 @@ test('tool-cache paths are derived from the version pin, never a repeated litera
   // A hardcoded GOROOT/JAVA_HOME/PATH copy of the pinned version silently points at a
   // nonexistent directory the moment the ARG above it is bumped — the image still builds and
   // the flavor ships with a broken default toolchain.
+  let inspected = 0;
   for (const name of TOOLCACHE_FLAVORS) {
     const df = read(`Dockerfile.${name}`);
     for (const line of df.split('\n')) {
-      if (!/hostedtoolcache/.test(line) || /^\s*#/.test(line)) continue;
-      assert.doesNotMatch(
-        line,
-        /hostedtoolcache\/[A-Za-z_]+\/\d+\.\d+/,
-        `${name}: hardcoded toolchain version in '${line.trim()}' — derive it from the ARG`,
-      );
+      if (/^\s*#/.test(line)) continue;
+      // Match the cache root in EVERY form it is written: the Dockerfiles reference it as
+      // ${RUNNER_TOOL_CACHE}, so a filter that only looked for the literal `hostedtoolcache`
+      // string skipped every real instruction and the assertion below could never fire.
+      for (const m of line.matchAll(
+        /(?:\$\{RUNNER_TOOL_CACHE\}|\$RUNNER_TOOL_CACHE|\/opt\/hostedtoolcache)\/([A-Za-z_][A-Za-z0-9_]*)\/([^\s/\\]+)/g,
+      )) {
+        inspected += 1;
+        const [, toolName, versionSegment] = m;
+        assert.doesNotMatch(
+          versionSegment,
+          /^\d/,
+          `${name}: hardcoded ${toolName} version '${versionSegment}' in '${line.trim()}' — ` +
+            'derive it from the ARG, or the path silently points at a nonexistent directory ' +
+            'the moment the pin is bumped',
+        );
+      }
     }
   }
+  // The guard is only worth anything if it actually looked at the tool-cache paths. Zero
+  // inspected means the matcher stopped agreeing with how the Dockerfiles are written.
+  assert.ok(
+    inspected >= TOOLCACHE_FLAVORS.length,
+    `found only ${inspected} tool-cache path(s) to check across ${TOOLCACHE_FLAVORS.length} ` +
+      'flavors — the matcher no longer recognizes how these Dockerfiles reference the cache root',
+  );
 });
 
 test('the node flavor\'s tool-cache pin agrees with its apt NODE_MAJOR', () => {
