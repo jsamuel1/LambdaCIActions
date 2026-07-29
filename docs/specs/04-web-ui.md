@@ -68,15 +68,18 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
   basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point.
 - **Partial rollups** — grouping is client-side over an index **page**, so a run's jobs can
-  straddle the page boundary. `GET /api/runs` therefore returns **`complete`**: the server's
-  verdict on whether the page holds every job of every run it mentions. It has to be decided
-  server-side, because truncation is judged on the raw index pages *before* the
-  installation-visibility filter — a page filled with another tenant's rows comes back short
-  while this operator's sibling jobs sit unread past the boundary. The client folds whole runs
-  only when `complete` is true for every loaded page **and** the cursor is exhausted;
-  otherwise every run in the window is badged `partial` and its status, job count and
-  durations render as `≥` lower bounds. A `status=` filter selects *jobs*, so it always
-  reports `complete: false` — the screen says so inline.
+  straddle the page boundary. Completeness is therefore two halves. `GET /api/runs` returns
+  **`complete`**, the server's answer to *were any job rows dropped from this response?* — it
+  deliberately does **not** mean "the index is exhausted", which the client already knows from
+  the cursor. The server half has to be server-side because truncation is judged on the raw
+  index pages *before* the installation-visibility filter — a page filled with another tenant's
+  rows comes back short while this operator's sibling jobs sit unread past the boundary. The
+  client folds whole runs only when `complete` held for every loaded page **and** the cursor is
+  exhausted; otherwise every run in the window is badged `partial` and its status, job count and
+  durations render as `≥` lower bounds. A repo-filtered page drops nothing, so paging it to the
+  end yields exact rollups. A `status=` filter selects *jobs*, so it always reports
+  `complete: false` (including alongside `repo=`, where it applies as a post-query predicate) —
+  the screen says so inline.
 - **Ids** — run/job ids are small dim text at the end of their column with a copy button
   (`CopyId`): an accessible label, a polite live region for the copied state, and
   `stopPropagation` so copying does not trigger the row's navigation.
@@ -123,7 +126,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
-| `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`); returns `complete` (may these rows be folded into whole runs?) | ✅ |
+| `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`; `repo`+`status` compose); returns `complete` (were any job rows dropped from this response?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |

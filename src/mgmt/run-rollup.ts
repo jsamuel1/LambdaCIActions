@@ -10,10 +10,12 @@ import type { RunStatus } from '../shared/types.js';
  *
  * That fold can lie: the API's cursor addresses an index PAGE, so a run's jobs can straddle
  * a page boundary and a rollup built from a partial job set would report a wrong duration
- * and a wrong status. Rather than guess, this module carries completeness explicitly —
- * `windowComplete` decides whether the loaded window can prove it holds every job of every
- * run in it, and each group is stamped `partial` when it cannot. The UI renders a partial
- * rollup as a lower bound (`≥`), never as a fact. See ADR-029.
+ * and a wrong status. Rather than guess, this module carries completeness explicitly, in two
+ * halves: the server reports whether any row was DROPPED from a response
+ * (`mergedResponseComplete` / `repoResponseComplete`), the client supplies index exhaustion,
+ * and `windowComplete` combines them into "can the loaded window prove it holds every job of
+ * every run in it". Each group is stamped `partial` when it cannot, and the UI renders a
+ * partial rollup as a lower bound (`≥`), never as a fact. See ADR-029.
  *
  * Pure by construction (no AWS, no DOM) and shared by the API package and the SPA so the
  * fold rules are unit-tested once — `test/run-rollup.test.mjs`.
@@ -151,10 +153,17 @@ export interface WindowShape {
   /** The API's cursor for the next older page, `null` when the index is exhausted. */
   nextCursor: string | null;
   /**
-   * The `complete` flag from the newest page the client loaded. Completeness cannot be
-   * derived client-side: the merged view queries each status index for `limit` rows and only
-   * THEN applies the installation-visibility filter, so a short response does not prove the
-   * indexes were not truncated. Only the server sees the per-status cursors.
+   * The `complete` flag from every page the client loaded, ANDed. It answers a narrow
+   * question — *did this response drop any job row that the client can never page back to?*
+   * — and NOT "is the index exhausted", which is `nextCursor`'s job. Splitting the verdict
+   * this way matters: a repo-filtered head page always has an open cursor while history
+   * remains, so folding exhaustion into `complete` would leave such a window permanently
+   * partial no matter how far the operator paged.
+   *
+   * The dropped-rows half cannot be derived client-side: the merged view queries each status
+   * index for `limit` rows and only THEN applies the installation-visibility filter, so a
+   * short response does not prove the indexes were not truncated. Only the server sees the
+   * per-status cursors.
    */
   serverComplete: boolean;
 }
@@ -169,8 +178,9 @@ export interface WindowShape {
  *   `createdAt`, not grouped, so any run in the window may continue past the boundary.
  *   Flagging only the run that owns the boundary row would be unsound: a straddling run's
  *   oldest LOADED job need not be the boundary row.
- * - otherwise the server's own verdict decides (`mergedResponseComplete` for the merged
- *   view, index exhaustion for a repo-filtered one).
+ * - otherwise the server's own verdict decides: no row was dropped on the way out
+ *   (`mergedResponseComplete` for the merged view; unconditionally true for a repo-filtered
+ *   page, which never slices).
  */
 export function windowComplete(w: WindowShape): boolean {
   if (w.statusFiltered) return false;
@@ -182,7 +192,8 @@ export function windowComplete(w: WindowShape): boolean {
  * Server-side completeness verdict for the unfiltered **merged** run view.
  *
  * That view queries every status index for `limit` rows, filters the union to the session's
- * installations, then slices to `limit`. Two independent ways to lose a job:
+ * installations, then slices to `limit`. It hands back no cursor, so a row dropped here is
+ * unrecoverable. Two independent ways to lose a job:
  *  - an index page was truncated (`anyIndexTruncated`) — note this must be judged on the RAW
  *    index page, before the visibility filter, or a page filled with other tenants' rows
  *    reads as "short" while visible siblings sit unread past the boundary;
@@ -196,6 +207,22 @@ export function mergedResponseComplete(input: {
   returnedRows: number;
 }): boolean {
   return !input.anyIndexTruncated && input.returnedRows === input.visibleRows;
+}
+
+/**
+ * Server-side completeness verdict for a **repo-filtered** page (GSI2 repo/time).
+ *
+ * `collectVisible` never slices, so an unfiltered repo page drops nothing: every visible row
+ * the query returned is in the response, and whatever lies past the boundary is reachable via
+ * `nextCursor` — which is the CLIENT's half of the verdict (`windowComplete`). Folding index
+ * exhaustion in here as well would make a repo-filtered window permanently partial, because
+ * the head page always carries an open cursor while history remains and the client ANDs the
+ * flag across every page it loads.
+ *
+ * A `status` predicate applied on top does drop sibling jobs, so it can never be complete.
+ */
+export function repoResponseComplete(statusFiltered: boolean): boolean {
+  return !statusFiltered;
 }
 
 export function runGroupKey(repoId: number, runId: number): string {

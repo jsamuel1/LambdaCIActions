@@ -34,7 +34,7 @@ import {
 } from './views.js';
 import { parseLimit, parseEpochMs, validateFlavorMap, validateRepoPatch } from './validate.js';
 import { collectVisible } from './paging.js';
-import { mergedResponseComplete } from './run-rollup.js';
+import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -487,18 +487,31 @@ async function listRunsRoute(
   if (q.repo !== undefined) {
     const repoId = asPositiveInt(q.repo);
     if (!repoId) return problem(400, 'repo must be a numeric repo id');
+    if (q.status !== undefined && !ALL_STATUSES.includes(q.status as RunStatus)) {
+      return problem(400, `status must be one of ${ALL_STATUSES.join(', ')}`);
+    }
+    // `repo` wins the index choice (GSI2 repo/time), but a `status` sent alongside it is
+    // honoured as a post-query predicate rather than ignored: the console can set both, and
+    // silently dropping one would show every status under a "failed" filter.
+    const status = q.status as RunStatus | undefined;
     const page = await collectVisible(
       (cursor) => listRunsByRepo(repoId, { limit, cursor }),
-      visible,
+      (runs) => visible(runs).filter((r) => status === undefined || r.status === status),
       limit,
       q.cursor,
     );
-    // GSI2 is repo/time, so an exhausted cursor means every job of every run in this window
-    // was read — the client may fold whole runs (ADR-029).
+    // `complete` reports whether rows were DROPPED from this response, not whether the index
+    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-029).
+    // `collectVisible` never slices, so an unfiltered repo page loses nothing: every visible
+    // row the query returned is here, and a run's remaining jobs are reachable through
+    // `nextCursor`. Reporting `nextCursor === undefined` here instead would make a
+    // repo-filtered window PERMANENTLY partial: the head page always has an open cursor while
+    // history remains, and the client ANDs every page's flag, so walking to the end could
+    // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
     return json(200, {
       runs: page.runs.map(toRunView),
       nextCursor: page.nextCursor ?? null,
-      complete: page.nextCursor === undefined,
+      complete: repoResponseComplete(status !== undefined),
     });
   }
   if (q.status !== undefined) {
@@ -528,10 +541,12 @@ async function listRunsRoute(
   // A merged multi-index view has no single coherent cursor — the client narrows by
   // status or repo to paginate deeper.
   //
-  // `complete` tells the client whether it may fold these job rows into whole-run rollups.
-  // It is decided HERE because only this code sees the raw per-status pages: truncation must
-  // be judged before the visibility filter, since a page filled with another tenant's rows
-  // looks short while this operator's sibling jobs sit unread past the boundary (ADR-029).
+  // `complete` tells the client whether any job row was dropped on the way out. This view
+  // hands back no cursor, so the client cannot recover a dropped row by paging — the flag
+  // carries the whole verdict here. It is decided HERE because only this code sees the raw
+  // per-status pages: truncation must be judged before the visibility filter, since a page
+  // filled with another tenant's rows looks short while this operator's sibling jobs sit
+  // unread past the boundary (ADR-029).
   return json(200, {
     runs: merged.map(toRunView),
     nextCursor: null,

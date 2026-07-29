@@ -9,6 +9,7 @@ import {
   runDurations,
   windowComplete,
   mergedResponseComplete,
+  repoResponseComplete,
   groupRuns,
   runGroupKey,
 } from '../dist/src/mgmt/run-rollup.js';
@@ -158,6 +159,38 @@ test('the merged view is complete only when no index truncated and nothing was s
   // The visible union itself overflowed `limit` and was sliced.
   assert.equal(
     mergedResponseComplete({ anyIndexTruncated: false, visibleRows: 80, returnedRows: 50 }),
+    false,
+  );
+});
+
+test('a repo page drops nothing, so its verdict ignores the cursor', () => {
+  // `complete` answers "were rows dropped?", NOT "is the index exhausted?". Conflating the
+  // two made a repo-filtered window permanently partial: the head page always carries an
+  // open cursor while history remains, and the client ANDs the flag across loaded pages, so
+  // paging to the end could never clear the badge.
+  assert.equal(repoResponseComplete(false), true);
+  // A status predicate on top of the repo index drops sibling jobs of a run.
+  assert.equal(repoResponseComplete(true), false);
+});
+
+test('an exhausted repo window folds exactly, matching ADR-029', () => {
+  // End-to-end of the two halves: server says nothing was dropped, client says the cursor is
+  // spent ⇒ exact rollups. This is the case the old server verdict could never reach.
+  assert.equal(
+    windowComplete({
+      statusFiltered: false,
+      nextCursor: null,
+      serverComplete: repoResponseComplete(false),
+    }),
+    true,
+  );
+  // Mid-walk the cursor still gates it.
+  assert.equal(
+    windowComplete({
+      statusFiltered: false,
+      nextCursor: 'c1',
+      serverComplete: repoResponseComplete(false),
+    }),
     false,
   );
 });

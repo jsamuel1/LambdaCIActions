@@ -91,6 +91,8 @@ export function Runs({
   const complete = windowComplete({
     statusFiltered: status !== '',
     nextCursor,
+    // Absent `complete` (older API) ⇒ false: partial is the safe default. `olderComplete`
+    // ANDs every appended page, since one page that dropped rows poisons the whole window.
     serverComplete: (runs.data?.complete ?? false) && olderComplete,
   });
   const groups = groupRuns(rows, complete);

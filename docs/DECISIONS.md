@@ -889,15 +889,24 @@ every run row built from it is partial by construction.
   queue → last transition, so queued time is included and the sum is an upper bound on billed
   microVM runtime, not a cost basis (v1 stores no per-phase timestamps — spec 04 OQ-5). It
   exceeds wall clock whenever jobs run in parallel, which is the question it answers.
-- **Completeness** is decided by the **server**, not the client, and returned as `complete` on
-  `GET /api/runs`. The client folds whole runs only when every loaded page said `complete` and
-  the cursor is exhausted; otherwise **every** group in the window is stamped `partial`, badged
-  in the UI, and its status/job count/durations render as `≥` lower bounds.
-  The verdict cannot be computed client-side: the merged multi-status view queries each status
-  index for `limit` rows and applies the installation-visibility filter *afterwards*, so a
-  response shortened by filtering out another tenant's rows would look like proof of
-  exhaustion while this operator's sibling jobs sit unread past the boundary. Only the route
-  sees the raw per-status cursors (`mergedResponseComplete`).
+- **Completeness** is split into two halves, so neither side can lie on its own. The **server**
+  returns `complete` on `GET /api/runs`, answering only *were any job rows dropped from this
+  response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
+  cursor. Whole runs are folded only when every loaded page said `complete` **and** the cursor
+  is spent; otherwise **every** group in the window is stamped `partial`, badged in the UI, and
+  its status/job count/durations render as `≥` lower bounds.
+  Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor
+  while history remains, so folding exhaustion into the server's flag would leave such a window
+  permanently partial no matter how far the operator paged. The dropped-rows half in turn cannot
+  be computed client-side: the merged multi-status view queries each status index for `limit`
+  rows and applies the installation-visibility filter *afterwards*, so a response shortened by
+  filtering out another tenant's rows would look like proof of exhaustion while this operator's
+  sibling jobs sit unread past the boundary. Only the route sees the raw per-status cursors
+  (`mergedResponseComplete`); the repo path never slices, so it reports
+  `repoResponseComplete`.
+  A `status=` filter drops sibling jobs by construction and therefore always reports
+  `complete: false`, including when combined with `repo=` — in which case `repo` picks the index
+  and `status` rides along as a post-query predicate rather than being ignored.
 **Why**: no new API surface — `complete` is one added response field on an existing read, so
 the change needs no infrastructure and no schema change. Server-side **grouping** was rejected
 for v1: it would mean a run-keyed index (GSI3) or a fan-out read per run, i.e. a hot-path
