@@ -191,6 +191,13 @@ real round trip: GitHub re-signs the payload with the configured secret and post
 configured URL, so success exercises URL + TLS + secret agreement in one shot. The heartbeat
 updating on the next poll is the confirmation.
 
+The App-JWT calls behind `status` (`GET /app`, `/app/installations`, `/app/hook/config`,
+`/app/hook/deliveries`) are **cached per broker container for 30 s**. That budget — 5,000
+JWT-authenticated requests/hour — belongs to the whole App and is the same one Provision spends
+minting an installation token per job, so a polling console (or several open tabs) must not be
+able to starve run provisioning. Any mutation clears the cache in that container, so a relink or
+label change is never read back stale.
+
 ### 4. Diagnostics (collapsed)
 
 SSM parameter **presence** (`DescribeParameters`, metadata only) survives in a collapsed
@@ -241,6 +248,33 @@ regardless, so a fresh environment can still show its state.
 Every mutation stamps an audit row (`CONFIG#AUDIT`, actor + action + operator-facing detail,
 surfaced as "Recent platform changes") and emits a structured log line. Audit details never
 contain a secret value.
+
+### What a non-admin sees
+
+Settings stays **readable** for any authenticated session — environment identity, App linkage,
+effective labels, webhook evidence, flavors and diagnostics are all environment-level facts, and
+a fresh environment has to be able to show its own state. Two blocks are not environment-level
+and are scoped per session (`scopeSettingsView`):
+
+- **Installations** name other tenants (account login + installation id). Any GitHub user can
+  complete the OAuth dance — a zero-grant session is minted deliberately so Setup is reachable —
+  so the list is filtered to the session's own grants, exactly like `GET /api/installations`.
+- **Recent platform changes** is the operator audit trail (who changed what) and is
+  platform-admin only.
+
+Platform admins see both in full: they already hold platform-wide authority, and reviewing a
+relink needs the whole picture.
+
+### Concurrency and retries
+
+Platform config **mutations** are serialized by a conditional DynamoDB lock row
+(`CONFIG#LOCK`), not by a Lambda concurrency cap — a cap would also serialize the polled read
+path. Losing that race is not a rejection: the broker answers `busy`, and the management API maps
+it to **503 with `Retry-After`** so the operator is told to retry rather than shown a validation
+or upstream failure. Rollback re-pushes the **restored** webhook secret to GitHub for the same
+reason a relink pushes the new one: restoring SSM alone would leave GitHub signing with the
+relinked App's secret while Ingest verifies against the restored one, and every delivery would
+401. A rollback whose hook re-sync fails reports `hookSynced: false` with a UI warning.
 
 ## Auth
 

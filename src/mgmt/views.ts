@@ -559,3 +559,33 @@ export function hostedLabelsIn(labels: string[], hosted: readonly string[]): str
   const set = new Set(hosted.map((l) => l.toLowerCase()));
   return labels.filter((l) => set.has(l.toLowerCase()));
 }
+
+/**
+ * Narrow a settings view to what THIS session may see (ADR-029).
+ *
+ * Everything else on the screen is environment-level (which App this deployment authenticates
+ * as, what it claims, whether GitHub reaches it) and stays readable — spec 04 requires a fresh
+ * environment to be able to show its own state. Two blocks are NOT environment-level and are
+ * scoped here instead:
+ *
+ *  - **installations** name other tenants (account login + installation id). Any GitHub user
+ *    can complete the OAuth dance — a zero-grant session is minted on purpose so Setup is
+ *    reachable — so returning the full list would let any authenticated stranger enumerate
+ *    every org/user that installed the App. Filtered to the session's own grants, exactly like
+ *    `GET /api/installations`; platform admins see all of them (they already hold
+ *    platform-wide authority, and reviewing a relink needs the full picture).
+ *  - **recentChanges** is the operator audit trail (who changed what). Platform admins only.
+ *
+ * Pure so the decision is unit-testable without AWS.
+ */
+export function scopeSettingsView<T extends SettingsView>(
+  view: T,
+  opts: { isPlatformAdmin: boolean; canSeeInstallation: (installationId: number) => boolean },
+): T {
+  if (opts.isPlatformAdmin) return view;
+  return {
+    ...view,
+    installations: view.installations.filter((i) => opts.canSeeInstallation(i.installationId)),
+    recentChanges: [],
+  };
+}

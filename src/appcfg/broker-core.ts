@@ -246,6 +246,8 @@ export interface AppLinkageView {
 export interface AppcfgResult {
   ok: boolean;
   error?: string;
+  /** True when the action was refused because another config change holds the lock. */
+  busy?: boolean;
   /** action=status. */
   linkage?: AppLinkageView;
   /** action=relink / rollback. */

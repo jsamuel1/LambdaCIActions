@@ -360,10 +360,21 @@ export const api = {
       body: JSON.stringify(creds),
     }),
   rollbackGithubApp: (restore: Record<string, number>) =>
-    request<{ rolledBack: boolean; verified: boolean; appId?: number }>(
-      '/api/settings/github-app/rollback',
-      { method: 'POST', body: JSON.stringify({ restore }) },
-    ),
+    request<{
+      rolledBack: boolean;
+      verified: boolean;
+      appId?: number;
+      /**
+       * Whether GitHub's hook config was re-pointed at the restored webhook secret. False means
+       * GitHub keeps signing with the relinked App's secret and every delivery fails its HMAC
+       * check until the operator fixes it at GitHub.
+       */
+      hookSynced?: boolean;
+      hookError?: string;
+    }>('/api/settings/github-app/rollback', {
+      method: 'POST',
+      body: JSON.stringify({ restore }),
+    }),
   testWebhook: (deliveryId?: number) =>
     request<{ requested: boolean; deliveryId?: number; lastReceivedAtBefore: string | null }>(
       '/api/settings/webhook/test',

@@ -24,6 +24,7 @@ import {
   buildWebhookHealth,
   foldWebhookState,
   hostedLabelsIn,
+  scopeSettingsView,
 } from '../dist/src/mgmt/views.js';
 import { canAdminPlatform, parsePlatformAdmins } from '../dist/src/mgmt/session.js';
 import {
@@ -420,4 +421,65 @@ test('broker redeliver accepts an optional positive delivery id', () => {
   assert.equal(parseAppcfgRequest({ action: 'redeliver', actor: 'a' }).deliveryId, undefined);
   assert.equal(parseAppcfgRequest({ action: 'redeliver', actor: 'a', deliveryId: 9 }).deliveryId, 9);
   assert.throws(() => parseAppcfgRequest({ action: 'redeliver', actor: 'a', deliveryId: 0 }), /positive/);
+});
+
+// ---- cross-tenant scoping of the settings payload (ADR-029) ----------------
+
+const SETTINGS_FIXTURE = {
+  envName: 'dev',
+  region: 'ap-southeast-2',
+  app: { appId: 1, name: 'LCA', slug: 'lca', htmlUrl: '', ownerLogin: 'acme', events: [], permissions: {} },
+  installations: [
+    { installationId: 11, accountLogin: 'acme', suspended: false, known: true },
+    { installationId: 22, accountLogin: 'rival-corp', suspended: false, known: true },
+  ],
+  runnerLabels: { labels: ['lca-base'], unset: false, hostedLabels: [] },
+  webhook: buildWebhookHealth({}),
+  flavors: [],
+  recentChanges: [{ at: '2026-07-29T00:00:00.000Z', actor: 'alice', action: 'runner-labels-change' }],
+  diagnostics: { secrets: [] },
+};
+
+test('a non-admin session only sees installations it administers', () => {
+  // Any GitHub user can complete the OAuth dance (a zero-grant session is minted on purpose so
+  // Setup is reachable), so an unscoped list would let a stranger enumerate every org that
+  // installed the App.
+  const scoped = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: false,
+    canSeeInstallation: (id) => id === 11,
+  });
+  assert.deepEqual(
+    scoped.installations.map((i) => i.installationId),
+    [11],
+  );
+});
+
+test('a zero-grant session sees no installations and no audit trail', () => {
+  const scoped = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: false,
+    canSeeInstallation: () => false,
+  });
+  assert.deepEqual(scoped.installations, []);
+  assert.deepEqual(scoped.recentChanges, [], 'the operator audit trail is admin-only');
+});
+
+test('environment-level facts stay visible to every session', () => {
+  // Spec 04: Settings stays readable so a fresh environment can show its own state.
+  const scoped = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: false,
+    canSeeInstallation: () => false,
+  });
+  assert.deepEqual(scoped.app, SETTINGS_FIXTURE.app);
+  assert.deepEqual(scoped.runnerLabels, SETTINGS_FIXTURE.runnerLabels);
+  assert.equal(scoped.webhook.state, SETTINGS_FIXTURE.webhook.state);
+  assert.equal(scoped.envName, 'dev');
+});
+
+test('a platform admin sees the full installation list and audit trail', () => {
+  const scoped = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: true,
+    canSeeInstallation: () => false,
+  });
+  assert.equal(scoped.installations.length, 2);
+  assert.equal(scoped.recentChanges.length, 1);
 });

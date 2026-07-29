@@ -828,6 +828,26 @@ visible without giving an anonymous caller a write amplifier. `/app/hook/config`
 `/app/hook/deliveries` require the App to own its hook config; where it does not (some
 Enterprise/org-hook setups) the screen degrades to heartbeat-only evidence and says why.
 
+Three further consequences of that design, each pinned by a test:
+
+- **The App's JWT rate budget is shared with job provisioning.** `status` costs four
+  App-JWT calls and the Settings screen polls it, while the same 5,000 requests/hour budget is
+  what Provision spends minting an installation token per job. `status` therefore caches its
+  answer per broker container for 30 s (poll interval is 15 s), and any mutation clears that
+  cache so a relink is never read back stale from the same warm container.
+- **Losing the config lock is retryable, not a rejection.** The broker returns `busy` and the
+  management API answers **503 with `Retry-After`**, rather than the 422/502 a real credential or
+  upstream failure gets. The lock holder is `actor:uuid`, not `actor:timestamp`: a
+  double-submitted form by one operator inside a millisecond would otherwise share a holder
+  string and the first completion would release the second's lock.
+- **Rollback must restore GitHub's hook config too.** Restoring the SSM credential versions
+  alone leaves GitHub signing with the *relinked* App's webhook secret while Ingest verifies
+  against the restored one — every delivery 401s, which is exactly the silent outage the relink
+  path's hook sync exists to prevent. Rollback re-pushes the restored secret and reports
+  `hookSynced`. Relatedly, the non-atomic `app-slug` write happens only AFTER post-write
+  verification passes, so a rolled-back environment does not keep advertising the slug of an App
+  whose credentials are no longer stored.
+
 ## ADR-029 — Platform-wide settings need their own fail-closed allow-list, not installation admin rights (M4)
 **Status**: Accepted (v1) · follows [ADR-022](#adr-022), [ADR-028](#adr-028)
 **Context**: every existing authorization decision in the console derives from
@@ -856,3 +876,20 @@ is read-only. It is a plain `String`, not a SecureString — a list of GitHub lo
 secret, and the Mgmt λ reads it directly (alongside `config/runner-labels`) rather than through
 the broker. Revocation is a parameter edit, effective on the next request (the Mgmt λ reads it
 with `ttlMs=0`, so no cached grant survives). Pinned by `test/mgmt-settings.test.mjs`.
+
+`GET /api/settings` being readable by any session is **not** the same as returning everything to
+every session. Two of its blocks are not environment-level facts and are scoped per session
+(`scopeSettingsView`, pure + unit-tested):
+
+- **installations** name other tenants (account login + installation id). Any GitHub user can
+  complete the OAuth dance — and a zero-grant session is minted on purpose so the Setup screen is
+  reachable (ADR-022) — so an unscoped list would let an authenticated stranger enumerate every
+  org/user that installed the App. It is filtered to the session's own grants, matching
+  `GET /api/installations`.
+- **recentChanges** is the operator audit trail (who changed what, when) and is platform-admin
+  only.
+
+Platform admins receive both in full: they already hold environment-wide authority, and
+reviewing a relink needs the complete picture. Everything else — env/region, App linkage,
+effective labels, webhook evidence, flavors, diagnostics — stays visible so a fresh environment
+can still show its own state, which is the whole point of the screen.

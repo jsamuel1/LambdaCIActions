@@ -30,6 +30,7 @@ import {
   buildWebhookHealth,
   hostedLabelsIn,
   rollupCompat,
+  scopeSettingsView,
   sortRunsNewestFirst,
   toRepoView,
   toRunView,
@@ -693,10 +694,18 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
   // Redaction guard (AGENTS.md hard rule). The shape cannot hold a secret, but the strings in
   // it are partly forwarded from GitHub/AWS; fail loudly rather than serve tainted content.
   assertNoSecrets(view, 'GET /api/settings');
+  const isPlatformAdmin = canAdminPlatform(session, parsePlatformAdmins(adminsRaw));
+  // Cross-tenant scoping (ADR-029): installation identities and the operator audit trail are
+  // not environment-level facts. Settings itself stays readable for everyone so a fresh
+  // environment can show its state.
+  const scoped = scopeSettingsView(view, {
+    isPlatformAdmin,
+    canSeeInstallation: (id) => canAdminInstallation(session, id),
+  });
   return json(200, {
-    ...view,
+    ...scoped,
     /** Whether THIS session may use the mutating actions (drives the UI's disabled state). */
-    canAdminPlatform: canAdminPlatform(session, parsePlatformAdmins(adminsRaw)),
+    canAdminPlatform: isPlatformAdmin,
   });
 }
 
@@ -740,11 +749,12 @@ async function invokeAppcfg(payload: Record<string, unknown>): Promise<AppcfgRes
       }),
     );
   } catch (err) {
-    // The broker is concurrency-capped so config changes serialize (ADR-028). A throttle is a
-    // retryable "busy", not a fault — and the raw SDK error must never be surfaced: on the
-    // relink path the request payload it may quote contains the submitted credentials.
+    // A throttle is a retryable "busy", not a fault. The broker is not concurrency-capped
+    // (write serialization is its own DynamoDB lock, ADR-028), but an account-level Lambda
+    // throttle can still surface here. The raw SDK error must never be surfaced either: on
+    // the relink path the request payload it may quote contains the submitted credentials.
     if ((err as { name?: string }).name === 'TooManyRequestsException') {
-      throw new BrokerBusyError('another platform configuration change is in progress');
+      throw new BrokerBusyError('the platform config broker is busy — retry in a moment');
     }
     throw new Error(`App-config broker invoke failed: ${(err as { name?: string }).name ?? 'error'}`);
   }
@@ -768,6 +778,23 @@ class BrokerBusyError extends Error {}
 /** Map a broker fault to a Reply: busy ⇒ 503 (retry), anything else ⇒ rethrow. */
 function brokerBusyReply(err: unknown): Reply | undefined {
   return err instanceof BrokerBusyError ? problem(503, err.message) : undefined;
+}
+
+/**
+ * Map a `!ok` broker result to a Reply. Lock contention (`busy`) is **503 with `Retry-After`**,
+ * not the caller's `failStatus`: the request was valid and will succeed once the in-flight
+ * config change finishes, so the client (and the operator) must be told to retry rather than
+ * shown a validation/upstream failure.
+ */
+function brokerFailureReply(res: AppcfgResult, failStatus: number, fallback: string): Reply {
+  if (res.busy) {
+    return json(
+      503,
+      { error: res.error ?? 'another platform configuration change is in progress' },
+      { headers: { 'Retry-After': '5' } },
+    );
+  }
+  return problem(failStatus, res.error ?? fallback);
 }
 
 /**
@@ -829,7 +856,7 @@ async function putRunnerLabelsRoute(
     if (busy) return busy;
     throw err;
   }
-  if (!res.ok) return problem(502, res.error ?? 'runner label write failed');
+  if (!res.ok) return brokerFailureReply(res, 502, 'runner label write failed');
 
   console.log(
     JSON.stringify({
@@ -915,6 +942,8 @@ async function relinkGithubAppRoute(
     throw err;
   }
   if (!res.ok) {
+    // Contention is retryable and must not read as "your credentials were rejected".
+    if (res.busy) return brokerFailureReply(res, 503, 'busy');
     // Deliberately NOT echoing the body. `rolledBack` tells the operator whether the
     // environment is back on its previous credentials.
     return json(422, {
@@ -962,8 +991,20 @@ async function rollbackGithubAppRoute(
     if (busy) return busy;
     throw err;
   }
-  if (!res.ok) return problem(502, res.error ?? 'rollback failed');
-  return json(200, { rolledBack: true, verified: res.verified === true, appId: res.appId });
+  if (!res.ok) return brokerFailureReply(res, 502, 'rollback failed');
+  return json(200, {
+    rolledBack: true,
+    verified: res.verified === true,
+    appId: res.appId,
+    /**
+     * Whether GitHub's hook config was re-pointed at the RESTORED webhook secret. False means
+     * GitHub still signs with the relinked App's secret while Ingest verifies against the
+     * restored one, so every delivery fails its HMAC check until the operator fixes it at
+     * GitHub by hand.
+     */
+    hookSynced: res.hookSynced === true,
+    ...(res.hookError ? { hookError: res.hookError } : {}),
+  });
 }
 
 /**
@@ -997,7 +1038,7 @@ async function testWebhookRoute(
     if (busy) return busy;
     throw err;
   }
-  if (!res.ok) return problem(502, res.error ?? 'redelivery failed');
+  if (!res.ok) return brokerFailureReply(res, 502, 'redelivery failed');
   return json(202, {
     requested: true,
     deliveryId: res.deliveryId,

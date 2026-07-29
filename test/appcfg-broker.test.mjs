@@ -353,3 +353,119 @@ test('setRunnerLabels is serialized by the same lock', async () => {
   assert.equal(res.ok, false);
   assert.deepEqual(h.calls.puts, []);
 });
+
+// ---- rollback must restore GitHub's hook config too ---------------------------------------
+
+test('rollback re-points GitHub at the RESTORED webhook secret', async () => {
+  // Restoring SSM alone would leave GitHub signing with the relinked App's secret while Ingest
+  // verifies against the restored one — every delivery 401s, which is the exact silent outage
+  // the relink path synchronizes to avoid.
+  const h = harness({ existing: linkedStore() });
+  const relink = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  const before = h.calls.hookUpdates.length;
+  const res = await h.handle({
+    action: 'rollback',
+    actor: 'alice',
+    restore: relink.replacedVersions,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.hookSynced, true);
+  assert.equal(h.calls.hookUpdates.length, before + 1, 'rollback must re-sync the hook config');
+  assert.equal(
+    h.calls.hookUpdates[before].config.secret,
+    'old-github/webhook-secret',
+    'the RESTORED secret must be pushed, not the relinked one',
+  );
+});
+
+test('a rollback whose hook re-sync fails still reports the restore, with hookSynced false', async () => {
+  const h = harness({ existing: linkedStore() });
+  const relink = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  // Only the ROLLBACK's hook update fails (some Apps don't own their hook config).
+  h.deps.updateAppHookConfig = async () => {
+    throw new Error('403 app does not own its hook config');
+  };
+  const res = await createHandler(h.deps)({
+    action: 'rollback',
+    actor: 'alice',
+    restore: relink.replacedVersions,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.rolledBack, true);
+  assert.equal(res.hookSynced, false);
+  assert.match(res.hookError, /hook config/);
+});
+
+// ---- lock holder identity ----------------------------------------------------------------
+
+test('two mutations by the same actor in the same millisecond get distinct lock holders', async () => {
+  // A holder string of `actor:Date.now()` collides on a double-submitted form, and the first
+  // release would then free the lock the second call is still working under.
+  const h = harness({ existing: linkedStore() });
+  await h.handle({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-base' });
+  await h.handle({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-docker' });
+  assert.equal(h.calls.locks.length, 2);
+  assert.notEqual(h.calls.locks[0], h.calls.locks[1]);
+  assert.deepEqual(h.calls.releases, h.calls.locks, 'each holder releases its own lock');
+});
+
+test('lock contention is reported as retryable busy, not a plain failure', async () => {
+  const h = harness({ existing: linkedStore(), lockHeld: true });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  assert.equal(res.busy, true, 'the management API answers 503 off this flag');
+});
+
+// ---- status caching (the App's JWT rate budget is shared with job provisioning) -----------
+
+test('polled status is served from a per-container cache', async () => {
+  // `status` costs four App-JWT GitHub calls, and the whole App shares a 5,000/h budget with
+  // Provision's installation-token minting. A polling console must not drain it.
+  const h = harness({ existing: linkedStore() });
+  await h.handle({ action: 'status', actor: 'system' });
+  const afterFirst = h.calls.identities.length;
+  assert.ok(afterFirst > 0);
+  await h.handle({ action: 'status', actor: 'system' });
+  assert.equal(h.calls.identities.length, afterFirst, 'a second poll must not re-hit GitHub');
+});
+
+test('a mutation invalidates the status cache so the next poll sees the new state', async () => {
+  const h = harness({ existing: linkedStore() });
+  await h.handle({ action: 'status', actor: 'system' });
+  const cached = h.calls.identities.length;
+  await h.handle({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-base' });
+  await h.handle({ action: 'status', actor: 'system' });
+  assert.ok(h.calls.identities.length > cached, 'stale linkage must not survive a write');
+});
+
+// ---- app-slug ordering -------------------------------------------------------------------
+
+test('the app-slug is written only after post-write verification succeeds', async () => {
+  // Written before verification, a rolled-back environment would keep advertising the slug of
+  // an App whose credentials are no longer stored.
+  const h = harness({ existing: linkedStore() });
+  // The submitted-credential verification passes; the post-write re-read verification fails.
+  let calls = 0;
+  h.deps.getAppIdentity = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        appId: 424242,
+        name: 'LCA',
+        slug: 'lca-dev',
+        htmlUrl: '',
+        ownerLogin: 'acme',
+        events: [],
+        permissions: {},
+      };
+    }
+    throw new Error('stored credentials do not authenticate');
+  };
+  const res = await createHandler(h.deps)({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  assert.equal(
+    h.calls.puts.includes(`${PREFIX}/github/app-slug`),
+    false,
+    'a failed relink must not leave the new slug behind',
+  );
+});

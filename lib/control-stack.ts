@@ -481,7 +481,9 @@ export class ControlStack extends Stack {
       // One credential change at a time is enforced by a conditional DynamoDB lock around the
       // MUTATING actions (`acquireConfigLock`), not by a concurrency cap: capping the function
       // would also serialize `status`, which the Settings screen polls every 15 s — two
-      // operators with the screen open would throttle each other into a blank view.
+      // operators with the screen open would throttle each other into a blank view. `status`
+      // instead caches its GitHub answers per container (STATUS_CACHE_MS) so polling cannot
+      // drain the App's shared 5,000/h JWT budget that Provision needs for job tokens.
       logGroup: appcfgLogGroup,
       bundling,
       environment: {

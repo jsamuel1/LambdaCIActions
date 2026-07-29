@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import {
   getAppHookConfig,
   getAppIdentity,
@@ -51,7 +52,15 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL ?? '';
 
 const APP_ID_PARAM = `${SSM_PREFIX}/github/app-id`;
 const APP_PEM_PARAM = `${SSM_PREFIX}/github/app-pem`;
+const WEBHOOK_SECRET_PARAM = `${SSM_PREFIX}/github/webhook-secret`;
 const RUNNER_LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
+
+/**
+ * How long a `status` answer may be reused within one warm container. The Settings screen
+ * polls every 15 s (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll
+ * from cache and bounds several open tabs to one GitHub round per 30 s per container.
+ */
+const STATUS_CACHE_MS = 30_000;
 
 /**
  * The AWS + GitHub seam, injected so the broker's decisions — verify before write, roll back
@@ -94,6 +103,21 @@ const defaultDeps: AppcfgDeps = {
 };
 
 export function createHandler(deps: AppcfgDeps = defaultDeps) {
+  /**
+   * Short-lived `status` cache.
+   *
+   * `status` costs four App-JWT GitHub calls (`GET /app`, `/app/installations`,
+   * `/app/hook/config`, `/app/hook/deliveries`) and the Settings screen POLLS it. GitHub's
+   * JWT-authenticated budget is 5,000 requests/hour for the WHOLE App, and that is the same
+   * budget Provision spends minting installation tokens for every job — so a couple of open
+   * console tabs must not be able to starve run provisioning. The cache bounds the console's
+   * share to a few calls per minute per container regardless of poll rate.
+   *
+   * Mutations in this container clear it, so a relink's result is never read back stale from
+   * the same warm Lambda; a different container is bounded by the TTL.
+   */
+  let statusCache: { at: number; result: AppcfgResult } | undefined;
+
   return async function handle(event: unknown): Promise<AppcfgResult> {
     let req;
     try {
@@ -115,10 +139,19 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
     const clean = (text: string): string =>
       scrubForOperator(redactLiterals(text, submitted));
 
+    // Any mutation invalidates the cached linkage: the next poll must observe what was just
+    // written (a new App id, new labels), not a pre-change snapshot.
+    if (req.action !== 'status') statusCache = undefined;
+
     try {
       switch (req.action) {
-        case 'status':
-          return finish(await statusAction(deps));
+        case 'status': {
+          const now = Date.now();
+          if (statusCache && now - statusCache.at < STATUS_CACHE_MS) return statusCache.result;
+          const result = finish(await statusAction(deps));
+          statusCache = { at: now, result };
+          return result;
+        }
         case 'relink':
           return finish(
             await withConfigLock(deps, req.actor, () =>
@@ -324,10 +357,6 @@ async function relinkAction(
       });
       written.push(suffix);
     }
-    // The App slug is convenience metadata (install URLs); not part of the atomic set.
-    await deps
-      .putParam(`${SSM_PREFIX}/github/app-slug`, identity.slug, { secure: false })
-      .catch(() => 0);
   } catch (err) {
     const rolled = await undoWrites(deps, before, absent, written, actor, 'relink-failure').catch(
       () => false,
@@ -373,7 +402,14 @@ async function relinkAction(
     };
   }
 
-  // 4. Synchronize GitHub's own hook config with what we just stored. Without this, a rotated
+  // 4. The App slug is convenience metadata (install URLs), written only AFTER the credential
+  //    set is verified: writing it earlier would leave a rolled-back environment advertising
+  //    the slug of an App whose credentials are no longer stored.
+  await deps
+    .putParam(`${SSM_PREFIX}/github/app-slug`, identity.slug, { secure: false })
+    .catch(() => 0);
+
+  // 5. Synchronize GitHub's own hook config with what we just stored. Without this, a rotated
   //    webhook secret makes GitHub sign with the old value and every delivery fails its HMAC
   //    check — the environment goes silent while every credential badge reads green.
   let hookSynced = false;
@@ -411,7 +447,16 @@ async function relinkAction(
   };
 }
 
-/** Explicit operator-driven rollback to a previously reported version snapshot. */
+/**
+ * Explicit operator-driven rollback to a previously reported version snapshot.
+ *
+ * Restoring the credential parameters is not sufficient on its own: a successful relink also
+ * pushed its webhook secret (and this deployment's URL) to GitHub, so rolling SSM back alone
+ * would leave GitHub signing with the NEW secret while Ingest verifies against the OLD one and
+ * rejects every delivery with 401 — the exact silent-outage failure mode the relink path
+ * synchronizes to avoid. So rollback re-pushes the RESTORED secret to GitHub too, and reports
+ * `hookSynced` so an operator whose App does not own its hook config knows to fix it by hand.
+ */
 async function rollbackAction(
   deps: AppcfgDeps,
   restore: ParameterVersionSnapshot,
@@ -421,8 +466,10 @@ async function rollbackAction(
   if (!rolled) return { ok: false, error: 'rollback failed — see CloudWatch for detail' };
   let appId: number | undefined;
   let verified = false;
+  let storedId: string | undefined;
+  let storedPem: string | undefined;
   try {
-    const [storedId, storedPem] = await Promise.all([
+    [storedId, storedPem] = await Promise.all([
       deps.getParam(APP_ID_PARAM, 0),
       deps.getParam(APP_PEM_PARAM, 0),
     ]);
@@ -432,7 +479,35 @@ async function rollbackAction(
   } catch {
     verified = false;
   }
-  return { ok: true, rolledBack: true, verified, ...(appId ? { appId } : {}) };
+
+  // Re-synchronize GitHub's hook config with the RESTORED secret. Only attempted when the
+  // restored credentials verify — a PATCH with a key that does not authenticate cannot work,
+  // and `verified: false` already tells the operator the rollback is incomplete.
+  let hookSynced = false;
+  let hookError: string | undefined;
+  if (verified && storedId && storedPem) {
+    try {
+      const secret = await deps.getParam(WEBHOOK_SECRET_PARAM, 0);
+      await deps.updateAppHookConfig(storedId, storedPem, {
+        secret,
+        ...(WEBHOOK_URL ? { url: WEBHOOK_URL } : {}),
+      });
+      hookSynced = true;
+    } catch (err) {
+      // `updateAppHookConfig` literal-redacts the secret it sends; scrub the rest.
+      hookError = scrubForOperator(errMsg(err));
+    }
+  }
+
+  await audit(deps, actor, 'github-app-rollback-hook-sync', { hookSynced, verified });
+  return {
+    ok: true,
+    rolledBack: true,
+    verified,
+    hookSynced,
+    ...(hookError ? { hookError } : {}),
+    ...(appId ? { appId } : {}),
+  };
 }
 
 /**
@@ -600,7 +675,10 @@ async function withConfigLock(
   actor: string,
   fn: () => Promise<AppcfgResult>,
 ): Promise<AppcfgResult> {
-  const holder = `${actor}:${Date.now()}`;
+  // Random, not `actor:Date.now()`: two changes by the SAME actor in the same millisecond
+  // (a double-submitted form) would share a holder string, and the first one to finish would
+  // release the lock the second is still working under.
+  const holder = `${actor}:${crypto.randomUUID()}`;
   let held = false;
   try {
     held = await deps.acquireConfigLock(holder);
@@ -613,8 +691,11 @@ async function withConfigLock(
     };
   }
   if (!held) {
+    // `busy` marks this as RETRYABLE contention rather than a rejected request, so the
+    // management API can answer 503 instead of a validation-style 422/502.
     return {
       ok: false,
+      busy: true,
       error: 'another platform configuration change is in progress — retry in a moment',
     };
   }

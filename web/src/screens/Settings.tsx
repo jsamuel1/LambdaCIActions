@@ -214,9 +214,20 @@ function RelinkForm({
     if (!result?.replacedVersions) return;
     setBusy(true);
     try {
-      await api.rollbackGithubApp(result.replacedVersions);
+      const res = await api.rollbackGithubApp(result.replacedVersions);
       setResult(undefined);
-      onDone();
+      // A rollback whose GitHub hook re-sync failed leaves signing broken; keep the panel open
+      // with the warning rather than closing on what looks like success.
+      if (res.hookSynced === false) {
+        setError(
+          `Credentials restored, but GitHub's webhook configuration could not be re-pointed at the ` +
+            `restored secret${res.hookError ? `: ${res.hookError}` : ''}. Set the webhook secret on ` +
+            'the App at GitHub manually — until then every delivery will be rejected.',
+        );
+        reload();
+      } else {
+        onDone();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
