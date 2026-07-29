@@ -882,7 +882,9 @@ every run row built from it is partial by construction.
   most advanced active status wins (`running` > `provisioning` > `queued`); `completed` only
   when every job completed. An empty job set folds to `queued`, never `completed`.
 - **Flavor rollup**: the single name when all jobs agree, else `<most common> +<n>` with the
-  full breakdown on expand. Jobs with no flavor yet are ignored, not folded in.
+  full breakdown on expand. Jobs with no flavor yet are ignored, not folded in. On a partial
+  window the label is weakened (`node +?` / `node +2?`) because an unread job may use an
+  unseen flavor — "all jobs agree" is exactly the claim a partial window cannot make.
 - **Duration**: **wall clock** (earliest job queued → latest transition) is the primary figure
   because it answers "how long did this run take". The **sum of job durations** is shown on
   expand as **job time** — deliberately not "compute": each job's `durationSeconds` is itself
@@ -894,7 +896,7 @@ every run row built from it is partial by construction.
   response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
   cursor. Whole runs are folded only when every loaded page said `complete` **and** the cursor
   is spent; otherwise **every** group in the window is stamped `partial`, badged in the UI, and
-  its status/job count/durations render as `≥` lower bounds.
+  its status/job count/flavor/durations render as lower bounds.
   Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor
   while history remains, so folding exhaustion into the server's flag would leave such a window
   permanently partial no matter how far the operator paged. The dropped-rows half in turn cannot

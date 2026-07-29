@@ -62,6 +62,9 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   only when every job completed. An empty job set folds to `queued`, never `completed`.
 - **Flavor rollup** — the single name when all jobs agree, else `<most common> +<n>` (e.g.
   `node +2`) with the full breakdown shown on expand. Jobs with no flavor yet are ignored.
+  On a **partial** window the label is weakened rather than stated as fact (`node +?`,
+  `node +2?`): an unread job may use a flavor the loaded jobs never mention, so
+  "all jobs agree" is unprovable there.
 - **Duration** — the run row shows **wall clock** (earliest job queued → latest transition),
   which answers "how long did the run take". The **sum of job durations** appears on expand as
   **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
@@ -75,9 +78,9 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   index pages *before* the installation-visibility filter — a page filled with another tenant's
   rows comes back short while this operator's sibling jobs sit unread past the boundary. The
   client folds whole runs only when `complete` held for every loaded page **and** the cursor is
-  exhausted; otherwise every run in the window is badged `partial` and its status, job count and
-  durations render as `≥` lower bounds. A repo-filtered page drops nothing, so paging it to the
-  end yields exact rollups. A `status=` filter selects *jobs*, so it always reports
+  exhausted; otherwise every run in the window is badged `partial` and its status, job count,
+  flavor and durations render as lower bounds. A repo-filtered page drops nothing, so paging it
+  to the end yields exact rollups. A `status=` filter selects *jobs*, so it always reports
   `complete: false` (including alongside `repo=`, where it applies as a post-query predicate) —
   the screen says so inline.
 - **Ids** — run/job ids are small dim text at the end of their column with a copy button

@@ -10,6 +10,7 @@
 export {
   foldRunStatus,
   rollupFlavor,
+  flavorLabel,
   runDurations,
   windowComplete,
   groupRuns,

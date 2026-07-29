@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Repo, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
-import { groupRuns, windowComplete, type RunGroup } from '../rollup.js';
+import { flavorLabel, groupRuns, windowComplete, type RunGroup } from '../rollup.js';
 import {
   Badge,
   CopyId,
@@ -253,14 +253,14 @@ function RunRows({
             {group.partial && (
               <span
                 className="badge warn"
-                title="Some of this run's jobs are outside the loaded page or excluded by the status filter — status and totals are lower bounds."
+                title="Some of this run's jobs are outside the loaded page or excluded by the status filter — status, flavor and totals are lower bounds."
               >
                 partial
               </span>
             )}
           </span>
         </td>
-        <td>{group.flavor.label}</td>
+        <td>{flavorLabel(group.flavor, group.partial)}</td>
         <td>
           {group.partial ? '≥ ' : ''}
           {formatDuration(durations.wallClockSeconds)}
@@ -271,7 +271,9 @@ function RunRows({
         <>
           <tr className="jobrow">
             <td className="jobs-head">
-              {group.flavor.mixed ? `flavors: ${group.flavor.distinct.join(', ')}` : 'jobs'}
+              {group.flavor.mixed
+                ? `flavors: ${group.flavor.distinct.join(', ')}${group.partial ? ' (loaded jobs)' : ''}`
+                : 'jobs'}
             </td>
             <td className="jobs-head" colSpan={COLS - 1}>
               wall clock {formatDuration(durations.wallClockSeconds)} · job time{' '}

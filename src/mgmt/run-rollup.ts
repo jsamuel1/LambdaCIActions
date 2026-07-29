@@ -86,6 +86,21 @@ export function rollupFlavor(flavors: (string | undefined)[]): FlavorRollup {
   return { label: `${distinct[0]} +${distinct.length - 1}`, distinct, mixed: true };
 }
 
+/**
+ * Display label for a flavor rollup, honouring window completeness.
+ *
+ * `rollupFlavor` folds only the jobs actually LOADED, so on a partial window its verdict is a
+ * lower bound in the same way the job count and durations are: a run that looks single-flavor
+ * (`node`) may own an unread `docker` job, and a `node +2` may really be `+3`. "All jobs agree"
+ * is the one rollup a bare label states as FACT, so a partial window has to weaken it — hence
+ * the trailing `?`, which reads as "and possibly more" against the `≥` used elsewhere.
+ */
+export function flavorLabel(flavor: FlavorRollup, partial: boolean): string {
+  if (!flavor.distinct.length) return '—';
+  if (!partial) return flavor.label;
+  return flavor.mixed ? `${flavor.label}?` : `${flavor.distinct[0]} +?`;
+}
+
 export interface RunDurations {
   /**
    * Earliest job queue → latest job transition. This is the human-visible "how long did the

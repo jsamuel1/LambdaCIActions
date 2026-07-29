@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {
   foldRunStatus,
   rollupFlavor,
+  flavorLabel,
   runDurations,
   windowComplete,
   mergedResponseComplete,
@@ -77,6 +78,24 @@ test('jobs with no flavor yet are ignored, not folded in as a pseudo-flavor', ()
     distinct: [],
     mixed: false,
   });
+});
+
+test('a partial window cannot claim the jobs agree on a flavor', () => {
+  // The run row is the one place a bare flavor name reads as "every job used this". On a
+  // partial window an unread job may use a flavor the loaded jobs never mention, so a single
+  // flavor weakens to `+?` and a mixed count to `+2?` rather than being stated as fact.
+  const single = rollupFlavor(['node', 'node']);
+  assert.equal(flavorLabel(single, false), 'node');
+  assert.equal(flavorLabel(single, true), 'node +?');
+
+  const mixed = rollupFlavor(['node', 'docker', 'node']);
+  assert.equal(flavorLabel(mixed, false), 'node +1');
+  assert.equal(flavorLabel(mixed, true), 'node +1?');
+
+  // Nothing known stays an em dash either way — `— +?` would be nonsense.
+  const none = rollupFlavor([undefined]);
+  assert.equal(flavorLabel(none, false), '—');
+  assert.equal(flavorLabel(none, true), '—');
 });
 
 // ---- durations -------------------------------------------------------------

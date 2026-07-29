@@ -97,7 +97,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .gap-top { margin-top: 10px; }
 .workflow { margin-bottom: 18px; }
 
-/* De-emphasized ids + copy affordance (Runs / Run detail). */
+/* De-emphasized ids + copy affordance (Runs). */
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 .idcell { display: inline-flex; align-items: center; gap: 4px; }
 button.copy {
