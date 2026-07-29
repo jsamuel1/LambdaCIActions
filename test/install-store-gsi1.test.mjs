@@ -225,7 +225,7 @@ test('reconcile cannot widen authorization beyond the session grants', async () 
 
 test('listInstallations requires an explicit grant list (no silent zero-arg regression)', () => {
   // A default of [] would let a future caller write `listInstallations()` and get the exact
-  // pre-ADR-028 behaviour back — index-only, legacy rows invisible — with no compile error.
+  // pre-ADR-029 behaviour back — index-only, legacy rows invisible — with no compile error.
   // Pinned on the source because the arity is the contract, not runtime behaviour.
   const src = readFileSync(
     new URL('../src/shared/install-store.ts', import.meta.url),

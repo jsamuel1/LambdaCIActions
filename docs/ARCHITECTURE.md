@@ -76,7 +76,7 @@ API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-022)).
 | Hook broker λ | Lambda | Only AWS surface a runner microVM can call: hands back that run's JIT config and terminates that run's VM, capability-token gated (ADR-020) |
 | Reaper λ | Lambda (EventBridge schedule) | Kill microVMs exceeding max lifetime; reconcile orphans |
 | Image builder | Lambda + code bucket | Build/snapshot flavor images; publish image ARNs |
-| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config + installation index repair only (ADR-025, ADR-028) |
+| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config + installation index repair only (ADR-025, ADR-029) |
 | Config + run store | DynamoDB | Installations, repos, workflows, flavor maps, run records |
 | Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024) |
 | Auth | GitHub OAuth + signed session cookie | UI login scoped to installations the user can admin (ADR-022) |

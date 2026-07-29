@@ -212,7 +212,7 @@ export interface InstallationRecord {
   entity?: string;
   /**
    * GSI1 enumeration keys (`INSTALLS` / account login), written since M4. ABSENT on rows
-   * written by M2-era code — which is exactly what reconcile-on-read repairs (ADR-028), so
+   * written by M2-era code — which is exactly what reconcile-on-read repairs (ADR-029), so
    * the read path must be able to see whether they are there.
    */
   gsi1pk?: string;
