@@ -110,10 +110,10 @@ Resolution order (first match wins):
 only `needs_docker`, so a job that runs `pytest` does **not** auto-upgrade off `base` — it is
 routed to `python` by an explicit label, a `FlavorMap` entry (e.g. `ubuntu-latest → python`),
 or the repo's `defaultFlavor`. Inferring a runtime from `setup-*` steps needs parser support
-plus a policy for jobs that need two runtimes, and is deliberately out of scope (ADR-031).
+plus a policy for jobs that need two runtimes, and is deliberately out of scope (ADR-039).
 
-A custom flavor (ADR-032) participates in every step above **only once it is `valid`**
-(ADR-033): an unvalidated or `invalid` custom flavor resolves as if it did not exist, so a
+A custom flavor (ADR-040) participates in every step above **only once it is `valid`**
+(ADR-041): an unvalidated or `invalid` custom flavor resolves as if it did not exist, so a
 half-configured flavor degrades to a working job on the fallback chain rather than a failed
 one. The reason string records that it was skipped.
 
@@ -145,7 +145,7 @@ accidentally suppress the warning, and a job needing Docker on `python`/`java`/`
 still warns. Capabilities are drawn from a closed vocabulary (`docker`, `node`, `python`,
 `java`, `go`, `rust`): an unrecognized capability string would be silently inert here and in
 the resolver's upgrade step, which is why custom-flavor registration validates against it
-(ADR-033).
+(ADR-041).
 
 
 ## Onboarding modes

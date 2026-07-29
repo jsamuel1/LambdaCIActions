@@ -29,12 +29,12 @@ export interface FlavorDef {
   label: string;
   arch: string;
   /**
-   * DESCRIPTIVE only — the GA `lambda-microvms` API exposes no vCPU request (ADR-030).
+   * DESCRIPTIVE only — the GA `lambda-microvms` API exposes no vCPU request (ADR-038).
    * Indicates the shape a flavor is intended for, and acts as the primary sort key when
    * picking the smallest flavor with a capability. Never present this as provisioned capacity.
    */
   vcpu: number;
-  /** Requested at image-build time as `--resources minimumMemoryInMiB` (ADR-030). */
+  /** Requested at image-build time as `--resources minimumMemoryInMiB` (ADR-038). */
   memoryMb: number;
   capabilities: string[];
   /**
@@ -50,7 +50,7 @@ const FLAVORS: FlavorDef[] = (flavorsCatalog as { flavors: FlavorDef[] }).flavor
 const DEFAULT_FLAVOR = 'base';
 
 /**
- * The closed capability vocabulary (ADR-033 static gate). Capabilities are not free-form
+ * The closed capability vocabulary (ADR-041 static gate). Capabilities are not free-form
  * strings: they drive `smallestWithCapability` upgrades here and the `docker-missing` compat
  * message in `src/ingest/compat.ts`, so an unrecognized capability would be silently inert.
  * Registering a custom flavor validates against this list; adding a capability means teaching

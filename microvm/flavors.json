@@ -1,5 +1,5 @@
 {
-  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md & docs/specs/03-workflow-ingestion.md. All arm64/Graviton only. `memoryMb` is REQUESTED at image-build time as --resources minimumMemoryInMiB; `vcpu` is DESCRIPTIVE only — the GA lambda-microvms API exposes no vCPU knob (ADR-030).",
+  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md & docs/specs/03-workflow-ingestion.md. All arm64/Graviton only. `memoryMb` is REQUESTED at image-build time as --resources minimumMemoryInMiB; `vcpu` is DESCRIPTIVE only — the GA lambda-microvms API exposes no vCPU knob (ADR-038).",
   "flavors": [
     {
       "name": "base",

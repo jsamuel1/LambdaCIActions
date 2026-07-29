@@ -22,7 +22,7 @@ test('docker label resolves to docker flavor', () => {
   assert.equal(resolveFlavor(['lambda-ci-docker']).flavor, 'docker');
 });
 
-// --- Expanded standard set (ADR-031) ---
+// --- Expanded standard set (ADR-039) ---
 
 test('each standard language flavor resolves from its explicit label', () => {
   for (const [label, flavor] of [
@@ -82,7 +82,7 @@ test('language flavors are NOT docker-capable', () => {
   }
 });
 
-// --- Capability vocabulary (ADR-033 static gate) ---
+// --- Capability vocabulary (ADR-041 static gate) ---
 
 test('every catalog capability is drawn from the known vocabulary', () => {
   for (const f of allFlavors()) {

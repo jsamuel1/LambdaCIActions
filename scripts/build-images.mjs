@@ -191,7 +191,7 @@ function buildFlavor(flavor, ctx) {
     JSON.stringify({ cloudWatch: { logGroup: `/aws/lambda/microvms/lca-${ENV}-${flavor.name}` } }),
   ];
 
-  // Resource + CPU shape (ADR-030). The GA API accepts memory ONLY:
+  // Resource + CPU shape (ADR-038). The GA API accepts memory ONLY:
   // `--resources minimumMemoryInMiB` (single-element list) and `--cpu-configurations
   // architecture=ARM_64` (whose only permitted value is ARM_64 — there is no vCPU knob, and
   // `run-microvm` has no sizing parameter at all, so a VM's shape is fixed by its image).

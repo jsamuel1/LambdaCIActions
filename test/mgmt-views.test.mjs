@@ -188,7 +188,7 @@ test('flavor views mark image availability from SSM presence', () => {
 });
 
 test('GET /api/flavors surfaces every standard flavor with a rate + availability', () => {
-  // Acceptance criterion for the expanded standard set (ADR-031): each new flavor must be
+  // Acceptance criterion for the expanded standard set (ADR-039): each new flavor must be
   // listed, priced, and reported as built once its image ARN is published to SSM.
   const expected = ['base', 'node', 'python', 'java', 'go', 'rust', 'docker'];
   const available = Object.fromEntries(expected.map((n) => [n, true]));

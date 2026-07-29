@@ -39,7 +39,7 @@ Key numbers (from reference + AWS docs, to validate in [ROADMAP](../ROADMAP.md) 
 - Size: e.g. 2 vCPU / 4 GB ≈ \$0.0044/min, per-second billing.
 - Arch: **arm64 only**.
 
-> **Sizing (ADR-030)**: only **memory** is requestable, and only at *image build* time —
+> **Sizing (ADR-038)**: only **memory** is requestable, and only at *image build* time —
 > `create-microvm-image --resources minimumMemoryInMiB=<memoryMb>` plus
 > `--cpu-configurations architecture=ARM_64` (whose sole permitted value is `ARM_64`).
 > `run-microvm` has **no** sizing parameter at all, so a VM's shape is fixed by its image, and
@@ -61,11 +61,11 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
 | `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
 | `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
-| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-032/033) |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-040/033) |
 
 † descriptive only — see the sizing note above.
 
-The standard language set is deliberately **one toolchain per flavor** (ADR-031): a combined
+The standard language set is deliberately **one toolchain per flavor** (ADR-039): a combined
 "kitchen sink" image would make every job pay every toolchain's snapshot cost. `dotnet` is
 intentionally **not** shipped — it is the largest candidate with no verified consumer; it
 belongs on the custom-flavor path until a real workload justifies it.
@@ -74,7 +74,7 @@ Flavors are defined once globally; a repo may **override** the mapping (e.g. `ub
 → `node`) or an operator may register a `custom-*` image for their installation. The
 built-in catalog is `microvm/flavors.json`, compiled into the Lambdas at build time; custom
 flavors live in the shared table and are **merged over** the built-in set, which always wins
-a name collision (ADR-032). Per-repo label mapping is stored in DynamoDB `FlavorMap`.
+a name collision (ADR-040). Per-repo label mapping is stored in DynamoDB `FlavorMap`.
 
 ### Prebaked runner tool cache
 
@@ -216,7 +216,8 @@ POST /terminate   # fires pre-teardown; best-effort final status report
   and the only one whose entrypoint stays root — a default microVM has an empty capability
   set, a read-only `/sys` and no writable cgroup hierarchy, so a rootful daemon cannot
   start, and in-guest `sudo` can never escalate (`NoNewPrivs: 1`). See **ADR-020** and
-  `docs/VERIFY-M3.md`. Cold `dockerd` init measures ~40 s on 4 vCPU Graviton.
+  `docs/VERIFY-M3.md`. Cold `dockerd` init measures ~40 s on Graviton (the vCPU count is not
+  established — the API exposes no vCPU request, see ADR-038).
 
 ## Provisioning lifecycle
 
@@ -254,7 +255,7 @@ The biggest reference win was baking dependencies into the snapshot:
 
 ## Custom flavors (bring-your-own image)
 
-An operator may register a `custom-*` flavor for their own installation (ADR-032). Storage is
+An operator may register a `custom-*` flavor for their own installation (ADR-040). Storage is
 a per-installation row in the shared table (`pk=INSTALL#<id>`, `sk=FLAVOR#<name>`) — the
 static JSON is compiled into the Lambdas and stays read-only. Resolution composes
 `builtin ++ custom`; built-in names always win, and a custom flavor that collides with one is
@@ -262,7 +263,7 @@ rejected at registration rather than silently shadowing (or being shadowed by) i
 flavors are visible only to their own installation, and their requested memory is bounds-checked
 against the region's microVM quota with the derived per-minute rate surfaced before save.
 
-A custom flavor is **not routable until it has demonstrably run a job** (ADR-033):
+A custom flavor is **not routable until it has demonstrably run a job** (ADR-041):
 `pending → validating → valid | invalid(reason)`, and only `valid` flavors are selectable in a
 `FlavorMap`/`defaultFlavor` or resolvable from a label. Validation is (1) static checks — arm64,
 image ARN resolves and is readable by the provisioner, capabilities drawn from the closed

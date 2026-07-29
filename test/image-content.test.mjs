@@ -105,7 +105,7 @@ test('extra OS capabilities are scoped to docker-capable flavors (ADR-020)', () 
   assert.match(build, /flavor\.osCapabilities/);
 });
 
-test('the build script requests the catalog memory + arm64 CPU config (ADR-030)', () => {
+test('the build script requests the catalog memory + arm64 CPU config (ADR-038)', () => {
   // `memoryMb` was inert until this was sent: run-microvm has NO sizing parameter, and
   // create-microvm-image takes memory only via --resources minimumMemoryInMiB. Without these
   // flags every flavor — including the 8 GB ones — builds at the service default.
@@ -186,7 +186,7 @@ test('flavors install the apt awscli that ADR-028 measured, not a swapped-in CLI
   }
 });
 
-// --- Expanded standard set (ADR-031) -----------------------------------------
+// --- Expanded standard set (ADR-039) -----------------------------------------
 
 /** Flavors whose toolchain is meant to be resolvable from the runner tool cache. */
 const TOOLCACHE_FLAVORS = ['node', 'python', 'java', 'go'];
@@ -258,7 +258,7 @@ test('the java tool-cache version dir uses - not + for the build separator', () 
 });
 
 test('toolchain versions are pinned, not latest (reproducible rebuilds)', () => {
-  // ADR-031: a `latest`/`stable` toolchain makes two builds of the same commit differ.
+  // ADR-039: a `latest`/`stable` toolchain makes two builds of the same commit differ.
   const pins = {
     python: /ARG PYTHON_VERSION=\d+\.\d+\.\d+/,
     java: /ARG JDK_VERSION=\d+\.\d+\.\d+/,
@@ -419,6 +419,19 @@ test('tool-cache paths are derived from the version pin, never a repeated litera
       );
     }
   }
+});
+
+test('the node flavor\'s tool-cache pin agrees with its apt NODE_MAJOR', () => {
+  // Dockerfile.node carries BOTH pins: NODE_MAJOR drives the nodesource apt repo (the Node the
+  // run-hook + the agent's node actions run on) and NODE_VERSION is the tool-cache entry
+  // setup-node resolves. If they drift, a `setup-node` with `node-version: 24` gets a cache hit
+  // on a major the rest of the image does not have — a comment asking to keep them in sync does
+  // not enforce anything.
+  const df = read('Dockerfile.node');
+  const major = df.match(/ARG NODE_MAJOR=(\d+)/)?.[1];
+  const version = df.match(/ARG NODE_VERSION=(\d+)\.\d+\.\d+/)?.[1];
+  assert.ok(major && version, 'node must pin both NODE_MAJOR and NODE_VERSION');
+  assert.equal(version, major, `NODE_VERSION major (${version}) must match NODE_MAJOR (${major})`);
 });
 
 test('the catalog memory values are plausible microVM requests', () => {

@@ -949,18 +949,17 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
-> **MERGE BLOCKER — ADR numbering collision.** The four ADRs below (030..033) are also claimed,
-> with entirely different subjects, by the concurrent branch `kermes/task-tidal-hawk`
-> ("M5: drop-in adopt mode, opt-in rewrite PR, observability, dev/prod split" — its 030 is
-> adopt-mode label claiming, 031 the auto-rewrite PR, 032 EMF metrics, 033 the per-environment
-> config module). Neither branch has landed. ADR numbers are a shared mutable namespace, so
-> **whichever of the two lands second must renumber its block** — headers, every in-repo
-> cross-reference, and the `#adr-0NN` anchors — rather than both shipping a duplicate number.
-> `kermes/task-nervous-mountain` holds 034/035, `kermes/task-admiring-beetle` 036 and
-> `kermes/task-bouncing-toad` 037, so the next free range is 038+. Not renumbered here: the
-> correct target depends on landing order, and churning a guess would just move the collision.
+> **ADR numbering note.** This block was originally authored as 030..033 and has been renumbered
+> to **038..041** to vacate a collision: the concurrent branch `kermes/task-tidal-hawk` claims
+> 030..033 for entirely different subjects (adopt-mode label claiming, the auto-rewrite PR, EMF
+> metrics, the per-environment config module). ADR numbers are a shared mutable namespace, and
+> 038+ was the lowest free range at the time of renumbering (`kermes/task-nervous-mountain`
+> holds 034/035, `kermes/task-admiring-beetle` 036, `kermes/task-bouncing-toad` 037). Renumbering
+> unconditionally — rather than deferring it to whichever branch lands second — means neither
+> branch has to renumber at merge time. If a branch holding 034..037 is abandoned the gap stays;
+> a gap in the sequence is cheaper than a duplicate number.
 
-## ADR-030 — Flavor `vcpu` is descriptive; only `minimumMemoryInMiB` is requestable (M5)
+## ADR-038 — Flavor `vcpu` is descriptive; only `minimumMemoryInMiB` is requestable (M5)
 **Status**: Accepted (v1) · corrects the flavor-size claims in [spec 02](specs/02-microvm-runners.md) and the cost model in [spec 04](specs/04-web-ui.md)
 **Context**: `microvm/flavors.json` carries `vcpu` + `memoryMb` per flavor, spec 02's flavor
 table advertises "2 / 4 GB" and "4 / 8 GB", `docs/VERIFY-M3.md` prices runs off those pairs,
@@ -1005,7 +1004,7 @@ rather than carried forward. `test/image-content.test.mjs` pins that the build s
 forwards both flags. Revisit if the API later exposes a vCPU request, at which point `vcpu`
 becomes requestable and this ADR's point 2 is superseded.
 
-## ADR-031 — Expanded standard flavor set with prebaked runner tool cache (M5)
+## ADR-039 — Expanded standard flavor set with prebaked runner tool cache (M5)
 **Status**: Accepted (v1) · extends the catalog established in [ADR-020](#adr-020)
 **Context**: The catalog shipped `base`, `node`, `docker`. Any other language runtime meant a
 workflow either used a `setup-*` action (a per-job download on every run) or the repo went
@@ -1018,7 +1017,7 @@ cache** (`/opt/hostedtoolcache`, `RUNNER_TOOL_CACHE`) so `actions/setup-python@v
 instead of downloading. Deliberately **excluded**:
 - **`dotnet`** — the SDK is the largest of the candidates and no verified consumer asked for
   it; snapshot size is a boot-latency and storage cost paid by every job of that flavor.
-  Left to the custom-flavor path (ADR-032) until a real workload justifies it.
+  Left to the custom-flavor path (ADR-040) until a real workload justifies it.
 - A combined "kitchen sink" flavor — it would pay every toolchain's snapshot cost on every
   job. One toolchain per flavor keeps the cost proportional to what the job asked for.
 Each new flavor declares a capability equal to its name (`python`, `java`, `go`, `rust`),
@@ -1045,7 +1044,7 @@ a separate change (it needs parser support for `setup-*` steps and a policy for 
 when a job needs two runtimes). The pinned versions are now a **patch-day obligation**: they
 age silently, and a stale pin is invisible until a workflow needs a newer runtime.
 
-## ADR-032 — Custom flavors live in the store and are merged over the built-in catalog (M5)
+## ADR-040 — Custom flavors live in the store and are merged over the built-in catalog (M5)
 **Status**: Accepted (v1) · shapes work deferred from this milestone
 **Context**: An operator cannot bring their own image. The catalog is `import
 flavorsCatalog from '../../microvm/flavors.json'` in `src/provision/flavor.ts`,
@@ -1070,7 +1069,7 @@ row, and the Phase 3 backlog has "custom per-repo images", but nothing implement
 4. **Bounds** — registration validates `minimumMemoryInMiB` against the region's microVM
    memory quota (spec 02: quota is total memory of `RUNNING`/`SUSPENDED` VMs) and surfaces
    the derived `flavorRatePerMinute` before save, so an operator sees the per-minute rate of
-   the shape they are about to request. Per ADR-030 memory is the only requestable
+   the shape they are about to request. Per ADR-038 memory is the only requestable
    dimension, so it is the only one bounds-checked.
 5. **Behavior with no custom flavors registered must be byte-identical** to today — the
    resolver returns the built-in catalog and performs no I/O when the installation has no
@@ -1084,10 +1083,10 @@ degrade to built-in-only on a DynamoDB fault (fail open, matching ADR-027's gate
 than failing the launch. `flavorNames()` (used by `validateFlavorMap`/`validateRepoPatch`) and
 `buildFlavorViews` become async/installation-scoped, which changes the Mgmt API's validation
 surface. Deferred to a follow-up card; this ADR fixes the shape so the standard-set work
-(ADR-031) does not have to guess it.
+(ADR-039) does not have to guess it.
 
-## ADR-033 — A custom flavor is not routable until a smoke run proves it (M5)
-**Status**: Accepted (v1) · depends on [ADR-032](#adr-032); reuses the broker from [ADR-021](#adr-021)
+## ADR-041 — A custom flavor is not routable until a smoke run proves it (M5)
+**Status**: Accepted (v1) · depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
 **Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
 published its image ARN, resolved correctly from its label, and then failed every single job
 because nothing in the guest could start `dockerd`. `imageAvailability()` probes only that an
@@ -1104,7 +1103,7 @@ gates:
    readable by the provisioner's role; declared capabilities are drawn from a **closed
    vocabulary** (`docker`, `node`, `python`, `java`, `go`, `rust`) because capabilities feed
    both `smallestWithCapability` upgrades and the `compat` gate — an unknown capability
-   string would be silently inert; `minimumMemoryInMiB` within quota bounds (ADR-032).
+   string would be silently inert; `minimumMemoryInMiB` within quota bounds (ADR-040).
 2. **Smoke run** — launch **one** microVM from the image with a synthetic JIT-registered
    runner and require that the Actions agent registers, executes a trivial job, and the VM
    self-terminates through the ADR-021 hook broker. Static checks alone would have passed the
@@ -1122,4 +1121,4 @@ extension). The smoke run **launches a real microVM and registers a real (throwa
 so it consumes quota, costs money, and needs a repo to register against; it is therefore
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
 the static gates; the smoke run itself is verified against a live environment. Deferred to a
-follow-up card together with ADR-032.
+follow-up card together with ADR-040.

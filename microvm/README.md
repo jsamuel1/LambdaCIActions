@@ -15,7 +15,7 @@ microvm/
   Dockerfile.java         `java` flavor — base + Eclipse Temurin JDK 21 LTS (aarch64)
   Dockerfile.go           `go` flavor — base + pinned Go + cgo C toolchain
   Dockerfile.rust         `rust` flavor — base + pinned Rust stable via rustup
-  Dockerfile.docker       `docker` flavor — base + Docker engine (arm64, 4 vCPU / 8 GB)
+  Dockerfile.docker       `docker` flavor — base + Docker engine (arm64, 8 GB requested)
   bootstrap/
     run-hook.mjs          Lifecycle-hook HTTP server (:8080): /run, /terminate, /healthz
 ```
@@ -92,7 +92,7 @@ zips this directory, uploads it to the code bucket (from `ImageStack`),
 runs `create-microvm-image`, polls to `CREATED`, and publishes the image ARN to SSM at
 `/lca/<env>/config/image-arn-<flavor>`.
 
-Sizing (ADR-030): the build requests `--resources minimumMemoryInMiB=<memoryMb>` from the
+Sizing (ADR-038): the build requests `--resources minimumMemoryInMiB=<memoryMb>` from the
 catalog plus `--cpu-configurations architecture=ARM_64`. **Memory is the only requestable
 dimension** — the GA API has no vCPU knob and `run-microvm` takes no sizing parameter at all,
 so the catalog's `vcpu` is descriptive.
