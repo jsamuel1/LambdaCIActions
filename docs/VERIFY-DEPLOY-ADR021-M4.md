@@ -418,3 +418,29 @@ It corrected three items:
 One repo-hygiene fix landed in the same pass: `.agents/` — the AGENTS.md-mandated scratch
 directory, holding this deploy's captured logs and JSON — was not gitignored, so its contents
 were commit-eligible. It is ignored now.
+
+A **fourth independent review pass** (2026-07-29) re-verified every live claim once more from
+the pinned account and matched: five stack statuses/timestamps, the six `lca-dev-*` functions
+(`nodejs22.x`/arm64), Provision's exact env set including `HOOK_BROKER_NAME`, the deployed
+exec-role policy statement-for-statement (one inline, zero attached, zero `dynamodb:*`, zero
+microVM control actions), the broker's `nodejs22.x`/30 s/256 MB + `TABLE_NAME` only +
+`ReservedConcurrentExecutions: 20` + its two-statement role and `AWSLambdaBasicExecutionRole`,
+per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with `ALL` on docker and `null` on node,
+zero non-`TERMINATED` VMs, run `30407823249` `success` ×3, the three run rows (`completed`,
+per-flavor, distinct `microvmId`, 64-hex `hookTokenHash`, `reason` null), the three brokered
+`self-terminate` lines in the broker group, **6** `START RequestId` vs **2** `INIT_START`, the
+six `ETIMEDOUT` jitconfig attempts (23:23:39–42 and 23:23:47–50), `totalBytes: 164` ×3, the
+token scan (0 in the broker/Provision/all three flavor groups; the only 2 hits in
+`microvms/runs/lca-dev` are the literal `run payload missing ref/broker/token` error lines,
+whose raw payloads carry the old `table` contract and no token), PR #16 created `23:20:42Z`
+with skew run `30407682591` now green, GSI2 `ACTIVE` at 106/9/97 with the unindexed range
+ending `23:20:48.571Z` and the earliest indexed row `23:23:28.786Z`, `list-microvms`
+per-page `--query` still emitting `10` then `9`, both M4 stacks' outputs, `PUBLIC_ORIGIN`, the
+SecureString session secret v1, live `200`/`302` (correct `client_id` + callback + state)/three
+`401`s/`403`, and the preflight gate `npm run build` + `npm test` → **281/281** with a
+credential-less `cdk synth -c env=dev` exit 0.
+
+It corrected one docs claim: DEPLOY-M1 said the credential traps could make the pin check
+"pass against the wrong account". They cannot — `bin/lca.ts` compares `CDK_DEFAULT_ACCOUNT`
+and `assertDeployTarget` compares the STS caller against the pin, so both traps only ever
+*refuse*. Reworded to fail-closed.

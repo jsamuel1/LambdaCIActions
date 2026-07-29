@@ -42,7 +42,10 @@ cp .env.local.example .env.local
 anywhere, it must match the pin (or just omit it — the pin wins). Each git worktree needs
 its own copy.
 
-Two credential traps make the pin check fail (or, worse, pass against the wrong account):
+Two credential traps make the pin check refuse a deploy. Both fail closed — the guards
+compare the *resolved* account (`CDK_DEFAULT_ACCOUNT` in `bin/lca.ts`, `sts
+get-caller-identity` in `assertDeployTarget`) against the pin, so a wrong-account shell can
+never deploy silently; it just blocks you:
 
 - **Ambient `AWS_*` env vars beat `AWS_PROFILE`.** A shell carrying
   `AWS_ACCESS_KEY_ID`/`AWS_SESSION_TOKEN` for another account resolves to that account and
