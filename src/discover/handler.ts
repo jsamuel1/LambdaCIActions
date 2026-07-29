@@ -64,10 +64,17 @@ async function discoverOne(record: SQSRecord): Promise<void> {
     repo: req.repo,
   };
 
-  // Per-repo FlavorMap override (may not exist yet — e.g. installation.created races the
-  // repo row write; fall back to no overrides).
+  // Per-repo FlavorMap override + onboarding mode (may not exist yet — e.g.
+  // installation.created races the repo row write; fall back to no overrides / label mode).
   const repoRecord = await getRepo(req.installationId, req.repoId).catch(() => undefined);
   const flavorMap = repoRecord?.flavorMap;
+  // `mode` is load-bearing for the stored routing preview (M5, ADR-030): without it an
+  // adopt-mode repo's `ubuntu-latest` jobs resolve through the FALLBACK, so every stored
+  // route reads `fallback to base (no matching label)` — a reason the console renders
+  // verbatim, contradicting the adopt-mode routing Provision will actually apply. The stored
+  // `routes[jobId].flavor` is also what the auto-rewrite planner reads to choose the label it
+  // inserts (ADR-031), so a fallback-derived flavor would leak into the customer's PR.
+  const mode = repoRecord?.mode;
 
   const files = await listWorkflowFiles(auth);
   console.log(
@@ -94,7 +101,7 @@ async function discoverOne(record: SQSRecord): Promise<void> {
     try {
       const parsed = parseWorkflow(file.path, content);
       const resolveFn = (job: ParsedJob) =>
-        resolveFlavor(job.runs_on, { flavorMap, signals: job.step_signals });
+        resolveFlavor(job.runs_on, { flavorMap, signals: job.step_signals, mode });
       const compat = analyzeWorkflowCompat(parsed, resolveFn);
       const routes: WorkflowAnalysisRecord['routes'] = {};
       for (const job of parsed.jobs) routes[job.id] = resolveFn(job);

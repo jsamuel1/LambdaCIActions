@@ -37,7 +37,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | Screen | Purpose | Key data | Route |
 |---|---|---|---|
 | **Setup / Install** | Installation list + platform readiness | install state, missing SSM params | `#/setup` |
-| **Dashboard** | Health at a glance | active/queued/running counts, error rate, stuck runs, recent runs | `#/` |
+| **Dashboard** | Health at a glance | active/queued/running counts, error rate, stuck runs, recent runs, **rolling cost estimate** | `#/` |
 | **Repos** | List installed repos; enable/disable; set mode + default flavor | full_name, mode, default flavor, compat rollup, last change + actor | `#/repos` |
 | **Repo detail** | Per-repo workflows + flavor map | workflows[], per-job routing, compat findings, override editor, re-scan | `#/repos/{repoId}` |
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
@@ -150,16 +150,18 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/me` | Session introspection (login, installations, expiry) | ✅ |
 | `GET /api/installations` | List installations the caller can admin | ✅ |
 | `GET /api/repos?installation=<id>` | List repos + compat rollup | ✅ |
-| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
+| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap`, `rewriteEnabled` | ✅ |
+| `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`; `repo`+`status` compose); returns `complete` (were any job rows dropped from this response?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
-| `GET /api/health` | Dashboard aggregates + stuck-run detection | ✅ |
+| `GET /api/health` | Dashboard aggregates + stuck-run detection + cost sample | ✅ |
 | `GET /api/settings` | Env identity + SSM parameter **presence** | ✅ |
-| `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)) | M5 |
+| `GET /api/repos/{repoId}/rewrite-pr` | Auto-rewrite **dry run** — always available, writes nothing | ✅ M5 |
+| `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)); 409 unless the deployment flag **and** the repo opt-in are both on | ✅ M5 |
 
 Run paths carry `repoId` because the run row's key is the `(repoId, runId, jobId)`
 idempotency triple (ADR-009) — the API mirrors the storage key rather than adding a lookup.
@@ -277,6 +279,11 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   $0.0044/min reference) rather than a hand-maintained rate table, so a new flavor cannot
   ship without a price. Surfaced as an explicit *estimate*: it uses wall-clock duration,
   which is an upper bound on billed microVM runtime (v1 stores no per-phase timestamps).
+  The Dashboard's rolling total (M5) folds the same per-run estimate over a bounded sample of
+  recent terminal runs, and counts **only runs that actually launched a microVM** (`microvmId`
+  present) — Provision stamps `flavor` on its mint/launch failure rows for support, so pricing
+  those would bill wall-clock for compute that never existed and inflate the estimate exactly
+  when provisioning is broken.
 
 ## Open questions
 

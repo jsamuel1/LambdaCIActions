@@ -1,5 +1,6 @@
 import type { RunRecord, RunStatus, WorkflowAnalysisRecord, RepoRecord } from '../shared/types.js';
 import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { isAdoptLabel, nonLinuxHostedLabel } from '../ingest/adopt.js';
 
 /**
  * Read-model helpers for the Management API (spec 04). Pure functions only — shaping,
@@ -50,6 +51,9 @@ interface FlavorDef {
 }
 
 const FLAVORS: FlavorDef[] = (flavorsCatalog as { flavors: FlavorDef[] }).flavors;
+
+/** Our routing labels, lowercased — a job carrying one already opted in explicitly. */
+const LCA_LABELS = new Set(FLAVORS.map((f) => f.label.toLowerCase()));
 
 /** Per-minute price of a flavor, or undefined for an unknown flavor name. */
 export function flavorRatePerMinute(flavor: string | undefined): number | undefined {
@@ -122,7 +126,64 @@ export interface HealthView {
   errorRate: number;
   /** Runs stuck in a non-terminal status longer than the stuck threshold. */
   stuck: RunView[];
+  /**
+   * Estimated spend over the sampled terminal runs (M5 — dashboard shows health + cost).
+   * Unlike `counts` (platform-wide by design), this is scoped to the caller's installations.
+   */
+  cost: CostSummary;
   generatedAt: string;
+}
+
+/**
+ * Rolling cost estimate for the dashboard (M5 exit criterion: "dashboard shows health +
+ * cost"). Derived from the sampled run rows the health route already reads — no Cost Explorer
+ * call, so it is free, instant, and consistent with the per-run estimate shown in Run detail.
+ * Labelled an estimate in the UI for the same reason `estimateCostUsd` is.
+ */
+export interface CostSummary {
+  /** Number of runs the estimate is based on (the sampled window, not all history). */
+  runs: number;
+  /** Sum of per-run estimates, USD. */
+  totalUsd: number;
+  /** Mean per-run estimate, USD; 0 when no priced runs were sampled. */
+  avgUsd: number;
+  /** Per-flavor breakdown so an operator can see which flavor dominates spend. */
+  byFlavor: Record<string, { runs: number; usd: number }>;
+}
+
+/**
+ * Fold sampled runs into a cost summary.
+ *
+ * Skipped: runs with no flavor (never routed) AND runs that never launched a microVM. A
+ * mint/launch failure stamps `flavor` on the row (Provision records it for support) but no VM
+ * ever ran, so pricing it would bill wall-clock for compute that never existed — inflating the
+ * dashboard estimate with the failures an operator is already looking at. `microvmId` is the
+ * only evidence a VM existed, so it is the gate.
+ */
+export function summarizeCost(runs: RunRecord[]): CostSummary {
+  const byFlavor: Record<string, { runs: number; usd: number }> = {};
+  let totalUsd = 0;
+  let priced = 0;
+  for (const run of runs) {
+    if (!run.microvmId) continue;
+    const usd = estimateCostUsd(run);
+    if (usd === undefined || !run.flavor) continue;
+    priced += 1;
+    totalUsd += usd;
+    const bucket = (byFlavor[run.flavor] ??= { runs: 0, usd: 0 });
+    bucket.runs += 1;
+    bucket.usd = round6(bucket.usd + usd);
+  }
+  return {
+    runs: priced,
+    totalUsd: round6(totalUsd),
+    avgUsd: priced ? round6(totalUsd / priced) : 0,
+    byFlavor,
+  };
+}
+
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
 }
 
 /** A non-terminal run older than this is "stuck" — the Reaper should have caught it. */
@@ -132,6 +193,7 @@ export function buildHealth(
   counts: Record<RunStatus, number>,
   activeRuns: RunRecord[],
   now: Date = new Date(),
+  costRuns: RunRecord[] = [],
 ): HealthView {
   const terminal = counts.completed + counts.failed + counts.timed_out;
   const bad = counts.failed + counts.timed_out;
@@ -143,6 +205,7 @@ export function buildHealth(
     active: counts.queued + counts.provisioning + counts.running,
     errorRate: terminal === 0 ? 0 : Math.round((bad / terminal) * 1000) / 1000,
     stuck,
+    cost: summarizeCost(costRuns),
     generatedAt: now.toISOString(),
   };
 }
@@ -157,6 +220,8 @@ export interface RepoView {
   mode: 'label' | 'adopt' | 'off';
   defaultFlavor?: string;
   flavorMap: Record<string, string>;
+  /** Per-repo auto-rewrite opt-in (ADR-031); false when unset. */
+  rewriteEnabled: boolean;
   updatedBy?: string;
   updatedAt: string;
 }
@@ -170,6 +235,7 @@ export function toRepoView(repo: RepoRecord): RepoView {
     mode: repo.mode ?? 'label',
     defaultFlavor: repo.defaultFlavor,
     flavorMap: repo.flavorMap ?? {},
+    rewriteEnabled: repo.rewriteEnabled === true,
     updatedBy: repo.updatedBy,
     updatedAt: repo.updatedAt,
   };
@@ -198,7 +264,24 @@ export interface WorkflowJobView {
   runsOn: string[];
   flavor?: string;
   flavorReason?: string;
-  compat: { level: 'ok' | 'warn' | 'risk' | 'block'; messages: { level: string; code: string; text: string }[] };
+  /**
+   * True when the job targets a standard GitHub-hosted label and carries no LCA label — i.e.
+   * it runs on GitHub-hosted runners today and would move to a microVM if the repo switched
+   * to `adopt` mode (M5). Deliberately NOT a compat message: candidacy is the normal state of
+   * an un-onboarded repo, and folding it into `compatLevel` would make every such workflow
+   * look degraded (see src/ingest/compat.ts).
+   *
+   * A job that ALSO carries a non-Linux hosted label (`[ubuntu-latest, windows-latest]`) is
+   * NOT a candidate: `decideClaim` refuses it in every mode (arm64 Linux only) and
+   * `rewriteTargets` excludes it. The predicate has to agree with those two, or the console
+   * counts jobs adopt mode will never claim and the RepoDetail copy ("N job(s) … run on arm64
+   * microVMs") states something false about a live repo.
+   */
+  adoptCandidate: boolean;
+  compat: {
+    level: 'ok' | 'warn' | 'risk' | 'block';
+    messages: { level: string; code: string; text: string; fix?: string }[];
+  };
 }
 
 export interface WorkflowView {
@@ -208,6 +291,8 @@ export interface WorkflowView {
   parseError?: string;
   lastParsedSha?: string;
   updatedAt: string;
+  /** Number of jobs in this workflow that adopt mode would claim (M5). */
+  adoptCandidates: number;
   jobs: WorkflowJobView[];
 }
 
@@ -216,12 +301,17 @@ export function toWorkflowView(a: WorkflowAnalysisRecord): WorkflowView {
   const jobs: WorkflowJobView[] = (a.parsed?.jobs ?? []).map((job) => {
     const compat = a.compat?.jobs?.[job.id];
     const route = a.routes?.[job.id];
+    const lower = job.runs_on.map((l) => l.trim().toLowerCase());
     return {
       id: job.id,
       name: job.name,
       runsOn: job.runs_on,
       flavor: route?.flavor,
       flavorReason: route?.reason,
+      adoptCandidate:
+        lower.some((l) => isAdoptLabel(l)) &&
+        !lower.some((l) => LCA_LABELS.has(l)) &&
+        !lower.some((l) => nonLinuxHostedLabel(l)),
       compat: { level: compat?.level ?? 'ok', messages: compat?.messages ?? [] },
     };
   });
@@ -232,6 +322,7 @@ export function toWorkflowView(a: WorkflowAnalysisRecord): WorkflowView {
     parseError: a.parseError,
     lastParsedSha: a.lastParsedSha,
     updatedAt: a.updatedAt,
+    adoptCandidates: jobs.filter((j) => j.adoptCandidate).length,
     jobs,
   };
 }

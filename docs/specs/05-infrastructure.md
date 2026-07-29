@@ -170,16 +170,41 @@ template, so re-widening the role fails the build.
   (`/aws/lambda/microvms/runs/lca-<env>`, ADR-016); Lambdas → standard log groups. The
   console's log viewer reads that group filtered by the run's `microvmId` (ADR-019) — log
   bodies never land in DynamoDB.
-- **Metrics**: emit `RunsQueued`, `RunsRunning`, `ProvisionLatency`, `BootLatency`, `JobDuration`, `ProvisionFailures`, `QuotaThrottles` (custom CW metrics).
-- **Alarms**: DLQ depth > 0; `QuotaThrottles > 0`; stuck-`provisioning` age; provision error rate.
-- **Tracing**: X-Ray across API GW → Lambda → SQS for the hot path.
+- **Metrics** (M5, ADR-032): emitted as **CloudWatch EMF log lines**, not `PutMetricData` — no
+  extra hot-path API call and no `cloudwatch:PutMetricData` grant on any Lambda. Namespace
+  `LambdaCIActions`; today's metrics are `RunsProvisioned`, `ProvisionLatency`,
+  `ProvisionFailures` and `QuotaThrottles`. Two dimension sets are published per datum: the full
+  set (`env` + `flavor`/`via`/`kind`) for drill-down, and an **`env`-only rollup that alarms
+  bind to** (CloudWatch does not aggregate across dimensions — an alarm on a set that is never
+  published stays at `INSUFFICIENT_DATA`, i.e. silently dead). Repo/run/job/microVM ids ride as
+  EMF **properties**, never dimensions, to keep cardinality (and billing) bounded.
+- **Alarms** (per env, all publishing to `lca-<env>-alarms`): provisioning DLQ depth > 0;
+  discovery DLQ depth > 0; `QuotaThrottles > 0`; `ProvisionFailures` above the env threshold;
+  per-λ `Errors` (Ingest / Provision / hook broker / Reaper); provisioning-queue **age of
+  oldest message** — the only signal that catches "Provision stopped consuming", which produces
+  no error metric anywhere. All treat missing data as *not breaching* so an idle platform never
+  pages. Subscribe a recipient with `-c alarmEmail=…` (unsubscribed by default: an alarm topic
+  with no subscriber is a silent alarm, but a committed address would be wrong for every other
+  deployment).
+- **Tracing**: X-Ray **active tracing on the Lambdas** on the hot path (per-env, ADR-033:
+  Ingest, Provision, Discovery, Reaper, hook broker, rewrite, mgmt). API Gateway and SQS are
+  *not* separately instrumented in v1 — SQS propagates the trace header, so a webhook→launch
+  trace links across the queue, but the HTTP API itself contributes no segment.
+- **Cost**: the console's Dashboard shows a rolling spend estimate over recently finished runs,
+  broken down per flavor, derived from the same per-run estimate as Run detail (no Cost Explorer
+  call). It is an upper bound (wall-clock × flavor rate) and labelled as an estimate.
 
 ## Quotas & limits
 
 - **microVM service quota** is the primary concurrency ceiling; defaults are **low and inconsistently granted** (per reference). Request increases per account **early** in M1.
 - Lambda reserved concurrency on Provision λ bounds launch rate (protects downstream + quota).
+  Per-env (ADR-033): dev 10, prod 25 — raise only alongside a granted quota increase.
 - SQS provides backpressure; DLQ isolates poison messages.
-- Document per-account quota status in the UI Settings screen (manual entry or Service Quotas API read).
+- A throttled launch is invisible to the developer waiting on their PR, so it is **alarmed**
+  (`QuotaThrottles`, above) rather than only logged.
+- Full quota inventory, current values, and the increase-request procedure: [QUOTAS.md](../QUOTAS.md).
+- Operational procedures (alarm response, stuck runs, adopt-mode rollback, rewrite PRs):
+  [RUNBOOK.md](../RUNBOOK.md).
 
 ## Cost model
 
@@ -199,7 +224,39 @@ jobs (per-second vs per-minute). Real win is **latency** + **VPC access**, not r
 
 - `dev` and `prod` as separate AWS accounts (or at least separate regions), each with its
   own GitHub App + secrets. One App per account+region in v1 (see [01](01-github-app.md) OQ-3).
-- CDK context / `.env` selects the environment; secrets namespaced under `/lca/<env>/...`.
+  This is an **operational convention, not a code-enforced invariant**: ADR-018 verifies that a
+  checkout's `.env.local` pin matches the ambient credentials, but nothing stops two env names
+  from pinning the same account. Resource names are `env`-suffixed (`lca-<env>-*`,
+  `/lca/<env>/...`), so co-tenanting would not collide — it would merely forfeit the isolation
+  the separation exists for.
+- CDK context selects the environment (`-c env=dev|prod`); the deploy target account+region is
+  **pinned** in `.env.local` and verified against the real caller identity (ADR-018). Secrets
+  are namespaced under `/lca/<env>/...`.
+- Per-environment knobs live in `lib/env-config.ts` (ADR-033) — log retention, log removal
+  policy, reserved concurrency, run-row retention, alarm thresholds, tracing, and the
+  auto-rewrite flag:
+
+  | Knob | `dev` | `prod` |
+  |---|---|---|
+  | Lambda log retention | 2 weeks | 3 months |
+  | Run (job) log retention | 2 weeks | 1 month |
+  | Log group removal | `DESTROY` | **`RETAIN`** |
+  | Provision reserved concurrency | 10 | 25 |
+  | Run-row retention (TTL) | 30 days | 90 days |
+  | `ProvisionFailures` alarm threshold | 5 / 5 min | 1 / 5 min |
+  | λ `Errors` alarm threshold | 2 | 0 |
+  | Auto-rewrite (`contents:write`) | off | off (opt-in per deploy) |
+
+  An **unknown** env name (a personal sandbox like `jsam-dev`) resolves to the dev shape, never
+  prod's, so a typo cannot create retained resources.
+- Deploy commands:
+
+  ```bash
+  # dev (default)
+  npx cdk deploy --all
+  # prod, with alarms delivered and auto-rewrite deliberately enabled
+  npx cdk deploy --all -c env=prod -c alarmEmail=oncall@example.com -c rewrite=true
+  ```
 
 ## Open questions
 

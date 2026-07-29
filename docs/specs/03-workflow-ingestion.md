@@ -45,7 +45,12 @@ Mechanics:
 **Implementation (M3-S4, ADR-017)**: discovery runs in a dedicated λ behind a standard
 SQS queue (`lca-<env>-discovery`), fed by the Ingest λ. Each scan upserts one
 `WorkflowAnalysisRecord` per file (`pk=REPO#<repoId>`, `sk=WF#<path>`) holding the parse
-output, per-job compat, and a routing preview computed with the repo's FlavorMap.
+output, per-job compat, and a routing preview computed with the repo's FlavorMap **and its
+onboarding `mode`** — the same inputs Provision uses, so the stored `routes[jobId]` (flavor +
+reason) is what will actually happen rather than a label-mode approximation. That row is not
+just a console decoration: the auto-rewrite planner reads its flavor to choose the label it
+writes into a customer's PR. Because the preview is mode-dependent, changing a repo's `mode`
+from the console **enqueues a re-scan** instead of waiting for the next `push`.
 Malformed YAML persists as a `parseError` row (surfaced in the UI, not retried).
 
 Consumers correlate a `workflow_job` webhook to its analysis by **rendered name**
@@ -93,12 +98,19 @@ Resolution order (first match wins):
 
 1. **Repo FlavorMap override** (DynamoDB) — explicit `label → flavor`.
 2. **Explicit LCA label** — `lambda-ci`, `lambda-ci-docker`, `lambda-ci-node` → that flavor.
-3. **Adopt-mode standard-label map** (if adopt enabled for the repo):
-   | GitHub label | Default flavor |
+3. **Adopt-mode standard-label map** — implemented in M5 (ADR-030), consulted only when the
+   repo's `mode` is `adopt`:
+   | GitHub label | Flavor |
    |---|---|
-   | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | `base` (or `node`/`docker` per signals) |
-   | any + docker signals | `docker` |
-   | `self-hosted` + our labels | matched flavor |
+   | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`, `ubuntu-20.04` | `base`, then signal-upgraded to `docker` when the job's steps need it |
+   | `windows-*`, `macos-*` | **never claimed, in any mode** — refused in the claim gate *above* the explicit-label rule, so even `runs-on: [windows-latest, lambda-ci]` stays on GitHub-hosted (compat fails open, so it cannot be the only guard) |
+   | `self-hosted` + a non-LCA label | not claimed — that is someone else's runner fleet |
+
+   This settles OQ-3 as **signal-driven**: the label itself says nothing about what the job
+   needs, so the flavor comes from `step_signals`, never from the label text. In v1 the only
+   signal the parser emits is `needs_docker`, so `docker` is the only automatic upgrade; a job
+   that wants the `node` flavor asks for it by label or FlavorMap entry (`base` already carries
+   Node for the runner agent itself). A `needs_node`-style signal would be additive.
 4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it.
 5. **Fallback** — the repo's operator-chosen `defaultFlavor` (set from the console, [04](04-web-ui.md))
    if present and valid, else `base`; record a warning if uncertain.
@@ -106,10 +118,24 @@ Resolution order (first match wins):
 The Ingest λ ([01](01-github-app.md)) only *claims* a `workflow_job` if routing says
 `eligible` for that job's labels. Non-eligible jobs are ignored (GitHub-hosted still runs them).
 
-**Repo opt-out** (ADR-027): before enqueueing a claimed job, Ingest reads the repo row and
-drops the job when the console has set `enabled=false` or `mode='off'`. The management plane
-only writes that config — this is where it takes effect. The check fails **open**: a missing
-repo row (pre-M4 onboarding) or a DynamoDB fault never blocks a labeled job.
+**Repo config gate** (ADR-027, extended by ADR-030): Ingest reads the repo row **before** the
+claim decision, because since M5 `mode` is an *input* to it, not only an opt-out. The row
+supplies: `enabled=false` / `mode='off'` ⇒ drop; `mode='adopt'` ⇒ widen claiming to standard
+hosted labels. The management plane only writes that config — this is where it takes effect.
+The read fails **open to `label` mode**: a missing repo row (pre-M4 onboarding) or a DynamoDB
+fault never blocks a labeled job, and equally never *starts* intercepting a repo's
+`ubuntu-latest` jobs.
+
+**Runner labels at registration**: the minted JIT runner advertises the **job's own** label
+set, because GitHub matches jobs to runners by label-set containment (labels are cumulative).
+In adopt mode that means the runner carries `ubuntu-latest`. See ADR-030, including the open
+verification item on GitHub's reserved hosted-label names.
+
+Unresolved `${{ … }}` entries are dropped from that set (an expression is not a label), so a
+job whose `runs-on` is *entirely* expression-driven normalizes to nothing. Provision **refuses
+such a job before minting**: a runner with no labels gets only GitHub's automatic defaults,
+cannot match the job, and would strand a booted VM plus a consumed single-use JIT config. The
+run fails with an actionable reason (add a literal LCA label beside the expression).
 
 ## Compatibility analysis
 
@@ -122,18 +148,28 @@ Because runners are **arm64-only** and single-use, ingestion computes a `compat.
 | `risk` | Likely needs attention | `runs-on: windows/macos`, x86-only binaries, `container:` with amd64-only image |
 | `block` | We won't claim it | explicitly x86-required, unsupported OS |
 
-Surfaced in the UI per workflow/job with actionable messages (e.g. "image `foo:amd64` is
-x86-only; publish an arm64 variant or exclude this job").
+Every finding carries a stable `code`, an operator-facing `text` stating the problem, and (M5)
+a `fix` naming the remedy — rendered as a separate line in the console so the two are not
+conflated (e.g. text: "container image `foo:amd64` looks x86-only"; fix: "push a multi-arch
+manifest with `docker buildx build --platform linux/amd64,linux/arm64`").
+
+**Adopt candidacy is not a compat finding.** A job targeting `ubuntu-latest` with no LCA label
+is the normal state of an un-onboarded repo, so it is reported as `adoptCandidate` on the
+workflow view rather than as a `warn`. Folding it into `compat.level` would turn every
+un-adopted repo yellow and destroy the "nudge toward adopt once compat is green" signal below.
 
 ## Onboarding modes
 
 Per-repo setting stored on the `Repo` row:
 
-- `disabled` — we ignore the repo.
+- `off` — we ignore the repo (also `enabled=false`).
 - `label` — claim only jobs carrying an LCA label. Safest; opt-in per workflow.
-- `adopt` — claim standard-label jobs too (drop-in, no YAML edits). Powerful; requires confidence in compat.
+- `adopt` — claim standard-label jobs too (drop-in, no YAML edits). Powerful; requires
+  confidence in compat, and it is **all-or-nothing per repo**: GitHub offers no way to take
+  some `ubuntu-latest` jobs and leave the rest on GitHub-hosted runners.
 
-Default on install: `label` (safe). UI nudges toward `adopt` once compat is green.
+Default on install: `label` (safe). UI nudges toward `adopt` once compat is green. Switching
+mode re-scans the repo, because the stored routing preview is resolved with the mode.
 
 ## Auto-rewrite (opt-in)
 
@@ -146,8 +182,23 @@ For teams that want explicit control in-repo, LCA can open a PR that adds LCA la
 +    runs-on: [self-hosted, lambda-ci]
 ```
 
-- Generated as a branch + PR via the App (`contents:write` would be required — an **elevated** permission, off by default; see [01](01-github-app.md) OQ).
-- Never force-pushed; always a reviewable PR. Dry-run diff shown in UI first.
+Implemented in M5 (ADR-031). Behaviour:
+
+- **Three gates, all required**: the deployment flag (`cdk deploy -c rewrite=true`), the
+  per-repo `rewriteEnabled` toggle, and the App actually holding `contents:write` (an
+  **elevated** permission, off by default — see [01](01-github-app.md) OQ). Any one off ⇒ no
+  write. The dry run works regardless.
+- **Only `runs-on:` lines change.** Comments, formatting, quoting and key order are preserved
+  byte-for-byte; the rewriter refuses shapes it cannot edit safely (block sequences, matrix
+  expressions, the runner-group object form) and reports them for hand-editing instead of
+  guessing.
+- The GitHub-hosted label is **removed** rather than kept alongside ours — leaving it would
+  require a runner advertising it and defeat the rewrite (label containment, ADR-030).
+- Branch + PR only: never a direct push, never a force-push, an existing PR is updated rather
+  than duplicated, and nothing is auto-merged. Commits are `sha`-guarded so a concurrent edit
+  is rejected rather than clobbered.
+- A separate control-plane λ performs the write; the management API only enqueues, so the
+  read-mostly console role never gains `contents:write` (ADR-025 boundary preserved).
 
 ## Edge cases
 
@@ -161,4 +212,10 @@ For teams that want explicit control in-repo, LCA can open a PR that adds LCA la
 
 - **OQ-1**: How aggressively to expand matrices we can't fully resolve? (Risk: over/under-claiming jobs.)
 - **OQ-2**: Registry arch inspection for `container:` images — worth the API cost, or defer to runtime failure + clear log?
-- **OQ-3**: Adopt-mode default flavor for bare `ubuntu-latest` — `base` vs signal-driven `node`/`docker`? (Leaning signal-driven.)
+- ~~**OQ-3**: Adopt-mode default flavor for bare `ubuntu-latest`~~ — **resolved (M5, ADR-030)**:
+  signal-driven. Every standard label maps to `base`; the flavor upgrade comes from
+  `step_signals` (v1 emits only `needs_docker`, so `docker` is the only automatic upgrade).
+- **OQ-4** (M5): does `generate-jitconfig` accept `ubuntu-latest` as a runner label, or does
+  GitHub reject reserved hosted-label names with HTTP 422? Adopt mode depends on it. Handled
+  defensively today (permanent-failure classification + an actionable run reason) and closed
+  by observing the M5 exit criterion against a live repo. See ADR-030.

@@ -6,6 +6,7 @@ import {
   Loading,
   StatusBadge,
   Stat,
+  formatCost,
   formatDuration,
   formatTime,
 } from '../components.js';
@@ -42,6 +43,7 @@ export function Dashboard({
         <Stat label="Running" value={h.counts.running} />
         <Stat label="Error rate" value={`${Math.round(h.errorRate * 100)}%`} />
         <Stat label="Repos enabled" value={enabled} />
+        <Stat label="Est. spend" value={formatCost(h.cost?.totalUsd)} />
       </div>
       {h.countsExact === false && (
         <p className="muted">
@@ -52,6 +54,44 @@ export function Dashboard({
       <p className="muted">
         Counts are platform-wide; run lists and stuck runs are scoped to your installations.
       </p>
+
+      {h.cost && (
+        <div className="card">
+          <h2>Cost estimate</h2>
+          <p className="muted">
+            Estimated microVM spend over the {h.cost.runs} most recent finished run(s) in your
+            installations that actually launched a VM — wall-clock minutes × flavor rate, so an
+            upper bound. A sample, not a complete window, and not a billing report: use Cost
+            Explorer for actuals.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Flavor</th>
+                <th>Runs</th>
+                <th>Est. cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(h.cost.byFlavor).map(([flavor, b]) => (
+                <tr key={flavor}>
+                  <td>{flavor}</td>
+                  <td>{b.runs}</td>
+                  <td>{formatCost(b.usd)}</td>
+                </tr>
+              ))}
+              {!Object.keys(h.cost.byFlavor).length && (
+                <tr>
+                  <td colSpan={3} className="muted">
+                    No finished runs to price yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          <p className="muted">Mean per run: {formatCost(h.cost.avgUsd)}</p>
+        </div>
+      )}
 
       {h.stuck.length > 0 && (
         <div className="card">

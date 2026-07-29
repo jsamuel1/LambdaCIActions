@@ -8,6 +8,7 @@ import {
   estimateCostUsd,
   flavorRatePerMinute,
   buildHealth,
+  summarizeCost,
   rollupCompat,
   toWorkflowView,
   toRepoView,
@@ -17,6 +18,8 @@ import {
   toSecretStatus,
   STUCK_AFTER_SECONDS,
 } from '../dist/src/mgmt/views.js';
+import { decideClaim } from '../dist/src/ingest/adopt.js';
+import { rewriteTargets } from '../dist/src/mgmt/rewrite.js';
 import {
   validateRepoPatch,
   validateFlavorMap,
@@ -107,6 +110,58 @@ test('error rate is 0 when nothing is terminal (no divide by zero)', () => {
   assert.equal(buildHealth(counts, []).errorRate, 0);
 });
 
+test('cost summary prices launched runs and breaks down per flavor', () => {
+  const a = run({ microvmId: 'mv-1' });
+  const b = run({ microvmId: 'mv-2', flavor: 'docker' });
+  const s = summarizeCost([a, b]);
+  assert.equal(s.runs, 2);
+  assert.ok(s.totalUsd > 0);
+  assert.equal(s.totalUsd, Math.round((estimateCostUsd(a) + estimateCostUsd(b)) * 1e6) / 1e6);
+  assert.deepEqual(Object.keys(s.byFlavor).sort(), ['base', 'docker']);
+  assert.equal(s.byFlavor.base.runs, 1);
+  assert.ok(Math.abs(s.avgUsd - s.totalUsd / 2) < 1e-9);
+});
+
+test('a run that never launched a microVM is not priced, even though it has a flavor', () => {
+  // Regression guard: Provision stamps `flavor` on its mint- and launch-failure paths (for
+  // support), so a failed run carries a priced flavor while NO VM ever existed. Pricing it
+  // billed wall-clock — including the whole queued wait — for compute that never ran, so the
+  // dashboard estimate grew every time provisioning broke. `microvmId` is the only evidence
+  // a VM existed, so it gates the sample.
+  const failedBeforeLaunch = run({
+    status: 'failed',
+    flavor: 'base',
+    microvmId: undefined,
+    reason: 'GitHub rejected the runner labels for this job (HTTP 422)',
+    updatedAt: '2026-07-01T00:30:00.000Z',
+  });
+  const s = summarizeCost([failedBeforeLaunch]);
+  assert.equal(s.runs, 0);
+  assert.equal(s.totalUsd, 0);
+  assert.equal(s.avgUsd, 0);
+  assert.deepEqual(s.byFlavor, {});
+  // A run that DID launch and then failed is still real spend.
+  assert.equal(summarizeCost([{ ...failedBeforeLaunch, microvmId: 'mv-9' }]).runs, 1);
+});
+
+test('an unpriceable flavor is skipped without poisoning the totals', () => {
+  const s = summarizeCost([run({ microvmId: 'mv-1', flavor: 'nope' })]);
+  assert.equal(s.runs, 0);
+  assert.equal(s.totalUsd, 0);
+});
+
+test('health carries a cost summary (empty when no sample was supplied)', () => {
+  const counts = { queued: 0, provisioning: 0, running: 0, completed: 1, failed: 0, timed_out: 0 };
+  assert.deepEqual(buildHealth(counts, []).cost, {
+    runs: 0,
+    totalUsd: 0,
+    avgUsd: 0,
+    byFlavor: {},
+  });
+  const withSample = buildHealth(counts, [], new Date(), [run({ microvmId: 'mv-1' })]);
+  assert.equal(withSample.cost.runs, 1);
+});
+
 test('runs sort newest-first when merged across status indexes', () => {
   const a = run({ runId: 1, createdAt: '2026-07-01T00:00:00.000Z' });
   const b = run({ runId: 2, createdAt: '2026-07-02T00:00:00.000Z' });
@@ -156,6 +211,67 @@ test('workflow view flattens jobs with routing + compat', () => {
   assert.equal(view.jobs[0].flavor, 'node');
   assert.equal(view.jobs[0].compat.level, 'warn');
   assert.equal(view.jobs[0].compat.messages[0].code, 'X');
+});
+
+// `adoptCandidate` drives a COUNT the console states as fact ("N job(s) … run on arm64
+// microVMs") and the operator's decision to flip a repo to adopt mode. It has to agree with the
+// two things that actually act on it: `decideClaim` (which refuses ANY job carrying a
+// windows/macos label, in every mode) and `rewriteTargets` (which excludes the same jobs). A
+// predicate that only asked "hosted label AND no LCA label" counted mixed selectors like
+// `[ubuntu-latest, windows-latest]` that adopt mode will never claim.
+function jobView(runsOn) {
+  return toWorkflowView({
+    repoId: 1,
+    path: '.github/workflows/ci.yml',
+    name: 'CI',
+    updatedAt: '2026-07-01T00:00:00.000Z',
+    parsed: {
+      path: '.github/workflows/ci.yml',
+      name: 'CI',
+      on: ['push'],
+      jobs: [
+        {
+          id: 'build',
+          name: 'Build',
+          runs_on: runsOn,
+          container: null,
+          services: [],
+          uses: null,
+          matrix_dims: {},
+          step_signals: { needs_docker: false, arch_hints: [], known_actions: [] },
+        },
+      ],
+    },
+  });
+}
+
+test('adopt candidacy matches what the claim gate would actually claim', () => {
+  assert.equal(jobView(['ubuntu-latest']).jobs[0].adoptCandidate, true);
+  assert.equal(jobView(['ubuntu-latest']).adoptCandidates, 1);
+  // Already opted in explicitly — not a candidate.
+  assert.equal(jobView(['self-hosted', 'lambda-ci']).jobs[0].adoptCandidate, false);
+  // No hosted label at all (someone else's fleet) — not a candidate.
+  assert.equal(jobView(['self-hosted', 'gpu']).jobs[0].adoptCandidate, false);
+});
+
+test('a mixed hosted selector is NOT an adopt candidate (decideClaim refuses it)', () => {
+  for (const runsOn of [
+    ['ubuntu-latest', 'windows-latest'],
+    ['macos-14', 'ubuntu-22.04'],
+  ]) {
+    const view = jobView(runsOn);
+    // Cross-check against the real gate rather than restating its rule here.
+    const decision = decideClaim({ jobLabels: runsOn, claimedLabels: ['lambda-ci'], mode: 'adopt' });
+    assert.equal(decision.claim, false, `decideClaim should refuse ${runsOn.join(',')}`);
+    assert.equal(
+      view.jobs[0].adoptCandidate,
+      false,
+      `${runsOn.join(',')} must not be advertised as an adopt candidate`,
+    );
+    assert.equal(view.adoptCandidates, 0);
+    // ...and the rewrite planner agrees, so the three surfaces cannot disagree.
+    assert.deepEqual(rewriteTargets([{ id: 'build', runs_on: runsOn }]), []);
+  }
 });
 
 test('workflow view survives a parse failure', () => {

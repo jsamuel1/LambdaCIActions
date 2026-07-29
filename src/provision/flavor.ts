@@ -1,22 +1,22 @@
 import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { adoptFlavorForLabel } from '../ingest/adopt.js';
+import type { RepoMode } from '../shared/types.js';
 
 /**
  * `runs-on` → flavor routing (spec 03 § routing).
  *
- * Resolution order (first match wins), per this slice (M3-S1):
+ * Resolution order (first match wins):
  *   1. Repo FlavorMap override (DynamoDB)   — explicit `label → flavor`.
  *   2. Explicit LCA label                   — `lambda-ci`, `lambda-ci-node`, `lambda-ci-docker`
  *                                             (most-specific label wins).
- *   3. Signal-based upgrade                 — if the job needs a capability the resolved flavor
+ *   3. Adopt-mode standard-label map        — `ubuntu-latest` & friends → `base` (M5, ADR-030).
+ *                                             Only consulted when the repo is in `adopt` mode.
+ *   4. Signal-based upgrade                 — if the job needs a capability the resolved flavor
  *                                             lacks (e.g. Docker), upgrade to the smallest flavor
  *                                             that provides it.
- *   4. Fallback                             — the repo's operator-chosen `defaultFlavor`
+ *   5. Fallback                             — the repo's operator-chosen `defaultFlavor`
  *                                             (console, spec 04) if set, else `base`; record a
  *                                             warning reason.
- *
- * NOTE: the spec-03 **adopt-mode standard-label map** (mapping GitHub's `ubuntu-*` labels to
- * flavors for zero-YAML-edit onboarding) is intentionally deferred to **M5 — Drop-in & polish**.
- * It is not implemented here.
  *
  * Kept pure (no AWS calls) so it is trivially testable; wiring into ingest/provision (supplying
  * the per-repo FlavorMap + job signals) is done by the caller.
@@ -61,6 +61,14 @@ export interface ResolveOptions {
   defaultFlavor?: string;
   /** Signals derived from the job's steps (drive signal-based upgrade). */
   signals?: JobSignals;
+  /**
+   * The repo's onboarding mode (spec 03). When `'adopt'`, standard GitHub-hosted labels
+   * (`ubuntu-latest`, …) resolve through the adopt map (step 3). Any other value leaves
+   * those labels unmatched, so they fall through to the `defaultFlavor`/`base` fallback —
+   * which is what `label` mode wants, since such a job was only claimed because it ALSO
+   * carried an LCA label.
+   */
+  mode?: RepoMode;
 }
 
 export interface FlavorResolution {
@@ -131,7 +139,20 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     );
   }
 
-  // 4. Fallback — the repo's operator-chosen defaultFlavor if set + valid, else base;
+  // 3. Adopt-mode standard-label map (M5, ADR-030) — only when the repo opted into adopt.
+  if (opts.mode === 'adopt') {
+    for (const label of lower) {
+      const mapped = adoptFlavorForLabel(label);
+      if (mapped && byName(mapped)) {
+        return applySignalUpgrade(
+          { flavor: mapped, reason: `adopt-mode standard label '${label}' → '${mapped}'` },
+          opts.signals,
+        );
+      }
+    }
+  }
+
+  // 5. Fallback — the repo's operator-chosen defaultFlavor if set + valid, else base;
   //    record a warning. Signal upgrade still applies (e.g. docker needed).
   const repoDefault = opts.defaultFlavor && byName(opts.defaultFlavor) ? opts.defaultFlavor : undefined;
   return applySignalUpgrade(

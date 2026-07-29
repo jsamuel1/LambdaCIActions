@@ -48,7 +48,9 @@ merge`); base branch is always `main`.
 - arm64 only — don't assume x86 binaries/base images.
 - Least privilege IAM per Lambda (see 05); microVM launch/terminate scoped to account/region — NOT by VM tag (the GA `lambda-microvms` API can't tag VMs; run↔VM mapping lives in the run store, see ADR-015).
 - Don't put secret **values** in the UI/API — presence/health only.
-- GitHub `contents:write` (auto-rewrite PRs) is **off by default** — don't enable without explicit decision.
+- GitHub `contents:write` (auto-rewrite PRs) is **off by default** — don't enable without explicit decision. Implemented in M5 behind three independent gates (deployment flag `-c rewrite=true`, per-repo `rewriteEnabled`, and the App permission itself); the writing code lives in a dedicated control-plane λ, never the management API (ADR-031).
+- **Adopt mode is per-repo and opt-in** (ADR-030). It claims jobs by GitHub's standard `ubuntu-*` labels, which silently moves work to arm64 — never default it on, and never let a config-read failure enable it (fail open to `label` mode).
+- **Metric dimensions must stay bounded.** Repo/run/job ids go in EMF *properties*, never dimensions. When adding a metric, keep the emitter's dimension set and the alarm's `dimensionsMap` in sync — an alarm bound to an unpublished set is silently dead (ADR-032).
 
 ## When adding code
 - Match the milestone in `docs/ROADMAP.md`; update the relevant spec + add an ADR for any design-affecting choice.

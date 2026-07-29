@@ -2,7 +2,8 @@ import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { getParam } from '../shared/ssm.js';
 import { verifySignature } from '../shared/hmac.js';
-import { shouldClaim, toProvisionRequest, dedupeKey, isRepoOptedOut } from './filter.js';
+import { toProvisionRequest, dedupeKey, isRepoOptedOut } from './filter.js';
+import { decideClaim } from './adopt.js';
 import { planInstallation } from './install-filter.js';
 import { matchJobAnalysis } from './job-match.js';
 import {
@@ -24,6 +25,7 @@ import type {
   InstallationEvent,
   PushEvent,
   DiscoveryRequest,
+  RepoMode,
   RunStatus,
 } from '../shared/types.js';
 
@@ -31,10 +33,12 @@ import type {
  * Ingest λ — API Gateway `POST /webhook` handler (spec 01 webhook handling).
  *
  * 1. Verify `X-Hub-Signature-256` HMAC over the RAW body (constant-time).
- * 2. Branch on `X-GitHub-Event`. For `workflow_job` + `queued` + our label → compat-gate
- *    against the stored workflow analysis (block ⇒ don't claim, spec 03) → enqueue a
- *    provisioning request onto SQS. `push` touching `.github/workflows/**` and
- *    installation repo grants → enqueue discovery scans (M3-S4). Everything else acks fast.
+ * 2. Branch on `X-GitHub-Event`. For `workflow_job` + `queued`, the claim decision combines
+ *    the repo's onboarding mode with the job's labels (`label` → explicit LCA label only;
+ *    `adopt` → standard `ubuntu-*` labels too, M5/ADR-030), then compat-gates against the
+ *    stored workflow analysis (block ⇒ don't claim, spec 03) → enqueues a provisioning
+ *    request onto SQS. `push` touching `.github/workflows/**` and installation repo grants
+ *    → enqueue discovery scans (M3-S4). Everything else acks fast.
  * 3. Always return 2xx quickly so GitHub's delivery never times out; real work is async.
  *
  * Env: WEBHOOK_SECRET_PARAM, RUNNER_LABELS_PARAM, QUEUE_URL, DISCOVERY_QUEUE_URL,
@@ -128,18 +132,24 @@ async function handleWorkflowJob(
     return json(202, { ok: true, status: wf.action });
   }
 
+  // Only `queued` is a claim trigger. `waiting` (deployment-gate) jobs are not runnable yet;
+  // GitHub re-delivers them as `queued` once approved.
+  if (wf.action !== 'queued') {
+    return json(202, { ok: true, claimed: false, ignored: wf.action });
+  }
+
   const claimedLabels = (await getParam(RUNNER_LABELS_PARAM))
     .split(',')
     .map((l) => l.trim())
     .filter(Boolean);
 
-  if (!shouldClaim(wf, claimedLabels)) {
-    return json(202, { ok: true, claimed: false });
-  }
-
-  // Repo opt-out gate (spec 04 Repos screen / ADR-027): the console's `enabled=false` and
-  // `mode='off'` are enforced HERE — the management plane only writes config. Fails OPEN:
-  // a missing row (pre-M4 repos) or a DDB fault must never stop a labeled job.
+  // Repo config gate FIRST (was: after the label check). Adopt mode (M5, ADR-030) makes the
+  // repo's `mode` an INPUT to the claim decision, not just an opt-out — a job with no LCA
+  // label is claimed iff the repo opted into adopt. So the row is read before deciding.
+  //
+  // Fails OPEN on a lookup error, but "open" here means `label` mode (the safe default):
+  // a DDB fault must never silently start intercepting a repo's `ubuntu-latest` jobs.
+  let repoMode: RepoMode | undefined;
   try {
     const repo = await getRepo(wf.installation.id, wf.repository.id);
     if (isRepoOptedOut(repo)) {
@@ -153,10 +163,23 @@ async function handleWorkflowJob(
       );
       return json(202, { ok: true, claimed: false, disabled: true });
     }
+    repoMode = repo?.mode;
   } catch (err) {
     console.error(
-      JSON.stringify({ msg: 'repo opt-out lookup failed (failing open)', error: errMsg(err) }),
+      JSON.stringify({
+        msg: 'repo config lookup failed (defaulting to label mode)',
+        error: errMsg(err),
+      }),
     );
+  }
+
+  const decision = decideClaim({
+    jobLabels: wf.workflow_job?.labels ?? [],
+    claimedLabels,
+    mode: repoMode,
+  });
+  if (!decision.claim) {
+    return json(202, { ok: true, claimed: false, reason: decision.reason });
   }
 
   // Compat gate (spec 03 § routing): a job whose stored analysis says `block` is not
@@ -184,8 +207,17 @@ async function handleWorkflowJob(
     console.error(JSON.stringify({ msg: 'compat gate lookup failed (failing open)', error: errMsg(err) }));
   }
 
-  const msg = toProvisionRequest(wf);
+  const msg = toProvisionRequest(wf, decision.via);
   const key = dedupeKey(msg.repoId, msg.runId, msg.jobId);
+  console.log(
+    JSON.stringify({
+      msg: 'job claimed',
+      key,
+      repo: msg.repoFullName,
+      via: decision.via,
+      reason: decision.reason,
+    }),
+  );
 
   // Persist a `queued` run row BEFORE enqueue so the UI + Reaper see the run even if the
   // enqueue or Provision fails. Idempotent: a duplicate delivery is a no-op.

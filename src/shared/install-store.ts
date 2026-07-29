@@ -214,6 +214,8 @@ export interface RepoConfigPatch {
   /** A known flavor name, or `null` to clear the override (revert to catalog default). */
   defaultFlavor?: string | null;
   flavorMap?: Record<string, string>;
+  /** Per-repo opt-in to the auto-rewrite PR (ADR-031). */
+  rewriteEnabled?: boolean;
 }
 
 /**
@@ -254,6 +256,10 @@ export async function patchRepoConfig(
   if (patch.flavorMap !== undefined) {
     sets.push('flavorMap = :fm');
     values[':fm'] = patch.flavorMap;
+  }
+  if (patch.rewriteEnabled !== undefined) {
+    sets.push('rewriteEnabled = :rw');
+    values[':rw'] = patch.rewriteEnabled;
   }
 
   try {

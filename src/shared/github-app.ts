@@ -253,6 +253,10 @@ export async function listWorkflowFiles(params: {
 /**
  * Fetch one file's raw contents (contents:read). The contents API returns base64 for
  * files ≤ 1 MB — plenty for workflow YAML.
+ *
+ * `ref` (branch, tag or commit sha) selects which version to read. It matters for the
+ * rewrite flow: the blob sha returned here is what guards the subsequent write, so reading
+ * the default branch while writing to an existing rewrite branch would always 409.
  */
 export async function getFileContent(params: {
   appId: string;
@@ -261,14 +265,218 @@ export async function getFileContent(params: {
   owner: string;
   repo: string;
   path: string;
+  ref?: string;
 }): Promise<{ content: string; sha: string }> {
   const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const query = params.ref ? `?ref=${encodeURIComponent(params.ref)}` : '';
   const { body } = await githubJson<{ content?: string; encoding?: string; sha: string }>(
-    `/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}`,
+    `/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}${query}`,
     { token, tokenType: 'token' },
   );
   if (body.encoding !== 'base64' || typeof body.content !== 'string') {
     throw new Error(`GitHub contents for '${params.path}' not base64 (encoding=${body.encoding})`);
   }
   return { content: Buffer.from(body.content, 'base64').toString('utf8'), sha: body.sha };
+}
+
+// ---- auto-rewrite PR (spec 03 § Auto-rewrite, ADR-031, M5) -------------------
+//
+// These are the ONLY functions in the codebase that write to a customer repository, and they
+// need the App's elevated `contents:write` + `pull_requests:write` permissions. They are
+// therefore:
+//   - reachable only from the dedicated rewrite λ (never the management API),
+//   - gated by a deployment flag AND a per-repo opt-in (ADR-031),
+//   - branch + PR only: no direct commit to the default branch, never a force-push.
+
+/** Repo metadata we need to branch from (`default_branch`). */
+export async function getRepoDefaultBranch(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+}): Promise<string> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{ default_branch?: string }>(
+    `/repos/${params.owner}/${params.repo}`,
+    { token, tokenType: 'token' },
+  );
+  if (!body.default_branch) throw new Error('GitHub repo response has no default_branch');
+  return body.default_branch;
+}
+
+/**
+ * Encode a ref for use in a URL PATH, keeping `/` as a literal separator.
+ *
+ * `encodeURIComponent` on the whole ref is wrong here: `GET /repos/{o}/{r}/git/ref/{ref}`
+ * matches the ref as literal path segments and does NOT decode `%2F` back into a separator,
+ * so `heads/lambda-ci-actions%2Fadopt-labels-dev` 404s even though the branch exists. Our
+ * rewrite branch always contains a slash (`rewriteBranchName`), so this was the normal case,
+ * not an edge one:
+ *   - the existence probe 404s, which `ensureBranch` reads as "branch absent",
+ *   - the create then fails `422 Reference already exists` (its BODY is unencoded, so the
+ *     first run really did create the branch),
+ *   - the whole rewrite request errors, SQS redelivers, and it DLQs — i.e. the second
+ *     "Open rewrite PR" click could never succeed, and `planRef` would have read the wrong
+ *     ref even if it had.
+ * Per-segment encoding keeps a `#`/`?`/space in a branch name escaped while leaving the
+ * hierarchy intact.
+ */
+function encodeRefPath(ref: string): string {
+  return ref.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * The tip sha of a branch, or undefined when it does not exist.
+ *
+ * Separate from `ensureBranch` because the rewrite λ must know whether the branch exists
+ * WITHOUT creating it: creating a branch is a visible, permanent change to the customer's
+ * repository, and it must not happen for a request that turns out to have nothing to rewrite.
+ */
+export async function getBranchSha(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+}): Promise<string | undefined> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  try {
+    const { body } = await githubJson<{ object?: { sha?: string } }>(
+      `/repos/${params.owner}/${params.repo}/git/ref/heads/${encodeRefPath(params.branch)}`,
+      { token, tokenType: 'token' },
+    );
+    return body.object?.sha;
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('HTTP 404')) return undefined;
+    throw err;
+  }
+}
+
+/**
+ * Ensure a branch exists at the tip of `fromBranch`.
+ *
+ * If the branch already exists it is left ALONE (not reset): the operator may have pushed
+ * review fixes onto our PR branch, and resetting it would be a force-push — explicitly out
+ * of bounds (spec 03: "never force-pushed").
+ */
+export async function ensureBranch(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  fromBranch: string;
+}): Promise<{ created: boolean; sha: string }> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const base = `/repos/${params.owner}/${params.repo}`;
+
+  try {
+    const { body } = await githubJson<{ object?: { sha?: string } }>(
+      `${base}/git/ref/heads/${encodeRefPath(params.branch)}`,
+      { token, tokenType: 'token' },
+    );
+    if (body.object?.sha) return { created: false, sha: body.object.sha };
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes('HTTP 404'))) throw err;
+  }
+
+  const { body: from } = await githubJson<{ object?: { sha?: string } }>(
+    `${base}/git/ref/heads/${encodeRefPath(params.fromBranch)}`,
+    { token, tokenType: 'token' },
+  );
+  const sha = from.object?.sha;
+  if (!sha) throw new Error(`cannot resolve '${params.fromBranch}' tip`);
+
+  await githubJson(`${base}/git/refs`, {
+    method: 'POST',
+    token,
+    tokenType: 'token',
+    body: { ref: `refs/heads/${params.branch}`, sha },
+  });
+  return { created: true, sha };
+}
+
+/** Commit one file's new content onto a branch (contents:write). */
+export async function putFileOnBranch(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  path: string;
+  content: string;
+  /** Blob sha of the version we rewrote — GitHub rejects the write if the file moved on. */
+  sha: string;
+  message: string;
+}): Promise<void> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  await githubJson(`/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}`, {
+    method: 'PUT',
+    token,
+    tokenType: 'token',
+    body: {
+      message: params.message,
+      content: Buffer.from(params.content, 'utf8').toString('base64'),
+      branch: params.branch,
+      // Optimistic concurrency: the sha is the blob we planned against. If someone edited the
+      // workflow between plan and apply, GitHub 409s instead of us clobbering their change.
+      sha: params.sha,
+    },
+  });
+}
+
+/**
+ * The open PR from `branch`, if any. Extracted so both `ensurePullRequest` and the rewrite
+ * λ's no-change path can use it: a second apply legitimately produces no edits (the first one
+ * already rewrote every job), and the operator still needs the link to the PR that is waiting
+ * for them.
+ */
+export async function findOpenPullRequest(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+}): Promise<{ url: string; number: number } | undefined> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{ number: number; html_url: string }[]>(
+    `/repos/${params.owner}/${params.repo}/pulls?state=open&head=${encodeURIComponent(`${params.owner}:${params.branch}`)}`,
+    { token, tokenType: 'token' },
+  );
+  if (!Array.isArray(body) || body.length === 0) return undefined;
+  return { url: body[0].html_url, number: body[0].number };
+}
+
+/**
+ * Open a PR from `branch` into `base`, or return the existing open one. Idempotent: a second
+ * apply for the same repo updates the branch and reuses the PR rather than opening a dupe.
+ */
+export async function ensurePullRequest(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  base: string;
+  title: string;
+  body: string;
+}): Promise<{ url: string; number: number; created: boolean }> {
+  const existing = await findOpenPullRequest(params);
+  if (existing) return { ...existing, created: false };
+
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const repoPath = `/repos/${params.owner}/${params.repo}`;
+  const { body: pr } = await githubJson<{ number: number; html_url: string }>(`${repoPath}/pulls`, {
+    method: 'POST',
+    token,
+    tokenType: 'token',
+    body: { title: params.title, body: params.body, head: params.branch, base: params.base },
+  });
+  return { url: pr.html_url, number: pr.number, created: true };
 }

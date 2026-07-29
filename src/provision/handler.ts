@@ -12,6 +12,10 @@ import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
 import type { ProvisionRequest, RunHookPayload } from '../shared/types.js';
 import { resolveFlavor, type ResolveOptions } from './flavor.js';
+import { jitRunnerLabels, classifyMintFailure, NoRunnerLabelsError, TooManyRunnerLabelsError, MAX_JIT_LABELS } from './labels.js';
+import { emitMetrics, isQuotaError } from '../shared/metrics.js';
+
+const LCA_ENV = process.env.LCA_ENV ?? 'dev';
 
 /**
  * Provision λ — SQS consumer (spec 02 provisioning lifecycle, ADR-012).
@@ -101,20 +105,66 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   const { flavor, reason: flavorReason } = resolveFlavor(req.labels, resolveOpts);
   console.log(JSON.stringify({ msg: 'flavor resolved', runId: req.runId, jobId: req.jobId, flavor, reason: flavorReason }));
   const imageArn = await getParam(`${IMAGE_ARN_PARAM_PREFIX}${flavor}`);
-
-  // 2. mint single-use JIT config (GitHub App chain)
-  const appId = await getParam(APP_ID_PARAM);
-  const pem = await getParam(APP_PEM_PARAM);
-  const jitConfig = await generateJitConfig({
-    appId,
-    pem,
-    installationId: req.installationId,
-    owner: req.owner,
-    repo: req.repo,
+  const via = req.claimVia ?? 'label';
+  const metricDims = { env: LCA_ENV, flavor, via };
+  const metricProps = {
+    repo: req.repoFullName,
     runId: req.runId,
     jobId: req.jobId,
-    labels: req.labels,
-  });
+  };
+
+  // 2. mint single-use JIT config (GitHub App chain). The runner must advertise the job's
+  //    OWN labels or GitHub will never assign the job to it (labels are cumulative) — in
+  //    adopt mode that includes the standard `ubuntu-*` label the workflow still carries.
+  const runnerLabels = jitRunnerLabels(req.labels);
+  const appId = await getParam(APP_ID_PARAM);
+  const pem = await getParam(APP_PEM_PARAM);
+  let jitConfig: string;
+  try {
+    // Refuse BEFORE the mint if nothing survived normalization: a runner with no labels gets
+    // only GitHub's automatic defaults, can never match the job, and would strand a booted
+    // VM plus a consumed single-use JIT config (see NoRunnerLabelsError).
+    if (!runnerLabels.length) throw new NoRunnerLabelsError(req.labels ?? []);
+    // …and refuse an over-cap set for the mirror-image reason: we cannot DROP a label either.
+    // GitHub assigns a job only to a runner advertising every label in `runs-on`, so a
+    // truncated set produces a VM the claimed job can never be assigned to.
+    if (runnerLabels.length > MAX_JIT_LABELS) throw new TooManyRunnerLabelsError(runnerLabels);
+    jitConfig = await generateJitConfig({
+      appId,
+      pem,
+      installationId: req.installationId,
+      owner: req.owner,
+      repo: req.repo,
+      runId: req.runId,
+      jobId: req.jobId,
+      labels: runnerLabels,
+    });
+  } catch (err) {
+    // A rejected mint is usually PERMANENT (bad labels / revoked install), and retrying it
+    // three times into the DLQ buys nothing but delay and noise. Classify: permanent ⇒ mark
+    // the run failed with an actionable reason and return (message consumed); transient ⇒
+    // rethrow so SQS redelivers. This is also the surface where an adopt-mode label refusal
+    // becomes a readable console message instead of "launch failed".
+    //
+    // A transient failure must NOT write a terminal status: `failed` is terminal, and the
+    // redelivered message's queued→provisioning idempotency guard would then refuse to
+    // advance the row and return early — the retry we asked SQS for would never reach the
+    // mint again. So the row stays `provisioning` (the Reaper backstops a run that never
+    // recovers) and only the metric + log record the attempt.
+    const { kind, reason } = classifyMintFailure(errMsg(err), runnerLabels);
+    emitMetrics([{ name: 'ProvisionFailures', value: 1, unit: 'Count' }], { ...metricDims, kind: 'mint' }, metricProps);
+    console.error(JSON.stringify({ msg: 'JIT mint failed', kind, reason, runId: req.runId, jobId: req.jobId }));
+    if (kind === 'transient') throw new Error(reason);
+    await transitionRun({
+      repoId: req.repoId,
+      runId: req.runId,
+      jobId: req.jobId,
+      to: 'failed',
+      flavor,
+      reason,
+    }).catch(() => {});
+    return;
+  }
 
   // 3. stash the JIT config in DynamoDB (the 4 KB run-hook payload can't hold it inline,
   //    ADR-016) together with the HASH of a freshly minted per-run capability token
@@ -140,6 +190,7 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   };
 
   let microvmId: string;
+  const launchStartedAt = Date.now();
   try {
     ({ microvmId } = await launchMicroVM(lambda, {
       imageArn,
@@ -161,6 +212,35 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     // the batch handler's log line, i.e. exactly the leak the guest-side redaction closes on
     // the other end of the same secret.
     const safeReason = redactSecret(errMsg(err), hookToken);
+    const quota = isQuotaError(err);
+    emitMetrics(
+      [
+        { name: 'ProvisionFailures', value: 1, unit: 'Count' },
+        ...(quota ? [{ name: 'QuotaThrottles', value: 1, unit: 'Count' as const }] : []),
+      ],
+      { ...metricDims, kind: quota ? 'quota' : 'launch' },
+      metricProps,
+    );
+    // A QUOTA refusal is transient — capacity, not correctness (spec 05 § Quotas). It must NOT
+    // write a terminal status, for the same reason a transient mint failure doesn't: `failed`
+    // is terminal, so the redelivered message's queued→provisioning guard would refuse to
+    // advance the row and return early — the SQS retry we asked for would never reach
+    // launchMicroVM again, and one throttle would permanently fail a job that only needed to
+    // wait. Leaving the row in `provisioning` keeps redelivery working (a same-status write is
+    // idempotent), and is what makes RUNBOOK's "jobs wait rather than fail" true. If every
+    // redelivery throttles, the message DLQs (alarmed) and the Reaper fails the stuck row.
+    if (quota) {
+      console.error(
+        JSON.stringify({
+          msg: 'launch throttled by quota (retrying)',
+          runId: req.runId,
+          jobId: req.jobId,
+          flavor,
+          reason: safeReason,
+        }),
+      );
+      throw new Error(`launch throttled by quota (retrying): ${safeReason}`);
+    }
     await transitionRun({
       repoId: req.repoId,
       runId: req.runId,
@@ -205,10 +285,23 @@ async function provisionOne(record: SQSRecord): Promise<void> {
       msg: 'microVM launched',
       microvmId,
       flavor,
+      via,
       runId: req.runId,
       jobId: req.jobId,
       repo: req.repoFullName,
     }),
+  );
+
+  // Metrics (spec 05 § Observability): `ProvisionLatency` is the RunMicrovm call itself — the
+  // part of boot we control — while end-to-end queue→running time is derivable from the run
+  // row's timestamps, so it is not double-counted here.
+  emitMetrics(
+    [
+      { name: 'RunsProvisioned', value: 1, unit: 'Count' },
+      { name: 'ProvisionLatency', value: Date.now() - launchStartedAt, unit: 'Milliseconds' },
+    ],
+    metricDims,
+    { ...metricProps, microvmId },
   );
 }
 
@@ -228,6 +321,10 @@ async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptio
   const repo = await getRepo(req.installationId, req.repoId).catch(() => undefined);
   if (repo?.flavorMap) opts.flavorMap = repo.flavorMap;
   if (repo?.defaultFlavor) opts.defaultFlavor = repo.defaultFlavor;
+  // Adopt-mode routing needs the repo's mode. Prefer the row (authoritative), but fall back
+  // to the claim provenance stamped by Ingest so a DDB blip doesn't silently downgrade an
+  // adopt-claimed job to the `base` fallback with a misleading "no matching label" reason.
+  opts.mode = repo?.mode ?? (req.claimVia === 'adopt' ? 'adopt' : undefined);
 
   if (req.jobName) {
     const analyses = await listWorkflowAnalyses(req.repoId).catch(() => []);

@@ -69,6 +69,13 @@ export interface ProvisionRequest {
   jobName?: string;
   /** Enclosing workflow name from the webhook (matches stored analyses; M3-S4). */
   workflowName?: string | null;
+  /**
+   * How Ingest came to claim this job (M5, ADR-030): `'label'` = explicit LCA label,
+   * `'adopt'` = standard GitHub-hosted label under adopt mode. Provision uses it to route
+   * (adopt-mode label map) and to emit the right metric dimension; absent on messages
+   * enqueued before M5, which are treated as `'label'`.
+   */
+  claimVia?: 'label' | 'adopt';
 }
 
 /**
@@ -100,6 +107,21 @@ export interface DiscoveryRequest {
   repo: string;
   /** Why the scan fired (logging / debugging only). */
   reason: 'push' | 'installation' | 'manual';
+}
+
+/**
+ * The message the Management API enqueues to request an auto-rewrite PR (spec 03 §
+ * Auto-rewrite, ADR-031). Consumed by the rewrite λ, which holds the App credentials the
+ * management plane deliberately lacks (ADR-025).
+ */
+export interface RewriteRequest {
+  installationId: number;
+  repoId: number;
+  repoFullName: string; // owner/repo
+  owner: string;
+  repo: string;
+  /** GitHub login of the operator who requested it (audit trail). */
+  actor: string;
 }
 
 /**
@@ -212,7 +234,8 @@ export interface InstallationRecord {
 
 /**
  * Onboarding mode for a repo (spec 03). `label` = workflows opt in with explicit LCA
- * labels (v1 default). `adopt` = standard-label mapping, M5. `off` = never claim.
+ * labels (v1 default). `adopt` = standard-label mapping (M5, ADR-030) — jobs carrying
+ * GitHub's standard `ubuntu-*` labels are claimed with no YAML edits. `off` = never claim.
  */
 export type RepoMode = 'label' | 'adopt' | 'off';
 
@@ -231,6 +254,13 @@ export interface RepoRecord {
    * the management UI (M4); consumed by Provision when resolving a job's flavor.
    */
   flavorMap?: Record<string, string>;
+  /**
+   * Per-repo opt-in to the auto-rewrite PR (M5, ADR-031). Absent ⇒ OFF. Even when true the
+   * platform only opens a PR when the deployment also enabled the feature — two independent
+   * gates, because auto-rewrite is the one capability that writes to a customer repo
+   * (AGENTS.md hard rule: `contents:write` off by default).
+   */
+  rewriteEnabled?: boolean;
   /** GitHub login of the operator who last changed config (M4 audit, spec 04). */
   updatedBy?: string;
   createdAt: string;
@@ -309,6 +339,13 @@ export interface CompatMessage {
   level: 'warn' | 'risk' | 'block';
   code: string;
   text: string;
+  /**
+   * Actionable remedy the operator can apply (M5, spec 03 § Compatibility analysis —
+   * "surfaced in the UI with actionable fixes"). Separated from `text` (which states the
+   * problem) so the console can render the two differently and a fix can be reworded
+   * without changing a finding's meaning.
+   */
+  fix?: string;
 }
 
 /**
