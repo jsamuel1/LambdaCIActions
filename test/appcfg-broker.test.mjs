@@ -33,9 +33,12 @@ const CRED_SUFFIXES = [
  * A fake SSM + GitHub environment. `existing` seeds parameter versions (so we can model both a
  * rotation and a fresh first-link); `failOn` makes one PutParameter throw.
  */
-function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = false, hookError, lockHeld = false } = {}) {
+function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = false, hookError, lockHeld = false, sharedCache } = {}) {
   const store = new Map(Object.entries(existing)); // name → { value, version }
-  const calls = { puts: [], deletes: [], audits: [], hookUpdates: [], identities: [], locks: [], releases: [] };
+  const calls = { puts: [], deletes: [], audits: [], hookUpdates: [], identities: [], locks: [], releases: [], cacheReads: 0, cacheWrites: [], cacheClears: 0 };
+  // Models the shared `CONFIG#STATUS` row: `sharedCache` seeds a warm row written by ANOTHER
+  // container, which is the case a per-container cache cannot cover.
+  const shared = { row: sharedCache };
 
   const deps = {
     getParam: async (name) => {
@@ -110,8 +113,20 @@ function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = fa
     releaseConfigLock: async (holder) => {
       calls.releases.push(holder);
     },
+    getStatusCache: async () => {
+      calls.cacheReads += 1;
+      return shared.row;
+    },
+    putStatusCache: async (payload) => {
+      calls.cacheWrites.push(payload);
+      shared.row = payload;
+    },
+    clearStatusCache: async () => {
+      calls.cacheClears += 1;
+      shared.row = undefined;
+    },
   };
-  return { deps, store, calls, handle: createHandler(deps) };
+  return { deps, store, calls, shared, handle: createHandler(deps) };
 }
 
 /** Seed a fully-linked environment (the rotation case). */
@@ -468,4 +483,50 @@ test('the app-slug is written only after post-write verification succeeds', asyn
     false,
     'a failed relink must not leave the new slug behind',
   );
+});
+
+// ---- shared (cross-container) status cache ---------------------------------
+//
+// The in-memory cache above only bounds ONE container. `GET /api/settings` is readable by any
+// authenticated session (ADR-029) and concurrent reads scale the broker out, so a cold container
+// must be able to reuse an answer another container already paid four App-JWT calls for.
+
+test('a cold container reuses a warm shared cache row instead of calling GitHub', async () => {
+  const warm = { ok: true, linkage: { app: { appId: 424242, name: 'LCA', slug: 'lca-dev', htmlUrl: '', ownerLogin: 'acme', events: [], permissions: {} }, installations: [], webhook: null } };
+  const h = harness({ existing: linkedStore(), sharedCache: warm });
+  const res = await h.handle({ action: 'status', actor: 'system' });
+  assert.equal(res.ok, true);
+  assert.equal(res.linkage.app.appId, 424242);
+  assert.equal(h.calls.identities.length, 0, 'a warm shared row must not cost a GitHub call');
+});
+
+test('a cold container with no shared row publishes its answer for the others', async () => {
+  const h = harness({ existing: linkedStore() });
+  await h.handle({ action: 'status', actor: 'system' });
+  assert.equal(h.calls.cacheReads, 1);
+  assert.equal(h.calls.cacheWrites.length, 1, 'the paid-for answer must be shared');
+  assert.ok(h.calls.cacheWrites[0].linkage, 'the shared row carries the linkage view');
+  const serialized = JSON.stringify(h.calls.cacheWrites[0]);
+  assert.equal(serialized.includes('PRIVATE KEY'), false, 'the shared row must hold no secret');
+});
+
+test('a mutation clears the SHARED row too, not just this container', async () => {
+  const h = harness({ existing: linkedStore(), sharedCache: { ok: true, linkage: { app: null, installations: [], webhook: null } } });
+  await h.handle({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-base' });
+  assert.equal(h.calls.cacheClears, 1, 'other containers would otherwise serve pre-change state');
+  assert.equal(h.shared.row, undefined);
+});
+
+test('a shared-cache fault degrades to a live GitHub read, it does not fail the request', async () => {
+  const h = harness({ existing: linkedStore() });
+  h.deps.getStatusCache = async () => {
+    throw new Error('DDB unavailable');
+  };
+  h.deps.putStatusCache = async () => {
+    throw new Error('DDB unavailable');
+  };
+  const fresh = createHandler(h.deps);
+  const res = await fresh({ action: 'status', actor: 'system' });
+  assert.equal(res.ok, true);
+  assert.equal(res.linkage.app.appId, 424242);
 });

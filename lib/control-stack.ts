@@ -536,13 +536,15 @@ export class ControlStack extends Stack {
         resources: credentialParams,
       }),
     );
-    // Audit rows + the config lock (`CONFIG#AUDIT`, `CONFIG#LOCK`) only — scoped by leading key
-    // so the broker cannot touch run rows or installation config. UpdateItem, not Put/Delete:
-    // it cannot destroy history either.
+    // Audit rows + the config lock + the shared status-cache row (`CONFIG#AUDIT`,
+    // `CONFIG#LOCK`, `CONFIG#STATUS`) only — scoped by leading key so the broker cannot touch
+    // run rows or installation config. UpdateItem (not Put/Delete): it cannot destroy history
+    // either. GetItem is needed to READ the shared status cache, which is what keeps a polled
+    // Settings screen from draining the App's shared GitHub JWT budget.
     appcfg.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'WriteConfigAudit',
-        actions: ['dynamodb:UpdateItem'],
+        actions: ['dynamodb:UpdateItem', 'dynamodb:GetItem'],
         resources: [table.tableArn],
         conditions: {
           'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['CONFIG#*'] },

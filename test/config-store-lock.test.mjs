@@ -133,3 +133,64 @@ test('release is conditional on still being the holder', async () => {
   }
   assert.equal(i.sent[0].ConditionExpression, 'holder = :h');
 });
+
+// ---- shared status cache (review follow-up) --------------------------------
+//
+// The broker's in-memory `status` cache does not bound GitHub spend on its own: `GET
+// /api/settings` is readable by ANY authenticated session (ADR-029), and concurrent reads scale
+// the broker out to fresh containers whose caches are all cold. `status` costs four App-JWT
+// calls against the App's 5,000/h budget — the same budget Provision spends minting a token per
+// job — so the bound has to be platform-wide.
+
+test('the shared status cache row is keyed CONFIG#STATUS and aliases the reserved `at`', async () => {
+  const i = intercept();
+  try {
+    await store.putStatusCache({ ok: true }, 1_000_000);
+  } finally {
+    i.restore();
+  }
+  const input = i.sent[0];
+  assert.equal(input.Key.pk, 'CONFIG#STATUS', 'must fall under the broker\u2019s CONFIG# key scope');
+  assert.equal(input.ExpressionAttributeNames['#at'], 'at');
+  assert.doesNotMatch(input.UpdateExpression, /(^|[\s,])at =/);
+  assert.equal(input.ExpressionAttributeValues[':at'], 1_000_000);
+});
+
+test('a fresh shared cache row is reused; a stale one is ignored', async () => {
+  const original = DynamoDBDocumentClient.prototype.send;
+  DynamoDBDocumentClient.prototype.send = async () => ({
+    Item: { pk: 'CONFIG#STATUS', sk: 'LINKAGE', at: 1_000_000, payload: { ok: true } },
+  });
+  try {
+    assert.deepEqual(await store.getStatusCache(30_000, 1_010_000), { ok: true });
+    // At/over the TTL the answer must be re-verified against GitHub, or a relink by another
+    // operator would be invisible for longer than the window.
+    assert.equal(await store.getStatusCache(30_000, 1_030_000), undefined);
+  } finally {
+    DynamoDBDocumentClient.prototype.send = original;
+  }
+});
+
+test('a malformed or absent shared cache row is a miss, not a crash', async () => {
+  const original = DynamoDBDocumentClient.prototype.send;
+  const rows = [undefined, { at: 'nope', payload: {} }, { at: 1, /* no payload */ }];
+  try {
+    for (const Item of rows) {
+      DynamoDBDocumentClient.prototype.send = async () => (Item ? { Item } : {});
+      assert.equal(await store.getStatusCache(30_000, 1), undefined);
+    }
+  } finally {
+    DynamoDBDocumentClient.prototype.send = original;
+  }
+});
+
+test('invalidation zeroes the timestamp so every container re-verifies', async () => {
+  const i = intercept();
+  try {
+    await store.clearStatusCache();
+  } finally {
+    i.restore();
+  }
+  assert.equal(i.sent[0].Key.pk, 'CONFIG#STATUS');
+  assert.equal(i.sent[0].ExpressionAttributeValues[':zero'], 0);
+});

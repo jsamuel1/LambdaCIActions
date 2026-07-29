@@ -8,7 +8,7 @@ import {
   updateAppHookConfig,
 } from '../shared/github-app.js';
 import { deleteParam, getParam, getParamVersion, paramVersion, putParam } from '../shared/ssm.js';
-import { appendAudit, acquireConfigLock, releaseConfigLock } from '../shared/config-store.js';
+import { appendAudit, acquireConfigLock, releaseConfigLock, clearStatusCache, getStatusCache, putStatusCache } from '../shared/config-store.js';
 import {
   APP_CREDENTIAL_PARAMS,
   SECURE_CREDENTIAL_PARAMS,
@@ -60,6 +60,15 @@ const RUNNER_LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
  * polls every 15 s (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll
  * from cache and bounds several open tabs to one GitHub round per 30 s per container.
  */
+/**
+ * How long a `status` answer may be reused. The Settings screen polls every 15 s
+ * (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll from cache.
+ *
+ * Cached in TWO places, because a per-container cache alone does not bound the spend: any
+ * authenticated session may read `GET /api/settings` (ADR-029), and concurrent reads scale the
+ * broker out to fresh containers whose in-memory caches are all cold. The shared `CONFIG#STATUS`
+ * row makes the bound platform-wide; the in-memory copy avoids a DynamoDB read per poll.
+ */
 const STATUS_CACHE_MS = 30_000;
 
 /**
@@ -75,6 +84,9 @@ export interface AppcfgDeps {
   putParam: typeof putParam;
   deleteParam: typeof deleteParam;
   appendAudit: typeof appendAudit;
+  getStatusCache: typeof getStatusCache;
+  putStatusCache: typeof putStatusCache;
+  clearStatusCache: typeof clearStatusCache;
   getAppIdentity: typeof getAppIdentity;
   listAppInstallations: typeof listAppInstallations;
   getAppHookConfig: typeof getAppHookConfig;
@@ -92,6 +104,9 @@ const defaultDeps: AppcfgDeps = {
   putParam,
   deleteParam,
   appendAudit,
+  getStatusCache,
+  putStatusCache,
+  clearStatusCache,
   getAppIdentity,
   listAppInstallations,
   getAppHookConfig,
@@ -140,16 +155,45 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
       scrubForOperator(redactLiterals(text, submitted));
 
     // Any mutation invalidates the cached linkage: the next poll must observe what was just
-    // written (a new App id, new labels), not a pre-change snapshot.
-    if (req.action !== 'status') statusCache = undefined;
+    // written (a new App id, new labels), not a pre-change snapshot. Both layers — this
+    // container's copy and the shared row every other container reads.
+    if (req.action !== 'status') {
+      statusCache = undefined;
+      await deps.clearStatusCache().catch((err) =>
+        console.error(
+          JSON.stringify({
+            msg: 'status cache invalidation failed',
+            error: scrubForOperator(errMsg(err)),
+          }),
+        ),
+      );
+    }
 
     try {
       switch (req.action) {
         case 'status': {
           const now = Date.now();
           if (statusCache && now - statusCache.at < STATUS_CACHE_MS) return statusCache.result;
+          // Shared cache next: another container may already have paid for this answer.
+          const shared = await deps
+            .getStatusCache<AppcfgResult>(STATUS_CACHE_MS, now)
+            .catch(() => undefined);
+          if (shared) {
+            // Re-assert on the way out: the row is platform state, so treat it as untrusted.
+            const checked = finish(shared);
+            statusCache = { at: now, result: checked };
+            return checked;
+          }
           const result = finish(await statusAction(deps));
           statusCache = { at: now, result };
+          await deps.putStatusCache(result, now).catch((err) =>
+            console.error(
+              JSON.stringify({
+                msg: 'status cache write failed',
+                error: scrubForOperator(errMsg(err)),
+              }),
+            ),
+          );
           return result;
         }
         case 'relink':

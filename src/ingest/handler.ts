@@ -66,7 +66,10 @@ export async function handler(
   const ghEvent = headers['x-github-event'] ?? headers['X-GitHub-Event'];
 
   const secret = await getParam(WEBHOOK_SECRET_PARAM);
-  if (!verifySignature(rawBody, signature, secret)) {
+  const verified = await verifyWithRotation(rawBody, signature, secret, () =>
+    getParam(WEBHOOK_SECRET_PARAM, 0),
+  );
+  if (!verified) {
     // Record the rejection (best-effort): GitHub reaching us with a signature we can't
     // verify is the signature of a half-finished secret rotation, and the Settings screen
     // must be able to distinguish it from silence (spec 04 § webhook health).
@@ -96,6 +99,59 @@ export async function handler(
   } finally {
     await heartbeat;
   }
+}
+
+/**
+ * At most one uncached secret re-read per container per window. `/webhook` is public and the
+ * signature check is what rejects an anonymous caller, so an unthrottled re-read would let
+ * anyone drive an SSM `GetParameter` per request.
+ */
+const SECRET_RECHECK_MS = 30_000;
+let lastSecretRecheck = 0;
+
+/**
+ * Verify a delivery, tolerating an in-flight webhook-secret rotation (ADR-028).
+ *
+ * `getParam` caches for 5 minutes, so a WARM container keeps verifying against the PREVIOUS
+ * secret for up to that long after a relink rotated it — while GitHub already signs with the new
+ * one. GitHub does NOT retry a delivery that failed verification, so every `workflow_job` in that
+ * window would be silently lost, and the Settings screen would read `degraded` for a rotation
+ * that actually succeeded. One bounded uncached re-read closes the window; because it goes
+ * through `getParam(name, 0)` it also refreshes the container's cache, so subsequent deliveries
+ * verify on the first attempt.
+ *
+ * Guards, in order: an absent/malformed signature never triggers a re-read (nothing to rotate
+ * toward), the re-read is rate-bounded per container, a read fault degrades to rejection rather
+ * than a 5xx, and an unchanged value short-circuits. Exported for tests — `readFresh` is the
+ * uncached-read seam.
+ */
+export async function verifyWithRotation(
+  rawBody: string,
+  signature: string | undefined,
+  cachedSecret: string,
+  readFresh: () => Promise<string>,
+  now = Date.now(),
+): Promise<boolean> {
+  if (verifySignature(rawBody, signature, cachedSecret)) return true;
+  // Only a well-formed signature is worth a re-read; `verifySignature` requires the `sha256=`
+  // prefix, so mirror that check rather than spending a read on arbitrary junk.
+  if (!signature || !signature.startsWith('sha256=')) return false;
+  if (now - lastSecretRecheck < SECRET_RECHECK_MS) return false;
+  lastSecretRecheck = now;
+  let fresh: string;
+  try {
+    fresh = await readFresh();
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'webhook secret re-read failed', error: errMsg(err) }));
+    return false;
+  }
+  if (fresh === cachedSecret) return false;
+  return verifySignature(rawBody, signature, fresh);
+}
+
+/** Test hook: reset the re-read throttle. */
+export function _resetSecretRecheck(): void {
+  lastSecretRecheck = 0;
 }
 
 /** Route a signature-verified delivery to its handler. */

@@ -268,6 +268,7 @@ test('the App-config broker cannot launch compute or destroy data', () => {
     'dynamodb:PutItem',
     'dynamodb:DeleteItem',
     'dynamodb:Query',
+    'dynamodb:Scan',
   ]) {
     assert.equal(brokerActions.includes(forbidden), false, `broker granted ${forbidden}`);
   }
@@ -298,9 +299,10 @@ test('the broker is NOT concurrency-capped (that would serialize the polled read
   assert.equal(appcfg.Properties.ReservedConcurrentExecutions, undefined);
 });
 
-test("the broker's DynamoDB write is scoped to CONFIG# leading keys", () => {
-  // It writes audit rows + the config lock. Without a LeadingKeys condition an UpdateItem
-  // grant on the whole table could patch run rows or installation config.
+test("the broker's DynamoDB access is scoped to CONFIG# leading keys", () => {
+  // It writes audit rows + the config lock + the shared status-cache row, and READS that cache
+  // row. Without a LeadingKeys condition an UpdateItem/GetItem grant on the whole table could
+  // patch run rows or read installation config.
   const t = synthControl();
   const policies = Object.values(t.findResources('AWS::IAM::Policy')).filter((p) =>
     JSON.stringify(p.Properties.Roles ?? '').includes('AppConfigFnServiceRole'),
@@ -308,6 +310,8 @@ test("the broker's DynamoDB write is scoped to CONFIG# leading keys", () => {
   const stmts = policies.flatMap((p) => p.Properties.PolicyDocument.Statement);
   const ddb = stmts.find((s) => JSON.stringify(s.Action).includes('dynamodb:UpdateItem'));
   assert.ok(ddb, 'broker has no DynamoDB write grant');
+  const actions = Array.isArray(ddb.Action) ? ddb.Action : [ddb.Action];
+  assert.ok(actions.includes('dynamodb:GetItem'), 'broker cannot read the shared status cache');
   assert.deepEqual(ddb.Condition, {
     'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['CONFIG#*'] },
   });

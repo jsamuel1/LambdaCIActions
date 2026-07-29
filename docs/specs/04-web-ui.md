@@ -192,11 +192,21 @@ configured URL, so success exercises URL + TLS + secret agreement in one shot. T
 updating on the next poll is the confirmation.
 
 The App-JWT calls behind `status` (`GET /app`, `/app/installations`, `/app/hook/config`,
-`/app/hook/deliveries`) are **cached per broker container for 30 s**. That budget — 5,000
+`/app/hook/deliveries`) are cached for 30 s at **two** levels: in-memory per broker container,
+and in a shared `CONFIG#STATUS / LINKAGE` row. The shared row is what actually bounds the cost —
+`GET /api/settings` is readable by any authenticated session, and concurrent reads scale the
+broker out to containers whose in-memory caches are all cold. That budget — 5,000
 JWT-authenticated requests/hour — belongs to the whole App and is the same one Provision spends
-minting an installation token per job, so a polling console (or several open tabs) must not be
-able to starve run provisioning. Any mutation clears the cache in that container, so a relink or
-label change is never read back stale.
+minting an installation token per job, so a polling console (or an unprivileged poller) must not
+be able to starve run provisioning. Any mutation clears both levels, so a relink or label change
+is never read back stale; a DynamoDB fault on the cache path degrades to a live GitHub read.
+
+Rotating the webhook secret has one further consequence on the **inbound** side: `getParam`
+caches for 5 minutes, so a warm Ingest container would keep verifying against the previous secret
+while GitHub already signs with the new one — and GitHub does not retry a delivery that failed
+verification, so those `workflow_job` events would be lost silently. Ingest therefore re-reads
+the secret **uncached once** before rejecting a signed-but-unverified delivery, rate-bounded per
+container and skipped for an absent/malformed signature (`verifyWithRotation`).
 
 ### 4. Diagnostics (collapsed)
 

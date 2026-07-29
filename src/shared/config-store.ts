@@ -27,6 +27,8 @@ export const WEBHOOK_LAST_SK = 'LAST';
 export const AUDIT_PK = 'CONFIG#AUDIT';
 export const LOCK_PK = 'CONFIG#LOCK';
 export const LOCK_SK = 'PLATFORM';
+export const STATUS_PK = 'CONFIG#STATUS';
+export const STATUS_SK = 'LINKAGE';
 
 function requireDoc(): DynamoDBDocumentClient {
   if (!doc || !TABLE) {
@@ -232,6 +234,59 @@ export async function releaseConfigLock(holder: string): Promise<void> {
   } catch (err) {
     if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
   }
+}
+
+/**
+ * Shared (cross-container) cache of the verified App linkage.
+ *
+ * A per-container cache alone does not bound the GitHub spend: `GET /api/settings` is readable
+ * by ANY authenticated session (ADR-029 keeps it readable on purpose), each read invokes the
+ * broker, and concurrent reads scale the broker out to fresh containers whose caches are all
+ * cold. Since `status` costs four App-JWT calls against the App's 5,000/h budget — the same
+ * budget Provision spends minting an installation token per job — an unprivileged poller could
+ * otherwise starve job provisioning. This row makes the bound platform-wide instead of
+ * per-container.
+ *
+ * Stores the already-redacted linkage payload (the broker asserts `assertNoSecrets` on it before
+ * writing), so the row can hold no secret value.
+ */
+export async function getStatusCache<T>(
+  maxAgeMs: number,
+  now = Date.now(),
+): Promise<T | undefined> {
+  const res = await requireDoc().send(
+    new GetCommand({ TableName: TABLE, Key: { pk: STATUS_PK, sk: STATUS_SK } }),
+  );
+  const item = res.Item as { at?: unknown; payload?: unknown } | undefined;
+  if (!item || typeof item.at !== 'number' || item.payload === undefined) return undefined;
+  if (now - item.at >= maxAgeMs) return undefined;
+  return item.payload as T;
+}
+
+export async function putStatusCache<T>(payload: T, now = Date.now()): Promise<void> {
+  await requireDoc().send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { pk: STATUS_PK, sk: STATUS_SK },
+      // `at` is a DynamoDB reserved word (see appendAudit).
+      UpdateExpression: 'SET entity = :e, payload = :p, #at = :at',
+      ExpressionAttributeNames: { '#at': 'at' },
+      ExpressionAttributeValues: { ':e': 'CONFIG_STATUS', ':p': payload, ':at': now },
+    }),
+  );
+}
+
+/** Drop the shared cache so the next read re-verifies (called after any mutation). */
+export async function clearStatusCache(): Promise<void> {
+  await requireDoc().send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { pk: STATUS_PK, sk: STATUS_SK },
+      UpdateExpression: 'SET #at = :zero',
+      ExpressionAttributeNames: { '#at': 'at' },
+      ExpressionAttributeValues: { ':zero': 0 },
+    }),
+  );
 }
 
 /** Most recent config changes, newest first. */

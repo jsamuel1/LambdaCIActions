@@ -832,9 +832,27 @@ Three further consequences of that design, each pinned by a test:
 
 - **The App's JWT rate budget is shared with job provisioning.** `status` costs four
   App-JWT calls and the Settings screen polls it, while the same 5,000 requests/hour budget is
-  what Provision spends minting an installation token per job. `status` therefore caches its
-  answer per broker container for 30 s (poll interval is 15 s), and any mutation clears that
-  cache so a relink is never read back stale from the same warm container.
+  what Provision spends minting an installation token per job. `status` is therefore cached at
+  **two** levels for 30 s (poll interval is 15 s): in-memory per broker container, and — because
+  `GET /api/settings` is readable by ANY authenticated session (ADR-029) and concurrent reads
+  scale the broker out to containers whose in-memory caches are all cold — in a shared
+  `CONFIG#STATUS / LINKAGE` row, so the bound is platform-wide rather than per-container. The row
+  holds the already-redacted linkage payload (`assertNoSecrets` runs before the write and again
+  on read-back, since the row is treated as untrusted platform state). Any mutation clears both
+  levels, so a relink is never read back stale. A DynamoDB fault on either cache path degrades to
+  a live GitHub read rather than failing the screen. This is why the broker's `CONFIG#*`-scoped
+  DynamoDB grant includes `GetItem` alongside `UpdateItem`.
+- **Rotating the webhook secret has an Ingest cache window.** `getParam` caches for 5 minutes,
+  so a warm Ingest container keeps verifying against the PREVIOUS webhook secret for up to that
+  long after a relink rotated it — while GitHub already signs with the new one. GitHub does **not**
+  retry a delivery that failed verification, so every `workflow_job` in that window would be lost
+  silently, and Settings would report `degraded` for a rotation that actually succeeded. Ingest
+  therefore re-reads the secret **uncached once** before rejecting a signed-but-unverified
+  delivery (`verifyWithRotation`). That re-read is the one SSM call reachable before
+  authentication, so it is rate-bounded per container (30 s), skipped entirely for an
+  absent/malformed `sha256=` signature, short-circuited when the stored value is unchanged, and
+  degrades to rejection (never a 5xx) if the read faults. Pinned by
+  `test/ingest-secret-rotation.test.mjs`.
 - **Losing the config lock is retryable, not a rejection.** The broker returns `busy` and the
   management API answers **503 with `Retry-After`**, rather than the 422/502 a real credential or
   upstream failure gets. The lock holder is `actor:uuid`, not `actor:timestamp`: a
