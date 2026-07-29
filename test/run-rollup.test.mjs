@@ -12,6 +12,8 @@ import {
   runDurations,
   windowComplete,
   headSeamIntact,
+  seamAfterHop,
+  noSeam,
   jobRowKey,
   mergedResponseComplete,
   repoResponseComplete,
@@ -236,31 +238,71 @@ test('a drifted head/older seam makes an otherwise-exact window partial', () => 
 });
 
 test('the head/older seam holds only while the boundary row is still on the head page', () => {
-  // No older pages ⇒ no seam to break, whatever the head page looks like.
-  assert.equal(headSeamIntact({ headKeys: [], hasOlderPages: false }), true);
+  // Never paged past the head page ⇒ no seam to break, whatever the head page looks like.
+  assert.equal(headSeamIntact({ headKeys: [], pagedPastHead: false }), true);
   assert.equal(
-    headSeamIntact({ boundaryKey: undefined, headKeys: ['1-1-1'], hasOlderPages: false }),
+    headSeamIntact({ boundaryKey: undefined, headKeys: ['1-1-1'], pagedPastHead: false }),
     true,
   );
 
   // The boundary row (the head row directly above older[0]) is still loaded ⇒ adjacent.
   assert.equal(
-    headSeamIntact({ boundaryKey: '1-100-2', headKeys: ['1-101-1', '1-100-2'], hasOlderPages: true }),
+    headSeamIntact({ boundaryKey: '1-100-2', headKeys: ['1-101-1', '1-100-2'], pagedPastHead: true }),
     true,
   );
 
   // A newly queued job pushed the boundary row off the fixed-size head page: the row is in
   // neither half, so the window has a gap in the middle.
   assert.equal(
-    headSeamIntact({ boundaryKey: '1-100-2', headKeys: ['1-102-1', '1-101-1'], hasOlderPages: true }),
+    headSeamIntact({ boundaryKey: '1-100-2', headKeys: ['1-102-1', '1-101-1'], pagedPastHead: true }),
     false,
   );
 
-  // Older rows present but no boundary recorded ⇒ adjacency cannot be shown, so not exact.
+  // Paged past the head page but no boundary recorded ⇒ adjacency cannot be shown.
   assert.equal(
-    headSeamIntact({ boundaryKey: undefined, headKeys: ['1-101-1'], hasOlderPages: true }),
+    headSeamIntact({ boundaryKey: undefined, headKeys: ['1-101-1'], pagedPastHead: true }),
     false,
   );
+});
+
+test('a hop that appends no rows still arms the seam', () => {
+  // `collectVisible` can spend its page budget on other tenants' rows and hand back an empty
+  // page WITH a live cursor. Keying the seam off appended rows would leave that hop
+  // invisible: the boundary would then be recorded on the next hop, against a head snapshot
+  // the 5 s poll has already moved on, and a window with a real hole would read as exact.
+  const armed = seamAfterHop(noSeam, '1-100-2');
+  assert.equal(armed.pagedPastHead, true);
+  assert.equal(armed.boundaryKey, '1-100-2');
+  assert.equal(
+    headSeamIntact({ ...armed, headKeys: ['1-102-1', '1-101-1'] }),
+    false,
+    'the empty hop is still watched, so a shifted head page is caught',
+  );
+});
+
+test('the boundary is captured on the first hop and never re-recorded', () => {
+  // Later pages chain off stable index-position cursors, so the seam that can drift is the
+  // FIRST one. Re-recording it from a later (fresher) head snapshot would silently repair a
+  // window that really has a hole.
+  const first = seamAfterHop(noSeam, '1-100-2');
+  const second = seamAfterHop(first, '1-090-1');
+  assert.equal(second, first, 'same object: a later hop is a no-op');
+  assert.equal(second.boundaryKey, '1-100-2');
+});
+
+test('an empty head page at the first hop cannot prove adjacency', () => {
+  // No head row to anchor the seam to ⇒ unprovable, so the window stays partial rather than
+  // defaulting to exact.
+  const armed = seamAfterHop(noSeam, undefined);
+  assert.equal(armed.pagedPastHead, true);
+  assert.equal(armed.boundaryKey, undefined);
+  assert.equal(headSeamIntact({ ...armed, headKeys: ['1-101-1'] }), false);
+});
+
+test('noSeam is the untouched state: nothing paged, nothing to check', () => {
+  assert.equal(noSeam.pagedPastHead, false);
+  assert.equal(noSeam.boundaryKey, undefined);
+  assert.equal(headSeamIntact({ ...noSeam, headKeys: ['1-101-1'] }), true);
 });
 
 test('jobRowKey identifies the idempotency triple', () => {

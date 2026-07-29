@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Repo, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
-import { durationLabel, flavorLabel, groupRuns, headSeamIntact, jobRowKey, startedAtLabel, windowComplete, type RunGroup } from '../rollup.js';
+import { durationLabel, flavorLabel, groupRuns, headSeamIntact, jobRowKey, noSeam, seamAfterHop, startedAtLabel, windowComplete, type RunGroup, type SeamState } from '../rollup.js';
 import {
   Badge,
   CopyId,
@@ -68,14 +68,16 @@ export function Runs({
    */
   const [cursor, setCursor] = useState<string | null | undefined>(undefined);
   /**
-   * Key of the head row that sat directly above `older[0]` when the first older page was
-   * appended — the head/older seam. The head page is re-polled every 5 s while the older
-   * pages stay in state, and GSI2 is sorted by the immutable `createdAt`, so a newly queued
-   * job pushes a row off the bottom of the head page into a gap the older pages do not
-   * cover. While this key is still in the head page the two halves are adjacent; once it is
-   * gone the window has a hole and its rollups are only lower bounds (`headSeamIntact`).
+   * Head/older seam bookkeeping: whether a cursor has been walked off the live head page,
+   * and the key of the head row that sat directly above the first older row when it was.
+   * The head page is re-polled every 5 s while the older pages stay in state, and GSI2 is
+   * sorted by the immutable `createdAt`, so a newly queued job pushes a row off the bottom
+   * of the head page into a gap the older pages do not cover. While the boundary key is
+   * still in the head page the two halves are adjacent; once it is gone the window has a
+   * hole and its rollups are only bounds (`headSeamIntact`). Tracked per HOP rather than by
+   * appended row count: a hop can append nothing and still advance the cursor.
    */
-  const [boundaryKey, setBoundaryKey] = useState<string | undefined>(undefined);
+  const [seam, setSeam] = useState<SeamState>(noSeam);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreErr, setMoreErr] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
@@ -85,7 +87,7 @@ export function Runs({
     setOlder([]);
     setOlderComplete(true);
     setCursor(undefined);
-    setBoundaryKey(undefined);
+    setSeam(noSeam);
     setMoreErr(undefined);
   }, [repoFilter, status]);
 
@@ -114,9 +116,9 @@ export function Runs({
     // The polled head page and the held older pages are snapshots taken at different times,
     // so their join can silently lose a row when new jobs are queued.
     seamIntact: headSeamIntact({
-      boundaryKey,
+      boundaryKey: seam.boundaryKey,
       headKeys: headRows.map((r) => jobRowKey(r.repoId, r.runId, r.jobId)),
-      hasOlderPages: older.length > 0,
+      pagedPastHead: seam.pagedPastHead,
     }),
     // Absent `complete` (older API) ⇒ false: partial is the safe default. `olderComplete`
     // ANDs every appended page, since one page that dropped rows poisons the whole window.
@@ -128,6 +130,11 @@ export function Runs({
     if (!nextCursor) return;
     setLoadingMore(true);
     setMoreErr(undefined);
+    // The boundary must come from the SAME head snapshot the cursor was read from, so it is
+    // captured before the await rather than from whatever the 5 s poll has replaced it with
+    // by the time the response lands. `seamAfterHop` keeps the first hop's value.
+    const last = headRows[headRows.length - 1];
+    const headTailKey = last ? jobRowKey(last.repoId, last.runId, last.jobId) : undefined;
     try {
       const page = await api.runs({
         repo: repoFilter,
@@ -135,13 +142,11 @@ export function Runs({
         limit: PAGE,
         cursor: nextCursor,
       });
-      // Record the seam on the FIRST older page only: the row above it is the last head row
-      // at the moment of the append, and later pages chain off stable index cursors. Computed
-      // outside the state updater, which must stay a pure function of previous state.
-      if (!older.length) {
-        const last = headRows[headRows.length - 1];
-        setBoundaryKey(last ? jobRowKey(last.repoId, last.runId, last.jobId) : undefined);
-      }
+      // Every hop that moved the cursor counts, including one that appended no rows: a repo
+      // page can come back empty with a live cursor when `collectVisible` walked its page
+      // budget through other tenants' rows, and the head page is no longer adjacent to the
+      // resume point either way.
+      setSeam((prev) => seamAfterHop(prev, headTailKey));
       setOlder((prev) => [...prev, ...page.runs]);
       setOlderComplete((prev) => prev && (page.complete ?? false));
       setCursor(page.nextCursor);

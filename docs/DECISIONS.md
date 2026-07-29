@@ -908,7 +908,12 @@ every run row built from it is partial by construction.
   both still say exact. The client therefore remembers the key of the head row directly above
   the first older row and treats the window as partial once that row is no longer on the head
   page (`headSeamIntact`) — identity, not a row count, because the count is unchanged by the
-  shift. Re-fetching the whole appended history on every poll was rejected: it would multiply
+  shift. The seam is armed by the paging **hop**, not by the arrival of appended rows: a repo
+  page can come back empty with a live cursor when `collectVisible` spent its page budget on
+  another tenant's rows, and that hop moved the cursor off the head page just the same. It is
+  also captured from the head snapshot the cursor was read from, before the request, so the
+  recorded row and the resume point belong to one snapshot. Re-fetching the whole appended
+  history on every poll was rejected: it would multiply
   the 5 s read cost by the number of pages walked to fix a case the operator resolves by
   reloading.
   Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor

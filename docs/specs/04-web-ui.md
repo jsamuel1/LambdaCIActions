@@ -87,7 +87,10 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   while appended older pages stay in state, and GSI2 sorts on the immutable `createdAt`, so a
   newly queued job pushes a row off the bottom of the head page into a gap the older pages
   start below. The client remembers the key of the head row directly above the first older row
-  and marks the window partial once it is gone (`headSeamIntact`). Whole runs are folded only
+  and marks the window partial once it is gone (`headSeamIntact`). The seam is armed by the
+  paging **hop** rather than by appended rows — an empty page with a live cursor still moved
+  the cursor off the head page — and the boundary is captured from the head snapshot the
+  cursor was read from. Whole runs are folded only
   when `complete` held for every loaded page, the cursor is exhausted, and the seam is intact;
   otherwise every run in the window is badged `partial` and its status, job count, flavor,
   durations and start time render as bounds rather than facts. A repo-filtered page drops nothing, so paging it to the end

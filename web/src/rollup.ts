@@ -16,6 +16,8 @@ export {
   runDurations,
   windowComplete,
   headSeamIntact,
+  seamAfterHop,
+  noSeam,
   jobRowKey,
   groupRuns,
   runGroupKey,
@@ -24,4 +26,5 @@ export {
   type FlavorRollup,
   type RunDurations,
   type WindowShape,
+  type SeamState,
 } from '../../src/mgmt/run-rollup.js';

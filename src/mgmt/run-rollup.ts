@@ -270,17 +270,51 @@ export function windowComplete(w: WindowShape): boolean {
  * Once it is gone the window is treated as partial. Only this one seam can drift — the older
  * pages chain off opaque index-position cursors, which are stable.
  *
- * With no older pages there is no seam and nothing to check.
+ * The trigger is `pagedPastHead` — *has the client walked a cursor off the head page?* — and
+ * deliberately NOT "are there appended rows". A hop can append nothing and still move the
+ * cursor: `collectVisible` walks up to `MAX_FILTER_PAGES` index pages and returns an empty
+ * page with a live cursor when they held only other tenants' rows. Keying off the appended
+ * row count would leave that hop invisible, so the boundary would be recorded later against
+ * a FRESHER head snapshot than the cursor it belongs to, and a window with a genuine hole
+ * would report exact. See `seamAfterHop`.
  */
 export function headSeamIntact(input: {
   boundaryKey?: string;
   headKeys: string[];
-  hasOlderPages: boolean;
+  pagedPastHead: boolean;
 }): boolean {
-  if (!input.hasOlderPages) return true;
-  // Older rows appended without a recorded boundary: adjacency cannot be shown.
+  if (!input.pagedPastHead) return true;
+  // Paged past the head page without a recorded boundary: adjacency cannot be shown.
   if (!input.boundaryKey) return false;
   return input.headKeys.includes(input.boundaryKey);
+}
+
+/** Head/older seam bookkeeping, advanced by `seamAfterHop` on every "Load older" hop. */
+export interface SeamState {
+  /** True once a cursor has been walked off the live head page — even by an empty hop. */
+  pagedPastHead: boolean;
+  /**
+   * Key of the head row directly above the first older row, captured on the hop that left
+   * the head page. `undefined` when that head snapshot was empty, which `headSeamIntact`
+   * treats as unprovable (partial) rather than as intact.
+   */
+  boundaryKey?: string;
+}
+
+export const noSeam: SeamState = { pagedPastHead: false };
+
+/**
+ * Advance the seam state for one "Load older" hop.
+ *
+ * The boundary is captured on the FIRST hop only, from the head snapshot the cursor was read
+ * from — those two must be the same snapshot or the recorded row does not sit where the
+ * cursor resumes. Later hops chain off stable index-position cursors, so they neither move
+ * nor re-record it. A hop that appends no rows still counts: it advanced the cursor, so the
+ * head page is no longer adjacent to the resume point and the seam must be watched from here.
+ */
+export function seamAfterHop(prev: SeamState, headTailKey: string | undefined): SeamState {
+  if (prev.pagedPastHead) return prev;
+  return { pagedPastHead: true, boundaryKey: headTailKey };
 }
 
 /** Per-job identity used for de-duplication and for the head/older seam check. */
