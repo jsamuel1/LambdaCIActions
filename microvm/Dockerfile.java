@@ -63,9 +63,11 @@ RUN mkdir -p ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/a
     && rm -rf /tmp/jdk /tmp/jdk.tar.gz \
     # Fail the BUILD (not a job) if the layout is wrong.
     && ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64/bin/java -version
-# Make the cached JDK the default so plain `java`/`javac`/`mvn` steps work with no setup-*
+# Make the cached JDK the default so plain `java`/`javac` steps work with no setup-*
 # action at all. setup-java sets these itself when it runs; these are the no-action defaults.
-ENV JAVA_HOME=/opt/hostedtoolcache/Java_temurin_jdk/21.0.12-8/arm64
+# Derived from the pins rather than repeated as a literal — a hardcoded copy silently points
+# at a nonexistent directory the moment JDK_VERSION/JDK_BUILD is bumped.
+ENV JAVA_HOME=${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64
 ENV PATH=${JAVA_HOME}/bin:$PATH
 # ----------------------------------------------------------------------------------------
 

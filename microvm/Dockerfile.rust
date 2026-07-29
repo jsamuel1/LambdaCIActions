@@ -30,7 +30,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
     AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
     # Shared, world-readable rustup/cargo so the toolchain is baked into the snapshot rather
-    # than re-resolved per job into the runner's home.
+    # than re-resolved per job into the runner's home. RUSTUP_HOME stays here at RUNTIME (the
+    # toolchain is read-only shared state); CARGO_HOME does NOT — see the runtime override at
+    # the bottom of this file.
     RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo
 
@@ -50,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- rust flavor extras -----------------------------------------------------------------
 # Install rustup non-interactively with the toolchain PINNED (not `stable`), plus the two
 # components CI almost always wants. `--profile minimal` keeps the snapshot down (no docs).
+# `--component` takes ONE value per occurrence — `--component clippy rustfmt` makes rustup-init
+# exit with "unexpected argument 'rustfmt' found" and fails the image build. Repeat the flag.
 RUN mkdir -p ${RUSTUP_HOME} ${CARGO_HOME} \
     && curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/rustup-init.sh \
     && sh /tmp/rustup-init.sh -y \
@@ -57,13 +61,14 @@ RUN mkdir -p ${RUSTUP_HOME} ${CARGO_HOME} \
          --profile minimal \
          --default-toolchain ${RUST_VERSION} \
          --default-host aarch64-unknown-linux-gnu \
-         --component clippy rustfmt \
+         --component clippy \
+         --component rustfmt \
     && rm /tmp/rustup-init.sh \
     && chmod -R a+rX /opt/rust \
     # Fail the BUILD (not a job) if the toolchain did not land.
     && ${CARGO_HOME}/bin/rustc --version \
     && ${CARGO_HOME}/bin/cargo --version
-ENV PATH=/opt/rust/cargo/bin:$PATH
+# NOTE: PATH is set once, after the runner user exists — see the CARGO_HOME override below.
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
@@ -83,9 +88,23 @@ COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
 # world-readable: a job can USE the toolchain but a compromised job can't poison it for the
 # (single-use, but still) VM. `rustup toolchain add` in a job needs a writable RUSTUP_HOME,
 # so a job that installs an extra toolchain must set its own — documented in spec 02.
+#
+# ${RUNNER_TOOL_CACHE} must be CREATED before it is chowned: this flavor bakes no tool-cache
+# entry (rustup owns the toolchain), so nothing above has made the directory and `chown -R`
+# on a missing path fails the image build outright.
 RUN useradd -m -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && mkdir -p ${RUNNER_TOOL_CACHE} \
     && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE}
+
+# CARGO_HOME must be WRITABLE at runtime. The build-time value above (/opt/rust/cargo) is
+# root-owned so a job cannot poison the shared toolchain — but cargo also writes the registry
+# index, crate cache and any `cargo install` binaries into CARGO_HOME, so leaving it there
+# makes every dependency fetch fail with "failed to download replaced source registry
+# `crates-io`: Permission denied (os error 13)". Point it at the runner's home and keep
+# /opt/rust/cargo/bin on PATH for the baked rustup shims.
+ENV CARGO_HOME=/home/runner/.cargo
+ENV PATH=/opt/rust/cargo/bin:/home/runner/.cargo/bin:$PATH
 
 USER runner
 WORKDIR ${RUNNER_DIR}

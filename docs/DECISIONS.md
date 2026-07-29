@@ -949,6 +949,17 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
+> **MERGE BLOCKER — ADR numbering collision.** The four ADRs below (030..033) are also claimed,
+> with entirely different subjects, by the concurrent branch `kermes/task-tidal-hawk`
+> ("M5: drop-in adopt mode, opt-in rewrite PR, observability, dev/prod split" — its 030 is
+> adopt-mode label claiming, 031 the auto-rewrite PR, 032 EMF metrics, 033 the per-environment
+> config module). Neither branch has landed. ADR numbers are a shared mutable namespace, so
+> **whichever of the two lands second must renumber its block** — headers, every in-repo
+> cross-reference, and the `#adr-0NN` anchors — rather than both shipping a duplicate number.
+> `kermes/task-nervous-mountain` holds 034/035, `kermes/task-admiring-beetle` 036 and
+> `kermes/task-bouncing-toad` 037, so the next free range is 038+. Not renumbered here: the
+> correct target depends on landing order, and churning a guess would just move the collision.
+
 ## ADR-030 — Flavor `vcpu` is descriptive; only `minimumMemoryInMiB` is requestable (M5)
 **Status**: Accepted (v1) · corrects the flavor-size claims in [spec 02](specs/02-microvm-runners.md) and the cost model in [spec 04](specs/04-web-ui.md)
 **Context**: `microvm/flavors.json` carries `vcpu` + `memoryMb` per flavor, spec 02's flavor

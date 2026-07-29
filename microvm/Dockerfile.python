@@ -62,8 +62,10 @@ RUN mkdir -p ${RUNNER_TOOL_CACHE} /tmp/py \
     && test -f ${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64.complete \
     && ${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64/bin/python3 --version
 # Put the cached interpreter on PATH so plain `python3`/`pip3` steps work with no setup-*
-# action at all (a job that just runs `python3 -m pytest` should not need one).
-ENV PATH=/opt/hostedtoolcache/Python/3.12.13/arm64/bin:$PATH
+# action at all (a job that just runs `python3 -m pytest` should not need one). Derived from
+# ${PYTHON_VERSION} rather than repeated as a literal — a hardcoded copy silently points at a
+# nonexistent directory the moment the pin is bumped.
+ENV PATH=${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64/bin:$PATH
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.

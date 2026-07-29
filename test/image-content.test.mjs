@@ -295,6 +295,87 @@ test('every flavor pins the same runner agent version', () => {
   assert.ok(!versions.has(undefined), 'a flavor Dockerfile has no pinned RUNNER_VERSION');
 });
 
+test('no flavor chowns a directory nothing created (image build would fail)', () => {
+  // `chown -R` on a missing path is a hard, non-obvious image-build failure: the rust flavor
+  // bakes no tool-cache entry, so nothing else in that Dockerfile creates
+  // ${RUNNER_TOOL_CACHE} and the final chown aborted the build. Every chowned path must be
+  // created earlier in the same Dockerfile.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    const df = read(flavor.dockerfile);
+    const chowned = new Set(
+      [...df.matchAll(/chown -R runner:runner ([^\n\\]+)/g)].flatMap((m) => m[1].trim().split(/\s+/)),
+    );
+    const made = [...df.matchAll(/mkdir -p ([^\n\\]+)/g)].flatMap((m) =>
+      m[1].trim().split(/\s+/),
+    );
+    for (const target of chowned) {
+      // A mkdir of a SUBPATH also creates the parent, so a prefix match counts.
+      assert.ok(
+        made.some((m) => m === target || m.startsWith(`${target}/`)),
+        `${flavor.dockerfile}: chowns '${target}' but never mkdir -p's it (or a subpath) — the ` +
+          `build fails with "chown: cannot access ...: No such file or directory"`,
+      );
+    }
+  }
+});
+
+test('rustup-init passes one --component per occurrence', () => {
+  // rustup-init's clap parser takes a SINGLE value per --component: `--component clippy rustfmt`
+  // exits with "unexpected argument 'rustfmt' found" and fails the image build. Verified against
+  // a real rustup-init run.
+  const df = read('Dockerfile.rust');
+  // Comment lines document the wrong form on purpose — only inspect real instructions.
+  const instructions = df
+    .split('\n')
+    .filter((l) => !/^\s*#/.test(l))
+    .join('\n');
+  const components = [...instructions.matchAll(/--component[ \t]+([^\s\\]+)([ \t]+[^\s\\-][^\s\\]*)?/g)];
+  assert.ok(components.length >= 2, 'rust must install clippy + rustfmt');
+  for (const m of components) {
+    assert.equal(
+      m[2],
+      undefined,
+      `--component takes one value per flag; found a second bare value '${m[2]?.trim()}'`,
+    );
+  }
+});
+
+test('the rust flavor gives the job a WRITABLE CARGO_HOME', () => {
+  // The baked toolchain lives in a root-owned /opt/rust so a job cannot poison it, but cargo
+  // ALSO writes the registry index + crate cache into CARGO_HOME. Left pointing at
+  // /opt/rust/cargo, every dependency fetch fails with "failed to download replaced source
+  // registry `crates-io`: Permission denied (os error 13)" — verified in a container as the
+  // unprivileged runner user. The final CARGO_HOME must be under the runner's home.
+  const df = read('Dockerfile.rust');
+  const values = [...df.matchAll(/^ *(?:ENV )?CARGO_HOME=(\S+)/gm)].map((m) => m[1]);
+  assert.ok(values.length >= 1, 'rust must set CARGO_HOME');
+  assert.match(
+    values[values.length - 1],
+    /^\/home\/runner\//,
+    'the effective (last) CARGO_HOME must be writable by the runner user',
+  );
+  // ...and the baked rustup shims must stay reachable.
+  assert.match(df, /PATH=\/opt\/rust\/cargo\/bin:/);
+});
+
+test('tool-cache paths are derived from the version pin, never a repeated literal', () => {
+  // A hardcoded GOROOT/JAVA_HOME/PATH copy of the pinned version silently points at a
+  // nonexistent directory the moment the ARG above it is bumped — the image still builds and
+  // the flavor ships with a broken default toolchain.
+  for (const name of TOOLCACHE_FLAVORS) {
+    const df = read(`Dockerfile.${name}`);
+    for (const line of df.split('\n')) {
+      if (!/hostedtoolcache/.test(line) || /^\s*#/.test(line)) continue;
+      assert.doesNotMatch(
+        line,
+        /hostedtoolcache\/[A-Za-z_]+\/\d+\.\d+/,
+        `${name}: hardcoded toolchain version in '${line.trim()}' — derive it from the ARG`,
+      );
+    }
+  }
+});
+
 test('the catalog memory values are plausible microVM requests', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {

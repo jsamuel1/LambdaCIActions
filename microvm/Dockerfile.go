@@ -58,7 +58,9 @@ RUN mkdir -p ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64 \
     && ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64/bin/go version
 # Put the cached toolchain on PATH so plain `go build`/`go test` steps work with no setup-*
 # action at all. GOPATH lives under the runner's home so a job can write modules without sudo.
-ENV GOROOT=/opt/hostedtoolcache/go/1.25.12/arm64 \
+# GOROOT is derived from ${GO_VERSION} rather than repeated as a literal — a hardcoded copy
+# silently points at a nonexistent directory the moment the pin is bumped.
+ENV GOROOT=${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64 \
     GOPATH=/home/runner/go
 ENV PATH=${GOROOT}/bin:${GOPATH}/bin:$PATH
 # ----------------------------------------------------------------------------------------

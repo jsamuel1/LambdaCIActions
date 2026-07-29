@@ -61,7 +61,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
 | `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
 | `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
-| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-032/031) |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-032/033) |
 
 † descriptive only — see the sizing note above.
 
@@ -108,8 +108,12 @@ reimplementing the layout, symlinks and marker by hand.
 `rust` has **no** tool-cache entry on purpose: there is no first-party `setup-rust` that reads
 the runner tool cache; the ecosystem standard (`dtolnay/rust-toolchain`) drives **rustup**,
 which manages its own store. That flavor bakes rustup + the pinned toolchain onto `PATH`
-instead. A job that needs an *additional* rustup toolchain must set a writable `RUSTUP_HOME`
-(the baked one is root-owned and world-readable).
+instead. The baked toolchain in `/opt/rust` is root-owned and world-readable so a job cannot
+poison it, so a job that installs an *additional* rustup toolchain must set its own writable
+`RUSTUP_HOME`. `CARGO_HOME`, by contrast, is pointed at the runner's home at runtime
+(`/home/runner/.cargo`): cargo writes the registry index and crate cache there, so leaving it
+under root-owned `/opt/rust` fails every dependency fetch with `Permission denied (os error
+13)`.
 
 Toolchain versions are **pinned** in each Dockerfile so rebuilds are reproducible — which
 makes them a patch-day obligation: a stale pin ages silently.
