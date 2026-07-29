@@ -17,6 +17,17 @@ const PAGE = 50;
 const COLS = 6;
 
 /**
+ * Duration with a lower-bound marker on a partial window. `formatDuration` renders a
+ * zero/unknown duration as an em dash, and `≥ —` is nonsense — "at least unknown" — so the
+ * marker is only attached to an actual figure. A run whose jobs are all still queued has no
+ * elapsed span yet, partial or not.
+ */
+function lowerBound(seconds: number, partial: boolean): string {
+  const text = formatDuration(seconds);
+  return partial && seconds > 0 ? `≥ ${text}` : text;
+}
+
+/**
  * Runs — run-primary history (spec 04 § Runs). The store is per JOB, so job rows are folded
  * into run rows by `src/mgmt/run-rollup.ts` (fold rules + partial semantics: ADR-029) and
  * expanded on demand.
@@ -261,10 +272,7 @@ function RunRows({
           </span>
         </td>
         <td>{flavorLabel(group.flavor, group.partial)}</td>
-        <td>
-          {group.partial ? '≥ ' : ''}
-          {formatDuration(durations.wallClockSeconds)}
-        </td>
+        <td>{lowerBound(durations.wallClockSeconds, group.partial)}</td>
         <td>{formatTime(group.startedAt)}</td>
       </tr>
       {open && (
@@ -276,8 +284,8 @@ function RunRows({
                 : 'jobs'}
             </td>
             <td className="jobs-head" colSpan={COLS - 1}>
-              wall clock {formatDuration(durations.wallClockSeconds)} · job time{' '}
-              {formatDuration(durations.jobTimeSeconds)}
+              wall clock {lowerBound(durations.wallClockSeconds, group.partial)} · job time{' '}
+              {lowerBound(durations.jobTimeSeconds, group.partial)}
               {group.partial ? ' (lower bounds)' : ''}
             </td>
           </tr>

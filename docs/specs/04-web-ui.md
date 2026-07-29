@@ -69,7 +69,9 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   which answers "how long did the run take". The **sum of job durations** appears on expand as
   **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
   time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
-  basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point.
+  basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point. On a
+  partial window a duration renders as `≥ 4m 10s`; a run with no elapsed span yet keeps the
+  plain em dash, since `≥ —` would read as "at least unknown".
 - **Partial rollups** — grouping is client-side over an index **page**, so a run's jobs can
   straddle the page boundary. Completeness is therefore two halves. `GET /api/runs` returns
   **`complete`**, the server's answer to *were any job rows dropped from this response?* — it
@@ -84,8 +86,12 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   `complete: false` (including alongside `repo=`, where it applies as a post-query predicate) —
   the screen says so inline.
 - **Ids** — run/job ids are small dim text at the end of their column with a copy button
-  (`CopyId`): an accessible label, a polite live region for the copied state, and
-  `stopPropagation` so copying does not trigger the row's navigation.
+  (`CopyId`): an accessible label, a polite live region for both the copied and the
+  could-not-copy outcome, and `stopPropagation` so copying does not trigger the row's
+  navigation. The button is rendered only when `navigator.clipboard` exists (it needs a secure
+  context — HTTPS-only in production per ADR-024, absent on a plain-HTTP dev origin), because a
+  control that does nothing when pressed is worse than none: the id is on screen and selectable
+  regardless.
 - **Expansion survives polling** — expansion is component state keyed `repoId-runId`, so the
   5 s poll re-renders rows without collapsing an open run.
 - **No cost column.** Cost belongs on a Reports screen with a time window and grouping, not on

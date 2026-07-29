@@ -63,44 +63,56 @@ export function ErrorBox({ message }: { message: string }): JSX.Element {
  *
  * The button lives inside a clickable table row, so it must stop propagation — otherwise
  * copying an id also navigates away from the list. Accessibility: the button carries an
- * explicit `aria-label` (its glyph is decorative) and the copied state is announced through
- * a polite live region rather than colour alone.
+ * explicit `aria-label` (its glyph is decorative) and the outcome is announced through a
+ * polite live region rather than colour alone.
+ *
+ * The button is only rendered when the Clipboard API is actually available. `navigator.
+ * clipboard` needs a secure context — the console is HTTPS-only behind CloudFront
+ * (ADR-024), but a plain-HTTP dev origin leaves it undefined — and a button that silently
+ * does nothing when pressed is worse than no button: the id itself is on screen and
+ * selectable either way. A *rejected* write (denied permission) is different: the press was
+ * real, so it is reported in the same live region instead of being swallowed.
  */
 export function CopyId({ label, value }: { label: string; value: string }): JSX.Element {
-  const [copied, setCopied] = useState(false);
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
+  const supported = typeof navigator !== 'undefined' && !!navigator.clipboard?.writeText;
+
   async function copy(): Promise<void> {
+    let next: 'copied' | 'failed';
     try {
-      // `navigator.clipboard` needs a secure context; the console is HTTPS-only behind
-      // CloudFront (ADR-024), but a plain-HTTP dev origin would leave it undefined.
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
-      else return;
-      setCopied(true);
-      window.clearTimeout(timer.current);
-      timer.current = window.setTimeout(() => setCopied(false), 1500);
+      await navigator.clipboard.writeText(value);
+      next = 'copied';
     } catch {
-      // A denied clipboard permission is not worth an error banner — the id is on screen.
+      // Not worth an error banner — the id is on screen and can be selected by hand.
+      next = 'failed';
     }
+    setState(next);
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setState('idle'), 1500);
   }
 
   return (
     <span className="idcell">
       <span className="muted mono">{value}</span>
-      <button
-        type="button"
-        className="copy"
-        aria-label={`Copy ${label} ${value}`}
-        onClick={(e) => {
-          e.stopPropagation();
-          void copy();
-        }}
-      >
-        <span aria-hidden="true">{copied ? '✓' : '⧉'}</span>
-      </button>
+      {supported && (
+        <button
+          type="button"
+          className="copy"
+          aria-label={`Copy ${label} ${value}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            void copy();
+          }}
+        >
+          <span aria-hidden="true">{state === 'copied' ? '✓' : '⧉'}</span>
+        </button>
+      )}
       <span className="sronly" role="status" aria-live="polite">
-        {copied ? `${label} ${value} copied` : ''}
+        {state === 'copied' ? `${label} ${value} copied` : ''}
+        {state === 'failed' ? `Could not copy ${label} ${value}` : ''}
       </span>
     </span>
   );
