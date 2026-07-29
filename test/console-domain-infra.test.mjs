@@ -179,6 +179,40 @@ test('the security posture is unchanged by the alias (ADR-024 invariants hold)',
   assert.equal(cfg.DefaultCacheBehavior.ViewerProtocolPolicy, 'redirect-to-https');
 });
 
+test('an apex hostname puts the alias records AT the apex (recordName omitted)', () => {
+  // `LCA_CONSOLE_DOMAIN=example.com` is accepted by the resolver, so the `recordName ===
+  // zoneName ? undefined` branch in WebStack is reachable in production. Passing the apex as
+  // a recordName would create `example.com.example.com`, which resolves to nothing.
+  const APEX = {
+    hostname: 'example.com',
+    origin: 'https://example.com',
+    hostedZoneId: DOMAIN.hostedZoneId,
+    zoneName: 'example.com',
+  };
+  const app = new App();
+  const cert = new CertStack(app, 'Cert', {
+    env: { account: ACCOUNT, region: 'us-east-1' },
+    envName: 'prod',
+    domain: APEX,
+  });
+  const t = Template.fromStack(
+    new WebStack(app, 'Web', {
+      env: { account: ACCOUNT, region: 'us-west-2' },
+      envName: 'prod',
+      apiHost: 'abc.execute-api.us-west-2.amazonaws.com',
+      domain: APEX,
+      certificate: cert.certificate,
+    }),
+  );
+  const records = Object.values(t.findResources('AWS::Route53::RecordSet'));
+  assert.equal(records.length, 2, 'apex still gets exactly A + AAAA');
+  for (const r of records) {
+    assert.equal(r.Properties.Name, 'example.com.');
+    assert.ok(r.Properties.AliasTarget, 'apex must be an alias record, not a CNAME (illegal at apex)');
+  }
+  assert.deepEqual(distributionConfig(t).Aliases, ['example.com']);
+});
+
 test('the OAuth callback URL is emitted as an output for the browser-only GitHub edit', () => {
   const outputs = withDomain().template.findOutputs('*');
   const callback = Object.values(outputs).find(

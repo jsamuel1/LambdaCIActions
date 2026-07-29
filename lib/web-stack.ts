@@ -136,6 +136,11 @@ export class WebStack extends Stack {
           referrerPolicy: cloudfront.HeadersReferrerPolicy.SAME_ORIGIN,
           override: true,
         },
+        // `includeSubdomains` is scoped to whatever host serves the shell. On the derived
+        // vanity scheme (`<env>.lambdaciactions.<zone>` / `lambdaciactions.<zone>`) that is a
+        // dedicated project label, so the directive only ever covers console hosts. On an
+        // apex `LCA_CONSOLE_DOMAIN` override it would pin the WHOLE zone to HTTPS for a year
+        // in every browser that loads the console — see ADR-036's apex caveat.
         strictTransportSecurity: {
           accessControlMaxAge: Duration.days(365),
           includeSubdomains: true,

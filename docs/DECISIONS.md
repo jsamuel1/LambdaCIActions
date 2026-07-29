@@ -650,7 +650,9 @@ the API behind CloudFront's TLS + edge termination for free.
 public origin, so the first deploy is **two-pass**: deploy `LCA-Web-<env>`, then re-deploy
 `LCA-Mgmt-<env>` with `-c publicOrigin=https://<domain>` (docs/DEPLOY-M4.md). We
 deliberately do NOT default `publicOrigin` to a guess — a wrong value is an open-redirect
-target, so login fails loudly (500) until it is set. Custom domains + ACM are M5.
+target, so login fails loudly (500) until it is set. Custom domains + ACM shipped in M5 —
+[ADR-036](#adr-036) makes the origin config-derived and removes the two-pass deploy for any
+env with a vanity domain configured; the two-pass path above still applies with none.
 
 ## ADR-025 — Management-plane IAM: read-mostly, config-write-only, no compute (M4)
 **Status**: Accepted (v1)
@@ -1020,6 +1022,15 @@ fails at `cdk deploy` on the distribution update, *after* the cert has been issu
 - Existing sessions do not survive the origin flip: the session cookie is scoped to the old
   host, so operators re-authenticate once. That is the same revocation lever as rotating the
   session secret (ADR-022), not a new failure mode.
+- **Apex override caveat**: `LCA_CONSOLE_DOMAIN` may name the zone apex (`example.com`), and
+  the alias records are then created at the apex (`recordName: undefined`). Two consequences
+  the derived scheme does not have: (a) the console's HSTS header carries
+  `includeSubdomains` with a one-year max-age, so serving the console at the apex pins
+  **every** host in that zone to HTTPS in any browser that has loaded it — including
+  unrelated subdomains; (b) an apex zone typically already carries other records. The derived
+  scheme puts the console under its own `lambdaciactions` label precisely so the HSTS scope
+  and the record namespace stay inside the console's own subtree. Use an apex override only
+  for a zone dedicated to this console.
 - `test/console-domain.test.mjs` pins the scheme + the refuse-on-partial-config behavior;
-  `test/console-domain-infra.test.mjs` pins the us-east-1 assertion, the A+AAAA pair, and
-  the no-domain fallback (no alias, no cert, no records).
+  `test/console-domain-infra.test.mjs` pins the us-east-1 assertion, the A+AAAA pair, the
+  apex-override record shape, and the no-domain fallback (no alias, no cert, no records).
