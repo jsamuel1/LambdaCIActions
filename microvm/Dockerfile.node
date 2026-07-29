@@ -21,6 +21,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Common toolchain + the runner agent's runtime deps. Node is needed both for the
 # run-hook server and for the GitHub Actions runner's node-based actions.
+# `awscli` is apt's aws-cli **v1** — the CLI ADR-028 measures the cold boot cost against.
+# See Dockerfile.base for why v1 is correct here and what to re-check before changing it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo \
       libicu70 lsb-release awscli \

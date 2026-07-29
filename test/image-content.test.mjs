@@ -135,3 +135,40 @@ test('every flavor Dockerfile is arm64-only (AGENTS.md hard rule)', () => {
     assert.doesNotMatch(df, /arch=amd64|linux\/amd64|x86_64\.tar\.gz/, `${flavor.dockerfile} has an x86 artifact`);
   }
 });
+
+// ADR-028 sizes the boot broker budget against the COLD start of the CLI the GUEST runs, and
+// its pre-warm decides `warmed` by matching that CLI's botocore connect-error wording. Both are
+// empirical facts about a specific binary: apt's `awscli` on Ubuntu 22.04, i.e. aws-cli v1
+// (1.22.34 / botocore 1.23.34) — NOT the deploy host's v2. The >=2.35.17 floor in spec 05 is a
+// deployer requirement (it needs the `lambda-microvms` service model); the guest only calls
+// plain `lambda invoke`, which v1 has.
+//
+// So pin the provenance: swapping the guest to CLI v2, or to a base image whose apt `awscli` is
+// a different major, silently invalidates the measured 6 s-vs-15 s budget AND the `warmed`
+// regex. Neither failure is visible at build time — a mismatched regex just reports
+// `warmed:false` forever, and an unmeasured cold cost is exactly how the original zero-margin
+// budget shipped. Fail here instead, so the change comes with a re-measurement.
+test('flavors install the apt awscli that ADR-028 measured, not a swapped-in CLI v2', () => {
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    const df = read(flavor.dockerfile);
+    assert.match(
+      df,
+      /^\s+libicu70 lsb-release awscli \\$/m,
+      `${flavor.dockerfile} must install the apt awscli package (ADR-028 measured aws-cli v1)`,
+    );
+    // A v2 install is the specific swap that would invalidate the budget + the warmed regex.
+    assert.doesNotMatch(
+      df,
+      /awscli-exe-linux|awscliv2|aws\/install/,
+      `${flavor.dockerfile} installs AWS CLI v2 — re-measure the ADR-028 cold cost and the ` +
+        'prewarm warmed regex before allowing this',
+    );
+    // ...and the reason must travel with the line, or the next reader deletes it as noise.
+    assert.match(
+      df,
+      /aws-cli \*\*v1\*\*/,
+      `${flavor.dockerfile} must state why apt awscli (v1) is deliberate — see ADR-028`,
+    );
+  }
+});

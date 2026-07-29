@@ -35,6 +35,14 @@ will fail at the image-build step. Minimum versions:
 | Node.js | ≥ 18 | Bootstrap scripts use built-ins only. |
 | CDK v2 | ≥ 2.113 | App is CDK v2 TypeScript. |
 
+These floors apply to the **deployer** — the host running `cdk deploy` / `npm run
+build:images`, which calls the `lambda-microvms` API. They do **not** apply inside the runner
+images: the guest only ever calls `lambda invoke` (the hook broker, ADR-021), so all three
+flavors ship Ubuntu 22.04's apt `awscli` — aws-cli **v1** (1.22.34 / botocore 1.23.34) — and
+that is sufficient. It is, however, the CLI whose **cold start** sizes the boot broker budget
+and whose botocore error wording the pre-warm's `warmed` check matches ([ADR-028](../DECISIONS.md)),
+so re-measure both before changing the guest CLI or base image.
+
 **Check before deploying:**
 ```bash
 aws --version                       # want ≥ 2.35.17
