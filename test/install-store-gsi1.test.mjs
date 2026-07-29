@@ -167,6 +167,35 @@ test('a lost repair race is not an error (idempotent conditional write)', async 
   assert.equal(out.length, 1);
 });
 
+test('an already-indexed row reached by reconcile is returned but never rewritten', async () => {
+  // A truncated/eventually-consistent index page can put an already-stamped row in the
+  // candidate set. Repairing it would be a pointless conditional write per poll.
+  const out = await reconcileInstallations([], [11], {
+    get: async () => install({ installationId: 11, gsi1pk: 'INSTALLS', gsi1sk: 'mine' }),
+    repair: async () => {
+      throw new Error('must not repair an already-indexed row');
+    },
+  });
+  assert.equal(out.length, 1, 'the row is still surfaced to the console');
+  assert.equal(out[0].installationId, 11);
+});
+
+test('a row with no accountLogin is surfaced but not stamped with an undefined sort key', async () => {
+  // `gsi1sk` IS the account login; writing it undefined would fail the write (or index the
+  // row under a meaningless key). The backfill script skips the same case.
+  const out = await reconcileInstallations([], [11], {
+    get: async () => {
+      const row = install({ installationId: 11 });
+      delete row.accountLogin;
+      return row;
+    },
+    repair: async () => {
+      throw new Error('must not repair a row with no accountLogin');
+    },
+  });
+  assert.equal(out.length, 1);
+});
+
 test('reconcile cannot widen authorization beyond the session grants', async () => {
   // The handler passes session grants as candidates AND filters the result. A row recovered
   // for a foreign id would still be dropped — but it must never be fetched in the first place.

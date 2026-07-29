@@ -184,13 +184,15 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - **Least privilege**: read-mostly. `dynamodb:UpdateItem` is the only write (no
   Put/Delete), `sqs:SendMessage` only on the discovery queue, log read-only on one group,
   and **no** microVM launch/terminate or `iam:PassRole`. Asserted against the synthesized
-  template in `test/mgmt-stack.test.mjs`.
+  template in `test/mgmt-stack.test.mjs`. Two code paths use that write: repo config
+  patches, and the ADR-028 installation index repair (`gsi1pk`/`gsi1sk` on an installation
+  the session already holds a grant for).
 - **Input allow-listing**: config bodies are validated field-by-field; unknown fields are a
   400, so a run's status/microVM id can't be patched through the config endpoint.
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo
   row and emit a structured log line with the actor and the patch.
 - **Config takes effect in the control plane** (ADR-027): the management λ only writes repo
-  config. `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
+  config (and the ADR-028 installation index repair, which changes no observable state). `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
   `defaultFlavor` by `resolveFlavor`'s fallback. Both fail open, so a config read fault
   cannot stop a labeled job.
 - **CSP and inline styles**: the console CSP has `style-src 'self'` with no

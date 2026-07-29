@@ -293,6 +293,9 @@ export interface ReconcileDeps {
  * keys as a side effect (ADR-029). Dependency-injected so the fix is unit-testable without
  * DynamoDB — this is the code path that decides whether the console can render an
  * installation the platform is already serving.
+ *
+ * The repair is guarded: a row that already carries the stamp, or that has no `accountLogin`
+ * to use as `gsi1sk`, is returned but not written.
  */
 export async function reconcileInstallations(
   indexed: InstallationRecord[],
@@ -307,6 +310,11 @@ export async function reconcileInstallations(
     const row = await deps.get(id);
     if (!row) continue; // a grant for an installation we never stored — nothing to show
     recovered.push(row);
+    // Only repair a row that is actually missing the stamp. An indexed row can legitimately
+    // reach here (a truncated index page), and `gsi1sk` is the account login — a row without
+    // one cannot be indexed meaningfully and must not be written with an undefined sort key
+    // (the backfill script skips the same case). Both leave the row in the response.
+    if (!isUnindexedInstall(row) || !row.accountLogin) continue;
     // Self-heal so this path costs one GetItem once, not on every poll.
     try {
       const repaired = await deps.repair({
