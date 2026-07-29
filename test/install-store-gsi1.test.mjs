@@ -22,7 +22,7 @@ import {
   INSTALL_SK,
   INSTALLS_GSI1PK,
 } from '../dist/src/shared/install-store.js';
-import { canAdminInstallation } from '../dist/src/mgmt/session.js';
+import { canAdminInstallation, grantedInstallationIds } from '../dist/src/mgmt/session.js';
 
 const NOW = new Date('2026-07-29T00:00:00.000Z');
 
@@ -330,4 +330,60 @@ test('listInstallations requires an explicit grant list (no silent zero-arg regr
   assert.ok(sig, 'listInstallations signature not found');
   assert.equal(sig[1], undefined, 'reconcileIds must NOT have a default value');
   assert.equal(listInstallations.length, 1, 'the grant list is a required parameter');
+});
+
+// ---- invariant 3: the ROUTE actually passes the grants ----------------------
+
+test('grantedInstallationIds is the session grant set, in order, ids only', () => {
+  const session = {
+    login: 'operator',
+    installations: [
+      { installationId: 146431062, accountLogin: 'jsamuel1' },
+      { installationId: 22, accountLogin: 'acme' },
+    ],
+    iat: 0,
+    exp: 2 ** 40,
+  };
+  assert.deepEqual(grantedInstallationIds(session), [146431062, 22]);
+  // No grants → nothing to reconcile, and nothing to fetch by primary key.
+  assert.deepEqual(grantedInstallationIds({ ...session, installations: [] }), []);
+});
+
+test('the installations route passes the session grants, not an empty candidate set', () => {
+  // The arity check above cannot catch the OTHER half of the regression: a caller that keeps
+  // the required parameter but hands it `[]` (or drops the argument during a refactor) is
+  // back to index-only enumeration, and the live dev symptom returns with every test green.
+  // The route must resolve its candidates through the named helper.
+  const src = readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  // Match to end of line, not to the first `)` — the argument itself is a call.
+  const call = /await listInstallations\((.*)\);/.exec(src);
+  assert.ok(call, 'the listInstallations route call was not found');
+  assert.equal(
+    call[1].trim(),
+    'grantedInstallationIds(session)',
+    'the route must reconcile against the session grants (ADR-037)',
+  );
+  assert.match(src, /grantedInstallationIds,?\n/, 'the helper must be imported, not shadowed');
+});
+
+test('an operator with a grant sees a legacy row through the route composition', async () => {
+  // End-to-end over the pure seam the route uses: grants → reconcile → visibility filter.
+  // This is the acceptance criterion in prose: installation 146431062 is served by the
+  // platform and MUST NOT be absent from the console, even on an un-backfilled table.
+  const session = {
+    login: 'jsamuel1',
+    installations: [{ installationId: 146431062, accountLogin: 'jsamuel1' }],
+    iat: 0,
+    exp: 2 ** 40,
+  };
+  const out = await reconcileInstallations([], grantedInstallationIds(session), {
+    get: async (id) => (id === 146431062 ? install() : undefined),
+    repair: async () => true,
+  });
+  const visible = out.filter((i) => canAdminInstallation(session, i.installationId));
+  assert.deepEqual(
+    visible.map((i) => i.accountLogin),
+    ['jsamuel1'],
+    'the empty-state bug would show up here as []',
+  );
 });
