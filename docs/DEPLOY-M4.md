@@ -73,6 +73,21 @@ npx cdk deploy LCA-Mgmt-<env> -c env=<env> -c publicOrigin=https://<console-doma
 This sets `PUBLIC_ORIGIN`, which the API uses to build the OAuth redirect URI and the
 post-login redirect. Only the Lambda's environment changes — no data migration.
 
+**`publicOrigin` is not sticky — pass it on every subsequent `LCA-Mgmt-<env>` deploy.**
+It is CDK *context*, read per-invocation (`bin/lca.ts`), and nothing persists it: there is
+no `cdk.context.json` in the repo and `cdk.json` doesn't carry it. `MgmtStack` defaults it
+to `''` (`lib/mgmt-stack.ts`), so a later flagless `npx cdk deploy LCA-Mgmt-<env> -c
+env=<env>` — e.g. a routine M5 change — silently resets `PUBLIC_ORIGIN` to empty and
+regresses login to the Phase-2 500. Confirm after any Mgmt deploy:
+
+```sh
+aws lambda get-function-configuration --function-name lca-<env>-mgmt \
+  --query 'Environment.Variables.PUBLIC_ORIGIN' --output text   # must be the console URL
+```
+
+A persistent default (SSM lookup or a pinned context value) is M5 work alongside custom
+domains; until then the flag is the contract.
+
 ## Phase 4 — register the OAuth callback on the GitHub App
 
 **This step is browser-only and cannot be automated.** GitHub exposes no REST endpoint to
@@ -121,7 +136,7 @@ only — the hot path (webhook → ingest → provision) keeps running.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Login → 500 | `PUBLIC_ORIGIN` unset | Phase 3 (re-deploy with `-c publicOrigin=...`) |
+| Login → 500 | `PUBLIC_ORIGIN` unset — first deploy, **or** a later Mgmt deploy that omitted `-c publicOrigin` (context is not persisted) | Phase 3 (re-deploy with `-c publicOrigin=...`) |
 | GitHub refuses the redirect after authorize | callback URL not on the App | Phase 4 (browser-only; no API for it) |
 | Repo history shorter than expected | GSI2 is sparse — only runs queued after the index was created appear (ADR-023) | expected on an env upgraded in place; Dashboard/`?status=` views are unaffected |
 | `invalid OAuth state` | state cookie lost (different host, or >10 min on the GitHub page) | Retry from the console origin |

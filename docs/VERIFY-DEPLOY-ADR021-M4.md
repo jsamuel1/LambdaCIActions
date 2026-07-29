@@ -232,6 +232,29 @@ Phases run per docs/DEPLOY-M4.md:
 - **Phase 3** — `npx cdk deploy LCA-Mgmt-dev -c env=dev -c publicOrigin=https://d2x4qcl1ibd2ax.cloudfront.net`
   → `PUBLIC_ORIGIN` now set on `lca-dev-mgmt` (19 s, Lambda env only).
 
+### `publicOrigin` is not persisted — a later flagless Mgmt deploy regresses login
+
+The Phase-3 value lives only in the CDK **context** of that one invocation. Nothing stores
+it: the repo has no `cdk.context.json`, `cdk.json`'s `context` block doesn't carry it, and
+`MgmtStack` defaults `PUBLIC_ORIGIN` to `''` (`lib/mgmt-stack.ts`). Synth proves both
+branches from this tree:
+
+```
+$ npx cdk synth LCA-Mgmt-dev -c env=dev                          | grep PUBLIC_ORIGIN
+          PUBLIC_ORIGIN: ""
+$ npx cdk synth LCA-Mgmt-dev -c env=dev -c publicOrigin=https://…  | grep PUBLIC_ORIGIN
+          PUBLIC_ORIGIN: https://d2x4qcl1ibd2ax.cloudfront.net
+```
+
+So any future `npx cdk deploy LCA-Mgmt-dev -c env=dev` without the flag — the form used
+throughout Phase 2 and in docs/VERIFY-M3.md's multi-stack deploys — silently empties the
+variable and puts login back at the Phase-2 500. That is ADR-024's deliberate
+fail-loud-rather-than-guess behaviour working as designed, but the runbook described it as a
+first-deploy state only; DEPLOY-M4 Phase 3 now flags it as a standing requirement with a
+post-deploy assertion. A persistent default (SSM lookup) belongs with M5 custom domains.
+
+The live value is currently correct: `PUBLIC_ORIGIN=https://d2x4qcl1ibd2ax.cloudfront.net`.
+
 Verified live:
 
 - Console serves the SPA: `GET /` → **200**, `<title>LambdaCIActions Console</title>`.
@@ -444,3 +467,33 @@ It corrected one docs claim: DEPLOY-M1 said the credential traps could make the 
 "pass against the wrong account". They cannot — `bin/lca.ts` compares `CDK_DEFAULT_ACCOUNT`
 and `assertDeployTarget` compares the STS caller against the pin, so both traps only ever
 *refuse*. Reworded to fail-closed.
+
+A **fifth independent review pass** (2026-07-29) matched every live claim again from the
+pinned account: five stack statuses/timestamps, the six `lca-dev-*` functions
+(`nodejs22.x`/arm64, broker included), the deployed exec-role policy statement-for-statement
+(one inline, zero attached, zero `dynamodb:*`, zero microVM control actions), Provision's
+exact six-variable env including `HOOK_BROKER_NAME`, the broker's `nodejs22.x`/30 s/256 MB
+with `TABLE_NAME` only and `ReservedConcurrentExecutions: 20`, the broker role's two
+statements (`GetItem` on the bare table ARN; region-conditioned `TerminateMicrovm`),
+per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with `additionalOsCapabilities: ["ALL"]`
+on every docker version and `null` on base/node, zero non-`TERMINATED` VMs, run
+`30407823249` `success` with all three jobs green, the three run rows (`completed`,
+per-flavor, distinct `microvmId`, 64-hex `hookTokenHash`, `reason` absent), a `"token"`
+log scan returning **0** across all six groups in the E2E window with exactly 6 broker
+`START` records, GSI2 `ACTIVE` with the three E2E rows queryable by `REPORUNS#1313438232`,
+both M4 stacks' outputs, `PUBLIC_ORIGIN`, the SecureString session secret v1, and live
+`200` / `302` (correct `client_id`, callback and CSRF state) / three `401`s. Gate re-run
+from this worktree: `npm run build` exit 0, `npm test` **281/281**, and a credential-less
+`cdk synth -c env=dev` exit 0 with config/credential files and every `AWS_*`/`CDK_*`
+variable unset and IMDS disabled.
+
+It found one new issue and one drift:
+
+- **`publicOrigin` is not sticky** — documented above, with DEPLOY-M4 Phase 3 + its
+  troubleshooting row updated. This is the only finding of the pass; it changes no live
+  state (the deployed value is correct today).
+- GSI2 re-measures **110 total / 13 indexed / 97 unindexed**, up from 106/9/97 — dev traffic
+  again. The invariant holds exactly: 97 legacy rows spanning
+  `2026-07-14T13:29:04.515Z`…`2026-07-28T23:20:48.571Z`, earliest indexed row
+  `23:23:28.786Z`. The snapshot table above is left as-measured and stays labelled
+  point-in-time.
