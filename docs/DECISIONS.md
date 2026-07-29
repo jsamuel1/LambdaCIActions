@@ -951,6 +951,7 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
+
 ## ADR-036 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
 **Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
 [ADR-024](#adr-024)
@@ -1010,8 +1011,10 @@ fails at `cdk deploy` on the distribution update, *after* the cert has been issu
   resolved publicly (wrong zone, or a zone that is not authoritative).
 - Migration off an existing raw-CloudFront origin requires **both** callbacks registered on
   the App simultaneously — add the vanity one, flip `PUBLIC_ORIGIN`, verify, then remove the
-  old one. `-c publicOrigin=` still wins over config precisely so an operator can pin a
-  transitional origin mid-flip. Removing the old entry first breaks login instantly.
+  old one. This is possible because a GitHub App accepts up to **10** callback URLs (matched
+  exactly; OAuth Apps allow only one, with prefix matching). `-c publicOrigin=` still wins
+  over config precisely so an operator can pin a transitional origin mid-flip. Removing the
+  old entry first breaks login instantly.
 - During that flip the console is reachable on **two** hosts but only **one** can complete
   OAuth: the `state` cookie is host-only (no `Domain` attribute) and `redirect_uri` is built
   from the single `PUBLIC_ORIGIN`, so a login started on the other host returns to a callback

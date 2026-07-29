@@ -198,7 +198,9 @@ Two facts drive the ordering:
    curl -sSI https://<vanity>/ | head -1          # expect 200 + a valid cert
    ```
 3. In the GitHub App settings, **add** `https://<vanity>/auth/callback` alongside the existing
-   CloudFront callback (GitHub Apps accept multiple callback URLs). Do not remove anything.
+   CloudFront callback (General → "Identifying and authorizing users" → **Add Callback URL**;
+   GitHub Apps accept up to **10** callback URLs, matched **exactly** — unlike OAuth Apps,
+   which allow one with prefix matching). Do not remove anything.
 4. Flip the origin by dropping the override — config takes over:
    ```sh
    npx cdk deploy LCA-Mgmt-<env> -c env=<env>
