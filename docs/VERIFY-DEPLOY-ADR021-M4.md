@@ -57,7 +57,7 @@ left behind, tracked on its own card and deliberately not touched here). Sequenc
 
 ### The window was still hit — and failed closed, as designed
 
-A concurrent kanban card opened PR #16 (`kermes/task-nimble-anemone`) at **23:20:46Z**,
+A concurrent kanban card opened PR #16 (`kermes/task-nimble-anemone`) at **23:20:42Z**,
 mid-window. Its two jobs launched with the OLD 97-byte payload against the NEW broker
 images, and the new run-hook rejected them:
 
@@ -202,7 +202,8 @@ and/or pre-warm the CLI in the image so the first call is not cold).
 GSI2 (`REPORUNS#<repoId>` / `createdAt`, ADR-023) did not exist before this deploy — it
 landed with the `LCA-Data-dev` update at **23:20:47Z**. `gsi2pk`/`gsi2sk` are written once
 in `buildQueuedItem` (`src/shared/run-store.ts`), so DynamoDB only projects rows **queued
-after** that point. Measured immediately after the deploy:
+after** that point. Measured immediately after the deploy (a point-in-time snapshot — dev
+traffic since grows both the total and the indexed count, never the 97-row unindexed gap):
 
 | RUN rows | count |
 |---|---|
@@ -265,8 +266,12 @@ observed**: GitHub documents that an OAuth `redirect_uri` must match a registere
 so clicking "Sign in with GitHub" is expected to reach the authorize page and then be
 refused on redirect back. Confirming the refusal itself requires an authenticated browser
 session, which this verification did not have — the same reason the setting cannot be
-automated. Either way console login (and therefore M4 phase-5 steps 1–7) cannot complete
-until the callback is registered.
+automated. An unauthenticated probe cannot substitute: `GET /login/oauth/authorize` returns
+the **same** `302 → /login?return_to=…` for the console callback, for the App's registered
+`http://localhost:8976/callback`, and for a deliberately bogus `https://example.invalid/nope`
+— GitHub defers all `redirect_uri` validation until after sign-in, so the pre-auth response
+carries no signal either way. Either way console login (and therefore M4 phase-5 steps 1–7)
+cannot complete until the callback is registered.
 
 ## Reproduction
 
@@ -376,3 +381,40 @@ Two refinements from the first pass:
   proof the timeout is spent in the guest's cold `aws` CLI rather than in broker latency,
   which is precisely what the defect above asserts.
 - **GSI2's backfill gap** was unrecorded; now [documented above](#gsi2-is-sparse-and-was-not-backfilled).
+
+A **third independent review pass** (2026-07-29) re-verified every live claim from the pinned
+account and matched again: all five stack statuses/timestamps, the six `lca-dev-*` functions
+(`nodejs22.x`/arm64), Provision's exact env set including `HOOK_BROKER_NAME`, the broker's
+runtime/timeout/memory and `ReservedConcurrentExecutions: 20`, the deployed exec-role policy
+statement-for-statement (one inline policy, zero attached, zero `dynamodb:*`, zero microVM
+control actions), the broker role's two statements plus its `AWSLambdaBasicExecutionRole`
+attachment, per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with
+`additionalOsCapabilities: ["ALL"]` on docker and `null` on node, zero non-`TERMINATED` VMs,
+run `30407823249` `success` with all three jobs green at the stated timings, the three run
+rows (`completed`, per-flavor, distinct `microvmId`, 64-hex `hookTokenHash`, `reason` null),
+the three brokered `self-terminate` lines, the broker log's **6** `START RequestId` vs **2**
+`INIT_START` in the E2E window (confirming the parenthetical above), the six `ETIMEDOUT`
+jitconfig attempts (3 × attempt 1 at 23:23:39–42, 3 × attempt 2 at 23:23:47–50), the token
+scan (0 in every group except the 2 literal-error-string hits in `microvms/runs/lca-dev`),
+`gsi2` `ACTIVE` with its `TableCD117FA1` update completing 23:20:44Z inside the
+`LCA-Data-dev` 23:20:19–47Z window, both M4 stacks' outputs, `PUBLIC_ORIGIN`, the session
+secret (`SecureString` v1), and live `200` / `302` / three `401`s / `403`. Preflight re-run
+clean: `npm run build` + `npm test` → **281/281**, and a credential-less `cdk synth -c
+env=dev` (config/credential files and every `AWS_*`/`CDK_*` variable unset, IMDS disabled)
+exits 0 — the ADR-018 CI-exemption path.
+
+It corrected three items:
+
+- PR #16's creation time was stated as `23:20:46Z`; the GitHub API reports **`23:20:42Z`**
+  (`23:20:46Z` is a `LCA-Data-dev` stack event). The skew-window conclusion is unchanged —
+  the PR still landed mid-window, four seconds earlier than recorded.
+- The GSI2 row counts re-measure as 106 total / 9 indexed rather than 104 / 7, because dev
+  traffic continued after the deploy. They are now labelled a point-in-time snapshot; the
+  invariant that matters (97 unindexed legacy rows, all pre-`23:20:48Z`) is unchanged.
+- The "expected, not observed" GitHub-refusal claim now records what an unauthenticated probe
+  actually shows, so a later reader cannot mistake the pre-auth `302` for evidence either
+  way.
+
+One repo-hygiene fix landed in the same pass: `.agents/` — the AGENTS.md-mandated scratch
+directory, holding this deploy's captured logs and JSON — was not gitignored, so its contents
+were commit-eligible. It is ignored now.

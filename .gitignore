@@ -15,6 +15,9 @@ web/dist/
 *.pem
 *.key
 
+# agent scratch space (AGENTS.md) — notes, captured logs, intermediate JSON
+.agents/
+
 # logs / os
 *.log
 .DS_Store
