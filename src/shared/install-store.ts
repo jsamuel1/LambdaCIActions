@@ -49,13 +49,25 @@ export function installGsi1Keys(accountLogin: string): { gsi1pk: string; gsi1sk:
   return { gsi1pk: INSTALLS_GSI1PK, gsi1sk: accountLogin };
 }
 
-/** True when a row is an installation that predates the M4 GSI1 stamp (ADR-029). */
+/** True when a row is an installation that predates the M4 GSI1 stamp (ADR-037). */
 export function isUnindexedInstall(row: {
   entity?: string;
   gsi1pk?: string;
   accountLogin?: string;
 }): boolean {
   return row.entity === 'INSTALL' && row.gsi1pk !== INSTALLS_GSI1PK;
+}
+
+/**
+ * Whether a row fetched BY PRIMARY KEY (`INSTALL#<id>` / `INSTALL`) still needs its GSI1
+ * stamp. Deliberately does NOT re-check `entity`: the key already proves the row is an
+ * installation, and `entity` is an optional attribute on the record type — gating the repair
+ * on it would leave a row that lacks it unrepairable by BOTH this path and the backfill
+ * script (whose scan DOES filter on `entity`, because a scan has no key to prove identity).
+ * `accountLogin` IS the `gsi1sk`, so a row without one cannot be indexed meaningfully.
+ */
+export function needsIndexRepair(row: { gsi1pk?: string; accountLogin?: string }): boolean {
+  return row.gsi1pk !== INSTALLS_GSI1PK && Boolean(row.accountLogin);
 }
 
 function requireDoc(): DynamoDBDocumentClient {
@@ -81,7 +93,7 @@ export async function upsertInstallation(input: {
 /**
  * Pure builder for the installation upsert. Extracted so a test can assert the write ALWAYS
  * carries the GSI1 keys — a write path that forgets them makes the installation invisible to
- * `listInstallations` (the M2 → M4 regression behind ADR-029).
+ * `listInstallations` (the M2 → M4 regression behind ADR-037).
  */
 export function buildInstallUpsert(
   input: {
@@ -122,7 +134,7 @@ export function buildInstallUpsert(
 }
 
 /**
- * Stamp GSI1 keys onto an installation row that lacks them (ADR-029 reconcile-on-read /
+ * Stamp GSI1 keys onto an installation row that lacks them (ADR-037 reconcile-on-read /
  * backfill). Conditional on the row existing so a stale id is a no-op, and on `gsi1pk` being
  * absent so a concurrent repair (or the backfill script) is a no-op rather than a clobber.
  * Returns true when this call actually repaired the row.
@@ -249,7 +261,7 @@ export async function getRepo(
 // ---- M4 management reads / config writes -----------------------------------
 
 /**
- * Enumerate installations for the management UI (ADR-029).
+ * Enumerate installations for the management UI (ADR-037).
  *
  * Primary path is the GSI1 `INSTALLS` partition — no table scan. But rows written before
  * M4 (commit 63069ff) carry no `gsi1pk`, so they are invisible to that query: the console
@@ -294,12 +306,12 @@ export interface ReconcileDeps {
 
 /**
  * Append any authorized-but-unindexed installation to the index result, repairing its index
- * keys as a side effect (ADR-029). Dependency-injected so the fix is unit-testable without
+ * keys as a side effect (ADR-037). Dependency-injected so the fix is unit-testable without
  * DynamoDB — this is the code path that decides whether the console can render an
  * installation the platform is already serving.
  *
- * The repair is guarded: a row that already carries the stamp, or that has no `accountLogin`
- * to use as `gsi1sk`, is returned but not written.
+ * The repair is guarded by {@link needsIndexRepair}: a row that already carries the stamp, or
+ * that has no `accountLogin` to use as `gsi1sk`, is returned but not written.
  */
 export async function reconcileInstallations(
   indexed: InstallationRecord[],
@@ -315,15 +327,15 @@ export async function reconcileInstallations(
     if (!row) continue; // a grant for an installation we never stored — nothing to show
     recovered.push(row);
     // Only repair a row that is actually missing the stamp. An indexed row can legitimately
-    // reach here (a truncated index page), and `gsi1sk` is the account login — a row without
-    // one cannot be indexed meaningfully and must not be written with an undefined sort key
-    // (the backfill script skips the same case). Both leave the row in the response.
-    if (!isUnindexedInstall(row) || !row.accountLogin) continue;
+    // reach here (a truncated index page), and a row with no `accountLogin` must not be
+    // written with an undefined sort key (the backfill script skips the same case). Both
+    // leave the row in the response.
+    if (!needsIndexRepair(row)) continue;
     // Self-heal so this path costs one GetItem once, not on every poll.
     try {
       const repaired = await deps.repair({
         installationId: id,
-        accountLogin: row.accountLogin,
+        accountLogin: row.accountLogin as string,
       });
       if (repaired) {
         console.log(

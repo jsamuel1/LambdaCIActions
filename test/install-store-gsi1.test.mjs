@@ -1,4 +1,4 @@
-// Installation GSI1 indexing + reconcile-on-read (src/shared/install-store.ts, ADR-029).
+// Installation GSI1 indexing + reconcile-on-read (src/shared/install-store.ts, ADR-037).
 //
 // The bug this pins: `listInstallations` enumerates installations from the GSI1 `INSTALLS`
 // partition. An INSTALL row written before M4 has no `gsi1pk`, so it is invisible to that
@@ -15,6 +15,7 @@ import {
   installGsi1Keys,
   isUnindexedInstall,
   missingInstallationIds,
+  needsIndexRepair,
   reconcileInstallations,
   installPk,
   listInstallations,
@@ -87,6 +88,21 @@ test('a legacy row is recognised as unindexed, an M4 row is not', () => {
   assert.equal(isUnindexedInstall(install()), true); // no gsi1pk — the live dev row
   assert.equal(isUnindexedInstall(install({ gsi1pk: 'INSTALLS' })), false);
   assert.equal(isUnindexedInstall({ entity: 'REPO', repoId: 1 }), false);
+});
+
+test('the repair gate keys off the missing stamp, not the optional entity attribute', () => {
+  // A row fetched by primary key (`INSTALL#<id>` / `INSTALL`) is an installation by
+  // construction. `entity` is optional on the record type, so gating the repair on it would
+  // leave such a row invisible to the console forever: this path would skip the write and
+  // the backfill script's `entity = :e` scan filter would never see it either.
+  const row = install();
+  delete row.entity;
+  assert.equal(needsIndexRepair(row), true, 'an entity-less legacy row is still repairable');
+  assert.equal(needsIndexRepair(install()), true);
+  assert.equal(needsIndexRepair(install({ gsi1pk: 'INSTALLS' })), false, 'already stamped');
+  const noLogin = install();
+  delete noLogin.accountLogin;
+  assert.equal(needsIndexRepair(noLogin), false, 'gsi1sk would be undefined');
 });
 
 // ---- invariant 2: the read path surfaces unindexed rows ---------------------
@@ -198,6 +214,24 @@ test('a row with no accountLogin is surfaced but not stamped with an undefined s
   assert.equal(out.length, 1);
 });
 
+test('an entity-less legacy row is still repaired through the read path', async () => {
+  // Regression: an earlier revision gated the repair on `entity === 'INSTALL'`. A row keyed
+  // `INSTALL#<id>`/`INSTALL` is an installation whether or not it carries that attribute,
+  // and the backfill script cannot rescue it (its scan filters on `entity`).
+  const legacy = install({ installationId: 11 });
+  delete legacy.entity;
+  const repairs = [];
+  const out = await reconcileInstallations([], [11], {
+    get: async () => legacy,
+    repair: async (input) => {
+      repairs.push(input);
+      return true;
+    },
+  });
+  assert.equal(out.length, 1);
+  assert.deepEqual(repairs, [{ installationId: 11, accountLogin: 'jsamuel1' }]);
+});
+
 test('reconcile cannot widen authorization beyond the session grants', async () => {
   // The handler passes session grants as candidates AND filters the result. A row recovered
   // for a foreign id would still be dropped — but it must never be fetched in the first place.
@@ -225,7 +259,7 @@ test('reconcile cannot widen authorization beyond the session grants', async () 
 
 test('listInstallations requires an explicit grant list (no silent zero-arg regression)', () => {
   // A default of [] would let a future caller write `listInstallations()` and get the exact
-  // pre-ADR-029 behaviour back — index-only, legacy rows invisible — with no compile error.
+  // pre-ADR-037 behaviour back — index-only, legacy rows invisible — with no compile error.
   // Pinned on the source because the arity is the contract, not runtime behaviour.
   const src = readFileSync(
     new URL('../src/shared/install-store.ts', import.meta.url),

@@ -143,7 +143,7 @@ npm run backfill:installs                 # dry run — lists the rows it would 
 npm run backfill:installs -- --apply      # write
 ```
 
-The script (`scripts/backfill-installs.mjs`, ADR-029) scans for `entity=INSTALL` rows missing
+The script (`scripts/backfill-installs.mjs`, ADR-037) scans for `entity=INSTALL` rows missing
 `gsi1pk` and stamps `gsi1pk=INSTALLS`, `gsi1sk=<accountLogin>`. It is idempotent (conditional
 on `attribute_not_exists(gsi1pk)`) — a second run reports nothing to do. It requires the
 same `.env.local` deploy-target pin as every other account-touching command (ADR-018), for
@@ -165,5 +165,5 @@ Every installation should be listed. Then reload the console — Setup lists the
 
 If you cannot run the backfill immediately, the console still self-heals **per operator**:
 `GET /api/installations` reconciles any installation the session holds a grant for but the
-index did not return, fetching it by primary key and repairing the row (ADR-029). The
+index did not return, fetching it by primary key and repairing the row (ADR-037). The
 backfill is still the right move — it repairs rows nobody has logged in for yet.

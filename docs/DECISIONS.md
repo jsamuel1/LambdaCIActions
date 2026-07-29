@@ -291,7 +291,7 @@ by every deploy-touching entry point:
 - **`scripts/build-images.mjs` / `scripts/create-github-app.mjs`**: refuse to start
   without a valid pin AND an STS caller-identity match; `--dry-run` is exempt (no AWS
   calls). Any explicit `--region`/`-c region` must equal the pinned region.
-- **`scripts/backfill-installs.mjs`** (ADR-029): same pin + STS match, but with **no dry-run
+- **`scripts/backfill-installs.mjs`** (ADR-037): same pin + STS match, but with **no dry-run
   exemption** — its dry run still reads the live table, so an unpinned one would report
   another account's rows as the target's. The exemption above is for commands whose dry run
   makes no AWS call at all; it is not a blanket rule.
@@ -683,7 +683,7 @@ which needs a GitHub token) requires a deliberate ADR + IAM change, not a one-li
 The `DescribeParameters` statement is `Resource: '*'` because the API has no resource-level
 scoping — acceptable since it returns metadata only.
 
-**Amended by [ADR-029](#adr-029)**: the `UpdateItem` grant now backs a second code path —
+**Amended by [ADR-037](#adr-037)**: the `UpdateItem` grant now backs a second code path —
 the installation GSI1 index repair. It needed **no IAM change** (same action, same table) and
 changes no observable state: it stamps `gsi1pk`/`gsi1sk` on an installation row the session
 already holds a grant for. "UpdateItem is the only write" still holds; "its only purpose is
@@ -873,7 +873,8 @@ the new hook timeout and the pre-warm both live in the **image**, so they need a
 pre-warm adds one CLI invocation to each image build. Boot logs gain an `aws cli prewarm` line
 and an `ms` field per broker attempt; neither carries payload content (the capability token and
 the JIT config stay redacted per ADR-021).
-## ADR-029 — Installation enumeration reconciles unindexed rows on read (M4 fix)
+
+## ADR-037 — Installation enumeration reconciles unindexed rows on read (M4 fix)
 **Status**: Accepted (v1) · follows [ADR-009](#adr-009), [ADR-022](#adr-022)
 **Context**: `listInstallations()` enumerates installations from the GSI1 `INSTALLS`
 partition so the console never table-scans. The `gsi1pk=INSTALLS` / `gsi1sk=<accountLogin>`

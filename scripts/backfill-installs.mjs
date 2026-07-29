@@ -7,7 +7,7 @@
  * (src/shared/install-store.ts). The `gsi1pk`/`gsi1sk` write landed in M4 (commit 63069ff),
  * so any INSTALL row written by M2-era code is invisible to that query and the console's
  * Setup screen renders the empty state for an installation the platform is actively serving.
- * GitHub never re-sends `installation.created`, so it does not self-heal. See ADR-029.
+ * GitHub never re-sends `installation.created`, so it does not self-heal. See ADR-037.
  *
  * This stamps `gsi1pk=INSTALLS`, `gsi1sk=<accountLogin>` on every `entity=INSTALL` row that
  * lacks `gsi1pk`. Idempotent: the update is conditional on `attribute_not_exists(gsi1pk)`,
