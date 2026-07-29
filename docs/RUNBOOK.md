@@ -138,6 +138,15 @@ adopt mode this is the known risk in ADR-030: the hosted label (`ubuntu-latest`)
 reserved. The run's `reason` names the fix. Immediate remedy: switch the repo back to `label`
 mode (below) and add LCA labels, or open a rewrite PR.
 
+**`kind=mint` failures naming a rate limit.** `generate-jitconfig` is a POST, so it spends the
+installation's **mutating** REST budget (~500 points/min) and GitHub refuses with **403**, not
+429. These are classified transient: the run stays `provisioning`, SQS redelivers, and the job
+runs once the budget refills — the reason reads `GitHub rate-limited JIT registration
+(retrying)`. A sustained storm DLQs after `maxReceiveCount` 3 and the Reaper fails the row. If
+this recurs, lower `provisionConcurrency` for the env (`lib/env-config.ts`) rather than raising
+it: the ceiling is GitHub's, not ours. A 403 that names a *permission* instead (`Resource not
+accessible by integration`) is permanent — grant the App permission.
+
 **A run fails immediately with "runs-on resolves to no usable runner label".** The job's
 `runs-on` is entirely an unresolved expression (`runs-on: ${{ matrix.os }}`), which leaves
 nothing we can advertise — so we refuse before minting rather than launch a VM that can never

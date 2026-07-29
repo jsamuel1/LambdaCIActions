@@ -997,13 +997,28 @@ current docs for label assignment do not state such a prohibition, and we have n
 the call against a live repo. Mitigation shipped now: `classifyMintFailure` treats a 4xx mint
 failure as **permanent** (no SQS retry storm, no burnt DLQ budget) and, for a 422 carrying a
 hosted label, writes an actionable reason onto the run row naming the fix (switch to `label`
-mode, or use the rewrite PR). A **transient** mint failure (429/5xx/network) deliberately does
+mode, or use the rewrite PR). A **transient** mint failure (429/5xx/network, and a rate-limit
+403 — see the sixth-review fix below) deliberately does
 NOT write a terminal status: `failed` is terminal, so the redelivered message's
 `queued→provisioning` idempotency guard would refuse to advance the row and skip the launch —
 the retry would never reach the mint again. The row stays `provisioning` and the Reaper
 backstops a run that never recovers. **Adopt mode must not be advertised as GA until a real
 adopt-mode job has been observed green end to end**; the M5 exit criterion is what closes this.
 `test/adopt.test.mjs` and `test/jit-labels.test.mjs` pin the behaviour either way.
+**Sixth-review fix**: a **rate-limit 403 is transient**, not permanent. `generate-jitconfig`
+is a POST, so it spends the installation's *mutating* REST budget (~500 points/min; a POST
+costs 5, i.e. ~100 mints/min) and GitHub refuses with **403**, not 429 — for both the primary
+limit and the secondary/abuse limit. The blanket "non-429 4xx is permanent" rule therefore
+stamped a merely throttled job terminal `failed` with "rejected by GitHub", and because
+`failed` is terminal the redelivered message's `queued→provisioning` guard refuses to advance
+the row — so the SQS retry that would have succeeded never reached the mint, and a developer's
+job needed a manual re-run. Adopt mode is exactly what makes the burst reachable: claiming by
+standard label mints a whole workflow's jobs at once, and Provision's reserved concurrency
+(10 dev / 25 prod) sits above GitHub's ceiling. The classification now matches on the response
+**body**, not the bare status, because 403 is also how GitHub reports a revoked installation or
+a missing permission — which is genuinely permanent and must keep naming the fix rather than
+retrying into the DLQ. `test/jit-labels.test.mjs` pins both halves.
+
 **Fifth-review fix**: the label cap is a **refusal**, not a truncation. `jitRunnerLabels`
 used to stop at `MAX_JIT_LABELS` (20), which is the same silent-failure class as the empty-set
 case above and quieter. `decideClaim` claims on the FULL webhook label set, so a job like

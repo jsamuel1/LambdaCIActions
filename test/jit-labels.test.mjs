@@ -90,6 +90,38 @@ test('a network error with no status is treated as transient', () => {
   assert.equal(classifyMintFailure('fetch failed').kind, 'transient');
 });
 
+test('a rate-limit 403 is transient — GitHub reports mint throttling as 403, not 429', () => {
+  // `generate-jitconfig` is a POST, so it spends the MUTATING REST budget (~500 points/min per
+  // installation) and a refusal arrives as 403. Adopt mode makes that burst reachable: a whole
+  // workflow's jobs mint at once. Classifying it permanent stamped the run terminal `failed`,
+  // and because `failed` is terminal the redelivered message's queued→provisioning guard
+  // refuses to advance the row — so the SQS retry that would have succeeded never reaches the
+  // mint. A throttled job must wait, not fail.
+  for (const body of [
+    'GitHub /x failed HTTP 403: {"message":"API rate limit exceeded for installation"}',
+    'GitHub /x failed HTTP 403: {"message":"You have exceeded a secondary rate limit"}',
+    'GitHub /x failed HTTP 403: {"message":"triggered an abuse detection mechanism"}',
+  ]) {
+    const c = classifyMintFailure(body, ['lambda-ci']);
+    assert.equal(c.kind, 'transient', body);
+    assert.match(c.reason, /rate-limited/);
+  }
+});
+
+test('a permission/revocation 403 stays PERMANENT — retrying it cannot help', () => {
+  // The mirror-image hazard: 403 is also how GitHub reports a revoked installation or a
+  // missing App permission. Reading every 403 as transient would retry those into the DLQ
+  // instead of telling the operator what to grant, so the body — not the bare status — decides.
+  for (const body of [
+    'GitHub /x failed HTTP 403: {"message":"Resource not accessible by integration"}',
+    'GitHub /x failed HTTP 403: {"message":"Bad credentials"}',
+  ]) {
+    const c = classifyMintFailure(body, ['lambda-ci']);
+    assert.equal(c.kind, 'permanent', body);
+    assert.match(c.reason, /rejected by GitHub/);
+  }
+});
+
 test('4xx is permanent — retrying the same request cannot help', () => {
   const c = classifyMintFailure('GitHub /x failed HTTP 404: Not Found');
   assert.equal(c.kind, 'permanent');

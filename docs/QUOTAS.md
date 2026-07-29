@@ -100,6 +100,7 @@ is a knob, not a bug.
 | Installation token | ~60 min | Cached until 5 min before expiry (`src/shared/github-app.ts`). |
 | App JWT | 10 min max | We mint 9 min. |
 | REST rate limit | 5,000 req/hr per installation | Discovery is the heaviest consumer (one fetch per workflow file). |
+| REST **mutating** rate limit | ~500 points/min per installation (a POST costs 5) | `generate-jitconfig` is a POST, so ~100 mints/min. Adopt mode makes this reachable — a whole workflow's jobs mint at once. GitHub refuses with **403**, which Provision classifies transient so the job waits instead of failing (ADR-030). |
 | JIT config | single use | By design (ADR-003) — one config per job, consumed at boot. |
 | Reserved runner labels | see ADR-030 | GitHub may reject hosted-label names (`ubuntu-latest`) at registration. This is the open verification item for adopt mode. |
 | Webhook delivery timeout | 10 s | Why Ingest acks fast and does real work async. |
@@ -111,7 +112,7 @@ is a knob, not a bug.
 | `lca-<env>-quota-throttles` alarm | microVM concurrency | Request an increase (above) |
 | Jobs queue, provisioning backlog age climbs | Our Provision concurrency, or the microVM quota | `lca-<env>-provision-backlog-age` alarm; [RUNBOOK](RUNBOOK.md) |
 | Discovery DLQ filling | GitHub REST rate limit | `/aws/lambda/lca-<env>-discovery` |
-| `kind=mint` provision failures | GitHub-side (labels, permissions, install state) | Run row `reason` — it names the fix |
+| `kind=mint` provision failures | GitHub-side (labels, permissions, install state) | Run row `reason` — it names the fix. A rate-limit 403 is retried, not failed. |
 | Launch fails with a validation error | Not a quota — bad image ARN or missing config | `/aws/lambda/lca-<env>-provision` |
 
 A quota refusal is **not** a correctness failure: the job is retried and, once capacity frees

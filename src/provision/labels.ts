@@ -127,11 +127,33 @@ export interface MintFailureClassification {
 }
 
 /**
+ * GitHub rate-limit language in a 403 body.
+ *
+ * `generate-jitconfig` is a POST, so it spends the **mutating** REST budget (~500 points per
+ * minute per installation), and GitHub answers a rate-limit refusal with **403**, not 429 —
+ * both the primary limit ("API rate limit exceeded") and the secondary one ("exceeded a
+ * secondary rate limit"). Adopt mode is what makes that burst reachable: claiming a repo by
+ * standard label means a whole workflow's jobs mint at once, and Provision's reserved
+ * concurrency (10 dev / 25 prod) is well above the ~100 mints/minute the budget allows.
+ *
+ * Matching the BODY, not the bare status, is deliberate. A 403 is also how GitHub reports a
+ * revoked installation or an App missing a permission, which is genuinely permanent — reading
+ * every 403 as transient would retry those into the DLQ instead of telling the operator what
+ * to fix. `githubJson` puts the first 300 bytes of the response body in the message, which is
+ * where these phrases live.
+ */
+const RATE_LIMIT_BODY =
+  /rate limit|secondary rate|abuse detection|too many requests|retry.?after/i;
+
+/**
  * Classify a `generate-jitconfig` failure.
  *
- * A 4xx other than 429 is the repo/App/labels being wrong — the same request will fail
- * forever, so we record an actionable failure instead of retrying into the DLQ. 429 (rate
- * limit) and 5xx are transient.
+ * A 4xx other than 429 is normally the repo/App/labels being wrong — the same request will
+ * fail forever, so we record an actionable failure instead of retrying into the DLQ. 429 and
+ * 5xx are transient, as is a **403 whose body says rate limit** (see `RATE_LIMIT_BODY`):
+ * stamping such a job terminal `failed` would throw away the SQS retry that was going to
+ * succeed, because `failed` is terminal and the redelivery's queued→provisioning guard then
+ * refuses to advance the row.
  *
  * `labels` is used only to make the message actionable when GitHub rejects a hosted label
  * in adopt mode, which is the one failure an operator can actually fix (switch the repo to
@@ -152,10 +174,17 @@ export function classifyMintFailure(
   }
   const status = /HTTP (\d{3})/.exec(message)?.[1];
   const code = status ? Number(status) : undefined;
-  const transient = code === undefined || code === 429 || code >= 500;
+  const rateLimited =
+    (code === 403 || code === 429) && (code === 429 || RATE_LIMIT_BODY.test(message));
+  const transient = code === undefined || rateLimited || code >= 500;
 
   if (transient) {
-    return { kind: 'transient', reason: `JIT registration failed (retrying): ${message}` };
+    return {
+      kind: 'transient',
+      reason: rateLimited
+        ? `GitHub rate-limited JIT registration (retrying): ${message}`
+        : `JIT registration failed (retrying): ${message}`,
+    };
   }
 
   const hostedLabel = labels.find((l) => /^(ubuntu|windows|macos)[-.]/i.test(l.trim()) || /^ubuntu-latest$/i.test(l.trim()));
