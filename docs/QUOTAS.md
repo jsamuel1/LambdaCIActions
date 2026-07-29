@@ -117,5 +117,7 @@ is a knob, not a bug.
 A quota refusal is **not** a correctness failure: the job is retried and, once capacity frees
 up, runs. Provision proves that by rethrowing a throttled launch **without** writing a terminal
 status — a `failed` row is final, so the redelivered SQS message would never re-attempt the
-launch. The failure mode to avoid is not noticing — which is why `QuotaThrottles` is alarmed
-rather than only logged (ADR-032).
+launch. Each redelivery re-mints a JIT config (single-use; the abandoned one TTLs out in 30 min
+and `maxReceiveCount` 3 bounds it to ≤3 mints per job), so a sustained throttle storm also
+spends GitHub API budget. The failure mode to avoid is not noticing — which is why
+`QuotaThrottles` is alarmed rather than only logged (ADR-032).

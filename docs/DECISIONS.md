@@ -1169,6 +1169,16 @@ CloudWatch alarm reads **one exact dimension set** — it does not aggregate acr
   silent alarm, but a hardcoded team address would be wrong for every other deployment (and
   is a small information leak in a public repo), so this is an explicit deploy-time input.
 - X-Ray active tracing on the hot path, per-env (`config.tracing`).
+- **A quota throttle is retried, not failed** — Provision rethrows without writing a terminal
+  status, because `failed` is final and the redelivered message's queued→provisioning guard
+  would then return early, so the retry we asked SQS for could never re-attempt the launch. One
+  throttle would permanently fail a job that only needed to wait. The accepted cost: the
+  redelivery re-mints a JIT config and abandons the previous one. That is safe (single-use, and
+  the side-store item TTLs out in 30 min unclaimed — [ADR-016](#adr-016)) and bounded
+  (`maxReceiveCount` 3, so ≤3 mints per job), whereas carrying the old config across deliveries
+  would risk launching on one another delivery already consumed. It does spend GitHub API budget
+  during a throttle storm, which is part of why `QuotaThrottles` is alarmed rather than only
+  logged.
 - **The dashboard cost sample prices only runs that actually launched a microVM** (third review
   fix). Provision stamps `flavor` on its mint- and launch-failure paths for support, so a run
   that never got a VM still carries a priced flavor; `estimateCostUsd` then billed its full

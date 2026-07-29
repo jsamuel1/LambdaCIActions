@@ -268,16 +268,47 @@ function unquoteLabel(raw: string): string {
 }
 
 /**
+ * Labels whose plain (unquoted) form is NOT the string it looks like, under the YAML 1.1
+ * resolver `js-yaml` 5.x uses (the same parser Discovery and the compat analysis run).
+ *
+ * The generic character-class check is not sufficient on its own: `null` / `NULL` resolve to
+ * a NULL scalar (the parser then DROPS the entry, so the runner silently advertises one label
+ * fewer than the operator was shown), `TRUE` resolves to the boolean `true` (renders as
+ * `"true"`, a different label), and `0x1A` / `0o17` / `1e3` resolve to NUMBERS (`26`, `15`,
+ * `1000`). A `runs-on` label like `0x1A` or `null` is unusual but perfectly legal on GitHub,
+ * and every one of these silently changes the label set the preview claims.
+ *
+ * Matched case-insensitively where YAML 1.1 does: null/bool words are, numeric forms are not
+ * (`0X1F` is, however, still a hex int, hence the `i` flag on the numeric patterns too).
+ */
+const YAML_NON_STRING_PLAIN = [
+  /^(?:null|~|true|false|yes|no|on|off|y|n)$/i,
+  /^[-+]?\d+$/, // decimal int
+  /^[-+]?0x[0-9a-f]+$/i, // hex int
+  /^[-+]?0o?[0-7]+$/i, // octal int (YAML 1.1 allows a bare leading 0)
+  /^[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:e[-+]?\d+)?$/i, // float / exponent
+  /^[-+]?(?:\.inf|\.nan)$/i,
+  /^\d+(?::[0-5]?\d)+$/, // sexagesimal (YAML 1.1 `1:30` → 90)
+];
+
+/**
  * Render a label as a token safe to place inside an inline YAML sequence.
  *
  * Plain (unquoted) is preferred so the common case stays readable, but a label that is not a
- * plain scalar MUST be quoted: `team: infra` would otherwise become a mapping, `123` a number,
- * `*special` an undefined alias (a parse error), and `yes`/`null` a bool/null. Used when
- * re-rendering a label that reached us ALREADY UNQUOTED — i.e. the console's dry run, which is
- * built from the parsed analysis rather than the file text.
+ * plain STRING scalar MUST be quoted: `team: infra` would otherwise become a mapping,
+ * `*special` an undefined alias (a parse error), `123` a number, `null` a dropped entry, and
+ * `TRUE` the boolean `true`. Used when re-rendering a label that reached us ALREADY UNQUOTED —
+ * i.e. the console's dry run, which is built from the parsed analysis rather than the file text.
+ *
+ * Round-tripping is verified against the production parser in `test/rewrite.test.mjs`: a
+ * preview token that does not parse back to the exact same label shows the operator a selector
+ * the write path would never emit.
  */
 export function yamlLabelToken(label: string): string {
-  if (/^[A-Za-z0-9][A-Za-z0-9._\/+-]*$/.test(label) && !/^\d+(\.\d+)?$/.test(label)) {
+  if (
+    /^[A-Za-z0-9][A-Za-z0-9._\/+-]*$/.test(label) &&
+    !YAML_NON_STRING_PLAIN.some((re) => re.test(label))
+  ) {
     return label;
   }
   return `"${label.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;

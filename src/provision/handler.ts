@@ -229,6 +229,14 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     // wait. Leaving the row in `provisioning` keeps redelivery working (a same-status write is
     // idempotent), and is what makes RUNBOOK's "jobs wait rather than fail" true. If every
     // redelivery throttles, the message DLQs (alarmed) and the Reaper fails the stuck row.
+    //
+    // COST of that choice, accepted deliberately: the redelivery re-runs step 2, so it MINTS A
+    // FRESH JIT CONFIG and abandons this one. That is safe (a JIT config is single-use and its
+    // side-store item TTLs out in 30 min unclaimed — ADR-016) and bounded (maxReceiveCount 3,
+    // so at most 3 mints per job), and the alternative is worse: reusing the abandoned config
+    // would mean persisting it across deliveries and risking a launch on a config another
+    // delivery already consumed. It does mean a throttle storm spends GitHub API budget, which
+    // is why `QuotaThrottles` is alarmed rather than silently retried forever.
     if (quota) {
       console.error(
         JSON.stringify({

@@ -13,6 +13,7 @@ import {
   rewritePrBody,
   rewriteRunsOnValue,
   rewriteTargets,
+  yamlLabelToken,
 } from '../dist/src/mgmt/rewrite.js';
 
 const SIMPLE = `name: CI
@@ -426,6 +427,87 @@ test('the dry run re-quotes labels the analysis stored unquoted', () => {
   assert.deepEqual(parsedLabels(preview.jobs[0].after), [
     'self-hosted',
     'team: infra',
+    'lambda-ci',
+  ]);
+});
+
+// Every preview token must ROUND-TRIP through the production parser back to the exact same
+// label. A token that resolves to something else shows the operator a selector the write path
+// would never emit — and the character-class check alone let several through under the YAML 1.1
+// resolver js-yaml 5.x uses:
+//   `null` / `NULL` resolved to a NULL scalar, which the parser DROPS: the preview claimed a
+//   label the runner would never advertise (one fewer than shown).
+//   `TRUE` resolved to the boolean true → rendered `"true"`, a DIFFERENT label.
+//   `0x1A` / `0o17` / `1e3` resolved to NUMBERS (26 / 15 / 1000).
+// Since a runner must advertise EVERY label in runs-on, each of those is a preview that
+// contradicts the real rewrite for a job that is otherwise perfectly rewritable.
+test('every preview token round-trips through the parser to the same label', () => {
+  const labels = [
+    // The cases that regressed.
+    'null',
+    'NULL',
+    'Null',
+    'TRUE',
+    '0x1A',
+    '0o17',
+    '1e3',
+    '1:30',
+    // Already-covered shapes, kept so a future "simplification" can't undo them.
+    'yes',
+    'no',
+    'on',
+    'off',
+    'true',
+    'false',
+    '~',
+    '123',
+    '1.5',
+    '.inf',
+    '.NaN',
+    '-5',
+    'team: infra',
+    '*special',
+    'a,b',
+    'label #1',
+    // Ordinary labels must stay PLAIN — quoting everything would be safe but unreadable.
+    'big-disk',
+    'ubuntu-latest',
+    'gpu_v2',
+    'x86.64',
+    'self-hosted',
+    '1_000',
+    '2026-07-29',
+  ];
+  const plain = new Set(['big-disk', 'ubuntu-latest', 'gpu_v2', 'x86.64', 'self-hosted', '1_000', '2026-07-29']);
+  for (const label of labels) {
+    const token = yamlLabelToken(label);
+    assert.deepEqual(
+      parsedLabels(`[${token}]`),
+      [label],
+      `token ${token} for label ${JSON.stringify(label)} must parse back to itself`,
+    );
+    if (plain.has(label)) {
+      assert.equal(token, label, `${label} should stay unquoted (readability)`);
+    }
+  }
+});
+
+test('a preview whose labels need quoting still yields a selector the rewriter accepts', () => {
+  // End-to-end version of the above: the dry run the operator sees must mean the same label
+  // set the λ would write, for the awkward labels too.
+  const preview = planPreviewFromAnalyses([
+    {
+      path: '.github/workflows/ci.yml',
+      parsed: { jobs: [{ id: 'build', runs_on: ['ubuntu-latest', 'null', '0x1A'] }] },
+      routes: { build: { flavor: 'base' } },
+    },
+  ]);
+  assert.equal(preview.changes, 1);
+  assert.deepEqual(parsedLabels(preview.jobs[0].before), ['ubuntu-latest', 'null', '0x1A']);
+  assert.deepEqual(parsedLabels(preview.jobs[0].after), [
+    'self-hosted',
+    'null',
+    '0x1A',
     'lambda-ci',
   ]);
 });
