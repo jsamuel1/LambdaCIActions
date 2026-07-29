@@ -48,7 +48,12 @@ Gotchas (all three are silent failures — the job just re-downloads at full spe
 the same artifact `setup-python` downloads — rather than hand-rolling the layout.
 
 `rust` has no tool-cache entry: the Rust actions drive **rustup**, not the runner tool cache,
-so that flavor bakes rustup + the pinned toolchain onto `PATH` instead.
+so that flavor bakes rustup + the pinned toolchain onto `PATH` instead. Both `RUSTUP_HOME` and
+`CARGO_HOME` are writable by the runner user — `dtolnay/rust-toolchain` writes toolchains into
+the former and cargo writes its registry cache into the latter.
+
+The `go` flavor sets no global `GOROOT`: `setup-go` only exports it for Go < 1.9, so a baked
+value would override a job's own toolchain choice. Only the toolchain's `bin` goes on `PATH`.
 
 Toolchain versions are pinned via `ARG` in each Dockerfile (reproducible rebuilds) — bump them
 deliberately on patch day.

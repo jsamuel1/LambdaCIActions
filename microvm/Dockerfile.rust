@@ -29,10 +29,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUN_HOOK_PORT=8080 \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
     AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
-    # Shared, world-readable rustup/cargo so the toolchain is baked into the snapshot rather
-    # than re-resolved per job into the runner's home. RUSTUP_HOME stays here at RUNTIME (the
-    # toolchain is read-only shared state); CARGO_HOME does NOT — see the runtime override at
-    # the bottom of this file.
+    # Shared rustup/cargo so the toolchain is baked into the snapshot rather than re-resolved
+    # per job into the runner's home. RUSTUP_HOME stays here at RUNTIME (and is chowned to the
+    # runner below — `rustup toolchain install` writes into it); CARGO_HOME does NOT — see the
+    # runtime override at the bottom of this file.
     RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo
 
@@ -84,10 +84,16 @@ RUN mkdir -p ${RUNNER_DIR} \
 COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
 
 # The runner must NOT run as root (agent refuses); create an unprivileged user that owns
-# the runner dir and can sudo for job steps that need it. /opt/rust stays root-owned and
-# world-readable: a job can USE the toolchain but a compromised job can't poison it for the
-# (single-use, but still) VM. `rustup toolchain add` in a job needs a writable RUSTUP_HOME,
-# so a job that installs an extra toolchain must set its own — documented in spec 02.
+# the runner dir and can sudo for job steps that need it.
+#
+# RUSTUP_HOME must be WRITABLE by the runner. The ecosystem-standard action this flavor exists
+# to serve (`dtolnay/rust-toolchain`) runs `rustup toolchain install …` and `rustup default …`,
+# and both write into RUSTUP_HOME (`toolchains/`, `settings.toml`). Left root-owned, any
+# workflow that pins a toolchain — i.e. nearly every real Rust workflow — fails with a
+# permission error before it compiles anything. The microVM is single-use and runs exactly one
+# job, so there is no later job for a compromised one to poison; write access buys correctness
+# at no cross-job cost. The baked TOOLCHAIN BINARIES stay world-readable via `chmod a+rX`
+# above, so a job that does not install its own toolchain still gets the pinned one.
 #
 # ${RUNNER_TOOL_CACHE} must be CREATED before it is chowned: this flavor bakes no tool-cache
 # entry (rustup owns the toolchain), so nothing above has made the directory and `chown -R`
@@ -95,7 +101,7 @@ COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
 RUN useradd -m -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
     && mkdir -p ${RUNNER_TOOL_CACHE} \
-    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE}
+    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE} ${RUSTUP_HOME}
 
 # CARGO_HOME must be WRITABLE at runtime. The build-time value above (/opt/rust/cargo) is
 # root-owned so a job cannot poison the shared toolchain — but cargo also writes the registry

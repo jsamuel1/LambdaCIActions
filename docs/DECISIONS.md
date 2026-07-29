@@ -1024,7 +1024,12 @@ instead of downloading. Deliberately **excluded**:
 Each new flavor declares a capability equal to its name (`python`, `java`, `go`, `rust`),
 keeps the unprivileged `USER runner` entrypoint and **no** `osCapabilities` (only `docker`
 gets `ALL`, per ADR-020), and pins toolchain versions rather than tracking `latest` so a
-rebuild is reproducible.
+rebuild is reproducible. Baked environment variables follow what each action actually does:
+`JAVA_HOME` is baked (setup-java `exportVariable`s it, so the action always wins), `GOROOT` is
+deliberately **not** (setup-go sets it only for Go < 1.9, so a baked value would override a
+job's chosen toolchain and pair its binary with the baked stdlib), and rust's `RUSTUP_HOME` +
+`CARGO_HOME` are both runner-writable because `dtolnay/rust-toolchain` and cargo write into
+them — safe because a microVM is single-use and runs exactly one job.
 **Why**: the wall-clock win is in the tool cache, not the runtime binary — a `setup-python`
 download+extract dominates a short job. Prebaking the cache is what makes a flavor faster
 than `base` + `setup-*`; without it the flavor only saves the download for jobs that skip the

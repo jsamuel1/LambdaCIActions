@@ -58,11 +58,18 @@ RUN mkdir -p ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64 \
     && ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64/bin/go version
 # Put the cached toolchain on PATH so plain `go build`/`go test` steps work with no setup-*
 # action at all. GOPATH lives under the runner's home so a job can write modules without sudo.
-# GOROOT is derived from ${GO_VERSION} rather than repeated as a literal — a hardcoded copy
-# silently points at a nonexistent directory the moment the pin is bumped.
-ENV GOROOT=${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64 \
-    GOPATH=/home/runner/go
-ENV PATH=${GOROOT}/bin:${GOPATH}/bin:$PATH
+#
+# GOROOT is deliberately NOT exported. `actions/setup-go` only sets GOROOT for Go < 1.9
+# (main.ts) — for every modern version it just `addPath`s the cache entry's `bin`. A baked
+# global GOROOT therefore survives the action and WINS: the `go` command prefers $GOROOT over
+# the location it was executed from, so a job running `setup-go` with any version other than
+# the pin would drive that version's binary against THIS version's stdlib. Left unset, each
+# `go` binary derives its own GOROOT from its path — correct for both the prebaked toolchain
+# and any setup-go install. The PATH entry is derived from ${GO_VERSION} rather than repeated
+# as a literal: a hardcoded copy silently points at a nonexistent directory the moment the pin
+# is bumped.
+ENV GOPATH=/home/runner/go
+ENV PATH=${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64/bin:${GOPATH}/bin:$PATH
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.

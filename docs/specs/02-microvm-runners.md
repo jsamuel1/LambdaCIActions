@@ -108,12 +108,19 @@ reimplementing the layout, symlinks and marker by hand.
 `rust` has **no** tool-cache entry on purpose: there is no first-party `setup-rust` that reads
 the runner tool cache; the ecosystem standard (`dtolnay/rust-toolchain`) drives **rustup**,
 which manages its own store. That flavor bakes rustup + the pinned toolchain onto `PATH`
-instead. The baked toolchain in `/opt/rust` is root-owned and world-readable so a job cannot
-poison it, so a job that installs an *additional* rustup toolchain must set its own writable
-`RUSTUP_HOME`. `CARGO_HOME`, by contrast, is pointed at the runner's home at runtime
-(`/home/runner/.cargo`): cargo writes the registry index and crate cache there, so leaving it
-under root-owned `/opt/rust` fails every dependency fetch with `Permission denied (os error
-13)`.
+instead. Both `RUSTUP_HOME` (`/opt/rust/rustup`) and `CARGO_HOME` must be **writable by the
+runner user**: `dtolnay/rust-toolchain` runs `rustup toolchain install` + `rustup default`,
+which write `toolchains/` and `settings.toml` under `RUSTUP_HOME`, and cargo writes the
+registry index and crate cache under `CARGO_HOME` (root-owned, every dependency fetch fails
+with `Permission denied (os error 13)`). `RUSTUP_HOME` is therefore chowned to the runner and
+`CARGO_HOME` is repointed at `/home/runner/.cargo` at runtime. The microVM is single-use and
+runs exactly one job, so there is no later job for a compromised one to poison.
+
+The `go` flavor deliberately does **not** export a global `GOROOT`. `actions/setup-go` sets
+`GOROOT` only for Go < 1.9; otherwise it just adds the cache entry's `bin` to `PATH`. A baked
+`GOROOT` would survive the action and win, driving a job's chosen `go` binary against the
+baked version's stdlib — so only the toolchain's `bin` goes on `PATH`, and each `go` derives
+its own `GOROOT`. `JAVA_HOME` is safe to bake by contrast: `setup-java` `exportVariable`s it.
 
 Toolchain versions are **pinned** in each Dockerfile so rebuilds are reproducible — which
 makes them a patch-day obligation: a stale pin ages silently.

@@ -341,8 +341,53 @@ test('rustup-init passes one --component per occurrence', () => {
   }
 });
 
+test('no flavor bakes a global GOROOT (it would override a setup-go install)', () => {
+  // `actions/setup-go` exports GOROOT only for Go < 1.9 (main.ts); for every modern version it
+  // just addPath()s the cache entry's bin. So a baked global GOROOT SURVIVES the action and
+  // wins: `go` prefers $GOROOT over the directory it was executed from, and a job that pins a
+  // different version would drive that binary against the baked version's stdlib. Unset, each
+  // `go` derives its own GOROOT from its own path, which is right for both cases.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    const instructions = read(flavor.dockerfile)
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l));
+    for (const line of instructions) {
+      assert.doesNotMatch(
+        line,
+        /^\s*(?:ENV\s+)?GOROOT=/,
+        `${flavor.dockerfile}: sets a global GOROOT — put the toolchain's bin on PATH instead`,
+      );
+    }
+  }
+  // ...and the go flavor must still reach its prebaked toolchain.
+  assert.match(
+    read('Dockerfile.go'),
+    /PATH=\$\{RUNNER_TOOL_CACHE\}\/go\/\$\{GO_VERSION\}\/arm64\/bin:/,
+    'the go flavor must put the cached toolchain bin on PATH',
+  );
+});
+
+test('the rust flavor gives the job a WRITABLE RUSTUP_HOME', () => {
+  // The action this flavor exists to serve (`dtolnay/rust-toolchain`) runs
+  // `rustup toolchain install` + `rustup default`, both of which WRITE into RUSTUP_HOME
+  // (toolchains/, settings.toml). Root-owned, every workflow that pins a toolchain fails with a
+  // permission error. The VM is single-use and runs one job, so there is no later job to poison.
+  const df = read('Dockerfile.rust');
+  const home = df.match(/^ *(?:ENV )?RUSTUP_HOME=(\S+)/m)?.[1];
+  assert.ok(home, 'rust must set RUSTUP_HOME');
+  const chowned = [...df.matchAll(/chown -R runner:runner ([^\n\\]+)/g)]
+    .flatMap((m) => m[1].trim().split(/\s+/))
+    // The Dockerfile chowns through the variable; resolve it so the assertion compares paths.
+    .map((p) => p.replace('${RUSTUP_HOME}', home));
+  assert.ok(
+    chowned.includes(home),
+    `RUSTUP_HOME (${home}) must be chowned to the runner user — rustup writes into it`,
+  );
+});
+
 test('the rust flavor gives the job a WRITABLE CARGO_HOME', () => {
-  // The baked toolchain lives in a root-owned /opt/rust so a job cannot poison it, but cargo
+  // cargo
   // ALSO writes the registry index + crate cache into CARGO_HOME. Left pointing at
   // /opt/rust/cargo, every dependency fetch fails with "failed to download replaced source
   // registry `crates-io`: Permission denied (os error 13)" — verified in a container as the
