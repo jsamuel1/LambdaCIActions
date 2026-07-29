@@ -764,6 +764,16 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
    endpoint path and then fails to connect. A non-zero exit is the expected outcome; only the
    elapsed time is interesting, and it is logged. It is best-effort and wrapped — a non-200
    from `/ready` fails the entire image build ("Ready hook check failed").
+
+   It must reach the **connect attempt** to be worth anything. A region is therefore passed
+   explicitly (`PREWARM_REGION`, defaulted — the guest images set no `AWS_REGION`): without
+   one the CLI aborts at parameter validation with `NoRegion`, *before* endpoint resolution
+   and HTTP-stack construction, i.e. before the expensive half of the cold path. Measured on
+   aws-cli 2.36.8: **0.60 s** and zero endpoint/HTTP work with no region, vs **1.05 s**
+   reaching `Could not connect to the endpoint URL` with one. The log line reports `warmed`
+   (the connect attempt was reached) separately from `ran` (the process started), so an early
+   exit reads as a failed warmup instead of a successful one — a `ran`-only signal would have
+   reported success for a warmup that did nothing.
 2. **Resize the budget for a cold call anyway**, because a pre-warm can regress silently (a
    base-image change, a CLI upgrade, a rebuilt snapshot) and the guest must not depend on it:
    per-invoke bound **6 s → 20 s**, and the image's `runTimeoutInSeconds` **30 s → 120 s**
@@ -778,8 +788,9 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
 4. **Pin it in tests.** `test/run-hook.test.mjs` keeps the original "budget < hook timeout"
    invariant (which the 6 s budget satisfied while still having no margin) and adds: budget +
    one more full-length attempt ≤ hook timeout, a floor on the per-invoke bound above the
-   measured cold cost, the presence of per-attempt duration logging, and the pre-warm's
-   credential-free/loopback/bounded properties.
+   measured cold cost, the presence of per-attempt duration logging, the pre-warm's
+   credential-free/loopback/bounded properties, that it passes a region, and that `warmed` is
+   false when the CLI exits before the connect attempt.
 
 **Why**: the two halves cover each other. The pre-warm removes the latency, so the raised
 bound is dead headroom on a healthy boot rather than added boot time; the raised bound means a

@@ -142,6 +142,16 @@ const BOOT_CALL_ATTEMPTS = 3;
 // endpoint-resolution work and then fails to connect, which is the expected outcome.
 const PREWARM_TIMEOUT_MS = 30000;
 const PREWARM_ENDPOINT = 'http://127.0.0.1:1'; // closed port — nothing leaves the guest
+// A region is REQUIRED even though nothing leaves the guest: without one the CLI aborts at
+// parameter validation (`NoRegion`) BEFORE it resolves an endpoint or builds its HTTP stack —
+// i.e. before the expensive half of the cold path this warmup exists to pay. The build guest
+// sets no AWS_REGION (see microvm/Dockerfile.*), so supply a default rather than inherit one.
+// The value is inert: `--endpoint-url` points at loopback, so it never selects a real endpoint.
+const PREWARM_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
+// The connect failure the warmup MUST end at, having done all the import/model-load/endpoint/
+// HTTP-client work. Reaching anything else (e.g. NoRegion) means it exited early and warmed
+// only the cheap half — that has to read as a FAILED warmup, not a successful one.
+const PREWARM_REACHED_RE = /Could not connect to the endpoint URL/i;
 let prewarmed = false;
 
 // Invoke the hook broker λ via the baked-in AWS CLI (no npm deps in the image). The VM's
@@ -345,6 +355,14 @@ function sleepSync(ms) {
  * matters, and it is logged so the build record MEASURES the cold cost instead of assuming it
  * (the assumption is what produced the 6 s budget). Idempotent and best-effort: the `ready`
  * hook must answer 200 regardless, or the image build fails with "Ready hook check failed".
+ *
+ * The warmup is only worth anything if it reaches the CONNECT attempt: an early exit (most
+ * plausibly `NoRegion`, since the build guest sets no AWS_REGION) returns non-zero after doing
+ * only argument parsing, leaving endpoint resolution and the HTTP stack cold — exactly the
+ * work the boot path would then pay for. So a region is always passed, and `warmed` reports
+ * whether the expected connect failure was actually reached rather than merely that the CLI
+ * ran. A false `warmed` in the build log means the boot path is back on the cold-cost path and
+ * is relying on the raised BOOT_CALL_TIMEOUT_MS alone.
  */
 export function prewarmAwsCli(spawn = spawnSync) {
   if (prewarmed) return { skipped: true };
@@ -355,6 +373,7 @@ export function prewarmAwsCli(spawn = spawnSync) {
     [
       'lambda', 'invoke',
       '--no-sign-request',
+      '--region', PREWARM_REGION,
       '--endpoint-url', PREWARM_ENDPOINT,
       '--cli-connect-timeout', '1',
       '--cli-read-timeout', '1',
@@ -372,11 +391,15 @@ export function prewarmAwsCli(spawn = spawnSync) {
     },
   );
   const ms = Date.now() - startedAt;
-  // `ok` reports only whether the CLI RAN (a connect failure still warms it); a missing binary
-  // or a timeout is the real signal, and it means the boot path will pay the cold cost.
+  // `ran` = the CLI process started at all (a missing binary or a timeout surfaces as r.error).
+  // `warmed` = it got as far as the connect attempt, which is the only outcome that proves the
+  // expensive cold path executed. `stderr` is a fixed CLI diagnostic against a loopback
+  // endpoint with no credentials — it carries no run data (there is no run yet at build time).
   const ran = !r.error;
-  log('aws cli prewarm', { ms, ran, status: r.status ?? null });
-  return { ms, ran, skipped: false };
+  const stderr = String(r.stderr || '').trim().slice(0, 200);
+  const warmed = ran && PREWARM_REACHED_RE.test(stderr);
+  log('aws cli prewarm', { ms, ran, warmed, status: r.status ?? null, stderr: warmed ? undefined : stderr });
+  return { ms, ran, warmed, skipped: false };
 }
 
 // Fetch the stashed JIT config through the hook broker (ADR-016 by-reference payload,

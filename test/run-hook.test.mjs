@@ -293,6 +293,17 @@ test('the ready hook pre-warms the AWS CLI without credentials or egress', () =>
   assert.match(fn, /timeout: PREWARM_TIMEOUT_MS/, 'a hung warmup must not eat the ready budget');
   const endpoint = src.match(/const PREWARM_ENDPOINT = '([^']+)'/)[1];
   assert.match(endpoint, /^http:\/\/127\.0\.0\.1:/, `prewarm endpoint ${endpoint} is not loopback`);
+  // A region must be passed EXPLICITLY. Without one the CLI aborts with `NoRegion` during
+  // parameter validation — before endpoint resolution and HTTP-stack construction, which is
+  // the expensive half of the cold path the warmup exists to pay. Measured on aws-cli 2.36.8:
+  // 0.60 s and zero endpoint/urllib3 work with no region, vs 1.05 s reaching the connect
+  // attempt with one. The guest images set no AWS_REGION, so inheriting it is not enough.
+  assert.match(fn, /'--region', PREWARM_REGION/, 'the warmup must pass a region or it exits early');
+  assert.match(
+    src,
+    /const PREWARM_REGION = process\.env\.AWS_REGION \|\| process\.env\.AWS_DEFAULT_REGION \|\| '[a-z0-9-]+'/,
+    'PREWARM_REGION must fall back to a literal — the build guest sets no AWS_REGION',
+  );
 });
 
 // The warmup runs on a real spawn in the guest; here, inject a fake so the invariants are
@@ -302,18 +313,36 @@ test('prewarmAwsCli spawns the CLI once and reports its duration', () => {
   const calls = [];
   const fake = (cmd, args) => {
     calls.push({ cmd, args });
-    return { status: 255, error: undefined }; // connect failure — the EXPECTED outcome
+    // The EXPECTED outcome: non-zero, having reached the connect attempt against loopback.
+    return { status: 255, error: undefined, stderr: 'Could not connect to the endpoint URL: "http://127.0.0.1:1/"' };
   };
   const first = prewarmAwsCli(fake);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, 'aws');
   assert.deepEqual(calls[0].args.slice(0, 2), ['lambda', 'invoke']);
   assert.equal(first.ran, true, 'a non-zero exit still warms the CLI');
+  assert.equal(first.warmed, true, 'reaching the connect attempt means the cold path executed');
   assert.equal(typeof first.ms, 'number');
   // Idempotent: a second ready probe must not re-pay the cost.
   const second = prewarmAwsCli(fake);
   assert.equal(calls.length, 1);
   assert.equal(second.skipped, true);
+});
+
+// The failure mode that made the first cut of this warmup a no-op: the CLI exits non-zero
+// having done only argument validation, so a `ran`-only signal reports success while endpoint
+// resolution and the HTTP stack stayed cold. `warmed` must distinguish the two, or a silent
+// regression here puts the boot path back on the full cold cost with nothing in the build log
+// to show it. Checked through the module's own entry point rather than a re-implementation.
+test('prewarmAwsCli reports warmed=false when the CLI exits before the connect attempt', async () => {
+  const mod = await import(`../microvm/bootstrap/run-hook.mjs?early-exit-${Date.now()}`);
+  const early = mod.prewarmAwsCli(() => ({
+    status: 253,
+    error: undefined,
+    stderr: 'aws: [ERROR]: An error occurred (NoRegion): You must specify a region.',
+  }));
+  assert.equal(early.ran, true, 'the process did start');
+  assert.equal(early.warmed, false, 'an early exit warms only the cheap half — not a success');
 });
 
 // The broker's reserved-concurrency cap (20) exists to stop an untrusted VM fleet draining
