@@ -106,6 +106,18 @@ export interface FlavorResolution {
   flavor: string;
   /** Human-readable reason describing which rule matched. */
   reason: string;
+  /**
+   * The flavor selected BEFORE a signal upgrade replaced it, when one did (step 3). Absent
+   * when no upgrade happened.
+   *
+   * Load-bearing for `compat`: the upgrade is a REPLACEMENT (flavors carry one toolchain
+   * each, ADR-039), and `compat` can only re-derive what was requested from `runs_on` labels.
+   * That misses every selection made WITHOUT a catalog label — a FlavorMap entry
+   * (`ubuntu-latest → python`) or the repo's `defaultFlavor` — so a `services:` job on either
+   * of those paths silently lost its toolchain with no `toolchain-dropped` warning. Carrying
+   * the pre-upgrade name makes the loss visible regardless of which rule selected it.
+   */
+  replaced?: string;
 }
 
 function byName(name: string): FlavorDef | undefined {
@@ -177,6 +189,9 @@ function applySignalUpgrade(current: FlavorResolution, signals?: JobSignals): Fl
   return {
     flavor: upgraded.name,
     reason: `${current.reason}; upgraded to '${upgraded.name}' for docker capability${lostNote}`,
+    // Record what was replaced so `compat` can warn even when no catalog LABEL named it
+    // (FlavorMap / defaultFlavor selections carry no `lambda-ci-<lang>` label to re-derive from).
+    replaced: current.flavor,
   };
 }
 

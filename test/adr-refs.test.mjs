@@ -128,3 +128,42 @@ test('the numbering-note exemption does not extend to other blockquotes', () => 
   assert.ok(!exempt.has(4), 'an unrelated blockquote must NOT be exempt');
   assert.ok(!exempt.has(0), 'headings are never exempt');
 });
+
+// A spec's `## Contents` list is the reader's only index into a long document, and a new
+// top-level section is exactly the thing a milestone adds without touching it. This branch
+// added `## Custom flavors (bring-your-own image)` to spec 02 and left it out of the TOC, so
+// the shipped contract for the follow-up card was unlisted. Drift is silent — the doc renders
+// fine either way — so pin it.
+test('every spec section with a Contents list is listed in it', () => {
+  const specsDir = path.join(REPO_ROOT, 'docs', 'specs');
+  /** GitHub's heading→anchor slug: lower-case, drop punctuation, spaces → dashes. */
+  const slug = (heading) =>
+    heading
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, '')
+      .trim()
+      .replace(/\s/g, '-');
+  let checked = 0;
+  const missing = [];
+  for (const name of fs.readdirSync(specsDir)) {
+    if (!name.endsWith('.md')) continue;
+    const text = fs.readFileSync(path.join(specsDir, name), 'utf8');
+    const tocBlock = text.match(/^## Contents$([\s\S]*?)^---$/m)?.[1];
+    // Specs without a Contents list have nothing to drift from.
+    if (!tocBlock) continue;
+    checked += 1;
+    const anchors = new Set([...tocBlock.matchAll(/\(#([^)]+)\)/g)].map((m) => m[1]));
+    for (const m of text.matchAll(/^## (.+)$/gm)) {
+      const heading = m[1].trim();
+      if (heading === 'Contents') continue;
+      const want = slug(heading);
+      if (!anchors.has(want)) missing.push(`${name}: '${heading}' (#${want})`);
+    }
+  }
+  assert.ok(checked > 0, 'no spec exposes a Contents list — has the format changed?');
+  assert.deepEqual(
+    missing,
+    [],
+    `spec sections missing from their own Contents list:\n  ${missing.join('\n  ')}`,
+  );
+});

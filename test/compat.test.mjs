@@ -230,6 +230,51 @@ test('the resolver names the dropped toolchain in its reason', () => {
   );
 });
 
+test('a toolchain selected WITHOUT a catalog label still warns when it is dropped', () => {
+  // A label is not the only way a flavor gets requested. `resolveFlavor` also selects one from a
+  // repo FlavorMap entry (`ubuntu-latest → python`) and from the repo's `defaultFlavor`, and
+  // NEITHER puts a `lambda-ci-python` label in `runs_on`. Re-deriving "requested" from labels
+  // alone therefore missed both: the job upgraded to `docker`, lost Python, and got no warning
+  // at all — the exact silent failure `toolchain-dropped` exists to prevent, on two of the three
+  // selection routes. The resolution now carries the flavor the upgrade REPLACED, which is the
+  // only signal available on those paths.
+  for (const [desc, labels, opts] of [
+    ['FlavorMap', ['ubuntu-latest'], { flavorMap: { 'ubuntu-latest': 'python' } }],
+    ['defaultFlavor', ['self-hosted'], { defaultFlavor: 'python' }],
+  ]) {
+    const r = resolveFlavor(labels, { ...opts, signals: { needs_docker: true } });
+    assert.equal(r.flavor, 'docker', `${desc}: upgrades to docker`);
+    assert.equal(r.replaced, 'python', `${desc}: records what it replaced`);
+    const c = analyzeCompat(job({ runs_on: labels, needs_docker: true }), r);
+    const m = c.messages.find((x) => x.code === 'toolchain-dropped');
+    assert.ok(m, `${desc}: must warn that Python is gone`);
+    assert.match(m.text, /'python'/, `${desc}: names the lost capability`);
+  }
+});
+
+test('an upgrade off a flavor with nothing to lose raises no toolchain warning', () => {
+  // The no-op case for the `replaced` path: base carries no capabilities, so upgrading it to
+  // docker drops nothing and must stay quiet rather than warning on every docker job.
+  const r = resolveFlavor(['lambda-ci'], { signals: { needs_docker: true } });
+  assert.equal(r.flavor, 'docker');
+  assert.equal(r.replaced, 'base');
+  const c = analyzeCompat(job({ runs_on: ['lambda-ci'], needs_docker: true }), r);
+  assert.equal(
+    c.messages.some((x) => x.code === 'toolchain-dropped'),
+    false,
+  );
+  assert.equal(c.level, 'ok');
+});
+
+test('no upgrade means no `replaced` field, and no warning from it', () => {
+  const r = resolveFlavor(['self-hosted', 'lambda-ci-python']);
+  assert.equal(r.flavor, 'python');
+  assert.equal(r.replaced, undefined, 'nothing was replaced');
+  const c = analyzeCompat(job({ runs_on: ['self-hosted', 'lambda-ci-python'] }), r);
+  assert.equal(c.level, 'ok');
+  assert.equal(c.messages.length, 0);
+});
+
 // 9. multiple rules → worst level wins, all messages present.
 test('block + docker-missing folds to block with both messages', () => {
   const r = analyzeCompat(

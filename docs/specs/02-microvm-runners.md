@@ -13,6 +13,7 @@ Actions runner agent, and reaps them. This is the compute engine.
 - [Provisioning lifecycle](#provisioning-lifecycle)
 - [Reaping & timeouts](#reaping--timeouts)
 - [Caching & pre-warming](#caching--pre-warming)
+- [Custom flavors (bring-your-own image)](#custom-flavors-bring-your-own-image)
 - [Constraints](#constraints)
 
 ---

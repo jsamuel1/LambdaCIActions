@@ -22,6 +22,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 - [Live run updates](#live-run-updates)
 - [Tech choices](#tech-choices)
 - [Non-functional](#non-functional)
+- [Resolved questions](#resolved-questions)
 - [Open questions](#open-questions)
 
 ---
