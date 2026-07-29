@@ -183,23 +183,35 @@ function RelinkForm({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<RelinkResult | undefined>();
   const [error, setError] = useState<string | undefined>();
+  /**
+   * Set when the server REFUSED because a rotated webhook secret could not be pushed to GitHub.
+   * The credentials were valid and were rolled back; proceeding would stop every delivery, so it
+   * requires a second, explicit confirmation rather than a silent retry.
+   */
+  const [desyncRefusal, setDesyncRefusal] = useState<string | undefined>();
 
   const set = (k: keyof typeof EMPTY_CREDS) => (e: { target: { value: string } }) =>
     setCreds((c) => ({ ...c, [k]: e.target.value }));
 
-  async function submit(): Promise<void> {
+  async function submit(allowHookDesync = false): Promise<void> {
     setBusy(true);
     setError(undefined);
     setResult(undefined);
+    if (!allowHookDesync) setDesyncRefusal(undefined);
     try {
-      const res = await api.relinkGithubApp(creds);
+      const res = await api.relinkGithubApp({ ...creds, ...(allowHookDesync ? { allowHookDesync } : {}) });
       setResult(res);
       if (res.applied) {
+        setDesyncRefusal(undefined);
         setCreds(EMPTY_CREDS); // drop the plaintext as soon as it is no longer needed
         // A hook-sync failure needs the operator's attention here, so keep the panel open
         // rather than collapsing it — the warning would otherwise vanish on close.
         if (res.hookSynced !== false) onDone();
         else reload();
+      } else if (res.hookSynced === false) {
+        // Webhook-secret desync refusal: keep the (still-populated) form so the operator can
+        // confirm after fixing the secret at GitHub, rather than re-typing every credential.
+        setDesyncRefusal(res.error ?? 'GitHub webhook configuration could not be updated');
       } else {
         setError(res.error ?? 'relink failed');
       }
@@ -211,10 +223,18 @@ function RelinkForm({
   }
 
   async function rollback(): Promise<void> {
-    if (!result?.replacedVersions) return;
+    // A first-link has an EMPTY `replacedVersions` (nothing existed to replace) and undoes itself
+    // through `createdParams` instead, so gating on the versions alone would make its rollback a
+    // no-op.
+    if (!result) return;
+    const versions = result.replacedVersions ?? {};
+    const created = result.createdParams ?? [];
+    if (!Object.keys(versions).length && !created.length) return;
     setBusy(true);
     try {
-      const res = await api.rollbackGithubApp(result.replacedVersions);
+      // `createdParams` matters as much as the versions: parameters this relink CREATED have no
+      // prior version, so a rollback that omitted them would leave a first-link in place.
+      const res = await api.rollbackGithubApp(versions, created);
       setResult(undefined);
       // A rollback whose GitHub hook re-sync failed leaves signing broken; keep the panel open
       // with the warning rather than closing on what looks like success.
@@ -284,15 +304,30 @@ function RelinkForm({
         </label>
       </div>
       <div className="row gap-top">
-        <button className="primary" disabled={busy || !complete} onClick={submit}>
+        <button className="primary" disabled={busy || !complete} onClick={() => submit()}>
           {busy ? 'Verifying…' : 'Verify & re-link'}
         </button>
-        {result?.replacedVersions && Object.keys(result.replacedVersions).length > 0 && (
+        {((result?.replacedVersions && Object.keys(result.replacedVersions).length > 0) ||
+          (result?.createdParams && result.createdParams.length > 0)) && (
           <button disabled={busy} onClick={rollback}>
             Roll back to previous App
           </button>
         )}
       </div>
+      {desyncRefusal && (
+        <div className="subcard gap-top">
+          <p className="error">{desyncRefusal}</p>
+          <p className="muted">
+            Nothing was changed — the credentials were verified and then rolled back. Set the new
+            webhook secret on the App at GitHub yourself (Settings → Webhook → Secret), then
+            confirm below. Until GitHub and this environment agree on the secret, every delivery is
+            rejected and no job is claimed.
+          </p>
+          <button className="danger" disabled={busy || !complete} onClick={() => submit(true)}>
+            {busy ? 'Re-linking…' : 'I set the secret at GitHub — re-link anyway'}
+          </button>
+        </div>
+      )}
       {error && <p className="error">{error}</p>}
       {result?.applied && (
         <>

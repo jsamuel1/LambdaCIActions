@@ -33,12 +33,13 @@ const CRED_SUFFIXES = [
  * A fake SSM + GitHub environment. `existing` seeds parameter versions (so we can model both a
  * rotation and a fresh first-link); `failOn` makes one PutParameter throw.
  */
-function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = false, hookError, lockHeld = false, sharedCache } = {}) {
+function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = false, hookError, lockHeld = false, sharedCache, sharedGen = 0, failRestoreRead } = {}) {
   const store = new Map(Object.entries(existing)); // name → { value, version }
-  const calls = { puts: [], deletes: [], audits: [], hookUpdates: [], identities: [], locks: [], releases: [], cacheReads: 0, cacheWrites: [], cacheClears: 0 };
+  const calls = { puts: [], deletes: [], audits: [], hookUpdates: [], identities: [], locks: [], releases: [], cacheReads: 0, cacheWrites: [], cacheClears: 0, genReads: 0, restoreReads: [] };
   // Models the shared `CONFIG#STATUS` row: `sharedCache` seeds a warm row written by ANOTHER
-  // container, which is the case a per-container cache cannot cover.
-  const shared = { row: sharedCache };
+  // container, which is the case a per-container cache cannot cover. `gen` models the
+  // invalidation generation that fences a stale in-flight publish.
+  const shared = { row: sharedCache, gen: sharedGen };
 
   const deps = {
     getParam: async (name) => {
@@ -48,6 +49,10 @@ function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = fa
     },
     paramVersion: async (name) => store.get(name)?.version,
     getParamVersion: async (name, version) => {
+      calls.restoreReads.push(`${name}:${version}`);
+      if (failRestoreRead && name.endsWith(failRestoreRead)) {
+        throw new Error(`version ${version} of ${name} is not retrievable`);
+      }
       const hit = store.get(name);
       // Model SSM's parameter history: only the seeded prior version is retrievable.
       if (!hit || hit.history?.[version] === undefined) {
@@ -117,13 +122,20 @@ function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = fa
       calls.cacheReads += 1;
       return shared.row;
     },
-    putStatusCache: async (payload) => {
+    getStatusGeneration: async () => {
+      calls.genReads += 1;
+      return shared.gen;
+    },
+    putStatusCache: async (payload, _now, expectedGen) => {
+      // Model the conditional write: a generation that moved on drops the (stale) payload.
+      if (expectedGen !== undefined && expectedGen !== shared.gen) return;
       calls.cacheWrites.push(payload);
       shared.row = payload;
     },
     clearStatusCache: async () => {
       calls.cacheClears += 1;
       shared.row = undefined;
+      shared.gen += 1;
     },
   };
   return { deps, store, calls, shared, handle: createHandler(deps) };
@@ -173,14 +185,113 @@ test('the rollback handle reports the versions that were replaced', async () => 
     'github/client-id': 3,
     'github/client-secret': 3,
   });
+  // Nothing was created, so there is nothing for a rollback to delete.
+  assert.equal(res.createdParams, undefined);
 });
 
-test('a hook-config failure is reported but does not fail an otherwise-verified relink', async () => {
-  const h = harness({ existing: linkedStore(), hookFails: true });
+test('a first-link reports the parameters it CREATED as part of the rollback handle', async () => {
+  // Empty environment: every credential parameter is created, so `replacedVersions` is empty and
+  // the ONLY way to undo the link is to delete what it made. Without `createdParams` the
+  // operator's rollback button would have nothing to act on and silently no-op.
+  const h = harness({ existing: {} });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.replacedVersions, {});
+  assert.deepEqual(res.createdParams, CRED_SUFFIXES);
+});
+
+test('an explicit rollback deletes the parameters a first-link created', async () => {
+  const h = harness({ existing: {} });
+  const linked = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.deepEqual(linked.createdParams, CRED_SUFFIXES);
+
+  const res = await h.handle({
+    action: 'rollback',
+    actor: 'alice',
+    restore: {},
+    remove: linked.createdParams,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.rolledBack, true);
+  for (const s of CRED_SUFFIXES) {
+    assert.ok(h.calls.deletes.includes(`${PREFIX}/${s}`), `${s} was not removed`);
+    assert.equal(h.store.has(`${PREFIX}/${s}`), false, `${s} still present after rollback`);
+  }
+});
+
+test('a rollback naming neither a version nor a removal is refused', async () => {
+  const h = harness({ existing: linkedStore() });
+  const res = await h.handle({ action: 'rollback', actor: 'alice', restore: {} });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /at least one parameter version or removal/);
+  assert.deepEqual(h.calls.puts, []);
+  assert.deepEqual(h.calls.deletes, []);
+});
+
+test('a rollback whose history read fails writes nothing at all', async () => {
+  // Every historical value is read BEFORE any write, so a purged/inaccessible version aborts
+  // while the environment is still wholly on the replacement credentials. A read-then-write loop
+  // would have restored the earlier parameters and left a mixed credential set behind.
+  const h = harness({ existing: linkedStore(), failRestoreRead: 'client-secret' });
+  const res = await h.handle({
+    action: 'rollback',
+    actor: 'alice',
+    restore: {
+      'github/app-id': 3,
+      'github/app-pem': 3,
+      'github/webhook-secret': 3,
+      'github/client-id': 3,
+      'github/client-secret': 3,
+    },
+  });
+  assert.equal(res.ok, false);
+  assert.deepEqual(h.calls.puts, [], 'a failed pre-read must leave SSM untouched');
+  assert.deepEqual(h.calls.deletes, []);
+});
+
+test('a hook-config failure is reported but does not fail a relink that kept the same secret', async () => {
+  // Same webhook secret ⇒ GitHub and Ingest still agree, so a failed hook PATCH is advisory:
+  // deliveries keep verifying and the operator only needs to know the URL may be stale.
+  const existing = linkedStore();
+  existing[`${PREFIX}/github/webhook-secret`] = {
+    value: CREDS.webhookSecret,
+    version: 3,
+    history: { 3: CREDS.webhookSecret },
+  };
+  const h = harness({ existing, hookFails: true });
   const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
   assert.equal(res.ok, true);
   assert.equal(res.hookSynced, false);
   assert.match(res.hookError, /hook config/);
+});
+
+test('a hook-config failure on a ROTATED secret is refused and rolled back', async () => {
+  // The wedge case: GitHub keeps signing with the old secret while Ingest verifies the new one,
+  // so every delivery is rejected 401 and no job is ever claimed. GitHub does not retry a
+  // delivery that failed verification, so that work is lost, not deferred. Fail closed.
+  const h = harness({ existing: linkedStore(), hookFails: true });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  assert.equal(res.hookSynced, false);
+  assert.equal(res.rolledBack, true);
+  assert.match(res.error, /rolled back/);
+  for (const s of CRED_SUFFIXES) {
+    assert.equal(h.store.get(`${PREFIX}/${s}`).value, `old-${s}`, `${s} not restored`);
+  }
+});
+
+test('an operator may accept a hook desync explicitly', async () => {
+  const h = harness({ existing: linkedStore(), hookFails: true });
+  const res = await h.handle({
+    action: 'relink',
+    actor: 'alice',
+    credentials: CREDS,
+    allowHookDesync: true,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.hookSynced, false);
+  // The new credentials stay in place — the operator said they would fix GitHub by hand.
+  assert.equal(h.store.get(`${PREFIX}/github/app-id`).value, CREDS.appId);
 });
 
 // ---- partial-write rollback ------------------------------------------------
@@ -219,8 +330,16 @@ test('a partial FIRST link deletes the parameters it created instead of strandin
   assert.equal(h.store.get(`${PREFIX}/github/app-id`).value, 'seed');
 });
 
-test('a hook-config failure does NOT trigger a rollback (credentials verified)', async () => {
-  const h = harness({ existing: linkedStore(), hookFails: true });
+test('a hook-config failure does NOT trigger a rollback when the secret is unchanged', async () => {
+  // Unchanged webhook secret ⇒ GitHub and Ingest still agree, so deliveries keep verifying and a
+  // failed hook PATCH is advisory. (The ROTATED case fails closed — covered above.)
+  const existing = linkedStore();
+  existing[`${PREFIX}/github/webhook-secret`] = {
+    value: CREDS.webhookSecret,
+    version: 3,
+    history: { 3: CREDS.webhookSecret },
+  };
+  const h = harness({ existing, hookFails: true });
   await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
   assert.deepEqual(h.calls.deletes, []);
   assert.equal(h.store.get(`${PREFIX}/github/app-id`).value, CREDS.appId);
@@ -310,16 +429,31 @@ test('operator-driven rollback restores the requested versions and re-verifies',
 test('a GitHub error quoting the submitted webhook secret never reaches the result', async () => {
   // GitHub's 422 bodies quote the offending request value back, and a webhook secret is an
   // opaque high-entropy string — the shape guard cannot recognize it, so the broker must
-  // redact it by literal value.
+  // redact it by literal value. This runs on the REFUSAL path (a rotated secret whose hook sync
+  // failed), which is precisely where GitHub's quoted-back body ends up in operator-facing text.
   const h = harness({
     existing: linkedStore(),
     hookError: `Invalid request. "${CREDS.webhookSecret}" is not a valid secret.`,
   });
   const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
-  assert.equal(res.ok, true);
+  assert.equal(res.ok, false, 'a rotated secret that GitHub never received must fail closed');
   const serialized = JSON.stringify(res);
   assert.ok(!serialized.includes(CREDS.webhookSecret), 'webhook secret leaked into the result');
   assert.ok(res.hookError.includes('[redacted]'), 'expected the value to be masked');
+  // ...and equally on the accepted-desync path, where the same text is returned with ok:true.
+  const accepted = harness({
+    existing: linkedStore(),
+    hookError: `Invalid request. "${CREDS.webhookSecret}" is not a valid secret.`,
+  });
+  const ok = await accepted.handle({
+    action: 'relink',
+    actor: 'alice',
+    credentials: CREDS,
+    allowHookDesync: true,
+  });
+  assert.equal(ok.ok, true);
+  assert.ok(!JSON.stringify(ok).includes(CREDS.webhookSecret), 'webhook secret leaked');
+  assert.ok(ok.hookError.includes('[redacted]'));
 });
 
 test('a thrown error quoting the submitted client secret is redacted from the error field', async () => {
@@ -588,4 +722,33 @@ test('a shared-cache fault degrades to a live GitHub read, it does not fail the 
   const res = await fresh({ action: 'status', actor: 'system' });
   assert.equal(res.ok, true);
   assert.equal(res.linkage.app.appId, 424242);
+});
+
+test('a status computation overtaken by a mutation does not publish its stale answer', async () => {
+  // `statusAction` makes four GitHub round-trips, so a relink/label change can land while it is
+  // still running. Publishing unconditionally would overwrite that mutation's invalidation with a
+  // PRE-change snapshot and serve it to every container for the full TTL. The generation captured
+  // before the computation fences that.
+  const h = harness({ existing: linkedStore() });
+  h.deps.getAppIdentity = async () => {
+    // Simulate a mutation landing mid-computation (this is exactly what clearStatusCache does).
+    await h.deps.clearStatusCache();
+    return { appId: 424242, name: 'LCA', slug: 'lca-dev', htmlUrl: '', ownerLogin: 'acme', events: [], permissions: {} };
+  };
+  const fresh = createHandler(h.deps);
+  const res = await fresh({ action: 'status', actor: 'system' });
+  assert.equal(res.ok, true, 'the caller still gets an answer');
+  assert.equal(h.calls.genReads, 1, 'the generation is captured before computing');
+  assert.deepEqual(h.calls.cacheWrites, [], 'the stale answer must not reach the shared row');
+  assert.equal(h.shared.row, undefined, 'the invalidation stands');
+});
+
+test('an uncontended status computation still publishes to the shared row', async () => {
+  // The negative control for the fence: with no mutation in flight the generation matches and the
+  // answer is published, so the bound on GitHub JWT spend still holds.
+  const h = harness({ existing: linkedStore(), sharedGen: 7 });
+  const res = await h.handle({ action: 'status', actor: 'system' });
+  assert.equal(res.ok, true);
+  assert.equal(h.calls.cacheWrites.length, 1);
+  assert.ok(h.shared.row, 'the row is populated for other containers');
 });

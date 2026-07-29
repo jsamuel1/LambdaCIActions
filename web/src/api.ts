@@ -259,6 +259,12 @@ export interface RelinkResult {
   appSlug?: string;
   replacedVersions?: Record<string, number>;
   /**
+   * Parameters this relink CREATED (they had no prior version). Part of the rollback handle:
+   * undoing them means deletion, so a rollback that only restored versions would leave a
+   * first-link in place.
+   */
+  createdParams?: string[];
+  /**
    * Whether GitHub's webhook config was updated to match the stored secret/URL. False means the
    * operator must set the secret at GitHub manually — otherwise every delivery fails its HMAC
    * check even though the credentials verified.
@@ -354,12 +360,19 @@ export const api = {
     webhookSecret: string;
     clientId: string;
     clientSecret: string;
+    /**
+     * Proceed even if GitHub's own hook config cannot be updated to the new webhook secret. Off
+     * by default: the server REFUSES and rolls back that case, because GitHub would keep signing
+     * with the previous secret while this environment verifies the new one — every delivery
+     * rejected, no job claimed. Only set once the operator has set the secret at GitHub by hand.
+     */
+    allowHookDesync?: boolean;
   }) =>
     request<RelinkResult>('/api/settings/github-app/relink', {
       method: 'POST',
       body: JSON.stringify(creds),
     }),
-  rollbackGithubApp: (restore: Record<string, number>) =>
+  rollbackGithubApp: (restore: Record<string, number>, remove: string[] = []) =>
     request<{
       rolledBack: boolean;
       verified: boolean;
@@ -373,7 +386,7 @@ export const api = {
       hookError?: string;
     }>('/api/settings/github-app/rollback', {
       method: 'POST',
-      body: JSON.stringify({ restore }),
+      body: JSON.stringify({ restore, ...(remove.length ? { remove } : {}) }),
     }),
   testWebhook: (deliveryId?: number) =>
     request<{ requested: boolean; deliveryId?: number; lastReceivedAtBefore: string | null }>(

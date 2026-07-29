@@ -457,6 +457,19 @@ test('relink body requires every credential field and rejects extras', () => {
   assert.equal(validateRelinkBody(missing).ok, false);
 });
 
+test('relink hook-desync acceptance is opt-in, boolean, and defaults off', () => {
+  // Off by default: without it, a relink that rotates the webhook secret and cannot PATCH the
+  // App's hook config is refused and rolled back, rather than silently stopping every delivery.
+  assert.equal(validateRelinkBody(GOOD_CREDS).value.allowHookDesync, false);
+  assert.equal(
+    validateRelinkBody({ ...GOOD_CREDS, allowHookDesync: true }).value.allowHookDesync,
+    true,
+  );
+  // A truthy non-boolean must not be coerced into accepting a platform-wide delivery outage.
+  assert.equal(validateRelinkBody({ ...GOOD_CREDS, allowHookDesync: 'yes' }).ok, false);
+  assert.equal(validateRelinkBody({ ...GOOD_CREDS, allowHookDesync: 1 }).ok, false);
+});
+
 test('broker credential validation checks PEM shape and secret lengths', () => {
   assert.equal(validateAppCredentials(GOOD_CREDS).ok, true);
   assert.equal(validateAppCredentials({ ...GOOD_CREDS, pem: 'not-a-pem' }).ok, false);
@@ -478,9 +491,60 @@ test('rollback snapshots accept known parameters with positive versions only', (
   assert.equal(validateVersionSnapshot({ 'github/app-pem': 3 }).ok, true);
   assert.equal(validateVersionSnapshot({ 'github/app-pem': 0 }).ok, false);
   assert.equal(validateVersionSnapshot({ 'mgmt/session-secret': 1 }).ok, false);
-  assert.equal(validateVersionSnapshot({}).ok, false);
   assert.equal(validateRollbackBody({ restore: { 'github/app-id': 2 } }).ok, true);
+});
+
+test('a rollback may name removals instead of versions (the first-link case)', () => {
+  // A first link CREATED every parameter, so there is no prior version to restore — the only way
+  // to undo it is deletion. Requiring a non-empty `restore` would make that rollback impossible.
+  const res = validateRollbackBody({ restore: {}, remove: ['github/app-pem'] });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.value.remove, ['github/app-pem']);
+  assert.deepEqual(res.value.restore, {});
+  // Omitting `restore` entirely is equally valid when removals carry the work.
+  assert.equal(validateRollbackBody({ remove: ['github/app-id'] }).ok, true);
+  // But a rollback that names NOTHING is a silent no-op and is refused.
   assert.equal(validateRollbackBody({ restore: {} }).ok, false);
+  assert.equal(validateRollbackBody({ restore: {}, remove: [] }).ok, false);
+});
+
+test('rollback removals are constrained to credential parameters', () => {
+  // The removal list drives DeleteParameter, so it must never be steerable at another path.
+  assert.equal(validateRollbackBody({ remove: ['mgmt/session-secret'] }).ok, false);
+  assert.equal(validateRollbackBody({ remove: ['../../etc/passwd'] }).ok, false);
+  assert.equal(validateRollbackBody({ remove: [42] }).ok, false);
+  assert.equal(validateRollbackBody({ remove: 'github/app-pem' }).ok, false);
+  // Duplicates collapse rather than double-deleting.
+  assert.deepEqual(
+    validateRollbackBody({ remove: ['github/app-pem', 'github/app-pem'] }).value.remove,
+    ['github/app-pem'],
+  );
+});
+
+test('broker rollback requests are refused unless they name a version or a removal', () => {
+  // Same rule at the broker boundary, which re-validates independently of the management API.
+  assert.equal(validateVersionSnapshot({}).ok, true, 'emptiness alone is not an error here');
+  assert.throws(
+    () => parseAppcfgRequest({ action: 'rollback', actor: 'alice', restore: {} }),
+    /at least one parameter version or removal/,
+  );
+  const ok = parseAppcfgRequest({
+    action: 'rollback',
+    actor: 'alice',
+    restore: {},
+    remove: ['github/app-id'],
+  });
+  assert.deepEqual(ok.remove, ['github/app-id']);
+  assert.throws(
+    () =>
+      parseAppcfgRequest({
+        action: 'rollback',
+        actor: 'alice',
+        restore: {},
+        remove: ['mgmt/session-secret'],
+      }),
+    /unknown parameter/,
+  );
 });
 
 test('webhook test body accepts nothing or a positive delivery id', () => {

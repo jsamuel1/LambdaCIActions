@@ -193,4 +193,81 @@ test('invalidation zeroes the timestamp so every container re-verifies', async (
   }
   assert.equal(i.sent[0].Key.pk, 'CONFIG#STATUS');
   assert.equal(i.sent[0].ExpressionAttributeValues[':zero'], 0);
+  // ...and bumps the generation, so a status computation already in flight (four GitHub
+  // round-trips) cannot publish its pre-mutation snapshot over this invalidation. A timestamp
+  // cannot express that: the stale write is genuinely newer.
+  assert.match(i.sent[0].UpdateExpression, /ADD gen :one/);
+  assert.equal(i.sent[0].ExpressionAttributeValues[':one'], 1);
+});
+
+test('a publish is conditional on the generation the reader observed', async () => {
+  const i = intercept();
+  try {
+    await store.putStatusCache({ ok: true }, 1_000_000, 4);
+  } finally {
+    i.restore();
+  }
+  assert.equal(i.sent[0].ConditionExpression, 'gen = :gen');
+  assert.equal(i.sent[0].ExpressionAttributeValues[':gen'], 4);
+});
+
+test('generation 0 accepts a row that has never been invalidated', async () => {
+  // A never-invalidated row has NO `gen` attribute, so a bare `gen = 0` condition would fail and
+  // the very first publish would be dropped — leaving the shared bound permanently unarmed.
+  const i = intercept();
+  try {
+    await store.putStatusCache({ ok: true }, 1_000_000, 0);
+  } finally {
+    i.restore();
+  }
+  assert.equal(i.sent[0].ConditionExpression, 'attribute_not_exists(gen) OR gen = :gen');
+});
+
+test('a publish with no observed generation is unconditional (back-compat)', async () => {
+  const i = intercept();
+  try {
+    await store.putStatusCache({ ok: true }, 1_000_000);
+  } finally {
+    i.restore();
+  }
+  assert.equal(i.sent[0].ConditionExpression, undefined);
+  assert.equal(i.sent[0].ExpressionAttributeValues[':gen'], undefined);
+});
+
+test('a generation-mismatch publish is swallowed, not thrown', async () => {
+  // The write losing its race is the mechanism working; it must not surface as a broker fault.
+  const original = DynamoDBDocumentClient.prototype.send;
+  DynamoDBDocumentClient.prototype.send = async () => {
+    throw Object.assign(new Error('conditional failed'), {
+      name: 'ConditionalCheckFailedException',
+    });
+  };
+  try {
+    await store.putStatusCache({ ok: true }, 1_000_000, 2);
+  } finally {
+    DynamoDBDocumentClient.prototype.send = original;
+  }
+});
+
+test('the generation read projects only `gen` and treats an absent row as 0', async () => {
+  const original = DynamoDBDocumentClient.prototype.send;
+  const seen = [];
+  DynamoDBDocumentClient.prototype.send = async (cmd) => {
+    seen.push(cmd.input);
+    return {};
+  };
+  try {
+    assert.equal(await store.getStatusGeneration(), 0);
+  } finally {
+    DynamoDBDocumentClient.prototype.send = original;
+  }
+  assert.equal(seen[0].ProjectionExpression, 'gen');
+  assert.equal(seen[0].Key.pk, 'CONFIG#STATUS');
+
+  DynamoDBDocumentClient.prototype.send = async () => ({ Item: { gen: 9 } });
+  try {
+    assert.equal(await store.getStatusGeneration(), 9);
+  } finally {
+    DynamoDBDocumentClient.prototype.send = original;
+  }
 });

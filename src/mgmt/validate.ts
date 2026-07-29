@@ -265,17 +265,27 @@ export function validateRelinkBody(
   webhookSecret: string;
   clientId: string;
   clientSecret: string;
+  allowHookDesync: boolean;
 }> {
   if (!isPlainObject(input)) return { ok: false, errors: ['body must be a JSON object'] };
   const required = ['appId', 'pem', 'webhookSecret', 'clientId', 'clientSecret'] as const;
+  const optional = ['allowHookDesync'] as const;
   const errors: string[] = [];
   for (const key of Object.keys(input)) {
-    if (!(required as readonly string[]).includes(key)) errors.push(`unknown field "${key}"`);
+    if (
+      !(required as readonly string[]).includes(key) &&
+      !(optional as readonly string[]).includes(key)
+    ) {
+      errors.push(`unknown field "${key}"`);
+    }
   }
   for (const key of required) {
     const v = input[key];
     if (typeof v !== 'string' || v.trim().length === 0) errors.push(`${key} is required`);
     else if (v.length > 16384) errors.push(`${key} is implausibly large`);
+  }
+  if (input.allowHookDesync !== undefined && typeof input.allowHookDesync !== 'boolean') {
+    errors.push('allowHookDesync must be a boolean');
   }
   if (errors.length) return { ok: false, errors };
   return {
@@ -286,30 +296,66 @@ export function validateRelinkBody(
       webhookSecret: String(input.webhookSecret),
       clientId: String(input.clientId).trim(),
       clientSecret: String(input.clientSecret),
+      // Explicit opt-in: proceed even though GitHub will keep signing with the previous webhook
+      // secret. Off by default because the default outcome of a desync is a total delivery
+      // outage (see `relinkAction` step 5).
+      allowHookDesync: input.allowHookDesync === true,
     },
   };
 }
 
-/** Validate a rollback body: `{ restore: { "<param>": <version> } }` (versions, not values). */
-export function validateRollbackBody(input: unknown): ValidationResult<Record<string, number>> {
+/**
+ * Validate a rollback body: `{ restore: { "<param>": <version> }, remove?: ["<param>"] }` —
+ * versions and names, never values.
+ *
+ * `remove` names parameters the relink CREATED (they have no prior version, so undoing them is a
+ * deletion). Without it an operator cannot roll back a FIRST link at all: `restore` would be
+ * empty and the request a no-op.
+ */
+export function validateRollbackBody(
+  input: unknown,
+): ValidationResult<{ restore: Record<string, number>; remove: string[] }> {
   if (!isPlainObject(input)) return { ok: false, errors: ['body must be a JSON object'] };
-  const restore = input.restore;
-  if (!isPlainObject(restore)) return { ok: false, errors: ['restore must be an object'] };
   const errors: string[] = [];
-  const out: Record<string, number> = {};
-  for (const [name, version] of Object.entries(restore)) {
-    if (!/^github\/[a-z-]+$/.test(name)) {
-      errors.push('restore keys must be GitHub App credential parameter names');
-      continue;
-    }
-    if (!Number.isSafeInteger(version) || (version as number) < 1) {
-      errors.push(`restore["${name}"] must be a positive SSM version`);
-      continue;
-    }
-    out[name] = version as number;
+  for (const key of Object.keys(input)) {
+    if (key !== 'restore' && key !== 'remove') errors.push(`unknown field "${key}"`);
   }
-  if (!errors.length && Object.keys(out).length === 0) errors.push('restore must not be empty');
-  return errors.length ? { ok: false, errors } : { ok: true, value: out };
+  const restore: Record<string, number> = {};
+  if (input.restore !== undefined) {
+    if (!isPlainObject(input.restore)) {
+      errors.push('restore must be an object');
+    } else {
+      for (const [name, version] of Object.entries(input.restore)) {
+        if (!/^github\/[a-z-]+$/.test(name)) {
+          errors.push('restore keys must be GitHub App credential parameter names');
+          continue;
+        }
+        if (!Number.isSafeInteger(version) || (version as number) < 1) {
+          errors.push(`restore["${name}"] must be a positive SSM version`);
+          continue;
+        }
+        restore[name] = version as number;
+      }
+    }
+  }
+  const remove: string[] = [];
+  if (input.remove !== undefined) {
+    if (!Array.isArray(input.remove)) {
+      errors.push('remove must be an array of parameter names');
+    } else {
+      for (const name of input.remove) {
+        if (typeof name !== 'string' || !/^github\/[a-z-]+$/.test(name)) {
+          errors.push('remove entries must be GitHub App credential parameter names');
+          continue;
+        }
+        if (!remove.includes(name)) remove.push(name);
+      }
+    }
+  }
+  if (!errors.length && !Object.keys(restore).length && !remove.length) {
+    errors.push('rollback must name at least one parameter version to restore or to remove');
+  }
+  return errors.length ? { ok: false, errors } : { ok: true, value: { restore, remove } };
 }
 
 /** Validate a webhook-test body: an optional positive delivery id. */

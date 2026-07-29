@@ -765,23 +765,37 @@ SSM paths survive only in a collapsed diagnostics section.
 
 **Relink is verify → snapshot → write → re-verify → sync-hook → auto-undo.** Credentials are
 validated against GitHub *before* any write, so a typo cannot take the environment offline. The
-rollback handle is a set of SSM parameter **version numbers**: the previous values stay in SSM's
-own parameter history and are never copied into a Lambda, a log, or a DynamoDB row. Two edge
-cases are handled explicitly, because each would otherwise leave a broken environment that reads
-as healthy:
+rollback handle is a set of SSM parameter **version numbers** plus the list of parameters the
+relink **created**: the previous values stay in SSM's own parameter history and are never copied
+into a Lambda, a log, or a DynamoDB row. Three edge cases are handled explicitly, because each
+would otherwise leave a broken environment that reads as healthy:
 
 - **A parameter this attempt created has no version to restore.** Undo therefore *deletes* such
   a parameter rather than trying to re-put a version that never existed. Without this, a
   first-link that fails part-way strands a partial credential set in SSM and reports rollback
   failure — the verify→write→undo contract has to hold on a fresh environment too.
+- **A *successful* first link must be undoable too.** Its `replacedVersions` is empty, because
+  nothing existed to replace, so the result also carries `createdParams` and `rollback` accepts a
+  `remove` list constrained to the same credential allow-list. A rollback handle made only of
+  versions would leave the operator's rollback button a silent no-op on exactly the environment
+  most likely to need it.
 - **The webhook secret has two homes.** Storing a rotated `webhook-secret` in SSM alone leaves
   GitHub signing with the previous value, so Ingest's HMAC check rejects every subsequent
   delivery with 401 and the environment goes silent while every credential badge reads green. The
   relink therefore also pushes the secret (and this deployment's receiver URL) to GitHub via
-  `PATCH /app/hook/config`. A failure there is **reported, not rolled back** (`hookSynced:
-  false`, surfaced as a UI warning): the credentials themselves verified, and some
-  Enterprise/org-hook Apps do not own their hook config, so the operator may legitimately have
-  to set it by hand.
+  `PATCH /app/hook/config`. When the secret **changed** and that push fails, the relink **fails
+  closed**: it is rolled back and refused. GitHub does not retry a delivery that failed
+  verification, so the jobs lost in a desync window are lost, not delayed — a `hookSynced: false`
+  warning on a green-looking relink is not a proportionate answer to a total claim outage. An
+  Enterprise/org-hook App that genuinely does not own its hook config is still supported, but the
+  operator must set the secret at GitHub and confirm explicitly (`allowHookDesync: true`), which
+  the console offers directly from the refusal. When the submitted secret is **unchanged**, GitHub
+  and Ingest still agree whatever the hook call did, so the failure stays advisory.
+
+An explicit rollback reads **every** historical value before writing any of them. A sequential
+read-then-write loop that faulted midway would leave a mixed credential set — some parameters
+restored, the rest still on the replacement values — and, unlike the relink path, there is no
+snapshot left to compensate from.
 
 Intake is **write-only** — the response carries presence + verification outcome, never a value,
 and validation errors never quote a submitted credential.
@@ -839,7 +853,12 @@ Three further consequences of that design, each pinned by a test:
   `CONFIG#STATUS / LINKAGE` row, so the bound is platform-wide rather than per-container. The row
   holds the already-redacted linkage payload (`assertNoSecrets` runs before the write and again
   on read-back, since the row is treated as untrusted platform state). Any mutation clears both
-  levels, so a relink is never read back stale. A DynamoDB fault on either cache path degrades to
+  levels and **bumps an invalidation generation** on that row; a `status` computation captures the
+  generation before it starts and publishes conditionally on it. Clearing alone is not enough: the
+  four GitHub round-trips take long enough for a relink to land midway, and an unconditional
+  publish would then overwrite that relink's invalidation with a pre-change snapshot and serve it
+  to every container for the full TTL. A timestamp cannot express this, because the stale write is
+  genuinely the newer one. A DynamoDB fault on either cache path degrades to
   a live GitHub read rather than failing the screen. This is why the broker's `CONFIG#*`-scoped
   DynamoDB grant includes `GetItem` alongside `UpdateItem`.
 - **Rotating the webhook secret has an Ingest cache window.** `getParam` caches for 5 minutes,

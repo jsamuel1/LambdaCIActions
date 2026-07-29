@@ -19,6 +19,9 @@ web/dist/
 *.log
 .DS_Store
 
+# agent scratch space (task notes, captured build/test output)
+.agents/
+
 # ide
 .idea/
 .vscode/

@@ -44,8 +44,27 @@ export interface AppcfgRequest {
   actor: string;
   /** action=relink only. */
   credentials?: AppCredentialsInput;
+  /**
+   * action=relink only — the operator accepts that GitHub's own hook config may not be
+   * updatable, so a rotated webhook secret can leave GitHub signing with the OLD value.
+   *
+   * Off by default and deliberately explicit: without it, a relink that rotates the webhook
+   * secret but cannot PATCH the App's hook config is refused and rolled back. The alternative
+   * is a silent outage — GitHub keeps signing with the previous secret while Ingest verifies
+   * against the new one, so every delivery is rejected 401 and no job is ever claimed again.
+   */
+  allowHookDesync?: boolean;
   /** action=rollback only — the parameter versions to restore (from a prior relink). */
   restore?: ParameterVersionSnapshot;
+  /**
+   * action=rollback only — parameters the relink CREATED, which have no prior version and must
+   * therefore be deleted rather than restored (ADR-029).
+   *
+   * Without this, an explicit rollback of a first-link is impossible: `restore` is empty because
+   * nothing existed beforehand, so the operator's rollback button would silently no-op and leave
+   * the environment on credentials they were trying to abandon.
+   */
+  remove?: string[];
   /** action=redeliver only; omitted ⇒ re-deliver the most recent delivery. */
   deliveryId?: number;
   /** action=setRunnerLabels only — the serialized (comma-separated) claim list. */
@@ -95,12 +114,30 @@ export function parseAppcfgRequest(raw: unknown): AppcfgRequest {
   if (action === 'relink') {
     const creds = validateAppCredentials(req.credentials);
     if (!creds.ok) throw new AppcfgRequestError(creds.errors.join('; '));
-    return { action, actor, credentials: creds.value };
+    return {
+      action,
+      actor,
+      credentials: creds.value,
+      ...(req.allowHookDesync === true ? { allowHookDesync: true } : {}),
+    };
   }
   if (action === 'rollback') {
     const restore = validateVersionSnapshot(req.restore);
     if (!restore.ok) throw new AppcfgRequestError(restore.errors.join('; '));
-    return { action, actor, restore: restore.value };
+    const remove = validateRemoveList(req.remove);
+    if (!remove.ok) throw new AppcfgRequestError(remove.errors.join('; '));
+    // A rollback must name SOMETHING to undo. `validateVersionSnapshot` allows an empty
+    // snapshot only when a removal list carries the work (a first-link created every
+    // parameter, so there is no prior version to restore — only creations to delete).
+    if (!Object.keys(restore.value).length && !remove.value.length) {
+      throw new AppcfgRequestError('rollback must name at least one parameter version or removal');
+    }
+    return {
+      action,
+      actor,
+      restore: restore.value,
+      ...(remove.value.length ? { remove: remove.value } : {}),
+    };
   }
   if (action === 'redeliver') {
     const id = req.deliveryId;
@@ -196,8 +233,27 @@ export function validateVersionSnapshot(input: unknown): Validated<ParameterVers
     }
     out[name] = version as number;
   }
-  if (!errors.length && Object.keys(out).length === 0) {
-    errors.push('restore must name at least one parameter version');
+  // Emptiness is NOT an error here: a first-link rollback restores nothing and only removes
+  // created parameters. `parseAppcfgRequest` enforces that at least one of the two is present.
+  return errors.length ? { ok: false, errors } : { ok: true, value: out };
+}
+
+/**
+ * Validate the list of parameters a rollback must DELETE (created by the relink being undone).
+ * Same allow-list as `restore`, so a rollback can never be steered at an unrelated parameter.
+ */
+export function validateRemoveList(input: unknown): Validated<string[]> {
+  if (input === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(input)) return { ok: false, errors: ['remove must be an array'] };
+  const known = new Set<string>(APP_CREDENTIAL_PARAMS);
+  const errors: string[] = [];
+  const out: string[] = [];
+  for (const name of input) {
+    if (typeof name !== 'string' || !known.has(name)) {
+      errors.push(`remove contains unknown parameter "${safeForLog(name)}"`);
+      continue;
+    }
+    if (!out.includes(name)) out.push(name);
   }
   return errors.length ? { ok: false, errors } : { ok: true, value: out };
 }
@@ -263,6 +319,12 @@ export interface AppcfgResult {
    * secrets; the values behind them stay in SSM.
    */
   replacedVersions?: ParameterVersionSnapshot;
+  /**
+   * Parameters the relink CREATED. Part of the same rollback handle: they have no prior version,
+   * so undoing them means deletion. Returned so an operator-driven rollback can undo a
+   * first-link, not only a re-link over an existing credential set.
+   */
+  createdParams?: string[];
   /** True when a failed relink was rolled back to the previous versions. */
   rolledBack?: boolean;
   /** action=redeliver. */

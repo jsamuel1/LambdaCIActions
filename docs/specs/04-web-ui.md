@@ -92,7 +92,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/settings` | Env identity, verified App linkage, runner labels, webhook health | ✅ |
 | `PUT /api/settings/runner-labels` | Replace the claimed runner labels (`dryRun` returns impact only) | ✅ |
 | `POST /api/settings/github-app/relink` | Write-only credential intake: verify against GitHub, then store | ✅ |
-| `POST /api/settings/github-app/rollback` | Restore the credential parameter versions a relink replaced | ✅ |
+| `POST /api/settings/github-app/rollback` | Undo a relink: restore replaced parameter versions and/or `remove` ones it created | ✅ |
 | `POST /api/settings/webhook/test` | Ask GitHub to re-deliver a delivery (real signed round-trip) | ✅ |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)) | M5 |
 
@@ -234,19 +234,30 @@ persisted in the browser, and error strings never quote a submitted value.
 
 **Relink is verify → snapshot → write → re-verify → sync-hook → auto-undo.** Credentials are
 validated against GitHub *before* any write, so a typo cannot take the environment offline. The
-rollback handle is a set of SSM parameter **version numbers**: the previous values stay in SSM's
-own parameter history and are never copied into a Lambda, a log, or a DynamoDB row. Two edge
-cases are handled explicitly because both would otherwise leave a broken environment that looks
-fine:
+rollback handle is a set of SSM parameter **version numbers** plus the list of parameters the
+relink **created**: the previous values stay in SSM's own parameter history and are never copied
+into a Lambda, a log, or a DynamoDB row. Three edge cases are handled explicitly because each
+would otherwise leave a broken environment that looks fine:
 - **A parameter this attempt CREATED has no version to restore**, so undo *deletes* it. Without
   that, a first-link that fails halfway strands a partial credential set and reports rollback
   failure.
+- **A first link is rollback-able too.** Its `replacedVersions` is empty (nothing existed to
+  replace), so the response also returns `createdParams` and `POST .../rollback` accepts a
+  `remove` list. Restoring versions alone would make the operator's rollback a silent no-op.
 - **The webhook secret must be pushed to GitHub too** (`PATCH /app/hook/config`). Storing a
   rotated secret in SSM alone means GitHub keeps signing with the old one and Ingest rejects
   every delivery with 401 — the environment goes silent while every credential badge reads
-  green. A hook-config failure is reported (`hookSynced: false` + a warning in the UI) rather
-  than rolled back: the credentials themselves verified, and some Apps do not own their hook
-  config.
+  green. GitHub does not retry a delivery that failed verification, so that work is *lost*, not
+  deferred. So a hook-sync failure **fails closed when the secret actually changed**: the relink
+  is refused and rolled back, and the response carries `hookSynced: false` so the console can
+  offer an explicit `allowHookDesync: true` retry for operators whose App does not own its hook
+  config (they set the secret at GitHub by hand first). When the submitted secret is *unchanged*,
+  GitHub and Ingest still agree, so the failure is advisory (`hookSynced: false` + a UI warning)
+  and the relink stands.
+
+An explicit rollback reads **every** historical value before it writes any of them. A
+read-then-write loop that faulted midway would leave a mixed credential set — some parameters
+restored, the rest on the replacement values — with nothing left to compensate from.
 Intake is **write-only** — the response carries presence + verification outcome, never a value,
 and validation errors never quote a submitted credential.
 
@@ -293,10 +304,16 @@ Platform config **mutations** are serialized by a conditional DynamoDB lock row
 (`CONFIG#LOCK`), not by a Lambda concurrency cap — a cap would also serialize the polled read
 path. Losing that race is not a rejection: the broker answers `busy`, and the management API maps
 it to **503 with `Retry-After`** so the operator is told to retry rather than shown a validation
-or upstream failure. Rollback re-pushes the **restored** webhook secret to GitHub for the same
-reason a relink pushes the new one: restoring SSM alone would leave GitHub signing with the
-relinked App's secret while Ingest verifies against the restored one, and every delivery would
-401. A rollback whose hook re-sync fails reports `hookSynced: false` with a UI warning.
+or upstream failure. Reads (`status`) run unlocked, but a status computation captures the cache's
+invalidation **generation** before it starts and publishes conditionally on it: four GitHub
+round-trips take long enough for a mutation to land midway, and an unconditional publish would
+overwrite that mutation's invalidation with a pre-change snapshot and serve it platform-wide for
+the full TTL.
+
+Rollback re-pushes the **restored** webhook secret to GitHub for the same reason a relink pushes
+the new one: restoring SSM alone would leave GitHub signing with the relinked App's secret while
+Ingest verifies against the restored one, and every delivery would 401. A rollback whose hook
+re-sync fails reports `hookSynced: false` with a UI warning.
 
 ## Auth
 

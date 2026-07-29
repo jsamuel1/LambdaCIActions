@@ -963,7 +963,14 @@ async function relinkGithubAppRoute(
     res = await invokeAppcfg({
       action: 'relink',
       actor: session.login,
-      credentials: parsed.value,
+      credentials: {
+        appId: parsed.value.appId,
+        pem: parsed.value.pem,
+        webhookSecret: parsed.value.webhookSecret,
+        clientId: parsed.value.clientId,
+        clientSecret: parsed.value.clientSecret,
+      },
+      ...(parsed.value.allowHookDesync ? { allowHookDesync: true } : {}),
     });
   } catch (err) {
     const busy = brokerBusyReply(err);
@@ -980,6 +987,14 @@ async function relinkGithubAppRoute(
       error: res.error ?? 'relink failed',
       rolledBack: res.rolledBack ?? false,
       ...(res.replacedVersions ? { replacedVersions: res.replacedVersions } : {}),
+      ...(res.createdParams ? { createdParams: res.createdParams } : {}),
+      /**
+       * Present and false when the refusal was a webhook-secret desync: the credentials were
+       * valid but GitHub's hook config could not be updated, so proceeding would have silently
+       * stopped every delivery. The UI offers `allowHookDesync` from here.
+       */
+      ...(res.hookSynced === false ? { hookSynced: false } : {}),
+      ...(res.hookError ? { hookError: res.hookError } : {}),
     });
   }
   return json(200, {
@@ -990,12 +1005,15 @@ async function relinkGithubAppRoute(
     /**
      * Whether GitHub's own hook config was updated to match the stored secret/URL. False means
      * the operator must set the webhook secret at GitHub by hand — otherwise GitHub keeps
-     * signing with the old value and every delivery fails its HMAC check.
+     * signing with the old value and every delivery fails its HMAC check. A relink that ROTATED
+     * the secret only reaches this branch when the operator explicitly accepted that risk.
      */
     hookSynced: res.hookSynced === true,
     ...(res.hookError ? { hookError: res.hookError } : {}),
     /** Rollback handle: SSM version numbers, not values. */
     replacedVersions: res.replacedVersions ?? {},
+    /** Rollback handle: parameters this relink CREATED, which a rollback must delete. */
+    createdParams: res.createdParams ?? [],
   });
 }
 
@@ -1014,7 +1032,12 @@ async function rollbackGithubAppRoute(
 
   let res: AppcfgResult;
   try {
-    res = await invokeAppcfg({ action: 'rollback', actor: session.login, restore: parsed.value });
+    res = await invokeAppcfg({
+      action: 'rollback',
+      actor: session.login,
+      restore: parsed.value.restore,
+      ...(parsed.value.remove.length ? { remove: parsed.value.remove } : {}),
+    });
   } catch (err) {
     const busy = brokerBusyReply(err);
     if (busy) return busy;

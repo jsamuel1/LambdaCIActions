@@ -8,7 +8,7 @@ import {
   updateAppHookConfig,
 } from '../shared/github-app.js';
 import { deleteParam, getParam, getParamVersion, paramVersion, putParam } from '../shared/ssm.js';
-import { appendAudit, acquireConfigLock, releaseConfigLock, clearStatusCache, getStatusCache, putStatusCache } from '../shared/config-store.js';
+import { appendAudit, acquireConfigLock, releaseConfigLock, clearStatusCache, getStatusCache, getStatusGeneration, putStatusCache } from '../shared/config-store.js';
 import {
   APP_CREDENTIAL_PARAMS,
   SECURE_CREDENTIAL_PARAMS,
@@ -85,6 +85,7 @@ export interface AppcfgDeps {
   deleteParam: typeof deleteParam;
   appendAudit: typeof appendAudit;
   getStatusCache: typeof getStatusCache;
+  getStatusGeneration: typeof getStatusGeneration;
   putStatusCache: typeof putStatusCache;
   clearStatusCache: typeof clearStatusCache;
   getAppIdentity: typeof getAppIdentity;
@@ -105,6 +106,7 @@ const defaultDeps: AppcfgDeps = {
   deleteParam,
   appendAudit,
   getStatusCache,
+  getStatusGeneration,
   putStatusCache,
   clearStatusCache,
   getAppIdentity,
@@ -184,9 +186,14 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
             statusCache = { at: now, result: checked };
             return checked;
           }
+          // Capture the invalidation generation BEFORE computing: `statusAction` makes four
+          // GitHub round-trips, so a mutation can land while it runs. Publishing unconditionally
+          // would overwrite that mutation's invalidation with a pre-change snapshot and serve it
+          // to every container for the full TTL.
+          const gen = await deps.getStatusGeneration().catch(() => undefined);
           const result = finish(await statusAction(deps));
           statusCache = { at: now, result };
-          await deps.putStatusCache(result, now).catch((err) =>
+          await deps.putStatusCache(result, now, gen).catch((err) =>
             console.error(
               JSON.stringify({
                 msg: 'status cache write failed',
@@ -199,14 +206,14 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
         case 'relink':
           return finish(
             await withConfigLock(deps, req.actor, () =>
-              relinkAction(deps, req.credentials!, req.actor),
+              relinkAction(deps, req.credentials!, req.actor, req.allowHookDesync === true),
             ),
             submitted,
           );
         case 'rollback':
           return finish(
             await withConfigLock(deps, req.actor, () =>
-              rollbackAction(deps, req.restore!, req.actor),
+              rollbackAction(deps, req.restore!, req.actor, req.remove ?? []),
             ),
           );
         case 'redeliver':
@@ -361,6 +368,7 @@ async function relinkAction(
   deps: AppcfgDeps,
   creds: AppCredentialsInput,
   actor: string,
+  allowHookDesync = false,
 ): Promise<AppcfgResult> {
   // 1. Verify with the SUBMITTED credentials — never write on trust.
   const identity = await deps.getAppIdentity(creds.appId, creds.pem);
@@ -392,6 +400,16 @@ async function relinkAction(
     'github/client-secret': creds.clientSecret,
   };
 
+  // Whether this relink ROTATES the webhook secret. Read BEFORE the write, because after it the
+  // stored value is the new one and the comparison is meaningless. This decides whether a failed
+  // GitHub hook-config sync is advisory or fatal (step 5): a secret that did not change leaves
+  // GitHub and Ingest in agreement regardless of the sync, while a rotated one does not.
+  // An unreadable/absent current secret is treated as ROTATED — fail toward the safe branch.
+  const secretRotated = await deps
+    .getParam(WEBHOOK_SECRET_PARAM, 0)
+    .then((current) => current !== creds.webhookSecret)
+    .catch(() => true);
+
   const written: string[] = [];
   try {
     for (const suffix of APP_CREDENTIAL_PARAMS) {
@@ -410,6 +428,7 @@ async function relinkAction(
       error: `relink failed after writing ${written.length}/${APP_CREDENTIAL_PARAMS.length} parameters: ${scrubForOperator(errMsg(err))}`,
       rolledBack: rolled,
       replacedVersions: before,
+      ...(absent.length ? { createdParams: absent } : {}),
     };
   }
 
@@ -443,6 +462,7 @@ async function relinkAction(
       error: `relink written but post-write verification failed: ${verifyError ?? 'unknown'}`,
       rolledBack: rolled,
       replacedVersions: before,
+      ...(absent.length ? { createdParams: absent } : {}),
     };
   }
 
@@ -465,11 +485,37 @@ async function relinkAction(
     });
     hookSynced = true;
   } catch (err) {
-    // NOT fatal, and deliberately not a rollback trigger: the credentials themselves verified,
-    // and some Apps (Enterprise / org-hook setups) don't own their hook config, so the operator
-    // may have to set the secret at GitHub by hand. Surfacing it is the right outcome — the
-    // Settings screen's signature-rejection counter is the backstop if they are out of sync.
     hookError = scrubForOperator(errMsg(err));
+  }
+
+  // A failed hook sync is only tolerable when the webhook secret did NOT change: GitHub keeps
+  // signing with a value Ingest still verifies against, so deliveries keep working and the
+  // warning is advisory. When the secret DID change, tolerating the failure wedges the whole
+  // platform — GitHub signs with the old secret, Ingest verifies the new one, every delivery is
+  // rejected 401, and no job is ever claimed again. GitHub does not retry a delivery that failed
+  // verification, so that work is lost, not delayed. So this fails CLOSED and rolls back, unless
+  // the operator explicitly accepted the desync (`allowHookDesync`) because their App cannot own
+  // its hook config — in which case they must set the secret at GitHub by hand.
+  if (!hookSynced && secretRotated && !allowHookDesync) {
+    const rolled = await undoWrites(deps, before, absent, written, actor, 'relink-hook-desync').catch(
+      () => false,
+    );
+    return {
+      ok: false,
+      error:
+        "credentials verified, but GitHub's webhook configuration could not be updated to the " +
+        'new webhook secret' +
+        (hookError ? `: ${hookError}` : '') +
+        '. GitHub would keep signing with the previous secret while this environment verifies ' +
+        'against the new one, so every delivery would be rejected and no job would be claimed. ' +
+        'The relink was rolled back. Set the webhook secret on the App at GitHub yourself and ' +
+        're-submit with allowHookDesync=true to proceed anyway.',
+      rolledBack: rolled,
+      replacedVersions: before,
+      ...(absent.length ? { createdParams: absent } : {}),
+      hookSynced: false,
+      ...(hookError ? { hookError } : {}),
+    };
   }
 
   await audit(deps, actor, 'github-app-relink', {
@@ -477,7 +523,10 @@ async function relinkAction(
     slug: identity.slug,
     installations: installations.length,
     hookSynced,
+    secretRotated,
+    allowHookDesync,
     replacedVersions: before,
+    createdParams: absent,
   });
 
   return {
@@ -486,6 +535,7 @@ async function relinkAction(
     appId: identity.appId,
     appSlug: identity.slug,
     replacedVersions: before,
+    ...(absent.length ? { createdParams: absent } : {}),
     hookSynced,
     ...(hookError ? { hookError } : {}),
   };
@@ -505,8 +555,9 @@ async function rollbackAction(
   deps: AppcfgDeps,
   restore: ParameterVersionSnapshot,
   actor: string,
+  remove: string[] = [],
 ): Promise<AppcfgResult> {
-  const rolled = await restoreVersions(deps, restore, actor, 'operator-rollback');
+  const rolled = await restoreVersions(deps, restore, actor, 'operator-rollback', remove);
   if (!rolled) return { ok: false, error: 'rollback failed — see CloudWatch for detail' };
   let appId: number | undefined;
   let verified = false;
@@ -640,27 +691,50 @@ async function undoWrites(
 }
 
 /**
- * Re-put the exact prior versions of each parameter. Reads `Name:version` from SSM's own
- * history — the only place the previous values exist. Used by the operator-driven rollback,
- * which by definition targets versions that existed.
+ * Re-put the exact prior versions of each parameter, and delete the ones the relink created.
+ * Reads `Name:version` from SSM's own history — the only place the previous values exist.
+ *
+ * **Every historical value is read BEFORE any write.** A sequential read-then-write loop that
+ * faults midway would leave a mixed credential set: some parameters restored, the rest still on
+ * the replacement values, with nothing left to compensate from. Reading first makes the common
+ * failure (a purged/inaccessible parameter version) abort before the environment is touched at
+ * all. Deletions run last for the same reason: they are the only irreversible step.
  */
 async function restoreVersions(
   deps: AppcfgDeps,
   snapshot: ParameterVersionSnapshot,
   actor: string,
   reason: string,
+  remove: string[] = [],
 ): Promise<boolean> {
   const entries = Object.entries(snapshot);
-  if (!entries.length) return false;
+  if (!entries.length && !remove.length) return false;
+
+  // Phase 1 — read every historical value. A failure here throws with nothing yet written.
+  const staged: { suffix: string; name: string; version: number; value: string }[] = [];
   for (const [suffix, version] of entries) {
     const name = `${SSM_PREFIX}/${suffix}`;
-    const value = await deps.getParamVersion(name, version);
-    await deps.putParam(name, value, {
-      secure: SECURE_CREDENTIAL_PARAMS.includes(suffix),
-      description: `LambdaCIActions GitHub App credential (restored v${version} by ${actor})`,
+    staged.push({ suffix, name, version, value: await deps.getParamVersion(name, version) });
+  }
+
+  // Phase 2 — write them back.
+  for (const s of staged) {
+    await deps.putParam(s.name, s.value, {
+      secure: SECURE_CREDENTIAL_PARAMS.includes(s.suffix),
+      description: `LambdaCIActions GitHub App credential (restored v${s.version} by ${actor})`,
     });
   }
-  await audit(deps, actor, 'github-app-rollback', { reason, restored: snapshot });
+
+  // Phase 3 — delete parameters the relink created; they have no version to return to.
+  for (const suffix of remove) {
+    await deps.deleteParam(`${SSM_PREFIX}/${suffix}`);
+  }
+
+  await audit(deps, actor, 'github-app-rollback', {
+    reason,
+    restored: snapshot,
+    ...(remove.length ? { removed: remove } : {}),
+  });
   return true;
 }
 

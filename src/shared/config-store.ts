@@ -263,28 +263,83 @@ export async function getStatusCache<T>(
   return item.payload as T;
 }
 
-export async function putStatusCache<T>(payload: T, now = Date.now()): Promise<void> {
-  await requireDoc().send(
-    new UpdateCommand({
+/**
+ * The cache's invalidation generation. Incremented by `clearStatusCache`, so a reader can prove
+ * no mutation happened while it was computing its answer.
+ *
+ * Needed because a `status` computation is not instantaneous (four GitHub round-trips): a read
+ * that starts before a relink can finish after it and publish a PRE-change snapshot on top of the
+ * invalidation, leaving every other container serving stale linkage for the full TTL. Comparing a
+ * generation captured at read start closes that window — a timestamp cannot, since the stale
+ * write is genuinely newer.
+ */
+export async function getStatusGeneration(): Promise<number> {
+  const res = await requireDoc().send(
+    new GetCommand({
       TableName: TABLE,
       Key: { pk: STATUS_PK, sk: STATUS_SK },
-      // `at` is a DynamoDB reserved word (see appendAudit).
-      UpdateExpression: 'SET entity = :e, payload = :p, #at = :at',
-      ExpressionAttributeNames: { '#at': 'at' },
-      ExpressionAttributeValues: { ':e': 'CONFIG_STATUS', ':p': payload, ':at': now },
+      ProjectionExpression: 'gen',
     }),
   );
+  const gen = (res.Item as { gen?: unknown } | undefined)?.gen;
+  return typeof gen === 'number' ? gen : 0;
 }
 
-/** Drop the shared cache so the next read re-verifies (called after any mutation). */
+/**
+ * Publish a status answer, but ONLY if the invalidation generation still matches the one the
+ * caller observed before it started computing. A mismatch means a mutation landed in between, so
+ * the answer is stale and is dropped rather than written (the next poll recomputes).
+ */
+export async function putStatusCache<T>(
+  payload: T,
+  now = Date.now(),
+  expectedGen?: number,
+): Promise<void> {
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: STATUS_PK, sk: STATUS_SK },
+        // `at` is a DynamoDB reserved word (see appendAudit).
+        UpdateExpression: 'SET entity = :e, payload = :p, #at = :at',
+        ExpressionAttributeNames: { '#at': 'at' },
+        ExpressionAttributeValues: {
+          ':e': 'CONFIG_STATUS',
+          ':p': payload,
+          ':at': now,
+          ...(expectedGen === undefined ? {} : { ':gen': expectedGen }),
+        },
+        // An absent `gen` attribute is generation 0 — the state of a row that has never been
+        // invalidated — so the guard must accept it when the caller observed 0.
+        ...(expectedGen === undefined
+          ? {}
+          : {
+              ConditionExpression:
+                expectedGen === 0
+                  ? 'attribute_not_exists(gen) OR gen = :gen'
+                  : 'gen = :gen',
+            }),
+      }),
+    );
+  } catch (err) {
+    // Generation moved on: a mutation invalidated the cache while we were computing. Dropping
+    // the write is the point.
+    if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
+  }
+}
+
+/**
+ * Drop the shared cache so the next read re-verifies (called after any mutation). Bumps the
+ * generation so a status computation already in flight cannot publish its pre-mutation answer.
+ */
 export async function clearStatusCache(): Promise<void> {
   await requireDoc().send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { pk: STATUS_PK, sk: STATUS_SK },
-      UpdateExpression: 'SET #at = :zero',
+      UpdateExpression: 'SET #at = :zero ADD gen :one',
       ExpressionAttributeNames: { '#at': 'at' },
-      ExpressionAttributeValues: { ':zero': 0 },
+      ExpressionAttributeValues: { ':zero': 0, ':one': 1 },
     }),
   );
 }
