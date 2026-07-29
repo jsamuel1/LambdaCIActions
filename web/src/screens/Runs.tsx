@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Repo, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
-import { flavorLabel, groupRuns, headSeamIntact, jobRowKey, windowComplete, type RunGroup } from '../rollup.js';
+import { flavorLabel, groupRuns, headSeamIntact, jobRowKey, startedAtLabel, windowComplete, type RunGroup } from '../rollup.js';
 import {
   Badge,
   CopyId,
@@ -289,7 +289,7 @@ function RunRows({
             {group.partial && (
               <span
                 className="badge warn"
-                title="Some of this run's jobs are outside the loaded window — excluded by the status filter, past the page boundary, or lost where the live head page has shifted past the older pages. Status, flavor and totals are lower bounds."
+                title="Some of this run's jobs are outside the loaded window — excluded by the status filter, past the page boundary, or lost where the live head page has shifted past the older pages. Status, flavor, job count and totals are lower bounds; the start time is an upper bound (an unread job may have been queued earlier)."
               >
                 partial
               </span>
@@ -298,7 +298,7 @@ function RunRows({
         </td>
         <td>{flavorLabel(group.flavor, group.partial)}</td>
         <td>{lowerBound(durations.wallClockSeconds, group.partial)}</td>
-        <td>{formatTime(group.startedAt)}</td>
+        <td>{startedAtLabel(group.startedAt, formatTime(group.startedAt), group.partial)}</td>
       </tr>
       {open && (
         <>

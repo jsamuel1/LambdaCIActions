@@ -101,6 +101,24 @@ export function flavorLabel(flavor: FlavorRollup, partial: boolean): string {
   return flavor.mixed ? `${flavor.label}?` : `${flavor.distinct[0]} +?`;
 }
 
+/**
+ * Display label for a run's start time, honouring window completeness.
+ *
+ * `startedAt` is the earliest job `createdAt` among the jobs actually LOADED, so on a partial
+ * window it is an upper bound: an unread job of the same run may have been queued earlier, and
+ * the run therefore started at or before the figure shown. This is the mirror image of the
+ * duration/job-count case — those are lower bounds (`≥`), a start time is an upper bound
+ * (`≤`) — and it is the one rollup on the row that would otherwise read as fact.
+ *
+ * The caller supplies the already-formatted, locale-rendered text (the fold module owns no
+ * DOM/locale concerns). An unparsable timestamp keeps the raw text: `≤ <garbage>` claims an
+ * ordering against a value that has none.
+ */
+export function startedAtLabel(startedAt: string, formatted: string, partial: boolean): string {
+  if (!partial) return formatted;
+  return Number.isFinite(Date.parse(startedAt)) ? `≤ ${formatted}` : formatted;
+}
+
 export interface RunDurations {
   /**
    * Earliest job queue → latest job transition. This is the human-visible "how long did the
@@ -152,7 +170,10 @@ export interface RunGroup {
   status: RunStatus;
   flavor: FlavorRollup;
   durations: RunDurations;
-  /** Earliest job `createdAt` in the group (ISO). */
+  /**
+   * Earliest job `createdAt` among the group's LOADED jobs (ISO). On a `partial` window this
+   * is an upper bound on the run's real start — render it through `startedAtLabel`.
+   */
   startedAt: string;
   /**
    * True when the loaded window cannot prove it holds every job of this run — the rollups

@@ -7,6 +7,7 @@ import {
   foldRunStatus,
   rollupFlavor,
   flavorLabel,
+  startedAtLabel,
   runDurations,
   windowComplete,
   headSeamIntact,
@@ -98,6 +99,24 @@ test('a partial window cannot claim the jobs agree on a flavor', () => {
   const none = rollupFlavor([undefined]);
   assert.equal(flavorLabel(none, false), '—');
   assert.equal(flavorLabel(none, true), '—');
+});
+
+// ---- start time ------------------------------------------------------------
+
+test('a partial window renders the start time as an upper bound', () => {
+  // `startedAt` is the earliest LOADED job, so an unread sibling may have been queued
+  // earlier: the run started at or BEFORE the figure shown. This is the mirror of the
+  // duration/job-count lower bounds, and the one other run-row value that would otherwise
+  // read as fact.
+  assert.equal(startedAtLabel('2026-07-01T00:00:00Z', '01/07/2026, 00:00', false), '01/07/2026, 00:00');
+  assert.equal(startedAtLabel('2026-07-01T00:00:00Z', '01/07/2026, 00:00', true), '≤ 01/07/2026, 00:00');
+});
+
+test('an unparsable start time keeps its raw text on a partial window', () => {
+  // `formatTime` echoes an unparsable ISO string verbatim, and `≤ <garbage>` would claim an
+  // ordering against a value that has none.
+  assert.equal(startedAtLabel('nope', 'nope', true), 'nope');
+  assert.equal(startedAtLabel('', '', true), '');
 });
 
 // ---- durations -------------------------------------------------------------

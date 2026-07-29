@@ -897,7 +897,10 @@ every run row built from it is partial by construction.
   cursor, plus the integrity of the join between its live head page and its appended older
   pages. Whole runs are folded only when every loaded page said `complete`, the cursor is
   spent, **and** that join is intact; otherwise **every** group in the window is stamped
-  `partial`, badged in the UI, and its status/job count/flavor/durations render as lower bounds.
+  `partial`, badged in the UI, and its status/job count/flavor/durations render as lower bounds,
+  while its **start time** renders as an *upper* bound (`≤`) — the earliest LOADED job's queue
+  time, which an unread earlier sibling would push back. Bounding the durations but not the
+  start time would leave one value on the row still asserted as fact.
   The head/older join is the third signal because the head page is re-polled every 5 s while
   the older pages sit in client state, and GSI2 is sorted by the immutable `createdAt`: a newly
   queued job pushes a row off the bottom of the fixed-size head page into a gap the older pages

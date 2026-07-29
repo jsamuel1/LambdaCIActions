@@ -72,6 +72,10 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point. On a
   partial window a duration renders as `≥ 4m 10s`; a run with no elapsed span yet keeps the
   plain em dash, since `≥ —` would read as "at least unknown".
+- **Started** — the earliest job queue time. On a **partial** window it is an *upper* bound and
+  renders as `≤ 01/07/2026, 09:14`: an unread job of the same run may have been queued earlier,
+  so the run started at or before the figure shown. It is the one run-row value bounded the
+  other way from the durations and job count.
 - **Partial rollups** — grouping is client-side over an index **page**, so a run's jobs can
   straddle the page boundary. Completeness is therefore three signals. `GET /api/runs` returns
   **`complete`**, the server's answer to *were any job rows dropped from this response?* — it
@@ -85,8 +89,8 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   start below. The client remembers the key of the head row directly above the first older row
   and marks the window partial once it is gone (`headSeamIntact`). Whole runs are folded only
   when `complete` held for every loaded page, the cursor is exhausted, and the seam is intact;
-  otherwise every run in the window is badged `partial` and its status, job count, flavor and
-  durations render as lower bounds. A repo-filtered page drops nothing, so paging it to the end
+  otherwise every run in the window is badged `partial` and its status, job count, flavor,
+  durations and start time render as bounds rather than facts. A repo-filtered page drops nothing, so paging it to the end
   yields exact rollups — until new jobs arrive and shift the seam, when the badge returns. A
   `status=` filter selects *jobs*, so it always reports `complete: false` (including alongside
   `repo=`, where it applies as a post-query predicate) — the screen says so inline.
