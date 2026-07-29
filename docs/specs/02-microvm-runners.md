@@ -111,8 +111,9 @@ POST /terminate   # fires pre-teardown; best-effort final status report
   CLI before the snapshot is captured, so a healthy boot resolves on attempt 1 and the raised
   bound is unused headroom. The warmup passes an explicit region (without one the CLI exits at
   `NoRegion` before the expensive endpoint/HTTP work) and logs `warmed` — whether it actually
-  reached the connect attempt — alongside its duration. Every broker attempt logs its measured
-  `ms`.
+  reached the connect attempt — alongside its duration. It cannot warm the credential/SigV4
+  path (no role in the build guest), which is part of why the boot bound stays generous. Every
+  broker attempt logs its measured `ms`.
 
 - There is **no in-guest id source** for the VM's own `microvmId` (no metadata file, no
   env var — verified from live runs, ADR-019). Self-terminate therefore goes through the

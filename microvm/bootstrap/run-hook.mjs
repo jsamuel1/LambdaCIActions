@@ -151,7 +151,14 @@ const PREWARM_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION 
 // The connect failure the warmup MUST end at, having done all the import/model-load/endpoint/
 // HTTP-client work. Reaching anything else (e.g. NoRegion) means it exited early and warmed
 // only the cheap half — that has to read as a FAILED warmup, not a successful one.
-const PREWARM_REACHED_RE = /Could not connect to the endpoint URL/i;
+//
+// BOTH botocore connect-phase errors count, because both are raised only after the endpoint is
+// resolved and the HTTP client is built: `EndpointConnectionError` ("Could not connect to the
+// endpoint URL") is the refused-port case this warmup normally hits, and `ConnectTimeoutError`
+// ("Connect timeout on endpoint URL") is what a guest that DROPS rather than refuses the
+// loopback SYN produces. Matching only the first would report warmed=false on a warmup that
+// did all the work — the exact false signal the `warmed` flag exists to prevent.
+const PREWARM_REACHED_RE = /(Could not connect to the endpoint URL|Connect timeout on endpoint URL)/i;
 let prewarmed = false;
 
 // Invoke the hook broker λ via the baked-in AWS CLI (no npm deps in the image). The VM's
@@ -355,6 +362,13 @@ function sleepSync(ms) {
  * matters, and it is logged so the build record MEASURES the cold cost instead of assuming it
  * (the assumption is what produced the 6 s budget). Idempotent and best-effort: the `ready`
  * hook must answer 200 regardless, or the image build fails with "Ready hook check failed".
+ *
+ * Residual cold cost, stated so the next reader does not over-trust this: `--no-sign-request`
+ * and the disabled IMDS mean the credential-provider chain and the SigV4 signing path are the
+ * one part of the cold path this warmup CANNOT pay — the build guest has no role to resolve.
+ * A real boot call signs, so attempt 1 still pays that fraction (the expensive terms — Python
+ * start, service-model load, endpoint resolution, HTTP-stack construction — are all warm). That
+ * is a second reason BOOT_CALL_TIMEOUT_MS stays sized for a cold-ish call rather than a warm one.
  *
  * The warmup is only worth anything if it reaches the CONNECT attempt: an early exit (most
  * plausibly `NoRegion`, since the build guest sets no AWS_REGION) returns non-zero after doing

@@ -773,7 +773,16 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
    reaching `Could not connect to the endpoint URL` with one. The log line reports `warmed`
    (the connect attempt was reached) separately from `ran` (the process started), so an early
    exit reads as a failed warmup instead of a successful one — a `ran`-only signal would have
-   reported success for a warmup that did nothing.
+   reported success for a warmup that did nothing. `warmed` accepts **either** botocore
+   connect-phase error — `EndpointConnectionError` (port refused, the normal case) or
+   `ConnectTimeoutError` (SYN dropped, e.g. a loopback firewall rule) — since both are raised
+   only after the expensive work is done; matching one wording would report a failed warmup on
+   a fully warm CLI.
+
+   What it does **not** warm: `--no-sign-request` plus disabled IMDS means the
+   credential-provider chain and the SigV4 signing path stay cold, because the build guest has
+   no role to resolve. A real boot call signs, so attempt 1 still pays that fraction — a second
+   reason the per-invoke bound below is sized for a cold-ish call rather than a warm one.
 2. **Resize the budget for a cold call anyway**, because a pre-warm can regress silently (a
    base-image change, a CLI upgrade, a rebuilt snapshot) and the guest must not depend on it:
    per-invoke bound **6 s → 20 s**, and the image's `runTimeoutInSeconds` **30 s → 120 s**
@@ -789,8 +798,11 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
    invariant (which the 6 s budget satisfied while still having no margin) and adds: budget +
    one more full-length attempt ≤ hook timeout, a floor on the per-invoke bound above the
    measured cold cost, the presence of per-attempt duration logging, the pre-warm's
-   credential-free/loopback/bounded properties, that it passes a region, and that `warmed` is
-   false when the CLI exits before the connect attempt.
+   credential-free/loopback/bounded properties, that its bound fits the `ready` hook deadline,
+   that it passes a region, and that `warmed` is false on an early exit but true on a connect
+   timeout. Both budget invariants read the backoff from the **jitconfig call site**, not from
+   `callBroker`'s parameter default — boot passes its own literal, so sizing off the default
+   would let a call-site change blow the deadline with the tests still green.
 
 **Why**: the two halves cover each other. The pre-warm removes the latency, so the raised
 bound is dead headroom on a healthy boot rather than added boot time; the raised bound means a

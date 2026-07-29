@@ -204,7 +204,13 @@ test('the boot fetch budget fits inside the platform /run hook timeout', () => {
 
   const bootMs = Number(src.match(/const BOOT_CALL_TIMEOUT_MS = (\d+);/)[1]);
   const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
-  const delayMs = Number(src.match(/function callBroker\(action, attempts = \d+, delayMs = (\d+)/)[1]);
+  // Read the backoff from the JITCONFIG CALL SITE, not from callBroker's parameter default.
+  // The boot path passes its own delay literal, so the default is not what boot actually uses:
+  // sizing this invariant off the default would let a call-site change (2000 → 30000) blow the
+  // hook deadline with every budget test still green.
+  const delayMs = Number(
+    src.match(/callBroker\('jitconfig', BOOT_CALL_ATTEMPTS, (\d+), BOOT_CALL_TIMEOUT_MS\)/)[1],
+  );
   // Attempt i>0 sleeps delayMs * 2**(i-1) before its invoke (exponential backoff).
   let worstMs = bootAttempts * bootMs;
   for (let i = 1; i < bootAttempts; i++) worstMs += delayMs * 2 ** (i - 1);
@@ -233,7 +239,10 @@ test('the boot budget leaves room for one more full-length attempt (no zero-marg
   const hookTimeoutMs = Number(build.match(/runTimeoutInSeconds: (\d+)/)[1]) * 1000;
   const bootMs = Number(src.match(/const BOOT_CALL_TIMEOUT_MS = (\d+);/)[1]);
   const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
-  const delayMs = Number(src.match(/function callBroker\(action, attempts = \d+, delayMs = (\d+)/)[1]);
+  // Same reason as above: the boot path's backoff is the call-site literal, not the default.
+  const delayMs = Number(
+    src.match(/callBroker\('jitconfig', BOOT_CALL_ATTEMPTS, (\d+), BOOT_CALL_TIMEOUT_MS\)/)[1],
+  );
 
   let worstMs = bootAttempts * bootMs;
   for (let i = 1; i < bootAttempts; i++) worstMs += delayMs * 2 ** (i - 1);
@@ -291,6 +300,17 @@ test('the ready hook pre-warms the AWS CLI without credentials or egress', () =>
   assert.match(fn, /--endpoint-url/, 'must target a local endpoint, not a real AWS one');
   assert.match(fn, /AWS_EC2_METADATA_DISABLED/, 'must not hang on an IMDS probe');
   assert.match(fn, /timeout: PREWARM_TIMEOUT_MS/, 'a hung warmup must not eat the ready budget');
+  // ...and that bound must actually FIT the ready-hook deadline it is protecting. The warmup
+  // runs inside the `ready` image hook, so a PREWARM_TIMEOUT_MS above `readyTimeoutInSeconds`
+  // would let a hung CLI fail the whole image build — which is the failure the `timeout` option
+  // exists to prevent, so pin the relationship and not just the option's presence.
+  const build = fs.readFileSync(new URL('../scripts/build-images.mjs', import.meta.url), 'utf8');
+  const readyTimeoutMs = Number(build.match(/readyTimeoutInSeconds: (\d+)/)[1]) * 1000;
+  const prewarmMs = Number(src.match(/const PREWARM_TIMEOUT_MS = (\d+);/)[1]);
+  assert.ok(
+    prewarmMs < readyTimeoutMs,
+    `prewarm bound ${prewarmMs}ms does not fit the ${readyTimeoutMs}ms ready hook deadline`,
+  );
   const endpoint = src.match(/const PREWARM_ENDPOINT = '([^']+)'/)[1];
   assert.match(endpoint, /^http:\/\/127\.0\.0\.1:/, `prewarm endpoint ${endpoint} is not loopback`);
   // A region must be passed EXPLICITLY. Without one the CLI aborts with `NoRegion` during
@@ -343,6 +363,22 @@ test('prewarmAwsCli reports warmed=false when the CLI exits before the connect a
   }));
   assert.equal(early.ran, true, 'the process did start');
   assert.equal(early.warmed, false, 'an early exit warms only the cheap half — not a success');
+});
+
+// The inverse false signal: botocore raises `ConnectTimeoutError` rather than
+// `EndpointConnectionError` when the SYN is DROPPED instead of refused (a guest with a
+// loopback firewall rule, say). That error is raised just as late — after endpoint resolution
+// and HTTP-stack construction — so the cold path WAS paid and it must read as warmed. Matching
+// only the refused-connection wording would report a failed warmup on a fully warm CLI and send
+// the next reader chasing a regression that isn't there.
+test('prewarmAwsCli counts a dropped-SYN connect timeout as warmed', async () => {
+  const mod = await import(`../microvm/bootstrap/run-hook.mjs?connect-timeout-${Date.now()}`);
+  const warm = mod.prewarmAwsCli(() => ({
+    status: 255,
+    error: undefined,
+    stderr: 'Connect timeout on endpoint URL: "http://127.0.0.1:1/"',
+  }));
+  assert.equal(warm.warmed, true, 'a connect TIMEOUT is still past the expensive cold path');
 });
 
 // The broker's reserved-concurrency cap (20) exists to stop an untrusted VM fleet draining
