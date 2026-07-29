@@ -203,11 +203,17 @@ Phased, because image ARNs must exist before the orchestrator reads them (ADR-01
 ```bash
 npm ci && npm run build && npm test          # gate
 npx cdk deploy LCA-Image-<env> LCA-Data-<env> -c env=<env>
-npm run build:images                          # publishes image ARNs to SSM
+npm run build:images -- --env <env>          # publishes image ARNs to /lca/<env>/config/image-arn-*
 npm run build:web
 npx cdk deploy LCA-Control-<env> LCA-Mgmt-<env> LCA-Web-<env> -c env=<env> \
   -c alarmEmail=oncall@example.com
 ```
+
+`build:images` takes its own `--env` (it is a plain node script, not the CDK app, so it does
+not see `-c env=…`) and **defaults to `dev`**. Omitting it on a prod deploy publishes the image
+ARNs under `/lca/dev/...`, leaving `/lca/prod/config/image-arn-*` absent — the `LCA-Control-prod`
+deploy then fails resolving them. Pass `--region <region>` too when the pinned region isn't
+your shell default.
 
 Prod adds nothing but flags — the account separation is the boundary (ADR-033):
 `-c env=prod`. Verify after deploy: console Settings shows every secret present, Flavors shows

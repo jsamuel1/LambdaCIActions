@@ -113,9 +113,12 @@ Same three-step shape as the reference, generalized:
                           (bucket + build role + tables; no orchestrator yet —
                            image ARNs don't exist)
 
-2. build microVM images →  npm run build:images
+2. build microVM images →  npm run build:images -- --env <env>
                           (per flavor: stage Dockerfile.<flavor>, zip microvm/,
                            upload, build, snapshot, poll, prune, write image ARN → SSM)
+                          NOTE: this is a node script, not the CDK app — it reads its own
+                          `--env` (default `dev`), NOT `-c env=…`. On a prod deploy the flag
+                          is mandatory, or the ARNs land under /lca/dev and step 3 fails.
 
 3. deploy orchestrator  →  cdk deploy ControlStack MgmtStack WebStack
                           (now image ARNs exist in SSM; Ingest/Provision/Discovery/Reaper λ,

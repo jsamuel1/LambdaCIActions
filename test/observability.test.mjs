@@ -238,4 +238,3 @@ test('the per-run microVM log group gets the env retention WITHOUT being re-crea
     assert.equal(expected, envConfig(envName).runLogRetention);
   }
 });
-
