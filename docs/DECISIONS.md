@@ -1001,7 +1001,10 @@ cost of one CLI flag.
 every flavor, so it is a **deploy-touching** change and re-baselines boot latency —
 `docs/VERIFY-M3.md`'s per-flavor figures predate it and its cost floors should be re-measured
 rather than carried forward. `test/image-content.test.mjs` pins that the build script
-forwards both flags. Revisit if the API later exposes a vCPU request, at which point `vcpu`
+forwards both flags, and that no flavor `description` advertises a vCPU count — the catalog's
+descriptions render verbatim on the console's Flavors screen, so a "4 vCPU / 8 GB" footprint
+there contradicts that screen's own footnote in the same view (the `docker` description was
+exactly this sweep miss). Revisit if the API later exposes a vCPU request, at which point `vcpu`
 becomes requestable and this ADR's point 2 is superseded.
 
 ## ADR-039 — Expanded standard flavor set with prebaked runner tool cache (M5)
@@ -1043,6 +1046,15 @@ slower (it is serial per flavor). Signal-driven upgrade still only understands
 a separate change (it needs parser support for `setup-*` steps and a policy for what to do
 when a job needs two runtimes). The pinned versions are now a **patch-day obligation**: they
 age silently, and a stale pin is invisible until a workflow needs a newer runtime.
+The pin rule covers **package managers too**, not just the language runtime: `corepack prepare
+pnpm@latest` / `npm install -g npm@latest` resolve at build time, so a floating tag beside a
+pinned runtime is a half-kept promise — `test/image-content.test.mjs` now rejects any `@latest`
+/`@stable`/`@next` install in a flavor Dockerfile.
+And a new flavor is **not reachable from its label until
+`/lca/<env>/config/runner-labels` lists it**: `shouldClaim` is an allowlist consulted *before*
+resolution, seeded by hand per DEPLOY-M1, so an omitted label makes those jobs sit queued on
+GitHub with a 202 `claimed:false` and nothing logged as an error. That seed is now pinned
+against the catalog by `test/filter.test.mjs`.
 
 ## ADR-040 — Custom flavors live in the store and are merged over the built-in catalog (M5)
 **Status**: Accepted (v1) · shapes work deferred from this milestone

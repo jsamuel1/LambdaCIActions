@@ -94,7 +94,7 @@ only *referenced* by CDK.
 | `/lca/<env>/mgmt/session-secret` | SecureString | Console session cookie signing key (ADR-022) |
 | `/lca/<env>/github/app-id` | String | App ID |
 | `/lca/<env>/config/image-arn-<flavor>` | String | Published by build script |
-| `/lca/<env>/config/runner-labels` | String | Claimed labels |
+| `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Must list every flavor label in `microvm/flavors.json` (plus any mapped label); a missing one means those jobs are never claimed. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
 | `/lca/<env>/config/table-name` | String | Published by `DataStack` |
 
 `scripts/create-github-app.mjs` writes the GitHub App credentials (app id, PEM, webhook

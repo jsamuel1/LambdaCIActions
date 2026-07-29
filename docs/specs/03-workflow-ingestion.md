@@ -115,10 +115,20 @@ plus a policy for jobs that need two runtimes, and is deliberately out of scope 
 A custom flavor (ADR-040) participates in every step above **only once it is `valid`**
 (ADR-041): an unvalidated or `invalid` custom flavor resolves as if it did not exist, so a
 half-configured flavor degrades to a working job on the fallback chain rather than a failed
-one. The reason string records that it was skipped.
+one. The reason string records that it was skipped. **Not implemented yet** — the resolver is
+built-in-catalog-only today; this is the contract the follow-up card must meet (see spec 02
+§ Custom flavors).
 
 The Ingest λ ([01](01-github-app.md)) only *claims* a `workflow_job` if routing says
 `eligible` for that job's labels. Non-eligible jobs are ignored (GitHub-hosted still runs them).
+
+**The claim allowlist runs first.** `shouldClaim` compares the job's `runs-on` against
+`/lca/<env>/config/runner-labels` *before* any of the resolution above happens, so a flavor
+label missing from that parameter is a dead end no resolver rule can rescue: the webhook is
+acked `claimed:false` and the job stays queued on GitHub with nothing logged as an error. That
+parameter is seeded by hand ([DEPLOY-M1](../DEPLOY-M1.md)) and must list every catalog label
+plus any label a repo `FlavorMap` maps — `test/filter.test.mjs` pins the documented seed against
+the catalog.
 
 **Repo opt-out** (ADR-027): before enqueueing a claimed job, Ingest reads the repo row and
 drops the job when the console has set `enabled=false` or `mode='off'`. The management plane

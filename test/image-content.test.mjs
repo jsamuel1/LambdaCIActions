@@ -273,6 +273,47 @@ test('toolchain versions are pinned, not latest (reproducible rebuilds)', () => 
   assert.doesNotMatch(read('Dockerfile.rust'), /--default-toolchain stable/);
 });
 
+test('no flavor installs a floating @latest / @stable package version', () => {
+  // The reproducibility claim in ADR-039 covers the whole image, not just the language
+  // runtime: `corepack prepare pnpm@latest` and `npm install -g npm@latest` resolve at BUILD
+  // time, so two builds of the SAME commit ship different package managers and a job that
+  // breaks on a new pnpm/npm major cannot be reproduced from the Dockerfile. A pinned runtime
+  // beside a floating package manager is a half-kept promise.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    const instructions = read(flavor.dockerfile)
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    const floating = [...instructions.matchAll(/[A-Za-z0-9@/._-]+@(?:latest|stable|next)\b/g)].map(
+      (m) => m[0],
+    );
+    assert.deepEqual(
+      floating,
+      [],
+      `${flavor.dockerfile} installs a floating version (${floating.join(', ')}) — pin it via an ` +
+        'ARG so a rebuild of this commit is reproducible (ADR-039)',
+    );
+  }
+});
+
+test('the node flavor pins its package managers via ARGs it actually uses', () => {
+  // A pin that is declared but not referenced is decoration — the RUN line must consume it.
+  const df = read('Dockerfile.node');
+  for (const [arg, tool] of [
+    ['PNPM_VERSION', 'pnpm'],
+    ['YARN_VERSION', 'yarn'],
+    ['NPM_VERSION', 'npm'],
+  ]) {
+    assert.match(df, new RegExp(`ARG ${arg}=\\d+\\.\\d+\\.\\d+`), `node: must pin ${tool}`);
+    assert.match(
+      df,
+      new RegExp(`${tool}@\\$\\{${arg}\\}`),
+      `node: ${tool} install must consume \${${arg}}, not a literal or a floating tag`,
+    );
+  }
+});
+
 test('every flavor Dockerfile bakes the run-hook server and exposes its port', () => {
   // The whole boot contract (ADR-012/016): no run-hook, no job.
   const catalog = JSON.parse(read('flavors.json'));
@@ -480,5 +521,24 @@ test('the catalog memory values are plausible microVM requests', () => {
     assert.ok(flavor.memoryMb >= 1024, `${flavor.name}: memoryMb too small`);
     assert.ok(flavor.memoryMb <= 32768, `${flavor.name}: memoryMb beyond a sane per-VM bound`);
     assert.ok(Number.isInteger(flavor.vcpu) && flavor.vcpu > 0, `${flavor.name}: vcpu`);
+  }
+});
+
+test('no flavor description advertises a vCPU shape (ADR-038)', () => {
+  // `description` is rendered VERBATIM under the flavor name on the console's Flavors screen,
+  // so it is the most operator-facing string in the catalog. A "4 vCPU / 8 GB" footprint there
+  // restates exactly the claim ADR-038 retracts — and it does so on the same page as that
+  // screen's own dagger footnote saying vCPU is indicative, so the two disagree in one view.
+  // The catalog's `vcpu` FIELD stays (it is the documented tie-break in
+  // `smallestWithCapability`); it is the prose promise of provisioned capacity that must not
+  // ship. This is the sweep ADR-038 asked for, enforced instead of remembered.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    assert.doesNotMatch(
+      flavor.description,
+      /vcpu/i,
+      `flavor ${flavor.name}: description names a vCPU count — the API accepts no vCPU ` +
+        'request (ADR-038). State the requested memory instead.',
+    );
   }
 });

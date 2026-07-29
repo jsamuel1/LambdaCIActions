@@ -61,7 +61,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
 | `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
 | `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
-| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-040/041) |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **planned, not implemented** — must pass validation before it is routable (ADR-040/041) |
 
 † descriptive only — see the sizing note above.
 
@@ -254,6 +254,13 @@ The biggest reference win was baking dependencies into the snapshot:
 - Warm pool intentionally out of scope for v1 (single-use only); revisit if boot latency proves painful.
 
 ## Custom flavors (bring-your-own image)
+
+> **Status: designed, NOT implemented.** This section is the agreed shape from ADR-040/041, not
+> a description of shipped behavior. Nothing in `src/` reads a custom flavor today: the three
+> catalog consumers (`src/provision/flavor.ts`, `src/mgmt/views.ts`, `src/ingest/compat.ts`)
+> still import `microvm/flavors.json` statically, there is no `FLAVOR#` row writer or reader,
+> and no validation state machine exists. Implementation is tracked as its own card. Read what
+> follows as the contract that work must satisfy — do not cite it as an existing capability.
 
 An operator may register a `custom-*` flavor for their own installation (ADR-040). Storage is
 a per-installation row in the shared table (`pk=INSTALL#<id>`, `sk=FLAVOR#<name>`) — the

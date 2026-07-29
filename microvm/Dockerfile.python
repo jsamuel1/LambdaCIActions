@@ -66,6 +66,15 @@ RUN mkdir -p ${RUNNER_TOOL_CACHE} /tmp/py \
 # ${PYTHON_VERSION} rather than repeated as a literal — a hardcoded copy silently points at a
 # nonexistent directory the moment the pin is bumped.
 ENV PATH=${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64/bin:$PATH
+#
+# KNOWN GAP (deliberate): this prebuilt CPython's extension modules link against shared libs
+# from the image it was built on. Checked the actual tarball's DT_NEEDED entries against a bare
+# ubuntu:22.04 plus the apt line above: every one resolves EXCEPT libtcl8.6 / libtk8.6, so
+# `import tkinter` fails while the rest of the stdlib (ssl, sqlite3, lzma, bz2, readline,
+# ctypes, curses, gdbm, uuid...) works. Left uninstalled on purpose — tkinter needs an X
+# toolchain no headless CI job uses, and `apt-get install python3-tk` would pull it in for
+# every python job's snapshot. If a workload ever needs tkinter, add `libtcl8.6 libtk8.6` to
+# the apt line above rather than swapping the interpreter build.
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.

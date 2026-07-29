@@ -70,7 +70,7 @@
       "memoryMb": 8192,
       "capabilities": ["docker"],
       "osCapabilities": ["ALL"],
-      "description": "base + Docker engine (rootful daemon started per-job, runner in docker group) for container:/services: jobs and docker build/run, arm64 images. Larger footprint (4 vCPU / 8 GB). Needs additionalOsCapabilities=ALL so dockerd can mount cgroup2 (ADR-020)."
+      "description": "base + Docker engine (rootful daemon started per-job, runner in docker group) for container:/services: jobs and docker build/run, arm64 images. Larger footprint (8 GB requested). Needs additionalOsCapabilities=ALL so dockerd can mount cgroup2 (ADR-020)."
     }
   ]
 }
