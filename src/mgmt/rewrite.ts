@@ -313,11 +313,20 @@ function splitInlineLabels(inner: string): LabelToken[] | undefined {
   const tokens: LabelToken[] = [];
   let current = '';
   let quote: "'" | '"' | undefined;
+  let undecodable = false;
   const push = (): void => {
     const raw = current.trim();
     current = '';
     if (!raw) return;
-    tokens.push({ raw, value: unquoteLabel(raw) });
+    const value = unquoteLabel(raw);
+    // An escape we cannot decode to the parser's exact result means we do not know what this
+    // label IS — and every refusal predicate (non-Linux, LCA-already-present) depends on
+    // knowing. Fail the whole tokenization so the caller refuses the file.
+    if (value === undefined) {
+      undecodable = true;
+      return;
+    }
+    tokens.push({ raw, value });
   };
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i];
@@ -346,27 +355,93 @@ function splitInlineLabels(inner: string): LabelToken[] | undefined {
   }
   if (quote) return undefined; // unterminated quote — do not guess at the boundaries
   push();
+  if (undecodable) return undefined;
   return tokens;
 }
+
+/**
+ * Single-character YAML 1.1 double-quoted escapes (the table `js-yaml` implements).
+ *
+ * The whole table is decoded, not just `\\` and `\"`, because a PARTIAL decode is not the
+ * conservative direction it looks like. Every predicate downstream matches on `value`, so an
+ * undecoded escape makes a label compare as a string no parser ever yields — and the one that
+ * matters is the arm64 refusal: `[ubuntu-latest, "\x77indows-latest"]` parses as
+ * `windows-latest` (verified against js-yaml 5.2.1), so leaving `\x77` verbatim let the
+ * mixed-selector guard MISS, the rewrite emit `[self-hosted, "\x77indows-latest", lambda-ci]`,
+ * and the job queue forever: `decideClaim` refuses the non-Linux label while the added
+ * `self-hosted` stops GitHub-hosted runners taking it. A miss is only "safe" for predicates
+ * that DROP a label; it is unsafe for every predicate that REFUSES on one.
+ */
+const YAML_DQ_ESCAPES: Readonly<Record<string, string>> = Object.freeze({
+  '0': '\0',
+  a: '\x07',
+  b: '\b',
+  t: '\t',
+  '\t': '\t',
+  n: '\n',
+  v: '\v',
+  f: '\f',
+  r: '\r',
+  e: '\x1b',
+  ' ': ' ',
+  '"': '"',
+  '/': '/',
+  '\\': '\\',
+  N: '\x85',
+  _: '\xa0',
+  L: '\u2028',
+  P: '\u2029',
+});
+
+/** Hex-escape forms: `\xNN`, `\uNNNN`, `\UNNNNNNNN`. */
+const YAML_DQ_HEX: Readonly<Record<string, number>> = Object.freeze({ x: 2, u: 4, U: 8 });
 
 /**
  * Strip one layer of matching surrounding quotes from a label token AND decode the escapes
  * that quoting introduced, so `value` is the label the YAML parser would produce.
  *
  * Comparison correctness depends on this: the claim/adopt/LCA predicates all match on `value`,
- * while `raw` is what gets re-emitted. Leaving `\"` or `''` undecoded made `value` a string
- * that no parser ever yields, so a label spelled `'lambda-ci'`-with-escapes could dodge a
- * predicate that is supposed to catch it. Only the escapes that can appear in a label we
- * would keep are decoded (`\\`, `\"`, and single-quoted `''`); any other escape sequence is
- * left verbatim, which can only make a comparison MISS — the conservative direction, since a
- * miss keeps the label as-is instead of dropping or rewriting it.
+ * while `raw` is what gets re-emitted. Returns undefined when the token carries an escape we
+ * cannot decode to the parser's exact result — the caller then REFUSES the rewrite rather
+ * than planning against a label whose real value it does not know. (Such a sequence is also
+ * invalid YAML, so the file would not have parsed for Discovery either; refusing costs
+ * nothing and keeps this decoder from having to be a superset of the parser.)
  */
-function unquoteLabel(raw: string): string {
+function unquoteLabel(raw: string): string | undefined {
   if (raw.length >= 2 && raw[0] === "'" && raw[raw.length - 1] === "'") {
+    // Single-quoted scalars have exactly one escape: `''` → `'`. No backslash processing.
     return raw.slice(1, -1).replace(/''/g, "'");
   }
   if (raw.length >= 2 && raw[0] === '"' && raw[raw.length - 1] === '"') {
-    return raw.slice(1, -1).replace(/\\([\\"])/g, '$1');
+    const body = raw.slice(1, -1);
+    let out = '';
+    for (let i = 0; i < body.length; i++) {
+      const ch = body[i];
+      if (ch !== '\\') {
+        out += ch;
+        continue;
+      }
+      const esc = body[i + 1];
+      if (esc === undefined) return undefined; // dangling escape — invalid YAML
+      const width = YAML_DQ_HEX[esc];
+      if (width !== undefined) {
+        const digits = body.slice(i + 2, i + 2 + width);
+        if (digits.length !== width || !/^[0-9a-fA-F]+$/.test(digits)) return undefined;
+        const code = Number.parseInt(digits, 16);
+        // Surrogates / out-of-range code points are not valid YAML escapes either.
+        if (!Number.isFinite(code) || code > 0x10ffff) return undefined;
+        out += String.fromCodePoint(code);
+        i += 1 + width;
+        continue;
+      }
+      const simple = Object.prototype.hasOwnProperty.call(YAML_DQ_ESCAPES, esc)
+        ? YAML_DQ_ESCAPES[esc]
+        : undefined;
+      if (simple === undefined) return undefined; // unknown escape — do not guess
+      out += simple;
+      i += 1;
+    }
+    return out;
   }
   return raw;
 }

@@ -547,6 +547,57 @@ test("a single-quoted label's '' escape survives the round trip", () => {
   assert.deepEqual(parsedLabels(r.value), ['self-hosted', "a'x,y'z", 'lambda-ci']);
 });
 
+// A partial escape decode is NOT the conservative direction it looks like. `unquoteLabel` used
+// to decode only `\\` and `\"` and leave every other escape verbatim, on the theory that a
+// missed comparison only keeps a label as-is. That holds for predicates that DROP a label; it
+// is false for the ones that REFUSE on one. `[ubuntu-latest, "\x77indows-latest"]` parses as
+// `windows-latest` (js-yaml 5.2.1), so the mixed-selector guard missed it, the rewrite emitted
+// `[self-hosted, "\x77indows-latest", lambda-ci]`, and the job queued forever: `decideClaim`
+// refuses the non-Linux label while the added `self-hosted` stops GitHub-hosted taking it.
+test('an ESCAPED non-Linux hosted label is still refused (arm64-only containment)', () => {
+  for (const spelling of [
+    '"\\x77indows-latest"', // \xNN
+    '"\\u0077indows-latest"', // \uNNNN
+    '"\\U00000077indows-latest"', // \UNNNNNNNN
+    '"\\x6dacos-14"',
+  ]) {
+    const r = rewriteRunsOnValue(`[ubuntu-latest, ${spelling}]`, 'lambda-ci');
+    assert.equal(r.ok, false, `${spelling} must not be rewritten`);
+    assert.match(r.reason, /never claims|arm64/i, spelling);
+  }
+});
+
+test('an escaped LCA label is recognised as already routed', () => {
+  const r = rewriteRunsOnValue('[ubuntu-latest, "lambda\\x2dci"]', 'lambda-ci');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /already carries an LCA label/);
+});
+
+test('an escaped hosted label IS the label we may replace (decode is symmetric)', () => {
+  // The decode has to work in the keep/drop direction too, or an escaped `ubuntu-latest`
+  // would be re-emitted alongside our label and leave the job unroutable.
+  const r = rewriteRunsOnValue('["\\x75buntu-latest", keep]', 'lambda-ci');
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.deepEqual(parsedLabels(r.value), ['self-hosted', 'keep', 'lambda-ci']);
+});
+
+test('the standard single-char escapes decode to what the parser yields', () => {
+  const r = rewriteRunsOnValue('[ubuntu-latest, "a\\tb\\nc"]', 'lambda-ci');
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.deepEqual(parsedLabels(r.value), ['self-hosted', 'a\tb\nc', 'lambda-ci']);
+});
+
+test('an escape we cannot decode exactly is refused, not guessed', () => {
+  // `\q` is not a YAML escape (the file would not parse), and a truncated `\x7` is not one
+  // either. Either way we do not know what the label IS, and every refusal predicate depends
+  // on knowing — so the whole tokenization fails and the caller rewrites nothing.
+  for (const bad of ['"\\qwindows"', '"\\x7"', '"\\u00"']) {
+    const r = rewriteRunsOnValue(`[ubuntu-latest, ${bad}]`, 'lambda-ci');
+    assert.equal(r.ok, false, `${bad} must be refused`);
+    assert.match(r.reason, /could not be parsed as a label list/, bad);
+  }
+});
+
 test('the whole-file rewrite emits a workflow that still parses', () => {
   const src = `name: CI
 on: push

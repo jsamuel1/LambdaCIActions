@@ -145,10 +145,11 @@ export interface Run {
 }
 
 export interface CostSummary {
-  runs: number;
+  /** Sampled **jobs** (run rows are per-job — a matrix workflow contributes one each). */
+  jobs: number;
   totalUsd: number;
   avgUsd: number;
-  byFlavor: Record<string, { runs: number; usd: number }>;
+  byFlavor: Record<string, { jobs: number; usd: number }>;
 }
 
 export interface Health {

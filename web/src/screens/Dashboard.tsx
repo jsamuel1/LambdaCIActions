@@ -59,16 +59,17 @@ export function Dashboard({
         <div className="card">
           <h2>Cost estimate</h2>
           <p className="muted">
-            Estimated microVM spend over the {h.cost.runs} most recent finished run(s) in your
+            Estimated microVM spend over the {h.cost.jobs} most recent finished job(s) in your
             installations that actually launched a VM — wall-clock minutes × flavor rate, so an
-            upper bound. A sample, not a complete window, and not a billing report: use Cost
-            Explorer for actuals.
+            upper bound. Counted per JOB, not per workflow run: a matrix workflow contributes
+            one row per variant. A sample, not a complete window, and not a billing report: use
+            Cost Explorer for actuals.
           </p>
           <table>
             <thead>
               <tr>
                 <th>Flavor</th>
-                <th>Runs</th>
+                <th>Jobs</th>
                 <th>Est. cost</th>
               </tr>
             </thead>
@@ -76,20 +77,20 @@ export function Dashboard({
               {Object.entries(h.cost.byFlavor).map(([flavor, b]) => (
                 <tr key={flavor}>
                   <td>{flavor}</td>
-                  <td>{b.runs}</td>
+                  <td>{b.jobs}</td>
                   <td>{formatCost(b.usd)}</td>
                 </tr>
               ))}
               {!Object.keys(h.cost.byFlavor).length && (
                 <tr>
                   <td colSpan={3} className="muted">
-                    No finished runs to price yet.
+                    No finished jobs to price yet.
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
-          <p className="muted">Mean per run: {formatCost(h.cost.avgUsd)}</p>
+          <p className="muted">Mean per job: {formatCost(h.cost.avgUsd)}</p>
         </div>
       )}
 

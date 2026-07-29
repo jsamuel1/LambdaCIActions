@@ -127,8 +127,9 @@ export interface HealthView {
   /** Runs stuck in a non-terminal status longer than the stuck threshold. */
   stuck: RunView[];
   /**
-   * Estimated spend over the sampled terminal runs (M5 — dashboard shows health + cost).
+   * Estimated spend over the sampled terminal run rows (M5 — dashboard shows health + cost).
    * Unlike `counts` (platform-wide by design), this is scoped to the caller's installations.
+   * Counted per JOB (`CostSummary.jobs`), matching the run store's granularity.
    */
   cost: CostSummary;
   generatedAt: string;
@@ -141,27 +142,36 @@ export interface HealthView {
  * Labelled an estimate in the UI for the same reason `estimateCostUsd` is.
  */
 export interface CostSummary {
-  /** Number of runs the estimate is based on (the sampled window, not all history). */
-  runs: number;
-  /** Sum of per-run estimates, USD. */
+  /**
+   * Number of **jobs** the estimate is based on (the sampled window, not all history).
+   *
+   * Jobs, not workflow runs: a run row is per-`(runId, jobId)` (spec 04 / ADR-029), so a
+   * matrix workflow contributes one row per variant. Naming it `runs` made the Dashboard
+   * print "3 finished runs" for one 3-job workflow and divide by 3 for a "mean per run" that
+   * was really a mean per job. The total spend was right either way — the denominator was not.
+   */
+  jobs: number;
+  /** Sum of per-job estimates, USD. */
   totalUsd: number;
-  /** Mean per-run estimate, USD; 0 when no priced runs were sampled. */
+  /** Mean per-JOB estimate, USD; 0 when no priced jobs were sampled. */
   avgUsd: number;
   /** Per-flavor breakdown so an operator can see which flavor dominates spend. */
-  byFlavor: Record<string, { runs: number; usd: number }>;
+  byFlavor: Record<string, { jobs: number; usd: number }>;
 }
 
 /**
- * Fold sampled runs into a cost summary.
+ * Fold sampled run rows into a cost summary.
  *
- * Skipped: runs with no flavor (never routed) AND runs that never launched a microVM. A
+ * Skipped: rows with no flavor (never routed) AND rows that never launched a microVM. A
  * mint/launch failure stamps `flavor` on the row (Provision records it for support) but no VM
  * ever ran, so pricing it would bill wall-clock for compute that never existed — inflating the
  * dashboard estimate with the failures an operator is already looking at. `microvmId` is the
  * only evidence a VM existed, so it is the gate.
+ *
+ * The unit is a JOB, not a workflow run — see `CostSummary.jobs`.
  */
 export function summarizeCost(runs: RunRecord[]): CostSummary {
-  const byFlavor: Record<string, { runs: number; usd: number }> = {};
+  const byFlavor: Record<string, { jobs: number; usd: number }> = {};
   let totalUsd = 0;
   let priced = 0;
   for (const run of runs) {
@@ -170,12 +180,12 @@ export function summarizeCost(runs: RunRecord[]): CostSummary {
     if (usd === undefined || !run.flavor) continue;
     priced += 1;
     totalUsd += usd;
-    const bucket = (byFlavor[run.flavor] ??= { runs: 0, usd: 0 });
-    bucket.runs += 1;
+    const bucket = (byFlavor[run.flavor] ??= { jobs: 0, usd: 0 });
+    bucket.jobs += 1;
     bucket.usd = round6(bucket.usd + usd);
   }
   return {
-    runs: priced,
+    jobs: priced,
     totalUsd: round6(totalUsd),
     avgUsd: priced ? round6(totalUsd / priced) : 0,
     byFlavor,

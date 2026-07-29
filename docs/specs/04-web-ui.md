@@ -37,7 +37,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | Screen | Purpose | Key data | Route |
 |---|---|---|---|
 | **Setup / Install** | Installation list + platform readiness | install state, missing SSM params | `#/setup` |
-| **Dashboard** | Health at a glance | active/queued/running counts, error rate, stuck runs, recent runs, **rolling cost estimate** | `#/` |
+| **Dashboard** | Health at a glance | active/queued/running counts, error rate, stuck runs, recent runs, **rolling cost estimate** (per **job**, sampled) | `#/` |
 | **Repos** | List installed repos; enable/disable; set mode + default flavor | full_name, mode, default flavor, compat rollup, last change + actor | `#/repos` |
 | **Repo detail** | Per-repo workflows + flavor map | workflows[], per-job routing, compat findings, override editor, re-scan | `#/repos/{repoId}` |
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
@@ -158,7 +158,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
-| `GET /api/health` | Dashboard aggregates + stuck-run detection + cost sample | ✅ |
+| `GET /api/health` | Dashboard aggregates + stuck-run detection + cost sample (`cost.jobs` — run rows are per-job, so a matrix workflow contributes one each; the denominator and mean are per job, not per workflow run) | ✅ |
 | `GET /api/settings` | Env identity + SSM parameter **presence** | ✅ |
 | `GET /api/repos/{repoId}/rewrite-pr` | Auto-rewrite **dry run** — always available, writes nothing | ✅ M5 |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)); 409 unless the deployment flag **and** the repo opt-in are both on | ✅ M5 |
@@ -296,5 +296,6 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   total over an arbitrary window cannot be served by the current per-job indexes without a
   scan. Tracked as its own M5 card, not part of the Runs work. **Still open after M5's
   observability slice**: the Dashboard's rolling total is a fixed bounded sample of recent
-  terminal runs (no window, no grouping), which is what a health screen can serve from the
-  existing per-status indexes — it is not the windowed report this OQ asks for.
+  terminal **job** rows (no window, no grouping, and a per-job denominator — see ADR-032),
+  which is what a health screen can serve from the existing per-status indexes — it is not the
+  windowed report this OQ asks for.

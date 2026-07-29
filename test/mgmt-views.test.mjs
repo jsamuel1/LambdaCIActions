@@ -110,16 +110,29 @@ test('error rate is 0 when nothing is terminal (no divide by zero)', () => {
   assert.equal(buildHealth(counts, []).errorRate, 0);
 });
 
-test('cost summary prices launched runs and breaks down per flavor', () => {
+test('cost summary prices launched jobs and breaks down per flavor', () => {
   const a = run({ microvmId: 'mv-1' });
   const b = run({ microvmId: 'mv-2', flavor: 'docker' });
   const s = summarizeCost([a, b]);
-  assert.equal(s.runs, 2);
+  assert.equal(s.jobs, 2);
   assert.ok(s.totalUsd > 0);
   assert.equal(s.totalUsd, Math.round((estimateCostUsd(a) + estimateCostUsd(b)) * 1e6) / 1e6);
   assert.deepEqual(Object.keys(s.byFlavor).sort(), ['base', 'docker']);
-  assert.equal(s.byFlavor.base.runs, 1);
+  assert.equal(s.byFlavor.base.jobs, 1);
   assert.ok(Math.abs(s.avgUsd - s.totalUsd / 2) < 1e-9);
+});
+
+test('the cost denominator counts JOBS, not workflow runs (matrix workflow)', () => {
+  // Run rows are per-(runId, jobId) (ADR-029), so ONE 3-variant matrix workflow is three
+  // rows. The field is named `jobs` because calling it `runs` made the Dashboard print
+  // "3 finished runs" for one workflow and divide the total by 3 for a "mean per run" that
+  // was really a mean per job. Total spend is unaffected; the denominator was the bug.
+  const sameRun = [1, 2, 3].map((j) => run({ runId: 77, jobId: 1000 + j, microvmId: `mv-${j}` }));
+  const s = summarizeCost(sameRun);
+  assert.equal(s.jobs, 3);
+  assert.equal(s.byFlavor.base.jobs, 3);
+  assert.ok(Math.abs(s.avgUsd - s.totalUsd / 3) < 1e-9);
+  assert.equal(s.runs, undefined, 'the misleading `runs` field must not come back');
 });
 
 test('a run that never launched a microVM is not priced, even though it has a flavor', () => {
@@ -136,30 +149,30 @@ test('a run that never launched a microVM is not priced, even though it has a fl
     updatedAt: '2026-07-01T00:30:00.000Z',
   });
   const s = summarizeCost([failedBeforeLaunch]);
-  assert.equal(s.runs, 0);
+  assert.equal(s.jobs, 0);
   assert.equal(s.totalUsd, 0);
   assert.equal(s.avgUsd, 0);
   assert.deepEqual(s.byFlavor, {});
   // A run that DID launch and then failed is still real spend.
-  assert.equal(summarizeCost([{ ...failedBeforeLaunch, microvmId: 'mv-9' }]).runs, 1);
+  assert.equal(summarizeCost([{ ...failedBeforeLaunch, microvmId: 'mv-9' }]).jobs, 1);
 });
 
 test('an unpriceable flavor is skipped without poisoning the totals', () => {
   const s = summarizeCost([run({ microvmId: 'mv-1', flavor: 'nope' })]);
-  assert.equal(s.runs, 0);
+  assert.equal(s.jobs, 0);
   assert.equal(s.totalUsd, 0);
 });
 
 test('health carries a cost summary (empty when no sample was supplied)', () => {
   const counts = { queued: 0, provisioning: 0, running: 0, completed: 1, failed: 0, timed_out: 0 };
   assert.deepEqual(buildHealth(counts, []).cost, {
-    runs: 0,
+    jobs: 0,
     totalUsd: 0,
     avgUsd: 0,
     byFlavor: {},
   });
   const withSample = buildHealth(counts, [], new Date(), [run({ microvmId: 'mv-1' })]);
-  assert.equal(withSample.cost.runs, 1);
+  assert.equal(withSample.cost.jobs, 1);
 });
 
 test('runs sort newest-first when merged across status indexes', () => {

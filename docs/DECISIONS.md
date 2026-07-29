@@ -1169,6 +1169,26 @@ the parser would produce rather than its escaped spelling — otherwise a label 
 so the backslash rule is scoped to `"`. `test/rewrite.test.mjs` pins each case by semantic round
 trip through the production parser, not by output string.
 
+**Ninth-review fix**: the escape decode is now the **whole YAML double-quoted table**, not just
+`\\` and `\"`, because a partial decode was not the conservative direction the eighth-review fix
+assumed. That fix argued an undecoded escape can only make a comparison MISS, which keeps the
+label as-is — true for the predicates that DROP a label, false for the ones that REFUSE on one.
+The arm64 containment guard is a refusal: `[ubuntu-latest, "\x77indows-latest"]` parses as
+`windows-latest` (verified against js-yaml 5.2.1, the parser Discovery runs), so
+`nonLinuxHostedLabel` never saw it, the mixed-selector refusal was skipped, and the rewrite
+emitted `[self-hosted, "\x77indows-latest", lambda-ci]` into the customer's PR — a job
+`decideClaim` refuses (non-Linux label) that GitHub-hosted can no longer take either (we added
+`self-hosted`), i.e. one that queues forever. The same hole let an escaped `"lambda\x2dci"` dodge
+the already-routed check. `unquoteLabel` therefore decodes every single-character escape
+`js-yaml` implements plus `\xNN`/`\uNNNN`/`\UNNNNNNNN`, and — the important half — **returns
+undefined for any escape it cannot decode exactly**, which fails the whole tokenization so the
+caller refuses the file. Guessing is not available: a predicate that refuses needs the label's
+real value, and a token carrying an unknown escape is invalid YAML anyway (the file would not
+have parsed for Discovery), so refusing costs nothing and keeps this decoder from having to be a
+superset of the parser. Pinned by `test/rewrite.test.mjs` in both directions — escaped
+`windows`/`macos`/LCA spellings are refused, and an escaped `ubuntu-latest` is still recognized
+as the label we may replace.
+
 **Consequences**: an extra queue + λ, both inert in a default deployment. The rewriter's
 coverage is deliberately partial; `skipped` entries are a first-class output surfaced in the
 UI and repeated in the PR body, alongside an explicit arm64 warning for the reviewer.
@@ -1249,6 +1269,17 @@ CloudWatch alarm reads **one exact dimension set** — it does not aggregate acr
   answers "is spend roughly what I expect" for the M5 exit criterion ("dashboard shows health
   + cost"). The windowed, groupable report remains open on the Reports screen (spec 04 OQ-6);
   when it lands, this sample is a candidate for removal rather than a second source of truth.
+- **The cost sample's unit is a JOB, not a workflow run** (review fix). The run store is keyed
+  `(repoId, runId, jobId)` (ADR-009/ADR-029), so a 3-variant matrix workflow is three rows.
+  `CostSummary` originally called its counter `runs`, and the Dashboard rendered it as
+  "3 finished run(s)" for ONE workflow and divided the total by 3 for a "mean per run" — a
+  denominator off by the matrix width. The summed spend was always right; only the count and the
+  mean lied. The field is `jobs` (and `byFlavor[f].jobs`), and the Dashboard says so, because
+  grouping by `(repoId, runId)` here would misrepresent the sample in the other direction: the
+  sample is a bounded page of job rows, so a run whose jobs straddle the page boundary would be
+  priced as a complete run when it is not — the same partial-window problem ADR-029 solved on
+  Runs with an explicit flag. Per-workflow-run cost belongs to the Reports screen (OQ-6), which
+  gets a read pattern that can see a whole run.
 **Consequences**: metric emission cannot fail a provision (`emitMetrics` swallows everything —
 telemetry is best-effort by construction). Alarm thresholds and λ error tolerances differ per
 environment (ADR-033). Anyone adding a metric must keep the emitter's dimension set and the
