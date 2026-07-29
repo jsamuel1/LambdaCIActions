@@ -1,4 +1,4 @@
-// Console vanity-domain config resolution (ADR-028).
+// Console vanity-domain config resolution (ADR-036).
 //
 // The origin these functions produce is load-bearing in three coupled places — PUBLIC_ORIGIN,
 // the GitHub App OAuth callback (browser-only to edit), and the first-party session cookie —
@@ -163,4 +163,25 @@ test('zone names are normalized (trailing dot, case)', () => {
 
 test('a non-DNS-label env name is rejected', () => {
   assert.throws(() => consoleHostname('Dev_1', 'example.com'), /not a valid DNS label/);
+});
+
+test('an env name that is not a legal DNS label is rejected in every spelling', () => {
+  // A derived hostname skips the LCA_CONSOLE_DOMAIN override's `isDnsName` check, so the
+  // label rule here is the only guard. A trailing hyphen (`dev-`) is the realistic slip: it
+  // would otherwise reach ACM + CloudFront + Route53 verbatim and fail mid-deploy.
+  for (const bad of ['dev-', '-dev', 'dev_1', 'dev.x', 'dev x', '', 'a'.repeat(64)]) {
+    assert.throws(
+      () => consoleHostname(bad, 'example.com'),
+      /not a valid DNS label/,
+      `expected env name "${bad}" to be rejected`,
+    );
+    assert.throws(
+      () => resolveConsoleDomain({ envName: bad, envLocal: ZONE }),
+      /not a valid DNS label/,
+      `expected resolve() to reject env name "${bad}"`,
+    );
+  }
+  // Legal labels with inner hyphens/digits still work.
+  assert.equal(consoleHostname('dev-2', 'example.com'), `dev-2.${CONSOLE_LABEL}.example.com`);
+  assert.equal(consoleHostname('a', 'example.com'), `a.${CONSOLE_LABEL}.example.com`);
 });

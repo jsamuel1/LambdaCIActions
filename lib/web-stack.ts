@@ -22,7 +22,7 @@ export interface WebStackProps extends StackProps {
   /** Bare host of the management HTTP API (MgmtStack.apiEndpointHost). */
   apiHost: string;
   /**
-   * Vanity console domain (ADR-028), or undefined to serve on the raw CloudFront domain.
+   * Vanity console domain (ADR-036), or undefined to serve on the raw CloudFront domain.
    * When set, `certificate` MUST also be supplied (issued in us-east-1 by CertStack).
    */
   domain?: ConsoleDomainConfig;
@@ -50,7 +50,7 @@ export interface WebStackProps extends StackProps {
  * The asset deployment is skipped when `web/dist` is absent so a credential-less
  * `cdk synth` (the CI gate) works on a fresh clone that hasn't built the SPA yet.
  *
- * Custom domain (ADR-028): when `domain` + `certificate` are supplied the distribution gets
+ * Custom domain (ADR-036): when `domain` + `certificate` are supplied the distribution gets
  * a stable vanity alias plus Route53 A/AAAA records, and the console origin is known before
  * any resource exists — which is what removes the two-pass `-c publicOrigin=...` bootstrap.
  * With no domain configured every custom-domain resource is skipped and the raw
@@ -202,7 +202,7 @@ export class WebStack extends Stack {
     new CfnOutput(this, 'ConsoleUrl', {
       value: this.consoleOrigin,
       description: domain
-        ? 'Console URL (vanity domain, ADR-028). PUBLIC_ORIGIN is derived from config, so no ' +
+        ? 'Console URL (vanity domain, ADR-036). PUBLIC_ORIGIN is derived from config, so no ' +
           "second deploy pass is needed. Register the GitHub App OAuth callback as " +
           `${domain.origin}/auth/callback.`
         : 'Console URL (raw CloudFront — no custom domain configured). Set this as MgmtStack ' +

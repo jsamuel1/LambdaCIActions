@@ -11,7 +11,7 @@
 // Secrets are NEVER defined here — they are created out-of-band (ADR-008) and referenced
 // by ARN/path inside the stacks.
 //
-// The console's vanity domain (ADR-028) is also configured in `.env.local`
+// The console's vanity domain (ADR-036) is also configured in `.env.local`
 // (LCA_CONSOLE_HOSTED_ZONE_ID + LCA_CONSOLE_ZONE_NAME): the hosted zone is an
 // account-specific resource, and an account owning no domain must still be able to deploy —
 // so with those unset every custom-domain resource is skipped and the console serves on the
@@ -101,7 +101,7 @@ controlStack.addDependency(dataStack);
 // to build the OAuth redirect URI and post-login redirects, so it must match the GitHub
 // App's registered callback URL exactly.
 //
-// With a vanity domain configured (ADR-028) the origin is KNOWN AT SYNTH TIME from config —
+// With a vanity domain configured (ADR-036) the origin is KNOWN AT SYNTH TIME from config —
 // no discovery, no second pass. Without one, the origin is CloudFront's generated domain,
 // which does not exist until WebStack's first deploy, so the legacy two-pass bootstrap in
 // docs/DEPLOY-M4.md still applies: deploy, then re-deploy MgmtStack with
@@ -132,7 +132,7 @@ mgmtStack.addDependency(dataStack);
 mgmtStack.addDependency(controlStack);
 
 // Phase 4 (M4): the console's ACM certificate. CloudFront only accepts viewer certs from
-// us-east-1, so this stack is region-pinned regardless of LCA_DEPLOY_REGION (ADR-028).
+// us-east-1, so this stack is region-pinned regardless of LCA_DEPLOY_REGION (ADR-036).
 // Only created when a vanity domain is configured.
 //
 // Cross-region references (WebStack consuming this cert ARN) require a CONCRETE account:

@@ -1,4 +1,4 @@
-// Console vanity-domain infrastructure (ADR-028).
+// Console vanity-domain infrastructure (ADR-036).
 //
 // Two failure modes are invisible at synth time and expensive at deploy time:
 //   1. an ACM cert in any region but us-east-1 — CloudFront rejects it, so the deploy fails

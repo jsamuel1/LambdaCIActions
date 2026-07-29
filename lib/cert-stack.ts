@@ -10,7 +10,7 @@ export interface CertStackProps extends StackProps {
 }
 
 /**
- * CertStack — the console's ACM certificate, pinned to **us-east-1** (ADR-028).
+ * CertStack — the console's ACM certificate, pinned to **us-east-1** (ADR-036).
  *
  * CloudFront only accepts viewer certificates from us-east-1, regardless of where the
  * distribution's stack lives. This is the classic trap: a cert issued in the deploy region

@@ -239,7 +239,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   makes the fallback unnecessary. The app shell is served with a `self`-only CSP
   (`frame-ancestors 'none'`), HSTS, `nosniff`, and `Referrer-Policy: same-origin`
   (`test/web-stack.test.mjs`).
-- **Console origin**: a **vanity domain** when configured (ADR-028) — `lambdaciactions.<zone>`
+- **Console origin**: a **vanity domain** when configured (ADR-036) — `lambdaciactions.<zone>`
   for prod, `<env>.lambdaciactions.<zone>` otherwise — with a us-east-1 ACM cert
   (`LCA-Cert-<env>`, CloudFront's only accepted cert region) and A+AAAA Route53 aliases.
   Because the origin is then known at synth time, `PUBLIC_ORIGIN` is plain config and the
@@ -287,7 +287,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 ## Open questions
 
 - **OQ-4**: ~~custom domain + ACM cert for the console~~ — **resolved** by
-  [ADR-028](../DECISIONS.md#adr-028) (M5): config-derived vanity origin + a us-east-1 cert
+  [ADR-036](../DECISIONS.md#adr-036) (M5): config-derived vanity origin + a us-east-1 cert
   stack, with the raw-CloudFront path kept for accounts owning no domain.
 - **OQ-5**: per-phase run timestamps (`provisioningAt`/`runningAt`) would make the cost
   estimate exact and enable boot-latency charts. Worth a run-row schema addition in M5?

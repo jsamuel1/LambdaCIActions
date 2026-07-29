@@ -1,4 +1,4 @@
-// console-domain.ts — vanity console hostname resolution (ADR-028).
+// console-domain.ts — vanity console hostname resolution (ADR-036).
 //
 // The console origin is load-bearing in three places that all break on change:
 //   1. `PUBLIC_ORIGIN` on the mgmt λ (OAuth redirect URI + post-login redirect),
@@ -48,7 +48,11 @@ export interface ConsoleDomainConfig {
 export function consoleHostname(envName: string, zoneName: string): string {
   const zone = normalizeZoneName(zoneName);
   const env = String(envName ?? '').trim();
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(env)) {
+  // Same grammar as `isDnsName`'s per-label rule: alphanumeric ends, inner hyphens only, and
+  // RFC 1035's 63-octet label cap. A trailing hyphen (`dev-`) is the realistic slip — it
+  // would otherwise reach ACM + CloudFront + Route53 verbatim and fail mid-deploy, which is
+  // the exact failure the LCA_CONSOLE_DOMAIN override path is validated against.
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(env) || env.length > 63) {
     throw new Error(
       `Console domain: env name "${envName}" is not a valid DNS label; cannot derive a hostname.`,
     );
@@ -147,6 +151,13 @@ export function resolveConsoleDomain(input: ResolveConsoleDomainInput): ConsoleD
     }
   } else {
     hostname = consoleHostname(envName, zoneName);
+    // Belt-and-braces: the label check above cannot see the assembled name, and a zone name
+    // long enough to push the FQDN past 253 octets is rejected here rather than at ACM.
+    if (!isDnsName(hostname) || hostname.length > 253) {
+      throw new Error(
+        `Console domain: derived hostname "${hostname}" is not a valid DNS hostname.`,
+      );
+    }
   }
 
   // A hostname outside the zone can never be resolved by the alias record we create, and

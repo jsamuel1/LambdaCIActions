@@ -949,7 +949,7 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
-## ADR-028 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
+## ADR-036 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
 **Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
 [ADR-024](#adr-024)
 **Context**: The dev console shipped on CloudFront's generated name

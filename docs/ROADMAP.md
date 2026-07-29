@@ -51,7 +51,7 @@ True zero-edit adoption + hardening.
 - Metrics/alarms/X-Ray; cost estimates in Run detail.
 - **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
   (cost left Runs per ADR-029; see spec 04 OQ-6).
-- Vanity console domain + us-east-1 ACM cert (ADR-028) — **shipped**; resolves spec 04 OQ-4.
+- Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
 - `dev`/`prod` account separation; runbook + quotas doc.
 - 🎯 A brand-new repo runs unchanged in `adopt` mode; dashboard shows health + cost.
 

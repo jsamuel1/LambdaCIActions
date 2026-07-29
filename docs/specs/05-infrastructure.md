@@ -127,7 +127,7 @@ Same three-step shape as the reference, generalized:
                           (ONLY when no vanity domain is configured: the management API
                            can't know CloudFront's generated origin until the distribution
                            exists — two-pass by design, ADR-024. With LCA_CONSOLE_* set the
-                           origin comes from config and this step disappears, ADR-028)
+                           origin comes from config and this step disappears, ADR-036)
 ```
 
 Re-running step 2 rebuilds images (e.g. patch day); steps 3–4 are idempotent. Full console

@@ -8,7 +8,7 @@ group the compute plane already writes.
 Design: [spec 04](specs/04-web-ui.md) · [ADR-022](DECISIONS.md#adr-020) (auth) ·
 [ADR-024](DECISIONS.md#adr-022) (single CloudFront origin) ·
 [ADR-025](DECISIONS.md#adr-023) (IAM boundary) ·
-[ADR-028](DECISIONS.md#adr-028) (vanity domain).
+[ADR-036](DECISIONS.md#adr-036) (vanity domain).
 
 ## Phase -1 — deploy-target pin (ADR-018)
 
@@ -16,7 +16,7 @@ Same rule as every other deploy: `.env.local` must pin `LCA_DEPLOY_ACCOUNT` +
 `LCA_DEPLOY_REGION` and your credentials must resolve to that account, or the command
 refuses. `cdk synth` without credentials stays exempt.
 
-## Phase -0.5 — console origin: vanity domain or raw CloudFront (ADR-028)
+## Phase -0.5 — console origin: vanity domain or raw CloudFront (ADR-036)
 
 The console's origin is load-bearing in three places — `PUBLIC_ORIGIN` on the Mgmt λ, the
 GitHub App's OAuth callback URL, and the session cookie — and GitHub has **no API for App
@@ -152,7 +152,7 @@ In the App's settings (Developer settings → GitHub Apps → your app):
 
 The callback URL must match exactly — GitHub rejects mismatches. This edit is **browser-only**:
 GitHub exposes no REST endpoint for App settings (`PATCH /app` does not exist), which is the
-whole reason the origin is worth pinning to a domain you control (ADR-028).
+whole reason the origin is worth pinning to a domain you control (ADR-036).
 
 ## Phase 5 — verify (M4 exit criterion)
 
@@ -169,7 +169,7 @@ whole reason the origin is worth pinning to a domain you control (ADR-028).
 7. **Settings** shows every secret as `set` — and no values (by construction: the API
    reads presence via `DescribeParameters`).
 
-## Migrating an existing console onto a vanity domain (ADR-028)
+## Migrating an existing console onto a vanity domain (ADR-036)
 
 For an env already live on `https://<id>.cloudfront.net`.
 
@@ -228,7 +228,7 @@ only — the hot path (webhook → ingest → provision) keeps running.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Login → 500 | `PUBLIC_ORIGIN` unset (no-domain path) | Phase 3 (re-deploy with `-c publicOrigin=...`), or configure a vanity domain (ADR-028) |
+| Login → 500 | `PUBLIC_ORIGIN` unset (no-domain path) | Phase 3 (re-deploy with `-c publicOrigin=...`), or configure a vanity domain (ADR-036) |
 | `LCA-Cert-<env>` fails instantly: bootstrap version SSM parameter not found | account not bootstrapped in **us-east-1** (the cert stack's region) | `npx cdk bootstrap aws://<account>/us-east-1` — see Phase 2 |
 | Deploy hangs on `LCA-Cert-<env>` | ACM validation CNAME not resolving publicly | Check the `_<hash>` CNAME exists in the zone and that the zone is authoritative for the apex; a private zone can never validate |
 | `cdk deploy` fails on the distribution with a certificate error | cert not in us-east-1 | Cannot happen via `LCA-Cert-<env>` (it asserts the region) — a manually-supplied ARN must be us-east-1 |
