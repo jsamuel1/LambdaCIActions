@@ -24,7 +24,7 @@ import {
 } from './broker-core.js';
 
 /**
- * GitHub App config broker λ (ADR-029) — control plane.
+ * GitHub App config broker λ (ADR-033) — control plane.
  *
  * The Settings screen needs two things the management λ deliberately cannot do:
  *
@@ -56,16 +56,11 @@ const WEBHOOK_SECRET_PARAM = `${SSM_PREFIX}/github/webhook-secret`;
 const RUNNER_LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
 
 /**
- * How long a `status` answer may be reused within one warm container. The Settings screen
- * polls every 15 s (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll
- * from cache and bounds several open tabs to one GitHub round per 30 s per container.
- */
-/**
  * How long a `status` answer may be reused. The Settings screen polls every 15 s
  * (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll from cache.
  *
  * Cached in TWO places, because a per-container cache alone does not bound the spend: any
- * authenticated session may read `GET /api/settings` (ADR-030), and concurrent reads scale the
+ * authenticated session may read `GET /api/settings` (ADR-034), and concurrent reads scale the
  * broker out to fresh containers whose in-memory caches are all cold. The shared `CONFIG#STATUS`
  * row makes the bound platform-wide; the in-memory copy avoids a DynamoDB read per poll.
  */
@@ -156,10 +151,20 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
     const clean = (text: string): string =>
       scrubForOperator(redactLiterals(text, submitted));
 
-    // Any mutation invalidates the cached linkage: the next poll must observe what was just
-    // written (a new App id, new labels), not a pre-change snapshot. Both layers — this
-    // container's copy and the shared row every other container reads.
-    if (req.action !== 'status') {
+    /**
+     * Invalidate the cached linkage: the next poll must observe what was just written (a new App
+     * id, new labels), not a pre-change snapshot. Both layers — this container's copy and the
+     * shared row every other container reads.
+     *
+     * Called BEFORE and AFTER every mutation, and both are necessary. A pre-mutation clear alone
+     * leaves the window this cache's generation fence exists to close open from the other side: a
+     * `status` read can start after the clear, observe the (now current) generation, spend its four
+     * GitHub round-trips on PRE-change data while the relink is still running, and publish that
+     * snapshot legitimately — its generation never moved. The mutation then completes with a stale
+     * shared row it never invalidated, so every container serves the pre-relink App for the full
+     * TTL. Clearing again on the way out bumps the generation past any such in-flight publish.
+     */
+    const invalidate = async (): Promise<void> => {
       statusCache = undefined;
       await deps.clearStatusCache().catch((err) =>
         console.error(
@@ -169,7 +174,17 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
           }),
         ),
       );
-    }
+    };
+    if (req.action !== 'status') await invalidate();
+
+    /** Run a mutating action, invalidating the cache again once its writes have landed. */
+    const mutate = async (fn: () => Promise<AppcfgResult>): Promise<AppcfgResult> => {
+      try {
+        return await fn();
+      } finally {
+        await invalidate();
+      }
+    };
 
     try {
       switch (req.action) {
@@ -205,23 +220,29 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
         }
         case 'relink':
           return finish(
-            await withConfigLock(deps, req.actor, () =>
-              relinkAction(deps, req.credentials!, req.actor, req.allowHookDesync === true),
+            await mutate(() =>
+              withConfigLock(deps, req.actor, () =>
+                relinkAction(deps, req.credentials!, req.actor, req.allowHookDesync === true),
+              ),
             ),
             submitted,
           );
         case 'rollback':
           return finish(
-            await withConfigLock(deps, req.actor, () =>
-              rollbackAction(deps, req.restore!, req.actor, req.remove ?? []),
+            await mutate(() =>
+              withConfigLock(deps, req.actor, () =>
+                rollbackAction(deps, req.restore!, req.actor, req.remove ?? []),
+              ),
             ),
           );
         case 'redeliver':
           return finish(await redeliverAction(deps, req.deliveryId, req.actor));
         case 'setRunnerLabels':
           return finish(
-            await withConfigLock(deps, req.actor, () =>
-              setRunnerLabelsAction(deps, req.labels!, req.actor),
+            await mutate(() =>
+              withConfigLock(deps, req.actor, () =>
+                setRunnerLabelsAction(deps, req.labels!, req.actor),
+              ),
             ),
           );
       }

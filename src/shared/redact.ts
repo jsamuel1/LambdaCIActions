@@ -1,5 +1,5 @@
 /**
- * Control-plane secret redaction (ADR-020, extended by ADR-029).
+ * Control-plane secret redaction (ADR-020, extended by ADR-033).
  *
  * Two related jobs live here, both serving the AGENTS.md hard rule that no secret VALUE ever
  * reaches the UI, an API response, or a log:
@@ -34,7 +34,7 @@ export function redactSecret(text: string, secret?: string): string {
   return out;
 }
 
-// ---- secret-SHAPE guard (settings / App-config surface, ADR-029) -------------
+// ---- secret-SHAPE guard (settings / App-config surface, ADR-033) -------------
 
 /**
  * Structured secret shapes that must never appear in an operator-facing string.

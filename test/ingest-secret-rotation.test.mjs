@@ -1,4 +1,4 @@
-// Ingest's webhook-secret rotation window (ADR-029 review follow-up).
+// Ingest's webhook-secret rotation window (ADR-033 review follow-up).
 //
 // `getParam` caches for 5 minutes, so after a relink rotates `github/webhook-secret` a WARM
 // Ingest container keeps verifying against the PREVIOUS secret while GitHub already signs with

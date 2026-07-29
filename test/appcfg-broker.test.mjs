@@ -1,4 +1,4 @@
-// Behavioural tests for the App-config broker's write path (ADR-029). The pure request
+// Behavioural tests for the App-config broker's write path (ADR-033). The pure request
 // contract + credential validation live in mgmt-settings.test.mjs; this pins the decisions the
 // λ makes with real (faked) SSM + GitHub seams:
 //
@@ -681,7 +681,7 @@ test('an unverifiable rollback leaves the slug alone rather than guessing', asyn
 // ---- shared (cross-container) status cache ---------------------------------
 //
 // The in-memory cache above only bounds ONE container. `GET /api/settings` is readable by any
-// authenticated session (ADR-030) and concurrent reads scale the broker out, so a cold container
+// authenticated session (ADR-034) and concurrent reads scale the broker out, so a cold container
 // must be able to reuse an answer another container already paid four App-JWT calls for.
 
 test('a cold container reuses a warm shared cache row instead of calling GitHub', async () => {
@@ -706,8 +706,35 @@ test('a cold container with no shared row publishes its answer for the others', 
 test('a mutation clears the SHARED row too, not just this container', async () => {
   const h = harness({ existing: linkedStore(), sharedCache: { ok: true, linkage: { app: null, installations: [], webhook: null } } });
   await h.handle({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-base' });
-  assert.equal(h.calls.cacheClears, 1, 'other containers would otherwise serve pre-change state');
+  assert.ok(h.calls.cacheClears >= 1, 'other containers would otherwise serve pre-change state');
   assert.equal(h.shared.row, undefined);
+});
+
+test('a status read that races a mutation cannot leave a pre-change row behind', async () => {
+  // The generation fence only covers a read that STARTED before the mutation's invalidation. A
+  // read that starts just AFTER it observes the already-bumped generation, so its publish is
+  // legitimate — yet it can still be computing PRE-change data while the writes are landing. If
+  // the mutation only invalidated on the way IN, that stale row would then survive for the full
+  // TTL and every container would serve the old App/labels. Invalidating again after the writes
+  // land bumps the generation past any such in-flight publish.
+  const h = harness({ existing: linkedStore() });
+  let racingRead;
+  const original = h.deps.putParam;
+  h.deps.putParam = async (name, value, opts) => {
+    // Mid-write: a poll arrives on another container, reads the (current) generation and starts
+    // computing. It resolves before this mutation returns.
+    racingRead ??= createHandler(h.deps)({ action: 'status', actor: 'system' });
+    return original(name, value, opts);
+  };
+  const fresh = createHandler(h.deps);
+  const res = await fresh({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-new' });
+  await racingRead;
+  assert.equal(res.ok, true);
+  assert.equal(
+    h.shared.row,
+    undefined,
+    'the racing read must not leave a pre-change snapshot in the shared row',
+  );
 });
 
 test('a shared-cache fault degrades to a live GitHub read, it does not fail the request', async () => {

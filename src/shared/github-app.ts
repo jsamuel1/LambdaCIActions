@@ -246,7 +246,7 @@ export async function listUserInstallations(
   }));
 }
 
-// ---- App identity + webhook introspection (spec 04 Settings, ADR-029) --------
+// ---- App identity + webhook introspection (spec 04 Settings, ADR-033) --------
 
 /** Identity of the App the environment's stored credentials actually authenticate as. */
 export interface AppIdentity {

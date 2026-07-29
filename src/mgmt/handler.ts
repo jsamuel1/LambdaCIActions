@@ -113,7 +113,7 @@ const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM ?? `${SSM_PREFIX}/co
 const PLATFORM_ADMINS_PARAM =
   process.env.PLATFORM_ADMINS_PARAM ?? `${SSM_PREFIX}/config/platform-admins`;
 /**
- * The App-config broker (ADR-029). The Mgmt λ holds `lambda:InvokeFunction` on this ARN and
+ * The App-config broker (ADR-033). The Mgmt λ holds `lambda:InvokeFunction` on this ARN and
  * nothing else — no App PEM read, no `ssm:PutParameter` on any secret path.
  */
 const APPCFG_BROKER_NAME = process.env.APPCFG_BROKER_NAME ?? '';
@@ -608,7 +608,7 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
 }
 
 /**
- * Settings (spec 04 § Settings, ADR-029). Answers the operator's real questions — *is this
+ * Settings (spec 04 § Settings, ADR-033). Answers the operator's real questions — *is this
  * environment linked to a GitHub App, which one, what does it claim, and is GitHub actually
  * reaching us* — rather than listing SSM paths.
  *
@@ -698,7 +698,7 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
   // it are partly forwarded from GitHub/AWS; fail loudly rather than serve tainted content.
   assertNoSecrets(view, 'GET /api/settings');
   const isPlatformAdmin = canAdminPlatform(session, parsePlatformAdmins(adminsRaw));
-  // Cross-tenant scoping (ADR-030): installation identities and the operator audit trail are
+  // Cross-tenant scoping (ADR-034): installation identities and the operator audit trail are
   // not environment-level facts. Settings itself stays readable for everyone so a fresh
   // environment can show its state.
   const scoped = scopeSettingsView(view, {
@@ -753,7 +753,7 @@ async function invokeAppcfg(payload: Record<string, unknown>): Promise<AppcfgRes
     );
   } catch (err) {
     // A throttle is a retryable "busy", not a fault. The broker is not concurrency-capped
-    // (write serialization is its own DynamoDB lock, ADR-029), but an account-level Lambda
+    // (write serialization is its own DynamoDB lock, ADR-033), but an account-level Lambda
     // throttle can still surface here. The raw SDK error must never be surfaced either: on
     // the relink path the request payload it may quote contains the submitted credentials.
     if ((err as { name?: string }).name === 'TooManyRequestsException') {

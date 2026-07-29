@@ -1,5 +1,5 @@
 /**
- * Pure logic for the GitHub App config broker (ADR-029).
+ * Pure logic for the GitHub App config broker (ADR-033).
  *
  * The management plane must be able to (a) show the operator which GitHub App this
  * environment is actually linked to and whether GitHub can reach our webhook, and (b)
@@ -58,7 +58,7 @@ export interface AppcfgRequest {
   restore?: ParameterVersionSnapshot;
   /**
    * action=rollback only — parameters the relink CREATED, which have no prior version and must
-   * therefore be deleted rather than restored (ADR-029).
+   * therefore be deleted rather than restored (ADR-033).
    *
    * Without this, an explicit rollback of a first-link is impossible: `restore` is empty because
    * nothing existed beforehand, so the operator's rollback button would silently no-op and leave
