@@ -1067,12 +1067,15 @@ The pin rule covers **package managers too**, not just the language runtime: `co
 pnpm@latest` / `npm install -g npm@latest` resolve at build time, so a floating tag beside a
 pinned runtime is a half-kept promise — `test/image-content.test.mjs` now rejects any `@latest`
 /`@stable`/`@next` install in a flavor Dockerfile.
-A prebaked runtime is also not a self-sufficient job environment: `python`, `go` and `rust`
-carry `build-essential`, because a source-only sdist (arm64 wheels are still commonly absent),
-cgo, and cargo's link step all shell out to `cc`, which the shared apt line does not install.
-Without it the failure surfaces mid-job as `command 'gcc' failed`, after the download cost is
-already paid. `base`/`node`/`java`/`docker` skip it deliberately — not compile-from-source
-paths, and ~200 MB of snapshot each.
+A prebaked runtime is also not a self-sufficient job environment: `node`, `python`, `go` and
+`rust` carry `build-essential`, because node-gyp (npm's fallback whenever a dependency ships no
+prebuilt binary), a source-only sdist (arm64 wheels are still commonly absent), cgo, and cargo's
+link step all shell out to a compiler the shared apt line does not install. Verified in a
+container: that line yields no `gcc`/`cc`/`g++`/`make`/`ld`. Without it the failure surfaces
+mid-job as `command 'gcc' failed` / `gyp ERR! ... not found: make`, after the download cost is
+already paid. `base`/`java`/`docker` skip it deliberately — `base` carries no runtime to compile
+against, Temurin builds consume published JARs, and a docker job compiles inside its own
+container; it is ~200 MB of snapshot each.
 And a new flavor is **not reachable from its label until
 `/lca/<env>/config/runner-labels` lists it**: `shouldClaim` is an allowlist consulted *before*
 resolution, seeded by hand per DEPLOY-M1, so an omitted label makes those jobs sit queued on

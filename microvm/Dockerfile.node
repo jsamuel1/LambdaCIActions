@@ -42,6 +42,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo \
       libicu70 lsb-release awscli \
+      # Node IS a compile-from-source path, for the same reason python is: npm/pnpm/yarn fall
+      # back to **node-gyp** whenever a dependency ships no prebuilt binary for this platform,
+      # and node-gyp shells out to `g++`, `make` and `ld`. Verified in a container that a bare
+      # ubuntu:22.04 plus the line above has NONE of those (only `python3`, which node-gyp also
+      # needs), so such an `npm ci` fails mid-job with "gyp ERR! ... not found: make" after the
+      # checkout is already paid for. arm64 is precisely where prebuilds are most often absent,
+      # so the node flavor needs this at least as much as python does.
+      build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

@@ -541,17 +541,30 @@ test('this repo\'s own CI asks setup-node for the major the node flavor prebaked
 test('flavors whose jobs compile native code ship a C toolchain', () => {
   // A prebaked interpreter/toolchain is not a self-sufficient job environment: any
   // `pip install` of a source-only sdist (arm64 manylinux wheels are still commonly absent),
-  // any `go build` touching cgo, and every `cargo` link step shell out to `cc`. Verified in a
-  // container that a bare ubuntu:22.04 plus the shared apt line has NO gcc/cc/make/ld, so
-  // without this the failure lands mid-job as "command 'gcc' failed: No such file or
-  // directory" — after the download cost is already paid, in someone else's build.
-  // `base`/`node`/`java`/`docker` are excluded deliberately: not compile-from-source paths,
-  // and build-essential is ~200 MB of snapshot per flavor.
-  for (const name of ['python', 'go', 'rust']) {
+  // any `npm ci` that falls through to node-gyp (same story for arm64 prebuilds — node-gyp
+  // needs g++/make/ld), any `go build` touching cgo, and every `cargo` link step shell out to
+  // a compiler. Verified in a container that a bare ubuntu:22.04 plus the shared apt line has
+  // NO gcc/cc/g++/make/ld, so without this the failure lands mid-job ("command 'gcc' failed:
+  // No such file or directory" / "gyp ERR! ... not found: make") after the download cost is
+  // already paid, in someone else's build.
+  // `base`/`java`/`docker` are excluded deliberately: `base` ships no language runtime to
+  // compile against, Temurin builds consume published JARs, and a docker job compiles inside
+  // its own container — and build-essential is ~200 MB of snapshot per flavor.
+  for (const name of ['node', 'python', 'go', 'rust']) {
     assert.match(
       instructions(`Dockerfile.${name}`),
       /^\s+build-essential\b/m,
       `${name}: needs build-essential — its jobs compile native code`,
+    );
+  }
+  // ...and the exclusions are deliberate, not drift: a flavor that gained a runtime without
+  // gaining its compiler is the regression this pins from the other side.
+  for (const name of ['base', 'java', 'docker']) {
+    assert.doesNotMatch(
+      instructions(`Dockerfile.${name}`),
+      /^\s+build-essential\b/m,
+      `${name}: carries build-essential — if that is intended, move it to the list above ` +
+        'with a reason (it is ~200 MB of snapshot)',
     );
   }
 });

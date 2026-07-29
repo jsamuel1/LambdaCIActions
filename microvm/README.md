@@ -47,8 +47,9 @@ Gotchas (all three are silent failures — the job just re-downloads at full spe
 `python` installs via the upstream `setup.sh` inside the `actions/python-versions` tarball —
 the same artifact `setup-python` downloads — rather than hand-rolling the layout.
 
-`python`, `go` and `rust` also carry `build-essential`: source-only sdists, cgo and cargo's
-link step all need `cc`, which the shared apt line does not provide.
+`node`, `python`, `go` and `rust` also carry `build-essential`: node-gyp (npm's fallback when a
+dependency has no prebuilt binary), source-only sdists, cgo and cargo's link step all need a
+compiler, which the shared apt line does not provide.
 
 `rust` has no tool-cache entry: the Rust actions drive **rustup**, not the runner tool cache,
 so that flavor bakes rustup + the pinned toolchain onto `PATH` instead. Both `RUSTUP_HOME` and
