@@ -2,7 +2,7 @@
 #
 # Dockerfile.go — the `go` flavor microVM image (docs/specs/02-microvm-runners.md,
 # capabilities: ["go"]). Base runner + a pinned Go toolchain, installed INTO the runner tool
-# cache so `actions/setup-go@v5` resolves from cache instead of downloading (ADR-031).
+# cache so `actions/setup-go@v5` resolves from cache instead of downloading (ADR-039).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -15,7 +15,7 @@ FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
-# Pinned Go. Bump deliberately (ADR-031) — `latest` would make image rebuilds
+# Pinned Go. Bump deliberately (ADR-039) — `latest` would make image rebuilds
 # non-reproducible.
 ARG GO_VERSION=1.25.12
 ENV DEBIAN_FRONTEND=noninteractive \

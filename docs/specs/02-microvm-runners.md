@@ -61,7 +61,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
 | `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
 | `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
-| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-040/033) |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-040/041) |
 
 † descriptive only — see the sizing note above.
 

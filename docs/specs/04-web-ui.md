@@ -277,6 +277,11 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   $0.0044/min reference) rather than a hand-maintained rate table, so a new flavor cannot
   ship without a price. Surfaced as an explicit *estimate*: it uses wall-clock duration,
   which is an upper bound on billed microVM runtime (v1 stores no per-phase timestamps).
+  **Amended by ADR-038**: the catalog's `vcpu` is *descriptive* — the microVM API accepts a
+  memory request (`--resources minimumMemoryInMiB`) and exposes no vCPU knob — so the vCPU
+  term is a proxy for the shape a flavor is intended for, not for provisioned capacity. The
+  two-term formula stays (memory is real and drives quota), but every surface must label the
+  figure an estimate; the Flavors screen footnotes the `vcpu` column for this reason.
 
 ## Open questions
 

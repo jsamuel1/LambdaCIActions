@@ -8,7 +8,7 @@
 # `actions/setup-rust` that consults the runner tool cache; the ecosystem standard
 # (`dtolnay/rust-toolchain`, `actions-rs/toolchain`) drives **rustup**, which manages its own
 # toolchain store under CARGO_HOME/RUSTUP_HOME. So the win here comes from having rustup +
-# the pinned toolchain already resolved on PATH, not from ${RUNNER_TOOL_CACHE} (ADR-031).
+# the pinned toolchain already resolved on PATH, not from ${RUNNER_TOOL_CACHE} (ADR-039).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -21,7 +21,7 @@ FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
-# Pinned Rust stable. Bump deliberately (ADR-031) — tracking `stable` would make image
+# Pinned Rust stable. Bump deliberately (ADR-039) — tracking `stable` would make image
 # rebuilds non-reproducible.
 ARG RUST_VERSION=1.97.1
 ENV DEBIAN_FRONTEND=noninteractive \

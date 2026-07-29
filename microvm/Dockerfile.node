@@ -51,7 +51,7 @@ RUN corepack enable \
     && node --version && npm --version && pnpm --version && yarn --version
 
 # Prebake the runner tool cache so `actions/setup-node@v4` short-circuits instead of
-# re-downloading Node on every job (ADR-031). Without this the apt-installed Node above only
+# re-downloading Node on every job (ADR-039). Without this the apt-installed Node above only
 # helps jobs that use no setup-node step at all. setup-node caches under toolName `node` and
 # arch `arm64` (base-distribution.ts `findVersionInHostedToolCacheDirectory` →
 # tc.find('node', spec, translateArchToDistUrl(arch)); arm64 passes through unchanged), and

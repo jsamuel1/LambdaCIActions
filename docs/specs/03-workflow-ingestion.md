@@ -147,7 +147,6 @@ still warns. Capabilities are drawn from a closed vocabulary (`docker`, `node`, 
 the resolver's upgrade step, which is why custom-flavor registration validates against it
 (ADR-041).
 
-
 ## Onboarding modes
 
 Per-repo setting stored on the `Repo` row:

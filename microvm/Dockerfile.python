@@ -3,7 +3,7 @@
 # Dockerfile.python — the `python` flavor microVM image (docs/specs/02-microvm-runners.md,
 # capabilities: ["python"]). Base runner + a pinned CPython toolchain, installed INTO the
 # runner tool cache so `actions/setup-python@v5` resolves from cache instead of downloading
-# (ADR-031).
+# (ADR-039).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -19,7 +19,7 @@ ARG NODE_MAJOR=24
 # Pinned CPython. This is the SAME artifact actions/setup-python downloads (the
 # actions/python-versions release matching this runner OS + arch), which is what makes the
 # prebaked cache entry indistinguishable from one the action installed itself. Bump
-# deliberately; `latest` would make image rebuilds non-reproducible (ADR-031).
+# deliberately; `latest` would make image rebuilds non-reproducible (ADR-039).
 ARG PYTHON_VERSION=3.12.13
 ARG PYTHON_RELEASE=3.12.13-27650778726
 ENV DEBIAN_FRONTEND=noninteractive \

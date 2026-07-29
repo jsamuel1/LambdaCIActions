@@ -2,7 +2,7 @@
 #
 # Dockerfile.java — the `java` flavor microVM image (docs/specs/02-microvm-runners.md,
 # capabilities: ["java"]). Base runner + a pinned Temurin JDK LTS, installed INTO the runner
-# tool cache so `actions/setup-java@v4` resolves from cache instead of downloading (ADR-031).
+# tool cache so `actions/setup-java@v4` resolves from cache instead of downloading (ADR-039).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -16,7 +16,7 @@ FROM --platform=linux/arm64 ubuntu:22.04
 ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
 # Pinned Eclipse Temurin JDK 21 (LTS), aarch64. JDK_BUILD is the Adoptium build number:
-# the release is `jdk-<JDK_VERSION>+<JDK_BUILD>`. Bump deliberately (ADR-031) — `latest`
+# the release is `jdk-<JDK_VERSION>+<JDK_BUILD>`. Bump deliberately (ADR-039) — `latest`
 # would make image rebuilds non-reproducible.
 ARG JDK_VERSION=21.0.12
 ARG JDK_BUILD=8
