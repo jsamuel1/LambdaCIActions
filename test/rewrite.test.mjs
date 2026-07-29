@@ -333,6 +333,100 @@ test('multi-job files still resolve each job independently after a nested block'
 });
 
 // ---------------------------------------------------------------------------
+// Job-id spellings the scanner must not misattribute.
+//
+// A line at the job-id column that the scanner cannot read as a key used to be skipped, which
+// left `currentJob` pointing at the PREVIOUS job while the scan walked into the new job's
+// body. The next `runs-on:` was then recorded under the wrong job id, so `planFileRewrite`
+// rewrote job B's selector using job A's target — committed straight into the customer's PR.
+// Every case below is legal YAML and a legal GitHub job id.
+
+test('a QUOTED job id owns its own runs-on line (not the previous job\'s)', () => {
+  const yaml = `jobs:
+  lint:
+    runs-on: ubuntu-latest
+  "build":
+    runs-on: ubuntu-22.04
+  'release':
+    runs-on: ubuntu-24.04
+`;
+  const lines = findRunsOnLines(yaml);
+  assert.equal(lines.get('lint'), 3);
+  assert.equal(lines.get('build'), 5);
+  assert.equal(lines.get('release'), 7);
+});
+
+test("a quoted job id after an unrewritable job is not attributed to that job", () => {
+  // `lint` has a block-sequence runs-on (refused). Before the fix, `release`'s selector was
+  // recorded under `lint`, so planning `lint` rewrote `release`'s line — and `release` itself
+  // was reported as having no runs-on.
+  const yaml = `jobs:
+  lint:
+    runs-on:
+      - ubuntu-latest
+  "release":
+    runs-on: ubuntu-latest
+`;
+  const lines = findRunsOnLines(yaml);
+  // `lint` has a `runs-on:` LINE (empty value — the sequence is on the following lines), so the
+  // scanner records it and the PLANNER refuses it. What matters is that `release` resolves to
+  // its own line 6 rather than being lost while `lint` owns it.
+  assert.equal(lines.get('lint'), 3);
+  assert.equal(lines.get('release'), 6);
+
+  const plan = planFileRewrite('ci.yml', yaml, [{ jobId: 'lint', flavor: 'base' }]);
+  assert.equal(plan.edits.length, 0, "lint's block sequence must not be rewritten via release");
+  assert.equal(plan.content, undefined);
+  assert.match(plan.skipped[0].reason, /block sequence/);
+});
+
+test('a job whose flavor differs from its neighbour gets ITS OWN label', () => {
+  // The concrete corruption: `a` routes to docker, `build` to base. Attributing `build`'s
+  // line to `a` wrote `lambda-ci-docker` onto `build` — a 4 vCPU/8 GB VM for a job that asked
+  // for neither, while `a` stayed unrouted.
+  const yaml = `jobs:
+  a:
+    runs-on: ubuntu-latest
+  "build":
+    runs-on: ubuntu-latest
+`;
+  const plan = planFileRewrite('ci.yml', yaml, [
+    { jobId: 'a', flavor: 'docker' },
+    { jobId: 'build', flavor: 'base' },
+  ]);
+  const byJob = Object.fromEntries(plan.edits.map((e) => [e.jobId, e.after]));
+  assert.match(byJob.a, /lambda-ci-docker/);
+  assert.match(byJob.build, /\[self-hosted, lambda-ci\]/);
+  assert.equal(/docker/.test(byJob.build), false);
+});
+
+test('an INLINE (flow-mapping) job body is refused, and its neighbours still resolve', () => {
+  // There is no `runs-on:` line of its own to edit without re-flowing the mapping, and the
+  // mapping must not be mistaken for the job body of the job before it.
+  const yaml = `jobs:
+  a: {runs-on: ubuntu-latest, steps: [{run: make}]}
+  b:
+    runs-on: ubuntu-latest
+`;
+  const lines = findRunsOnLines(yaml);
+  assert.equal(lines.get('a'), undefined);
+  assert.equal(lines.get('b'), 4);
+
+  const plan = planFileRewrite('ci.yml', yaml, [{ jobId: 'a', flavor: 'base' }]);
+  assert.equal(plan.edits.length, 0);
+  assert.match(plan.skipped[0].reason, /no single-line runs-on/);
+});
+
+test('a trailing comment on the job-id line does not refuse the job', () => {
+  // `inlineBody` must distinguish an inline mapping from an ordinary comment.
+  const yaml = `jobs:
+  build:   # the only job
+    runs-on: ubuntu-latest
+`;
+  assert.equal(findRunsOnLines(yaml).get('build'), 3);
+});
+
+// ---------------------------------------------------------------------------
 // Quoting: the rewritten line must MEAN the same thing, not just look similar.
 //
 // The first cut split the inline sequence on `,` and stripped surrounding quotes, then

@@ -57,11 +57,11 @@ const env = { account, region };
 const ssmPrefix = `/lca/${envName}`;
 const tagPrefix = 'lca';
 
-// Per-environment config (ADR-032): retention, concurrency, alarm thresholds, tracing.
+// Per-environment config (ADR-033): retention, concurrency, alarm thresholds, tracing.
 // `dev` and `prod` are separate ACCOUNTS (spec 05) — this only varies the knobs.
 //   -c alarmEmail=oncall@example.com   subscribe the alarm topic (unsubscribed by default)
 //   -c rewrite=true                    enable the auto-rewrite PR capability (OFF by default;
-//                                      requires the App to hold contents:write — ADR-030)
+//                                      requires the App to hold contents:write — ADR-031)
 const alarmEmail = app.node.tryGetContext('alarmEmail') as string | undefined;
 const rewriteCtx = app.node.tryGetContext('rewrite') as string | boolean | undefined;
 const config = envConfig(envName, {

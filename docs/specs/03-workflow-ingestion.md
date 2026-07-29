@@ -190,8 +190,10 @@ Implemented in M5 (ADR-031). Behaviour:
   write. The dry run works regardless.
 - **Only `runs-on:` lines change.** Comments, formatting, quoting and key order are preserved
   byte-for-byte; the rewriter refuses shapes it cannot edit safely (block sequences, matrix
-  expressions, the runner-group object form) and reports them for hand-editing instead of
-  guessing.
+  expressions, the runner-group object form, and a job whose body is an inline flow mapping)
+  and reports them for hand-editing instead of guessing. A job whose surrounding structure the
+  line scanner cannot parse is likewise refused rather than attributed to a neighbouring job
+  (ADR-031, seventh-review fix).
 - The GitHub-hosted label is **removed** rather than kept alongside ours — leaving it would
   require a runner advertising it and defeat the rewrite (label containment, ADR-030).
 - Branch + PR only: never a direct push, never a force-push, an existing PR is updated rather

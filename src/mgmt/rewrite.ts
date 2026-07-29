@@ -20,8 +20,9 @@
  * is confident about and leaves every other byte untouched.
  *
  * The tradeoff is coverage: shapes it cannot rewrite safely (block sequences, matrix
- * expressions, runner-group objects) are reported as `skipped` with a reason so the console
- * can tell the operator what to hand-edit, instead of guessing and corrupting a workflow.
+ * expressions, runner-group objects, inline flow-mapping job bodies) are reported as `skipped`
+ * with a reason so the console can tell the operator what to hand-edit, instead of guessing
+ * and corrupting a workflow.
  */
 import { isAdoptLabel, nonLinuxHostedLabel } from '../ingest/adopt.js';
 import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
@@ -74,8 +75,26 @@ export interface RewriteTarget {
 /** `runs-on: <value>` on a single line, capturing indent + inline comment. */
 const RUNS_ON_RE = /^(\s*)runs-on:[ \t]*(.*?)[ \t\r]*$/;
 
-/** A `key:` line that starts a mapping (used to find job blocks). */
-const KEY_RE = /^(\s*)([A-Za-z0-9_.-]+):\s*(.*)$/;
+/**
+ * A `key:` line that starts a mapping (used to find job blocks).
+ *
+ * The key may be a plain scalar OR a QUOTED one: `"build":` / `'build':` are legal YAML and
+ * legal GitHub job ids. A plain-only pattern silently failed to recognize such a line as a
+ * key, which does not merely lose that job — it makes the scanner attribute the job's own
+ * `runs-on:` line to the PREVIOUS job (see `findRunsOnLines`), i.e. it plans an edit for job
+ * A against job B's selector and commits that to the customer's repo.
+ *
+ * Group 3 is the quoted form's inner text, group 4 the plain form; `keyName` picks whichever
+ * matched. Escapes inside a double-quoted id are not decoded — job ids are matched against
+ * `parseWorkflow`'s ids, which come from the same YAML source, and an id needing escapes is
+ * refused below rather than guessed at.
+ */
+const KEY_RE = /^(\s*)(?:"([^"\\]*)"|'([^']*)'|([A-Za-z0-9_.-]+)):\s*(.*)$/;
+
+/** The key name a `KEY_RE` match names, whichever of the three spellings matched. */
+function keyName(m: RegExpExecArray): string {
+  return m[2] ?? m[3] ?? m[4];
+}
 
 /**
  * Split a workflow into lines WITHOUT losing CRLF.
@@ -129,6 +148,33 @@ function joinLines(lines: string[], endings: string[]): string {
  * A first-match scanner rewrites the matrix dimension and leaves the real selector alone —
  * i.e. it opens a PR that corrupts the customer's matrix and does not even route the job. The
  * same applies to a `runs-on:`-looking line inside a `run: |` block scalar.
+ *
+ * ## Unrecognized structure must FORGET the current job, not skip the line
+ *
+ * The mirror-image hazard is a line at the job-id column the scanner cannot parse as a key.
+ * Merely `continue`-ing there does not lose one job — it leaves `currentJob` pointing at the
+ * PREVIOUS job while the scan walks into the new job's body, so the next `runs-on:` is
+ * recorded under the wrong job id. `planFileRewrite` then rewrites job B's selector using job
+ * A's target (or rewrites a selector no target asked about at all) and commits that to the
+ * customer's repo:
+ *
+ *   jobs:
+ *     lint:
+ *       runs-on:                     ← block sequence: the planner refuses `lint`
+ *         - ubuntu-latest
+ *     "release":                      ← quoted id (legal YAML, legal job id)
+ *       runs-on: ubuntu-latest        ← was attributed to `lint`, and rewritten
+ *
+ * Quoted ids are now recognized (`KEY_RE`), but the class does not end there — an id needing
+ * escapes, a complex `?` key, or a multi-line flow mapping are all unparseable here. So any
+ * non-blank line at or shallower than the job-id column that is NOT a recognized key clears
+ * `currentJob`: an unrecognized shape yields "no single-line runs-on found" (a safe `skipped`
+ * reason) instead of an edit against the wrong job.
+ *
+ * A job whose body is INLINE on the job-id line (`build: {runs-on: ubuntu-latest}`, or an
+ * anchor) is refused for the same reason: there is no line we can edit without re-flowing the
+ * mapping, and a multi-line flow mapping would otherwise expose an interior `runs-on:` line
+ * whose trailing comma we would silently drop.
  */
 export function findRunsOnLines(yamlText: string): Map<string, number> {
   const { lines } = splitLines(yamlText);
@@ -146,19 +192,36 @@ export function findRunsOnLines(yamlText: string): Map<string, number> {
     const m = KEY_RE.exec(line);
 
     if (jobsIndent === undefined) {
-      if (m && m[2] === 'jobs' && m[1].length === 0) jobsIndent = 0;
+      if (m && keyName(m) === 'jobs' && m[1].length === 0) jobsIndent = 0;
       continue;
     }
 
-    if (!m) continue; // list items, block-scalar text, continuations: never a job key
+    if (!m) {
+      // Not a key we can parse. If it sits at (or shallower than) the job-id column it is
+      // structure we do not understand — most likely a job id in a spelling this scanner
+      // cannot read. Forget the current job so its target can never be planned against the
+      // next job's selector; deeper lines (list items, block-scalar text) are ordinary body
+      // content and change nothing.
+      const indent = line.length - line.replace(/^\s*/, '').length;
+      if (jobIdIndent !== undefined && indent <= jobIdIndent) {
+        currentJob = undefined;
+        jobBodyIndent = undefined;
+      }
+      continue;
+    }
 
     const indent = m[1].length;
+    const name = keyName(m);
     // Dedent back to (or past) `jobs:` ⇒ we left the jobs block.
-    if (indent <= jobsIndent && m[2] !== 'jobs') break;
+    if (indent <= jobsIndent && name !== 'jobs') break;
     if (jobIdIndent === undefined && indent > jobsIndent) jobIdIndent = indent;
     if (indent === jobIdIndent) {
-      currentJob = m[2];
       jobBodyIndent = undefined; // learned from this job's first body key
+      // Anything on the job-id line itself means the body is inline (a flow mapping) or
+      // anchored: there is no `runs-on:` line of its own to edit, and treating the flow
+      // mapping's interior lines as body keys would drop their separators. Refuse the job.
+      const inlineBody = m[5].trim();
+      currentJob = !inlineBody || inlineBody.startsWith('#') ? name : undefined;
       continue;
     }
     if (!currentJob) continue;

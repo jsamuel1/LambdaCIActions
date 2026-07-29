@@ -1112,6 +1112,22 @@ cannot simply exist.
 credential, by design), so its dry run is derived from the stored parse (`runs_on` per job).
 It shows the exact label change per job — the thing being decided — without pretending to be
 a byte-level diff. The λ produces the real unified diff when it commits.
+**Seventh-review fix**: the `runs-on:` scanner must **forget the current job** on structure it
+cannot parse, not skip the line. Its job-key pattern accepted only plain scalars, so a YAML-quoted
+job id (`"build":` / `'release':` — legal YAML and a legal GitHub job id) was not recognized as a
+key. That did not merely lose the job: `currentJob` stayed pointing at the PREVIOUS job while the
+scan walked into the new job's body, so the next `runs-on:` was recorded under the wrong job id.
+The planner then rewrote job B's selector using job A's target — e.g. stamping `lambda-ci-docker`
+(4 vCPU / 8 GB) onto a job that asked for neither, while the job that did need docker stayed
+unrouted and was reported as having no `runs-on`. In the worst shape (`lint` with a block-sequence
+selector followed by a quoted `"release"`), planning the *refused* job edited the *other* job's
+line. Quoted ids are now recognized, and — because the class is open (ids needing escapes,
+complex `?` keys) — any unrecognized non-blank line at or shallower than the job-id column clears
+the current job, so the outcome is a `skipped` reason rather than an edit against the wrong job.
+A job whose body is an **inline flow mapping** (`build: {runs-on: ubuntu-latest}`) is refused for
+the same reason: there is no line to edit without re-flowing the mapping, and treating its
+interior lines as body keys would drop their separators. Pinned by `test/rewrite.test.mjs`.
+
 **Consequences**: an extra queue + λ, both inert in a default deployment. The rewriter's
 coverage is deliberately partial; `skipped` entries are a first-class output surfaced in the
 UI and repeated in the PR body, alongside an explicit arm64 warning for the reviewer.
