@@ -1005,4 +1005,6 @@ repair is idempotent and concurrency-safe (conditional write; a losing racer is 
 `test/install-store-gsi1.test.mjs` pins that every write path carries them — the regression
 class here is "a new write path forgets the index stamp". The reconciled list is re-sorted by
 account login so a recovered row occupies the same position it will hold on the next poll,
-once the index serves it.
+once the index serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
+that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
+the reverse, and the mismatch would be the same row-jump wearing a disguise.

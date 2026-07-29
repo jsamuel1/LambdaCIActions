@@ -313,8 +313,6 @@ export async function reconcileInstallations(
   if (missing.length === 0) return indexed;
 
   const recovered: InstallationRecord[] = [];
-  const byLogin = (a: InstallationRecord, b: InstallationRecord): number =>
-    (a.accountLogin ?? '').localeCompare(b.accountLogin ?? '');
   for (const id of missing) {
     const row = await deps.get(id);
     if (!row) continue; // a grant for an installation we never stored — nothing to show
@@ -353,7 +351,22 @@ export async function reconcileInstallations(
   // Sort the merged list by account login — the order GSI1 already returns. Appending
   // recovered rows raw would put a legacy installation last, then move it once the repair
   // lands and the next poll (ADR-026) reads it from the index: the console row would jump.
-  return [...indexed, ...recovered].sort(byLogin);
+  return [...indexed, ...recovered].sort(byGsi1sk);
+}
+
+/**
+ * Order two installation rows the way DynamoDB orders them in the GSI1 `INSTALLS` partition.
+ * `gsi1sk` is the account login, and DynamoDB sorts String sort keys by their **UTF-8 bytes**
+ * — so this is a byte comparison, deliberately NOT `localeCompare`. GitHub logins may be mixed
+ * case, and locale collation puts `abc` before `Acme` while the index puts `Acme` first
+ * (uppercase sorts below lowercase in ASCII). Locale order here would reintroduce exactly the
+ * row-jump this sort exists to prevent: this response and the next index-served poll (ADR-026)
+ * would disagree.
+ */
+export function byGsi1sk(a: InstallationRecord, b: InstallationRecord): number {
+  const x = a.accountLogin ?? '';
+  const y = b.accountLogin ?? '';
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 
 /**

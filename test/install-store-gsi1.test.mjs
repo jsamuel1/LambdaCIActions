@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   buildInstallUpsert,
+  byGsi1sk,
   installGsi1Keys,
   missingInstallationIds,
   needsIndexRepair,
@@ -175,6 +176,43 @@ test('the merged list is ordered by account login, like the index itself', async
     ['bravo', 'charlie', 'delta'],
     'a recovered row sorts into place rather than being appended',
   );
+});
+
+test('the merge order is DynamoDB byte order, not locale collation', async () => {
+  // gsi1sk is the account login and DynamoDB sorts String sort keys by UTF-8 bytes: `Acme`
+  // (uppercase A = 0x41) precedes `abc` (0x61). `localeCompare` reverses that pair, so a
+  // locale sort here would put the recovered row in a DIFFERENT slot than the next
+  // index-served poll — the row-jump this sort exists to prevent, just harder to spot.
+  const indexed = [install({ installationId: 22, accountLogin: 'abc', gsi1pk: 'INSTALLS' })];
+  const out = await reconcileInstallations(indexed, [22, 11], {
+    get: async (id) => (id === 11 ? install({ installationId: 11, accountLogin: 'Acme' }) : undefined),
+    repair: async () => true,
+  });
+  assert.deepEqual(out.map((i) => i.accountLogin), ['Acme', 'abc']);
+  assert.equal(
+    ['abc', 'Acme'].sort((a, b) => a.localeCompare(b))[0],
+    'abc',
+    'sanity: locale collation really does disagree with the index for this pair',
+  );
+});
+
+test('byGsi1sk matches DynamoDB string sort-key ordering', () => {
+  const bytes = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  for (const [x, y] of [
+    ['Acme', 'abc'],
+    ['Zed', 'apple'],
+    ['a-b', 'aB'],
+    ['jsamuel1', 'jsamuel1'],
+    ['a', 'aa'],
+  ]) {
+    assert.equal(
+      Math.sign(byGsi1sk({ accountLogin: x }, { accountLogin: y })),
+      Math.sign(bytes(x, y)),
+      `${x} vs ${y}`,
+    );
+  }
+  // A row with no accountLogin sorts first rather than throwing.
+  assert.equal(byGsi1sk({}, { accountLogin: 'a' }), -1);
 });
 
 test('a grant for an installation we never stored is skipped, not faked', async () => {
