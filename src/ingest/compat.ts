@@ -30,6 +30,27 @@ const DOCKER_CAPABLE_FLAVORS = new Set<string>(
     .map((f) => f.name),
 );
 
+/**
+ * Catalog view used to detect a job whose explicitly requested toolchain is not in the flavor
+ * it actually resolved to. Derived from the catalog (never hard-coded) so a new flavor is
+ * covered by construction.
+ */
+const CATALOG = (
+  flavorsCatalog as {
+    flavors: { name: string; label: string; capabilities: string[] }[];
+  }
+).flavors;
+
+/** `label` (lower-cased) → the capabilities that label's flavor advertises. */
+const CAPABILITIES_BY_LABEL = new Map<string, string[]>(
+  CATALOG.map((f) => [f.label.toLowerCase(), f.capabilities]),
+);
+
+/** `name` → the capabilities that flavor advertises. */
+const CAPABILITIES_BY_FLAVOR = new Map<string, string[]>(
+  CATALOG.map((f) => [f.name, f.capabilities]),
+);
+
 /** Return the worst (highest-rank) of two levels. */
 function worse(a: CompatLevel, b: CompatLevel): CompatLevel {
   return LEVEL_RANK[a] >= LEVEL_RANK[b] ? a : b;
@@ -126,6 +147,33 @@ export function analyzeCompat(job: ParsedJob, resolution: FlavorResolution): Com
       level: 'warn',
       code: 'docker-missing',
       text: `job needs Docker but resolved flavor '${resolution.flavor}' lacks it.`,
+    });
+  }
+
+  // warn: the job asked for a toolchain by label that the flavor it resolved to does not have.
+  // Flavors are one-toolchain-per-image (ADR-039), so the resolver's docker signal upgrade is a
+  // REPLACEMENT: `runs-on: [self-hosted, lambda-ci-python]` on a job with `services:` resolves
+  // to `docker`, which carries a daemon and no Python. That job then fails at its first
+  // `python`/`pip` step with a command-not-found, having asked for Python explicitly and been
+  // told nothing. Same shape for a FlavorMap override pointed at the wrong flavor. Derived from
+  // the catalog, so it covers any future flavor without being taught about it.
+  const resolvedCaps = CAPABILITIES_BY_FLAVOR.get(resolution.flavor) ?? [];
+  const requested = new Set<string>();
+  for (const label of job.runs_on) {
+    for (const cap of CAPABILITIES_BY_LABEL.get(label.toLowerCase()) ?? []) {
+      if (!resolvedCaps.includes(cap)) requested.add(cap);
+    }
+  }
+  if (requested.size > 0) {
+    const missing = [...requested].sort();
+    add({
+      level: 'warn',
+      code: 'toolchain-dropped',
+      text:
+        `job's labels ask for ${missing.map((c) => `'${c}'`).join(', ')} but resolved flavor ` +
+        `'${resolution.flavor}' does not provide it — flavors carry one toolchain each, so a ` +
+        'capability upgrade replaces rather than adds. Install the toolchain in the job, or ' +
+        'register a custom flavor that has both.',
     });
   }
 

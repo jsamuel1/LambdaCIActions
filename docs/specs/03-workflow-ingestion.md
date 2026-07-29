@@ -109,7 +109,7 @@ Resolution order (first match wins):
    | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | `base` (or `node`/`docker` per signals) |
    | any + docker signals | `docker` |
    | `self-hosted` + our labels | matched flavor |
-4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it.
+4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it. The upgrade is a **replacement, not an addition**: flavors carry one toolchain each (ADR-039), so a `lambda-ci-python` job with `services:` resolves to `docker` and no longer has Python. The resolution reason names what the swap drops and compat raises `toolchain-dropped` (below) — a job needing both a runtime and a daemon wants a custom flavor, or an in-job toolchain install.
 5. **Fallback** — the repo's operator-chosen `defaultFlavor` (set from the console, [04](04-web-ui.md))
    if present and valid, else `base`; record a warning if uncertain.
 
@@ -163,6 +163,14 @@ still warns. Capabilities are drawn from a closed vocabulary (`docker`, `node`, 
 `java`, `go`, `rust`): an unrecognized capability string would be silently inert here and in
 the resolver's upgrade step, which is why custom-flavor registration validates against it
 (ADR-041).
+
+The mirror-image check is **`toolchain-dropped`**: the job's labels ask for a capability the
+flavor it actually resolved to does not provide. That happens whenever the docker signal
+upgrade replaces a language flavor (`[self-hosted, lambda-ci-python]` + `services:` → `docker`,
+which has a daemon and no Python) and whenever a `FlavorMap` points a language label at the
+wrong flavor. Without it the job fails at its first `python`/`go`/`cargo` step with a bare
+command-not-found, having asked for the runtime explicitly. Also derived from the catalog, so a
+new flavor is covered without teaching the gate about it.
 
 ## Onboarding modes
 

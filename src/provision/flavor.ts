@@ -13,7 +13,9 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
  *                                             `explicitLabelMatch`).
  *   3. Signal-based upgrade                 — if the job needs a capability the resolved flavor
  *                                             lacks (e.g. Docker), upgrade to the smallest flavor
- *                                             that provides it.
+ *                                             that provides it. This REPLACES the flavor, so a
+ *                                             language toolchain is lost — the reason names it and
+ *                                             `compat` warns (`toolchain-dropped`).
  *   4. Fallback                             — the repo's operator-chosen `defaultFlavor`
  *                                             (console, spec 04) if set, else `base`; record a
  *                                             warning reason.
@@ -163,9 +165,18 @@ function applySignalUpgrade(current: FlavorResolution, signals?: JobSignals): Fl
   if (def?.capabilities.includes('docker')) return current;
   const upgraded = smallestWithCapability('docker');
   if (!upgraded) return current;
+  // The upgrade is a REPLACEMENT, not an addition: flavors are one-toolchain-per-image
+  // (ADR-039), so upgrading `python` → `docker` for a `services:` block hands the job an
+  // image with a daemon and NO Python. Name the capabilities the swap drops, so the reason
+  // on the Repo detail screen and in the provision log says what happened instead of
+  // presenting the upgrade as pure gain. `compat` raises the matching warning.
+  const lost = (def?.capabilities ?? []).filter((c) => !upgraded.capabilities.includes(c));
+  const lostNote = lost.length
+    ? ` (drops ${lost.map((c) => `'${c}'`).join(', ')} — flavors carry one toolchain each)`
+    : '';
   return {
     flavor: upgraded.name,
-    reason: `${current.reason}; upgraded to '${upgraded.name}' for docker capability`,
+    reason: `${current.reason}; upgraded to '${upgraded.name}' for docker capability${lostNote}`,
   };
 }
 

@@ -1052,7 +1052,16 @@ slower (it is serial per flavor). Signal-driven upgrade still only understands
 `needs_docker` — a job that needs Python does **not** auto-upgrade off `base`; label or
 `FlavorMap`/`defaultFlavor` selects these. Extending signal inference to language runtimes is
 a separate change (it needs parser support for `setup-*` steps and a policy for what to do
-when a job needs two runtimes). The pinned versions are now a **patch-day obligation**: they
+when a job needs two runtimes).
+One-toolchain-per-flavor also makes the existing docker signal upgrade a **replacement rather
+than an addition**, which the pre-expansion catalog hid: upgrading `base` → `docker` lost
+nothing, but upgrading `python` → `docker` for a `services:` block hands the job a daemon and
+**no Python**, so it dies at its first `pip` step with a command-not-found after having asked
+for Python explicitly. The upgrade still happens (a missing daemon is the harder failure), but
+it is no longer silent: `resolveFlavor`'s reason names the dropped capabilities and `compat`
+raises `toolchain-dropped`, both derived from the catalog. A job that genuinely needs a runtime
+*and* a daemon wants a custom flavor (ADR-040) or an in-job toolchain install — the standard set
+deliberately does not carry a `python`+`docker` image. The pinned versions are now a **patch-day obligation**: they
 age silently, and a stale pin is invisible until a workflow needs a newer runtime.
 The pin rule covers **package managers too**, not just the language runtime: `corepack prepare
 pnpm@latest` / `npm install -g npm@latest` resolve at build time, so a floating tag beside a

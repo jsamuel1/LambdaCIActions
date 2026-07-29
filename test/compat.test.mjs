@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { analyzeCompat, analyzeWorkflowCompat } from '../dist/src/ingest/compat.js';
+import { resolveFlavor } from '../dist/src/provision/flavor.js';
 
 /** Build a ParsedJob fixture with sane defaults; override any field. */
 function job(overrides = {}) {
@@ -151,6 +152,82 @@ test('an arm64-hinted language job stays ok; an x86-hinted one is risk', () => {
   const x86 = analyzeCompat(job({ arch_hints: ['x86_64'] }), res('rust'));
   assert.equal(x86.level, 'risk');
   assert.equal(x86.messages[0].code, 'x86-arch-hint');
+});
+
+// 8c. The docker signal upgrade REPLACES the flavor, so a job that asked for a language
+// toolchain by label and got `docker` has lost that toolchain. Warn instead of failing the job
+// at its first `python`/`go` step with a command-not-found.
+test('a labelled toolchain missing from the resolved flavor warns', () => {
+  const r = analyzeCompat(
+    job({ runs_on: ['self-hosted', 'lambda-ci-python'], needs_docker: true }),
+    res('docker'), // what resolveFlavor's docker signal upgrade actually returns
+  );
+  assert.equal(r.level, 'warn');
+  const m = r.messages.find((x) => x.code === 'toolchain-dropped');
+  assert.ok(m, 'must warn that the requested toolchain is gone');
+  assert.match(m.text, /'python'/);
+  assert.match(m.text, /'docker'/);
+  // ...and it must NOT also claim docker is missing — the flavor has it.
+  assert.equal(
+    r.messages.some((x) => x.code === 'docker-missing'),
+    false,
+  );
+});
+
+test('a FlavorMap override onto the wrong toolchain warns the same way', () => {
+  // Nothing about this one involves an upgrade: an operator mapped a language label at a
+  // flavor that does not carry that toolchain.
+  const r = analyzeCompat(job({ runs_on: ['self-hosted', 'lambda-ci-go'] }), res('java'));
+  const m = r.messages.find((x) => x.code === 'toolchain-dropped');
+  assert.ok(m);
+  assert.match(m.text, /'go'/);
+});
+
+test('every language label warns when resolved onto docker', () => {
+  for (const [label, cap] of [
+    ['lambda-ci-python', 'python'],
+    ['lambda-ci-java', 'java'],
+    ['lambda-ci-go', 'go'],
+    ['lambda-ci-rust', 'rust'],
+    ['lambda-ci-node', 'node'],
+  ]) {
+    const r = analyzeCompat(
+      job({ runs_on: ['self-hosted', label], needs_docker: true }),
+      res('docker'),
+    );
+    const m = r.messages.find((x) => x.code === 'toolchain-dropped');
+    assert.ok(m, `${label} should warn`);
+    assert.match(m.text, new RegExp(`'${cap}'`), `${label} names the lost capability`);
+  }
+});
+
+test('a label whose toolchain the flavor HAS does not warn', () => {
+  // The no-op case, so the check cannot become a blanket warning on every LCA label.
+  for (const [label, flavor] of [
+    ['lambda-ci-python', 'python'],
+    ['lambda-ci-docker', 'docker'],
+    ['lambda-ci', 'base'],
+  ]) {
+    const r = analyzeCompat(job({ runs_on: ['self-hosted', label] }), res(flavor));
+    assert.equal(
+      r.messages.some((x) => x.code === 'toolchain-dropped'),
+      false,
+      `${label} on ${flavor} must not warn`,
+    );
+  }
+});
+
+test('the resolver names the dropped toolchain in its reason', () => {
+  // The compat warning is the operator-facing half; the resolution reason is the log/UI half.
+  // Both must say it, or the Repo detail screen presents the upgrade as pure gain.
+  const r = resolveFlavor(['self-hosted', 'lambda-ci-python'], { signals: { needs_docker: true } });
+  assert.equal(r.flavor, 'docker');
+  assert.match(r.reason, /drops 'python'/);
+  // An upgrade off a flavor with nothing to lose stays quiet.
+  assert.doesNotMatch(
+    resolveFlavor(['lambda-ci'], { signals: { needs_docker: true } }).reason,
+    /drops/,
+  );
 });
 
 // 9. multiple rules → worst level wins, all messages present.
