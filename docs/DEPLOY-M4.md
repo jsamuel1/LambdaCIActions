@@ -75,13 +75,22 @@ post-login redirect. Only the Lambda's environment changes — no data migration
 
 ## Phase 4 — register the OAuth callback on the GitHub App
 
+**This step is browser-only and cannot be automated.** GitHub exposes no REST endpoint to
+modify a GitHub App's callback URLs (`GET /app` is read-only; there is no `PATCH /app`), so
+no script or agent can do it. It is also not done for you at bootstrap:
+`scripts/create-github-app.mjs` registers the App with
+`redirect_url: http://localhost:<port>/callback` — the one-shot listener it uses to capture
+credentials — because the console origin does not exist yet at that point.
+
 In the App's settings (Developer settings → GitHub Apps → your app):
 
-- **Callback URL**: `https://<console-domain>/auth/callback`
+- **Callback URL**: add `https://<console-domain>/auth/callback`
 - Leave "Request user authorization (OAuth) during installation" as-is; the console drives
   the OAuth flow itself.
 
-The callback URL must match exactly — GitHub rejects mismatches.
+The callback URL must match exactly — GitHub rejects mismatches. Until it is added,
+`/auth/login` correctly 302s to GitHub's authorize page and GitHub then refuses the
+redirect back, so Phase 5 cannot start.
 
 ## Phase 5 — verify (M4 exit criterion)
 
@@ -113,6 +122,8 @@ only — the hot path (webhook → ingest → provision) keeps running.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Login → 500 | `PUBLIC_ORIGIN` unset | Phase 3 (re-deploy with `-c publicOrigin=...`) |
+| GitHub refuses the redirect after authorize | callback URL not on the App | Phase 4 (browser-only; no API for it) |
+| Repo history shorter than expected | GSI2 is sparse — only runs queued after the index was created appear (ADR-023) | expected on an env upgraded in place; Dashboard/`?status=` views are unaffected |
 | `invalid OAuth state` | state cookie lost (different host, or >10 min on the GitHub page) | Retry from the console origin |
 | Redirected to Setup with `reason=no-installations` | GitHub returned no installations for this user | Install the App on an org/account you can admin |
 | Repos list empty | App granted no repositories | Add repos to the installation, then reload |

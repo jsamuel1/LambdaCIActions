@@ -25,7 +25,7 @@ were merged and CI-green but had never been deployed — the running control pla
 
 | Stack | Status | Last updated (UTC) |
 |---|---|---|
-| `LCA-Data-dev` | UPDATE_COMPLETE | 2026-07-28T23:20:19Z |
+| `LCA-Data-dev` | UPDATE_COMPLETE | 2026-07-28T23:20:19Z (GSI2 added — see [below](#gsi2-is-sparse-and-was-not-backfilled)) |
 | `LCA-Image-dev` | UPDATE_COMPLETE | 2026-07-14T14:26:13Z (no diff) |
 | `LCA-Control-dev` | UPDATE_COMPLETE | 2026-07-28T23:21:12Z |
 | `LCA-Mgmt-dev` | UPDATE_COMPLETE | 2026-07-28T23:37:25Z |
@@ -43,12 +43,16 @@ were merged and CI-green but had never been deployed — the running control pla
 
 The run-hook payload contract is baked into the image. ADR-021 replaced `{ref, region,
 table}` with `{ref, region, broker, token}`, so images and control plane must move in the
-same window with no in-flight jobs (docs/DEPLOY-M1.md § Phase 2). Sequence used:
+same window with no in-flight jobs (docs/DEPLOY-M1.md § Phase 2 — that note cites the
+decision as ADR-020; it is ADR-021, one of the stale cross-references the ADR-021 renumber
+left behind, tracked on its own card and deliberately not touched here). Sequence used:
 
 1. Confirmed the window was quiet: zero open PRs, zero non-`TERMINATED` microVMs
    (`list-microvms` → 12/12 `TERMINATED`).
 2. `npm run build:images -- --env dev --region us-west-2` (all three flavors).
-3. `npx cdk deploy LCA-Control-dev -c env=dev` — **74.8 s**, closing the window.
+3. `npx cdk deploy LCA-Control-dev -c env=dev` — **74.8 s**, closing the window. This also
+   updated `LCA-Data-dev` (declared dependency, `bin/lca.ts`), which is where GSI2
+   (ADR-023) was actually created — the M4 stacks were not yet involved.
 
 ### The window was still hit — and failed closed, as designed
 
@@ -189,6 +193,30 @@ and/or pre-warm the CLI in the image so the first call is not cold).
 | `LCA-Mgmt-dev.MgmtApiEndpoint` | `https://q2s2zkcji8.execute-api.us-west-2.amazonaws.com` |
 | `LCA-Mgmt-dev.RunLogGroup` | `/aws/lambda/microvms/runs/lca-dev` |
 
+### GSI2 is sparse and was not backfilled
+
+GSI2 (`REPORUNS#<repoId>` / `createdAt`, ADR-023) did not exist before this deploy — it
+landed with the `LCA-Data-dev` update at **23:20:47Z**. `gsi2pk`/`gsi2sk` are written once
+in `buildQueuedItem` (`src/shared/run-store.ts`), so DynamoDB only projects rows **queued
+after** that point. Measured immediately after the deploy:
+
+| RUN rows | count |
+|---|---|
+| total | 104 |
+| in GSI2 (`gsi2pk` present) | 7 — every run queued from 23:23:28Z onward |
+| not in GSI2 | 97 — `2026-07-14T13:29:04Z` … `2026-07-28T23:20:48Z` |
+
+Consequence for the console: `GET /api/runs?repo=<id>` and the Repo-detail history it
+backs (`listRunsByRepo` → `IndexName: 'gsi2'`) show **only post-deploy runs** for every
+repo. The unfiltered Dashboard view and `?status=` filter are unaffected — they read GSI1,
+which predates this deploy.
+
+This is expected sparse-index behaviour, not a defect: `createdAt` is immutable so a
+backfill is a pure one-off `UpdateItem` per row, and the pre-existing rows are dev-only
+traffic that ages out on the table's `ttl`. Recorded here so the M4 exit walkthrough is not
+read as broken when a repo's history looks short. Prod cutover has no such gap (GSI2 exists
+before the first run).
+
 Phases run per docs/DEPLOY-M4.md:
 
 - **Phase 0** — `/lca/dev/mgmt/session-secret` created out-of-band as a **SecureString**
@@ -268,3 +296,45 @@ npx cdk deploy LCA-Mgmt-dev -c env=dev -c publicOrigin=https://d2x4qcl1ibd2ax.cl
 `aws_access_key_id`/`aws_session_token` entries for the same profile name in
 `~/.aws/credentials`, which take precedence over the `credential_process` in
 `~/.aws/config`. `ada credentials update … --once` rewrites those entries and fixes it.
+
+### Gotcha: `list-microvm-image-versions` wants an ARN, and its payload is `items`
+
+The image-inspection verbs are worth pinning, because the obvious guesses fail:
+`--image-identifier` rejects a bare image name (`Invalid ARN format: lca-dev-base`) and
+wants the full `arn:aws:lambda:<region>:<acct>:microvm-image:<name>`. The response key is
+`items` (not `MicrovmImageVersions`) and each entry's version field is `imageVersion`, so
+JMESPath written against the CLI's usual PascalCase shape silently returns `null`. For
+"what is live right now", `get-microvm-image` → `latestActiveImageVersion` is direct:
+
+```sh
+aws lambda-microvms get-microvm-image \
+  --image-identifier arn:aws:lambda:us-west-2:863638663908:microvm-image:lca-dev-docker \
+  --query '[name,latestActiveImageVersion,updatedAt]' --output text
+
+aws lambda-microvms list-microvm-image-versions \
+  --image-identifier arn:aws:lambda:us-west-2:863638663908:microvm-image:lca-dev-docker \
+  --query 'items[].[imageVersion,state,additionalOsCapabilities]' --output text
+```
+
+## Independent re-verification (review pass)
+
+Every live claim above was re-checked against AWS/GitHub afterwards from the same pinned
+account — as a review of this note, not a re-run of the deploy. All matched: stack
+statuses/timestamps, the six `lca-dev-*` functions, the deployed exec-role policy
+(statement-for-statement), Provision's `HOOK_BROKER_NAME`, the broker's own two-statement
+role, `ReservedConcurrentExecutions: 20`, per-flavor `latestActiveImageVersion`
+(10.0 / 9.0 / 10.0) with `additionalOsCapabilities: ["ALL"]` on docker **only**, run
+`30407823249`'s three green jobs and their labels, all three run rows (`completed`,
+`microvmId`, `hookTokenHash`, no plaintext), the three brokered `self-terminate` log lines,
+the six `ETIMEDOUT` jitconfig attempts, the 97 → 164 byte payload transition, the
+token-pattern log scan (2 hits, both the literal error string), M4's `PUBLIC_ORIGIN` / 302 /
+401s / 403, and `npm test` → 281/281 with a credential-less `cdk synth` clean.
+
+Two refinements from that pass:
+
+- **The 6-invocation count is right, and the evidence is stronger than stated.** The broker
+  log shows exactly 6 `START` lines in the E2E window (8 only if `INIT_START` is miscounted).
+  The six timed-out jitconfig attempts produced **no broker `START` at all** — independent
+  proof the timeout is spent in the guest's cold `aws` CLI rather than in broker latency,
+  which is precisely what the defect above asserts.
+- **GSI2's backfill gap** was unrecorded; now [documented above](#gsi2-is-sparse-and-was-not-backfilled).

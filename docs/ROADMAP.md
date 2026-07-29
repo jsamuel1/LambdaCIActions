@@ -38,11 +38,11 @@ Multiple runner types + workflow awareness.
 - 🎯 **verified** — A repo with docker + node jobs routes each to the right flavor with no YAML edits beyond adding LCA labels. Evidence: [`docs/VERIFY-M3.md`](VERIFY-M3.md) (`jsamuel1/lca-m3-verify` run `30244719785`, all three jobs green on `base`/`node`/`docker` microVMs). Verification found + fixed one platform defect: the `docker` flavor could never start `dockerd` (ADR-020).
 
 ## M4 — Web UI & Management API
-Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md), ADR-022..024, [DEPLOY-M4](DEPLOY-M4.md).
+Operator visibility + control. **Shipped + deployed to `dev`** — see [spec 04](specs/04-web-ui.md), ADR-022..027, [DEPLOY-M4](DEPLOY-M4.md).
 - `MgmtStack` API + `WebStack` SPA + GitHub OAuth.
 - Screens: Setup, Dashboard, Repos, Repo/Workflow detail, Runs, Run detail (logs), Flavors, Settings.
 - Run history (GSI2, ADR-023) + CloudWatch log viewer; live status via polling (ADR-026).
-- 🎯 An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI.
+- 🎯 An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI. **Not yet verified** — `LCA-Mgmt-dev`/`LCA-Web-dev` are live and the OAuth redirect is correct, but the App's callback URL is unregistered (browser-only setting), so login cannot complete. Deploy evidence: [`docs/VERIFY-DEPLOY-ADR021-M4.md`](VERIFY-DEPLOY-ADR021-M4.md).
 
 ## M5 — Drop-in & polish
 True zero-edit adoption + hardening.
