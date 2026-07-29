@@ -17,6 +17,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 - [Personas & jobs-to-be-done](#personas--jobs-to-be-done)
 - [Screens](#screens)
 - [Management API](#management-api)
+- [Settings](#settings)
 - [Auth](#auth)
 - [Live run updates](#live-run-updates)
 - [Tech choices](#tech-choices)
@@ -43,7 +44,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Runs** | Filterable run history | status, repo, run/job, flavor, duration, est. cost, started | `#/runs` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
-| **Settings** | Secret/config presence, env identity | SSM param presence (**not values**), env, region | `#/settings` |
+| **Settings** | GitHub App linkage, runner labels, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
 
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has
 a handful of workflow files, and the operator's question ("which job goes where, and what's
@@ -88,7 +89,11 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
 | `GET /api/health` | Dashboard aggregates + stuck-run detection | ✅ |
-| `GET /api/settings` | Env identity + SSM parameter **presence** | ✅ |
+| `GET /api/settings` | Env identity, verified App linkage, runner labels, webhook health | ✅ |
+| `PUT /api/settings/runner-labels` | Replace the claimed runner labels (`dryRun` returns impact only) | ✅ |
+| `POST /api/settings/github-app/relink` | Write-only credential intake: verify against GitHub, then store | ✅ |
+| `POST /api/settings/github-app/rollback` | Restore the credential parameter versions a relink replaced | ✅ |
+| `POST /api/settings/webhook/test` | Ask GitHub to re-deliver a delivery (real signed round-trip) | ✅ |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)) | M5 |
 
 Run paths carry `repoId` because the run row's key is the `(repoId, runId, jobId)`
@@ -118,6 +123,125 @@ while `stuck` and every run list are filtered to the session's installations. Co
 `LastEvaluatedKey` for up to 10 pages and set `countsExact: false` when that budget is spent,
 so a large history reads as a labelled lower bound rather than a wrong total.
 
+## Settings
+
+The Settings screen answers four operator questions with **evidence**, not with SSM parameter
+paths (ADR-028). SSM is an implementation detail: knowing that `/lca/dev/github/app-pem`
+exists tells an operator nothing about whether their platform works.
+
+### 1. GitHub App linkage
+
+App id, name, slug, owner, subscribed events and permissions, **verified live** by minting an
+App JWT and calling `GET /app`. A green badge therefore proves the *stored* PEM + app id pair
+actually authenticates — the previous "parameter present ✓" could be green with a corrupt key.
+Installation ids + account logins come from `GET /app/installations` (GitHub's ground truth),
+cross-referenced against our install store so a **missed `installation` webhook** shows up as
+`not in run store` rather than silently diverging. A stored `app-id` that disagrees with the
+App the key authenticates as is called out explicitly — that is the signature of a
+half-finished rotation.
+
+### 2. Runner labels
+
+The **effective** claim list (the value Ingest reads per delivery), not the parameter path.
+Labels that name GitHub-hosted images are flagged, because claiming them is an adopt-mode
+takeover.
+
+`PUT /api/settings/runner-labels` validates field-by-field (`src/mgmt/validate.ts`):
+
+- normalized to lower case — claim-time matching is case-insensitive, so storing mixed case
+  would let the UI and the claim comparison disagree;
+- **GitHub-reserved** labels (`self-hosted`, `linux`, `arm64`, …) are rejected outright with no
+  opt-in: GitHub refuses to register a self-hosted runner carrying one, so the job would fail
+  at provision time;
+- **GitHub-hosted** label names (`ubuntu-latest`, `macos-14`, …) require an explicit
+  `allowHostedLabels: true` — adopt mode depends on that distinction, and a typo here takes
+  over every job in every enabled repo;
+- an **empty** list is rejected: it would claim nothing while every status badge stayed green.
+  Turning the platform off is per-repo `mode: 'off'`, not a global empty label set;
+- commas/whitespace are rejected (they would split one label into two in the SSM value).
+
+Because a label change takes effect on the **very next** `workflow_job` delivery, the flow is
+two-phase: `dryRun: true` returns a **label-impact analysis** — which repos/workflows/jobs
+stop or start being claimed — and the UI requires a preview before Apply. The impact matcher
+mirrors `shouldClaim` exactly (asserted in `test/mgmt-settings.test.mjs`), or the preview would
+lie about whose jobs move. The scan is bounded to 50 repos and reports `truncated`.
+
+### 3. Webhook health
+
+Evidence from **both directions**, because neither alone is conclusive:
+
+- **Inbound** — Ingest writes a `CONFIG#WEBHOOK / LAST` heartbeat row on every
+  signature-verified delivery (event name, timestamp, `X-GitHub-Delivery` guid, count) and a
+  separate `lastRejectedAt` / `rejections` counter on every HMAC failure. A rejection **newer
+  than** the newest accepted delivery is the exact symptom of a half-finished secret rotation,
+  and must not read as silence. One fixed-key `UpdateItem` per delivery, best-effort — a failed
+  heartbeat degrades the screen, never a webhook.
+- **Outbound** — GitHub's own `GET /app/hook/deliveries` log (status codes, durations,
+  redelivery flag) shows deliveries that never arrived: wrong URL after a redeploy, 5xx, TLS.
+- **Configuration** — the URL GitHub is configured to POST to (`GET /app/hook/config`) next to
+  the URL this deployment actually exposes. A mismatch is the classic post-redeploy failure and
+  is flagged as `degraded` even while old deliveries still land.
+
+The folded badge (`healthy` / `degraded` / `unknown`) requires **positive** evidence for green:
+an accepted delivery or a 2xx in GitHub's log, with no URL mismatch, no `insecure_ssl`, and no
+newer signature rejection. Anything ambiguous is `unknown` — a checkmark has to mean something.
+
+`POST /api/settings/webhook/test` asks GitHub to re-deliver the most recent delivery. That is a
+real round trip: GitHub re-signs the payload with the configured secret and posts it to the
+configured URL, so success exercises URL + TLS + secret agreement in one shot. The heartbeat
+updating on the next poll is the confirmation.
+
+### 4. Diagnostics (collapsed)
+
+SSM parameter **presence** (`DescribeParameters`, metadata only) survives in a collapsed
+section for deploy debugging. It is no longer how platform health is expressed.
+
+### Re-linking the GitHub App
+
+`POST /api/settings/github-app/relink` is a **write-only intake**: the operator submits
+`appId` + `pem` + `webhookSecret` + `clientId` + `clientSecret`, and the response carries only
+*presence + verification outcome*. No endpoint can return a credential value, nothing is
+persisted in the browser, and error strings never quote a submitted value.
+
+**Relink is verify → snapshot → write → re-verify → sync-hook → auto-undo.** Credentials are
+validated against GitHub *before* any write, so a typo cannot take the environment offline. The
+rollback handle is a set of SSM parameter **version numbers**: the previous values stay in SSM's
+own parameter history and are never copied into a Lambda, a log, or a DynamoDB row. Two edge
+cases are handled explicitly because both would otherwise leave a broken environment that looks
+fine:
+- **A parameter this attempt CREATED has no version to restore**, so undo *deletes* it. Without
+  that, a first-link that fails halfway strands a partial credential set and reports rollback
+  failure.
+- **The webhook secret must be pushed to GitHub too** (`PATCH /app/hook/config`). Storing a
+  rotated secret in SSM alone means GitHub keeps signing with the old one and Ingest rejects
+  every delivery with 401 — the environment goes silent while every credential badge reads
+  green. A hook-config failure is reported (`hookSynced: false` + a warning in the UI) rather
+  than rolled back: the credentials themselves verified, and some Apps do not own their hook
+  config.
+Intake is **write-only** — the response carries presence + verification outcome, never a value,
+and validation errors never quote a submitted credential.
+
+Critically, **the management λ performs none of this itself.** It holds no App PEM read and no
+`ssm:PutParameter` grant at all; it invokes a control-plane **App-config broker** λ
+(`src/appcfg/`) and can reach nothing else (ADR-028). Secret-read and secret-write authority
+stay in the control plane, behind one function whose only caller is the console λ.
+
+### Who may change platform settings
+
+Installation admin rights are **not** sufficient. GitHub answers "may this person administer
+this installation", which is right for repo config but wrong here: one environment can host
+several installations, and any one admin could otherwise re-point the whole platform's
+credentials or stop every other tenant's jobs from being claimed. GitHub has no notion of
+"admin of this deployment", so the platform keeps an explicit allow-list —
+`/lca/<env>/config/platform-admins`, comma-separated GitHub logins — checked by
+`canAdminPlatform`. It **fails closed**: an unset or empty list authorizes nobody, and the API
+says so instead of granting authority to the first person who logs in. Settings stays readable
+regardless, so a fresh environment can still show its state.
+
+Every mutation stamps an audit row (`CONFIG#AUDIT`, actor + action + operator-facing detail,
+surfaced as "Recent platform changes") and emits a structured log line. Audit details never
+contain a secret value.
+
 ## Auth
 
 GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
@@ -141,9 +265,14 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   empty, and `/api/health` (whose counts are platform-wide) is explicitly denied. Installing
   the App and re-logging-in picks up the grant.
 - Cognito is **not** used in v1 (ADR-022 rationale).
-- Secrets are shown as **presence/health only** ("webhook secret: set ✓") — never values.
-  The API reads presence via `ssm:DescribeParameters`, which cannot return a value, and the
-  Mgmt λ has no IAM permission to read the App PEM or webhook secret at all (ADR-025).
+- Secrets are **never** exposed as values. Presence is read via `ssm:DescribeParameters`
+  (which cannot return a value) and demoted to a collapsed diagnostics section; the Mgmt λ has
+  no IAM permission to read the App PEM or webhook secret at all, and no `ssm:PutParameter`
+  grant of any kind (ADR-025, ADR-028). The relink intake accepts credentials write-only and
+  answers with presence + verification outcome. A `assertNoSecrets` guard
+  (`src/shared/redact.ts`) scans every settings/broker payload for secret-shaped content
+  (PEM blocks, `ghp_*`/`v1.<40 hex>` tokens) and throws rather than serving it, so a future
+  field addition cannot quietly become a leak.
 
 ## Live run updates
 
@@ -180,11 +309,15 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   Dashboard counts use `Select: COUNT` on GSI1 (paged, bounded); run history uses GSI2
   (ADR-023).
 - **No secret exposure**: presence via `DescribeParameters`; the λ holds no IAM grant for
-  secret paths beyond its own OAuth/session credentials (ADR-025).
+  secret paths beyond its own OAuth/session credentials (ADR-025), no `ssm:PutParameter`, and
+  every settings payload passes the `assertNoSecrets` shape guard (ADR-028).
 - **Least privilege**: read-mostly. `dynamodb:UpdateItem` is the only write (no
-  Put/Delete), `sqs:SendMessage` only on the discovery queue, log read-only on one group,
-  and **no** microVM launch/terminate or `iam:PassRole`. Asserted against the synthesized
-  template in `test/mgmt-stack.test.mjs`.
+  Put/Delete), `sqs:SendMessage` only on the discovery queue, `lambda:InvokeFunction` only on
+  the App-config broker's exact ARN, log read-only on one group, and **no** microVM
+  launch/terminate or `iam:PassRole`. Asserted against the synthesized template in
+  `test/mgmt-stack.test.mjs`, which also pins the broker's `ssm:PutParameter` blast radius to
+  the exact credential + label paths (specifically *not* the console session key or the image
+  ARNs).
 - **Input allow-listing**: config bodies are validated field-by-field; unknown fields are a
   400, so a run's status/microVM id can't be patched through the config endpoint.
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo

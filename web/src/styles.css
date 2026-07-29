@@ -71,7 +71,7 @@ tbody tr:hover { background: var(--panel-2); }
 .badge.running, .badge.provisioning { color: var(--accent); }
 .badge.queued { color: var(--muted); }
 
-button, select, input[type="text"] {
+button, select, input[type="text"], input[type="password"], textarea {
   background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
   border-radius: 6px; padding: 6px 10px; font-size: 13px;
 }
@@ -96,6 +96,26 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .clickable { cursor: pointer; }
 .gap-top { margin-top: 10px; }
 .workflow { margin-bottom: 18px; }
+
+/* Settings screen: nested panel for the relink form / label impact preview. */
+.subcard {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+}
+.subcard h4 { margin-top: 0; }
+
+/* Labelled form field. Stacked so long values (a PEM) get the full width. */
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+.field input, .field textarea { width: 100%; }
+textarea.pem {
+  min-height: 120px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre;
+}
 
 pre.logs {
   background: #0b0d12;

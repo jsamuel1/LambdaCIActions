@@ -34,7 +34,11 @@ export type RouteId =
   | 'getRunLogs'
   | 'listFlavors'
   | 'health'
-  | 'settings';
+  | 'settings'
+  | 'putRunnerLabels'
+  | 'relinkGithubApp'
+  | 'rollbackGithubApp'
+  | 'testWebhook';
 
 export const ROUTES: readonly RouteDef[] = [
   // --- auth (unauthenticated by definition) ---
@@ -59,6 +63,31 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'listFlavors', method: 'GET', template: '/api/flavors', authRequired: true },
   { id: 'health', method: 'GET', template: '/api/health', authRequired: true },
   { id: 'settings', method: 'GET', template: '/api/settings', authRequired: true },
+  // --- settings mutations (spec 04 § Settings, ADR-028) ---
+  {
+    id: 'putRunnerLabels',
+    method: 'PUT',
+    template: '/api/settings/runner-labels',
+    authRequired: true,
+  },
+  {
+    id: 'relinkGithubApp',
+    method: 'POST',
+    template: '/api/settings/github-app/relink',
+    authRequired: true,
+  },
+  {
+    id: 'rollbackGithubApp',
+    method: 'POST',
+    template: '/api/settings/github-app/rollback',
+    authRequired: true,
+  },
+  {
+    id: 'testWebhook',
+    method: 'POST',
+    template: '/api/settings/webhook/test',
+    authRequired: true,
+  },
 ];
 
 export interface RouteMatch {

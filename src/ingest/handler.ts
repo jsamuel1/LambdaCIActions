@@ -19,6 +19,7 @@ import {
   disableRepo,
   getRepo,
 } from '../shared/install-store.js';
+import { recordWebhookDelivery, recordWebhookRejection } from '../shared/config-store.js';
 import type {
   WorkflowJobEvent,
   InstallationEvent,
@@ -66,8 +67,24 @@ export async function handler(
 
   const secret = await getParam(WEBHOOK_SECRET_PARAM);
   if (!verifySignature(rawBody, signature, secret)) {
+    // Record the rejection (best-effort): GitHub reaching us with a signature we can't
+    // verify is the signature of a half-finished secret rotation, and the Settings screen
+    // must be able to distinguish it from silence (spec 04 § webhook health).
+    await recordWebhookRejection().catch((err) =>
+      console.error(JSON.stringify({ msg: 'webhook rejection heartbeat failed', error: errMsg(err) })),
+    );
     return json(401, { error: 'invalid signature' });
   }
+
+  // Delivery heartbeat (spec 04 § webhook health): real evidence that GitHub is delivering
+  // to THIS environment, recorded for every verified delivery regardless of event type.
+  // One fixed-key UpdateItem, and best-effort — a failed heartbeat must never drop a webhook.
+  await recordWebhookDelivery({
+    event: ghEvent ?? 'unknown',
+    deliveryId: headers['x-github-delivery'] ?? headers['X-GitHub-Delivery'],
+  }).catch((err) =>
+    console.error(JSON.stringify({ msg: 'webhook heartbeat failed', error: errMsg(err) })),
+  );
 
   let payload: unknown;
   try {

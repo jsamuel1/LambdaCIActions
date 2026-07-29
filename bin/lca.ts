@@ -102,6 +102,9 @@ const mgmtStack = new MgmtStack(app, `LCA-Mgmt-${envName}`, {
   table: dataStack.table,
   discoveryQueueUrl: controlStack.discoveryQueueUrl,
   discoveryQueueArn: controlStack.discoveryQueueArn,
+  appcfgBrokerName: controlStack.appcfgBrokerName,
+  appcfgBrokerArn: controlStack.appcfgBrokerArn,
+  webhookUrl: controlStack.webhookUrl,
   publicOrigin,
 });
 mgmtStack.addDependency(dataStack);

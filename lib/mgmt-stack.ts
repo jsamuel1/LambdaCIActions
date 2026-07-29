@@ -33,6 +33,15 @@ export interface MgmtStackProps extends StackProps {
    * origin (an attacker-controlled redirect target would be worse).
    */
   publicOrigin?: string;
+  /**
+   * App-config broker (ControlStack, ADR-028). The console λ invokes it to verify the GitHub
+   * App linkage, read webhook delivery evidence, and apply relink / runner-label changes — it
+   * holds NO App PEM read and NO `ssm:PutParameter` grant of its own.
+   */
+  appcfgBrokerName?: string;
+  appcfgBrokerArn?: string;
+  /** Deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
+  webhookUrl?: string;
 }
 
 /**
@@ -51,6 +60,9 @@ export interface MgmtStackProps extends StackProps {
  *   - NO `lambda:RunMicrovm` / `TerminateMicrovm`, NO GitHub App PEM. It cannot launch
  *     compute or mint installation tokens; the only GitHub calls it makes are OAuth
  *     (its own client creds) and `/user/*` with the operator's token.
+ *   - NO `ssm:PutParameter` — not even for non-secret config. Platform config writes and
+ *     every App-PEM-requiring GitHub call go through the App-config broker in the control
+ *     plane, reachable only via `lambda:InvokeFunction` on that one ARN (ADR-028).
  */
 export class MgmtStack extends Stack {
   public readonly httpApi: apigw.HttpApi;
@@ -96,6 +108,10 @@ export class MgmtStack extends Stack {
         TABLE_NAME: table.tableName,
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
         PUBLIC_ORIGIN: props.publicOrigin ?? '',
+        RUNNER_LABELS_PARAM: `${ssmPrefix}/config/runner-labels`,
+        PLATFORM_ADMINS_PARAM: `${ssmPrefix}/config/platform-admins`,
+        APPCFG_BROKER_NAME: props.appcfgBrokerName ?? '',
+        WEBHOOK_URL: props.webhookUrl ?? '',
       },
     });
 
@@ -112,7 +128,11 @@ export class MgmtStack extends Stack {
       }),
     );
 
-    // Its OWN secrets only (OAuth client creds + session signing key).
+    // Its OWN secrets only (OAuth client creds + session signing key), plus the two
+    // NON-secret config parameters the Settings screen reports as effective values.
+    // `runner-labels` and `platform-admins` are String (not SecureString) by design: labels
+    // appear in every workflow file and the admin list is a set of GitHub logins — neither is
+    // a secret, and showing the effective value is the point (spec 04 § Settings).
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'ReadOwnAuthSecrets',
@@ -121,6 +141,8 @@ export class MgmtStack extends Stack {
           paramArn(`${ssmPrefix}/github/client-id`),
           paramArn(`${ssmPrefix}/github/client-secret`),
           paramArn(`${ssmPrefix}/mgmt/session-secret`),
+          paramArn(`${ssmPrefix}/config/runner-labels`),
+          paramArn(`${ssmPrefix}/config/platform-admins`),
         ],
       }),
     );
@@ -150,6 +172,19 @@ export class MgmtStack extends Stack {
     if (props.discoveryQueueArn) {
       const queue = sqs.Queue.fromQueueArn(this, 'DiscoveryQueueRef', props.discoveryQueueArn);
       queue.grantSendMessages(fn);
+    }
+
+    // App-config broker (ADR-028): the console's ONLY route to App-PEM-requiring GitHub calls
+    // and to platform config writes. One action, one ARN — the console cannot read the PEM, and
+    // cannot write any parameter directly.
+    if (props.appcfgBrokerArn) {
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeAppConfigBroker',
+          actions: ['lambda:InvokeFunction'],
+          resources: [props.appcfgBrokerArn],
+        }),
+      );
     }
 
     this.httpApi = new apigw.HttpApi(this, 'MgmtApi', {

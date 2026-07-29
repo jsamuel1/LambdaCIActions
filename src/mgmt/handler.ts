@@ -11,9 +11,11 @@ import {
   OAUTH_STATE_COOKIE,
   SESSION_TTL_SECONDS,
   canAdminInstallation,
+  canAdminPlatform,
   decodeSession,
   encodeSession,
   parseCookies,
+  parsePlatformAdmins,
   serializeCookie,
   signState,
   verifyState,
@@ -24,15 +26,33 @@ import {
   ACTIVE_STATUSES,
   buildFlavorViews,
   buildHealth,
+  buildLabelImpact,
+  buildWebhookHealth,
+  hostedLabelsIn,
   rollupCompat,
   sortRunsNewestFirst,
   toRepoView,
   toRunView,
   toSecretStatus,
   toWorkflowView,
+  type AppInstallationView,
+  type LabelImpactView,
   type SettingsView,
+  type WebhookDeliveryView,
 } from './views.js';
-import { parseLimit, parseEpochMs, validateFlavorMap, validateRepoPatch } from './validate.js';
+import {
+  HOSTED_LABELS,
+  parseLimit,
+  parseEpochMs,
+  parseRunnerLabels,
+  serializeRunnerLabels,
+  validateFlavorMap,
+  validateRelinkBody,
+  validateRepoPatch,
+  validateRollbackBody,
+  validateRunnerLabels,
+  validateWebhookTestBody,
+} from './validate.js';
 import { collectVisible } from './paging.js';
 import { fetchRunLogs } from './logs.js';
 import {
@@ -47,16 +67,20 @@ import {
   listRepos,
   patchRepoConfig,
 } from '../shared/install-store.js';
+import { appendAudit, getWebhookHeartbeat, listAudit } from '../shared/config-store.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getParam, paramExists } from '../shared/ssm.js';
+import { assertNoSecrets, scrubForOperator } from '../shared/redact.js';
+import type { AppcfgResult } from '../appcfg/broker-core.js';
 import {
   OAUTH_AUTHORIZE_URL,
   exchangeOauthCode,
   getOauthUser,
   listUserInstallations,
 } from '../shared/github-app.js';
-import type { RepoRecord, RunRecord, RunStatus } from '../shared/types.js';
+import type { RepoRecord, RunRecord, RunStatus, WorkflowAnalysisRecord } from '../shared/types.js';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 
 /**
  * Management API λ (spec 04). One Lambda behind an HTTP API, routing every
@@ -81,10 +105,21 @@ const OAUTH_CLIENT_SECRET_PARAM =
   process.env.OAUTH_CLIENT_SECRET_PARAM ?? `${SSM_PREFIX}/github/client-secret`;
 const RUN_LOG_GROUP = process.env.RUN_LOG_GROUP ?? `/aws/lambda/microvms/runs/lca-${ENV_NAME}`;
 const DISCOVERY_QUEUE_URL = process.env.DISCOVERY_QUEUE_URL ?? '';
+const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM ?? `${SSM_PREFIX}/config/runner-labels`;
+const PLATFORM_ADMINS_PARAM =
+  process.env.PLATFORM_ADMINS_PARAM ?? `${SSM_PREFIX}/config/platform-admins`;
+/**
+ * The App-config broker (ADR-028). The Mgmt λ holds `lambda:InvokeFunction` on this ARN and
+ * nothing else — no App PEM read, no `ssm:PutParameter` on any secret path.
+ */
+const APPCFG_BROKER_NAME = process.env.APPCFG_BROKER_NAME ?? '';
+/** The webhook receiver this deployment exposes, for configured-vs-deployed comparison. */
+const WEBHOOK_URL = process.env.WEBHOOK_URL ?? '';
 /** Public origin of the console (CloudFront). Used to build the OAuth redirect URI. */
 const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN ?? '').replace(/\/+$/, '');
 
 const sqs = new SQSClient({});
+const lambdaClient = new LambdaClient({});
 
 // ---- HTTP plumbing ---------------------------------------------------------
 
@@ -458,7 +493,19 @@ async function route_(
       return healthRoute(session);
 
     case 'settings':
-      return settingsRoute();
+      return settingsRoute(session);
+
+    case 'putRunnerLabels':
+      return putRunnerLabelsRoute(session, event);
+
+    case 'relinkGithubApp':
+      return relinkGithubAppRoute(session, event);
+
+    case 'rollbackGithubApp':
+      return rollbackGithubAppRoute(session, event);
+
+    case 'testWebhook':
+      return testWebhookRoute(session, event);
 
     default:
       return problem(404, 'not found');
@@ -549,10 +596,18 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
 }
 
 /**
- * Settings: presence/health of the SSM parameters the platform depends on. Values are
- * NEVER read here — `paramExists` uses DescribeParameters (spec 04 hard rule).
+ * Settings (spec 04 § Settings, ADR-028). Answers the operator's real questions — *is this
+ * environment linked to a GitHub App, which one, what does it claim, and is GitHub actually
+ * reaching us* — rather than listing SSM paths.
+ *
+ * The App identity + webhook evidence come from GitHub itself, fetched through the App-config
+ * broker (the Mgmt λ cannot read the App PEM by design — ADR-025). SSM parameter presence is
+ * still computed here (`DescribeParameters`, metadata only) but demoted to `diagnostics`.
+ *
+ * Every sub-fetch degrades independently: a broker fault must leave the rest of the screen
+ * usable and say what failed, because "we can't verify the App" is itself the answer.
  */
-async function settingsRoute(): Promise<Reply> {
+async function settingsRoute(session: SessionPayload): Promise<Reply> {
   const checks: { param: string; label: string }[] = [
     { param: `${SSM_PREFIX}/github/app-id`, label: 'GitHub App ID' },
     { param: `${SSM_PREFIX}/github/app-pem`, label: 'GitHub App private key' },
@@ -560,19 +615,340 @@ async function settingsRoute(): Promise<Reply> {
     { param: `${SSM_PREFIX}/github/client-id`, label: 'OAuth client ID' },
     { param: `${SSM_PREFIX}/github/client-secret`, label: 'OAuth client secret' },
     { param: `${SSM_PREFIX}/mgmt/session-secret`, label: 'Console session key' },
-    { param: `${SSM_PREFIX}/config/runner-labels`, label: 'Runner labels' },
+    { param: RUNNER_LABELS_PARAM, label: 'Runner labels' },
+    { param: PLATFORM_ADMINS_PARAM, label: 'Platform admins' },
     { param: `${SSM_PREFIX}/config/table-name`, label: 'Run table name' },
   ];
-  const secrets = await Promise.all(
-    checks.map(async (c) => toSecretStatus(c.param, c.label, await paramExists(c.param))),
-  );
+
+  const [secrets, labelsRaw, adminsRaw, storedInstalls, heartbeat, audit, linkage, flavors] =
+    await Promise.all([
+      Promise.all(
+        checks.map(async (c) => toSecretStatus(c.param, c.label, await paramExists(c.param))),
+      ),
+      getParam(RUNNER_LABELS_PARAM, 0).catch(() => undefined),
+      getParam(PLATFORM_ADMINS_PARAM, 0).catch(() => undefined),
+      listInstallations().catch(() => []),
+      getWebhookHeartbeat().catch(() => undefined),
+      listAudit(10).catch(() => []),
+      appLinkage(),
+      imageAvailability(),
+    ]);
+
+  const labels = parseRunnerLabels(labelsRaw);
+  const knownIds = new Set(storedInstalls.map((i) => i.installationId));
+
+  // Installations come from GitHub when the linkage verified (ground truth even if an
+  // `installation` webhook was missed); fall back to our store when it didn't.
+  const installations: AppInstallationView[] = linkage?.installations?.length
+    ? linkage.installations.map((i) => ({
+        installationId: i.installationId,
+        accountLogin: i.accountLogin,
+        suspended: i.suspended,
+        known: knownIds.has(i.installationId),
+      }))
+    : storedInstalls
+        .filter((i) => !i.deleted)
+        .map((i) => ({
+          installationId: i.installationId,
+          accountLogin: i.accountLogin,
+          suspended: i.suspended,
+          known: true,
+        }));
+
+  const deliveries: WebhookDeliveryView[] = linkage?.webhook?.recentDeliveries ?? [];
   const view: SettingsView = {
     envName: ENV_NAME,
     region: process.env.AWS_REGION ?? '',
-    secrets,
-    flavors: buildFlavorViews(await imageAvailability()),
+    app: linkage?.app ?? null,
+    ...(linkage?.verifyError ? { appVerifyError: linkage.verifyError } : {}),
+    ...(linkage?.configuredAppId ? { configuredAppId: linkage.configuredAppId } : {}),
+    installations,
+    runnerLabels: {
+      labels,
+      unset: labels.length === 0,
+      hostedLabels: hostedLabelsIn(labels, HOSTED_LABELS),
+    },
+    webhook: buildWebhookHealth({
+      configuredUrl: linkage?.webhook?.configuredUrl,
+      deployedUrl: WEBHOOK_URL || undefined,
+      secretConfigured: linkage?.webhook?.secretConfigured,
+      insecureSsl: linkage?.webhook?.insecureSsl,
+      heartbeat,
+      recentDeliveries: deliveries,
+      error: linkage?.webhookError ?? linkage?.brokerError,
+    }),
+    flavors: buildFlavorViews(flavors),
+    recentChanges: audit,
+    diagnostics: { secrets },
   };
-  return json(200, view);
+
+  // Redaction guard (AGENTS.md hard rule). The shape cannot hold a secret, but the strings in
+  // it are partly forwarded from GitHub/AWS; fail loudly rather than serve tainted content.
+  assertNoSecrets(view, 'GET /api/settings');
+  return json(200, {
+    ...view,
+    /** Whether THIS session may use the mutating actions (drives the UI's disabled state). */
+    canAdminPlatform: canAdminPlatform(session, parsePlatformAdmins(adminsRaw)),
+  });
+}
+
+/** Broker `status` call, folded into a shape the settings view can consume. */
+async function appLinkage(): Promise<
+  (AppcfgResult['linkage'] & { brokerError?: string }) | undefined
+> {
+  if (!APPCFG_BROKER_NAME) {
+    return {
+      app: null,
+      installations: [],
+      webhook: null,
+      verifyError: 'App-config broker not configured for this environment',
+    };
+  }
+  try {
+    const res = await invokeAppcfg({ action: 'status', actor: 'system' });
+    if (!res.ok) return { app: null, installations: [], webhook: null, verifyError: res.error };
+    return res.linkage;
+  } catch (err) {
+    const detail = scrubForOperator(errMsg(err));
+    console.error(JSON.stringify({ msg: 'appcfg status failed', error: detail }));
+    return { app: null, installations: [], webhook: null, verifyError: detail, brokerError: detail };
+  }
+}
+
+/**
+ * Invoke the App-config broker. RequestResponse (the operator is waiting on the verification
+ * result), and the broker's own response contract guarantees no secret values come back —
+ * re-asserted here so a broker regression can't leak through the API.
+ */
+async function invokeAppcfg(payload: Record<string, unknown>): Promise<AppcfgResult> {
+  if (!APPCFG_BROKER_NAME) throw new Error('App-config broker not configured');
+  const res = await lambdaClient.send(
+    new InvokeCommand({
+      FunctionName: APPCFG_BROKER_NAME,
+      InvocationType: 'RequestResponse',
+      Payload: Buffer.from(JSON.stringify(payload), 'utf8'),
+    }),
+  );
+  if (res.FunctionError) {
+    throw new Error(`App-config broker returned ${res.FunctionError}`);
+  }
+  const text = res.Payload ? Buffer.from(res.Payload).toString('utf8') : '';
+  let parsed: AppcfgResult;
+  try {
+    parsed = JSON.parse(text || '{}') as AppcfgResult;
+  } catch {
+    throw new Error('App-config broker returned a non-JSON payload');
+  }
+  assertNoSecrets(parsed, 'App-config broker response');
+  return parsed;
+}
+
+/**
+ * Platform-mutation gate. Distinct from installation admin rights on purpose: these actions
+ * affect the whole environment (see `canAdminPlatform`). Fails CLOSED when the allow-list is
+ * unset, and says so, so a fresh environment is inert rather than open.
+ */
+async function requirePlatformAdmin(session: SessionPayload): Promise<Reply | undefined> {
+  const admins = parsePlatformAdmins(await getParam(PLATFORM_ADMINS_PARAM, 0).catch(() => undefined));
+  if (!admins.length) {
+    return problem(
+      403,
+      `no platform administrators are configured — set ${PLATFORM_ADMINS_PARAM} ` +
+        '(comma-separated GitHub logins) to enable platform settings changes',
+    );
+  }
+  if (!canAdminPlatform(session, admins)) return problem(403, 'not a platform administrator');
+  return undefined;
+}
+
+/**
+ * Replace the environment's runner labels.
+ *
+ * Two safeguards beyond validation, because this takes effect on the very next
+ * `workflow_job` webhook (Ingest reads the parameter per delivery):
+ *   - `dryRun: true` returns the impact analysis and writes nothing;
+ *   - a non-dry-run STILL returns the impact of what it just did, so the audit trail and the
+ *     operator see the same set of affected jobs.
+ */
+async function putRunnerLabelsRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+): Promise<Reply> {
+  const denied = await requirePlatformAdmin(session);
+  if (denied) return denied;
+
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const parsed = validateRunnerLabels(raw);
+  if (!parsed.ok) return problem(400, 'invalid runner labels', parsed.errors);
+
+  const current = parseRunnerLabels(await getParam(RUNNER_LABELS_PARAM, 0).catch(() => undefined));
+  const impact = await labelImpact(current, parsed.value.labels);
+
+  if (parsed.value.dryRun) {
+    return json(200, { dryRun: true, applied: false, labels: current, impact });
+  }
+
+  // The Mgmt λ has no PutParameter grant at all (ADR-025/028) — the broker owns config writes.
+  const res = await invokeAppcfg({
+    action: 'setRunnerLabels',
+    actor: session.login,
+    labels: serializeRunnerLabels(parsed.value.labels),
+  });
+  if (!res.ok) return problem(502, res.error ?? 'runner label write failed');
+
+  console.log(
+    JSON.stringify({
+      msg: 'runner labels changed',
+      actor: session.login,
+      from: current,
+      to: parsed.value.labels,
+      losing: impact.losing.length,
+      gaining: impact.gaining.length,
+    }),
+  );
+  // The broker audits the parameter write itself; this row adds the IMPACT the broker cannot
+  // see (which jobs changed claim status), so the trail records what the operator was shown.
+  await appendAudit({
+    at: new Date().toISOString(),
+    actor: session.login,
+    action: 'runner-labels-impact',
+    detail: scrubForOperator(
+      `from [${current.join(', ')}] to [${parsed.value.labels.join(', ')}]; ` +
+        `${impact.losing.length} job(s) no longer claimed, ${impact.gaining.length} newly claimed` +
+        (impact.truncated ? ' (impact scan truncated)' : ''),
+    ),
+  }).catch((err) =>
+    console.error(JSON.stringify({ msg: 'label audit write failed', error: errMsg(err) })),
+  );
+  return json(200, { dryRun: false, applied: true, labels: parsed.value.labels, impact });
+}
+
+/**
+ * Which stored workflow jobs change claim status under a proposed label set. Bounded: the
+ * scan walks installations → repos → analyses, so it is capped at `MAX_IMPACT_REPOS` repos and
+ * reports `truncated` rather than fanning out unboundedly inside a 29 s API timeout.
+ */
+const MAX_IMPACT_REPOS = 50;
+
+async function labelImpact(current: string[], proposed: string[]): Promise<LabelImpactView> {
+  const installs = await listInstallations().catch(() => []);
+  const repos: { repoId: number; repoFullName: string }[] = [];
+  for (const inst of installs) {
+    if (inst.deleted) continue;
+    const list = await listRepos(inst.installationId).catch(() => []);
+    for (const r of list) if (r.enabled !== false) repos.push({ repoId: r.repoId, repoFullName: r.repoFullName });
+  }
+  const truncated = repos.length > MAX_IMPACT_REPOS;
+  const scanned = repos.slice(0, MAX_IMPACT_REPOS);
+  const withAnalyses = await Promise.all(
+    scanned.map(async (r) => ({
+      ...r,
+      analyses: (await listWorkflowAnalyses(r.repoId).catch(() => [])) as WorkflowAnalysisRecord[],
+    })),
+  );
+  return buildLabelImpact(current, proposed, withAnalyses, truncated);
+}
+
+/**
+ * Re-link the environment to a new/rotated GitHub App. **Write-only intake**: the credentials
+ * go straight to the broker, which verifies them against GitHub before writing and answers
+ * with presence + verification outcome only. Nothing in this function's response, logs, or
+ * audit row can carry a submitted value (AGENTS.md hard rule).
+ */
+async function relinkGithubAppRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+): Promise<Reply> {
+  const denied = await requirePlatformAdmin(session);
+  if (denied) return denied;
+
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const parsed = validateRelinkBody(raw);
+  if (!parsed.ok) return problem(400, 'invalid credentials payload', parsed.errors);
+
+  const res = await invokeAppcfg({
+    action: 'relink',
+    actor: session.login,
+    credentials: parsed.value,
+  });
+  if (!res.ok) {
+    // Deliberately NOT echoing the body. `rolledBack` tells the operator whether the
+    // environment is back on its previous credentials.
+    return json(422, {
+      applied: false,
+      error: res.error ?? 'relink failed',
+      rolledBack: res.rolledBack ?? false,
+      ...(res.replacedVersions ? { replacedVersions: res.replacedVersions } : {}),
+    });
+  }
+  return json(200, {
+    applied: true,
+    verified: res.verified === true,
+    appId: res.appId,
+    appSlug: res.appSlug,
+    /**
+     * Whether GitHub's own hook config was updated to match the stored secret/URL. False means
+     * the operator must set the webhook secret at GitHub by hand — otherwise GitHub keeps
+     * signing with the old value and every delivery fails its HMAC check.
+     */
+    hookSynced: res.hookSynced === true,
+    ...(res.hookError ? { hookError: res.hookError } : {}),
+    /** Rollback handle: SSM version numbers, not values. */
+    replacedVersions: res.replacedVersions ?? {},
+  });
+}
+
+/** Restore the credential parameter versions a prior relink replaced. */
+async function rollbackGithubAppRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+): Promise<Reply> {
+  const denied = await requirePlatformAdmin(session);
+  if (denied) return denied;
+
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const parsed = validateRollbackBody(raw);
+  if (!parsed.ok) return problem(400, 'invalid rollback payload', parsed.errors);
+
+  const res = await invokeAppcfg({ action: 'rollback', actor: session.login, restore: parsed.value });
+  if (!res.ok) return problem(502, res.error ?? 'rollback failed');
+  return json(200, { rolledBack: true, verified: res.verified === true, appId: res.appId });
+}
+
+/**
+ * Test webhook delivery: ask GitHub to re-deliver a real, signed delivery to the configured
+ * URL. A success proves URL + TLS + secret agreement end to end — which a parameter-presence
+ * checkmark cannot. The heartbeat row updates when the redelivered payload lands, so the UI's
+ * next poll shows the round-trip completing.
+ */
+async function testWebhookRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+): Promise<Reply> {
+  const denied = await requirePlatformAdmin(session);
+  if (denied) return denied;
+
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const parsed = validateWebhookTestBody(raw);
+  if (!parsed.ok) return problem(400, 'invalid body', parsed.errors);
+
+  const before = await getWebhookHeartbeat().catch(() => undefined);
+  const res = await invokeAppcfg({
+    action: 'redeliver',
+    actor: session.login,
+    ...(parsed.value.deliveryId ? { deliveryId: parsed.value.deliveryId } : {}),
+  });
+  if (!res.ok) return problem(502, res.error ?? 'redelivery failed');
+  return json(202, {
+    requested: true,
+    deliveryId: res.deliveryId,
+    /** The watermark to compare against: a later `lastReceivedAt` means the round-trip landed. */
+    lastReceivedAtBefore: before?.lastAt ?? null,
+  });
 }
 
 /** Which flavors have a published image ARN in SSM (presence only). */

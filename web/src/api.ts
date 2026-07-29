@@ -141,11 +141,132 @@ export interface Flavor {
   imageAvailable: boolean;
 }
 
+export interface AppLinkage {
+  appId: number;
+  name: string;
+  slug: string;
+  htmlUrl: string;
+  ownerLogin: string;
+  events: string[];
+  permissions: Record<string, string>;
+}
+
+export interface AppInstallation {
+  installationId: number;
+  accountLogin: string;
+  suspended: boolean;
+  /** True when our install store also knows it (a false means a missed webhook). */
+  known: boolean;
+}
+
+export interface WebhookDelivery {
+  id: number;
+  event: string;
+  action: string | null;
+  status: string;
+  statusCode: number;
+  deliveredAt: string;
+  durationMs: number;
+  redelivery: boolean;
+}
+
+export interface WebhookHealth {
+  configuredUrl?: string;
+  deployedUrl?: string;
+  urlMismatch: boolean;
+  secretConfigured?: boolean;
+  insecureSsl?: boolean;
+  lastReceivedAt?: string;
+  lastReceivedEvent?: string;
+  lastDeliveryId?: string;
+  deliveries?: number;
+  lastRejectedAt?: string;
+  rejections?: number;
+  recentDeliveries: WebhookDelivery[];
+  recentFailures: number;
+  error?: string;
+  state: 'healthy' | 'degraded' | 'unknown';
+}
+
+export interface RunnerLabels {
+  labels: string[];
+  unset: boolean;
+  hostedLabels: string[];
+}
+
+export interface AuditEntry {
+  at: string;
+  actor: string;
+  action: string;
+  detail?: string;
+}
+
+export interface LabelImpactJob {
+  repoId: number;
+  repoFullName: string;
+  workflowPath: string;
+  jobId: string;
+  runsOn: string[];
+}
+
+export interface LabelImpact {
+  current: string[];
+  proposed: string[];
+  added: string[];
+  removed: string[];
+  losing: LabelImpactJob[];
+  gaining: LabelImpactJob[];
+  truncated: boolean;
+}
+
+/**
+ * Settings payload. Note the absence of any secret VALUE field — the API answers with App
+ * identity, effective labels and delivery evidence; SSM paths live only in `diagnostics`
+ * (spec 04 hard rule).
+ */
 export interface Settings {
   envName: string;
   region: string;
-  secrets: { param: string; label: string; present: boolean }[];
+  app: AppLinkage | null;
+  appVerifyError?: string;
+  configuredAppId?: string;
+  installations: AppInstallation[];
+  runnerLabels: RunnerLabels;
+  webhook: WebhookHealth;
   flavors: Flavor[];
+  recentChanges: AuditEntry[];
+  diagnostics: { secrets: { param: string; label: string; present: boolean }[] };
+  /** Whether THIS session may use the mutating actions. */
+  canAdminPlatform: boolean;
+}
+
+/** Result of a runner-label write (or dry-run preview). */
+export interface RunnerLabelsResult {
+  dryRun: boolean;
+  applied: boolean;
+  labels: string[];
+  impact: LabelImpact;
+}
+
+/**
+ * Result of a relink. `replacedVersions` is the rollback handle — SSM parameter VERSION
+ * numbers, never values.
+ */
+export interface RelinkResult {
+  applied: boolean;
+  verified?: boolean;
+  appId?: number;
+  appSlug?: string;
+  replacedVersions?: Record<string, number>;
+  /**
+   * Whether GitHub's webhook config was updated to match the stored secret/URL. False means the
+   * operator must set the secret at GitHub manually — otherwise every delivery fails its HMAC
+   * check even though the credentials verified.
+   */
+  hookSynced?: boolean;
+  hookError?: string;
+  error?: string;
+  rolledBack?: boolean;
 }
 
 export interface LogPage {
@@ -212,5 +333,41 @@ export const api = {
   flavors: () => request<{ flavors: Flavor[] }>('/api/flavors'),
   health: () => request<Health>('/api/health'),
   settings: () => request<Settings>('/api/settings'),
+  /**
+   * Replace the environment's claimed runner labels. Always call with `dryRun: true` first —
+   * the response carries the impact analysis (which jobs stop/start being claimed), which the
+   * operator must see before committing (spec 04 § Settings).
+   */
+  putRunnerLabels: (body: { labels: string[]; allowHostedLabels?: boolean; dryRun?: boolean }) =>
+    request<RunnerLabelsResult>('/api/settings/runner-labels', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  /**
+   * Write-only credential intake: submit new App credentials, receive presence + verification
+   * outcome. The API never echoes a submitted value back, and the browser must not persist
+   * one — callers keep the form state in memory and clear it on success.
+   */
+  relinkGithubApp: (creds: {
+    appId: string;
+    pem: string;
+    webhookSecret: string;
+    clientId: string;
+    clientSecret: string;
+  }) =>
+    request<RelinkResult>('/api/settings/github-app/relink', {
+      method: 'POST',
+      body: JSON.stringify(creds),
+    }),
+  rollbackGithubApp: (restore: Record<string, number>) =>
+    request<{ rolledBack: boolean; verified: boolean; appId?: number }>(
+      '/api/settings/github-app/rollback',
+      { method: 'POST', body: JSON.stringify({ restore }) },
+    ),
+  testWebhook: (deliveryId?: number) =>
+    request<{ requested: boolean; deliveryId?: number; lastReceivedAtBefore: string | null }>(
+      '/api/settings/webhook/test',
+      { method: 'POST', body: JSON.stringify(deliveryId ? { deliveryId } : {}) },
+    ),
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 };

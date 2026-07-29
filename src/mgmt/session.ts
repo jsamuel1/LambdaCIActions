@@ -163,3 +163,34 @@ export function verifyState(state: string | undefined, secret: string): string |
 export function canAdminInstallation(session: SessionPayload, installationId: number): boolean {
   return session.installations.some((i) => i.installationId === installationId);
 }
+
+/**
+ * Whether the session may perform **platform-wide** mutations (re-link the GitHub App,
+ * change the environment's runner labels, trigger a webhook redelivery) — spec 04 § Settings,
+ * ADR-028.
+ *
+ * Installation admin rights are NOT sufficient. GitHub's access model answers "may this
+ * person administer this installation", which is the right question for repo config but the
+ * wrong one here: an environment can host several installations, and any one of their admins
+ * could otherwise re-point the whole platform's credentials or stop every other tenant's jobs
+ * from being claimed. GitHub has no notion of "admin of this deployment", so the platform
+ * keeps its own explicit allow-list (`/lca/<env>/config/platform-admins`, a comma-separated
+ * list of GitHub logins).
+ *
+ * **Fails CLOSED**: an unset/empty allow-list authorizes nobody. Settings remains readable,
+ * so a fresh environment shows its state and tells the operator to set the parameter, rather
+ * than silently granting platform authority to the first person who logs in.
+ */
+export function canAdminPlatform(session: SessionPayload, admins: string[]): boolean {
+  if (!admins.length) return false;
+  const login = session.login.toLowerCase();
+  return admins.some((a) => a.trim().toLowerCase() === login);
+}
+
+/** Parse the comma-separated platform-admin allow-list from config. */
+export function parsePlatformAdmins(raw: string | undefined): string[] {
+  return (raw ?? '')
+    .split(',')
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
