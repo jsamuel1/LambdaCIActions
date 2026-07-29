@@ -93,7 +93,10 @@ self-terminate), the Reaper + run store, flavors + workflow ingestion, and now t
 CloudFront) with GitHub OAuth login, repo/workflow management, run history, and a
 CloudWatch log viewer. Deploy the console with
 [docs/DEPLOY-M4.md](docs/DEPLOY-M4.md); the platform bootstrap is
-[docs/DEPLOY-M1.md](docs/DEPLOY-M1.md). M5 (drop-in `adopt` mode + polish) is next — see
+[docs/DEPLOY-M1.md](docs/DEPLOY-M1.md). The `dev` environment runs all of it today
+(deploy evidence: [docs/VERIFY-DEPLOY-ADR021-M4.md](docs/VERIFY-DEPLOY-ADR021-M4.md));
+console login there awaits one browser-only GitHub App setting. M5 (drop-in `adopt` mode +
+polish) is next — see
 [docs/ROADMAP.md](docs/ROADMAP.md). Specs 01–05 + ADRs remain the design source of truth.
 
 ## License

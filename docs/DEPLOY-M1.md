@@ -39,7 +39,22 @@ cp .env.local.example .env.local
 ```
 
 `.env.local` is gitignored — never commit it. If you pass `--region`/`-c region`
-anywhere, it must match the pin (or just omit it — the pin wins).
+anywhere, it must match the pin (or just omit it — the pin wins). Each git worktree needs
+its own copy.
+
+Two credential traps make the pin check fail (or, worse, pass against the wrong account):
+
+- **Ambient `AWS_*` env vars beat `AWS_PROFILE`.** A shell carrying
+  `AWS_ACCESS_KEY_ID`/`AWS_SESSION_TOKEN` for another account resolves to that account and
+  the deploy refuses with `Deploy-target mismatch`. Unset them (`unset AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CREDENTIAL_EXPIRATION`) rather than editing
+  the pin.
+- **Stale static credentials in `~/.aws/credentials` shadow a `credential_process`** in
+  `~/.aws/config` under the same profile name, so `sts get-caller-identity` returns
+  `ExpiredToken` even though the helper works. `ada credentials update … --once` rewrites
+  the entries and fixes it.
+
+Credential-less `cdk synth` and `--dry-run` are exempt from the pin check (the CI path).
 
 ## Phase 0 — secrets (out-of-band, ADR-008)
 
@@ -80,6 +95,23 @@ The run-hook payload contract is baked into the image, so on any change to it th
 the control plane must move together (ADR-020 replaced `table` with `broker` + `token`): on
 an existing env, rebuild the images in the same window as the Phase 3 deploy, with no
 in-flight jobs. A version-skewed pair fails `/run` (400) instead of running degraded.
+
+The freeze gate is "zero non-`TERMINATED` microVMs", and it has one sharp edge:
+`list-microvms` paginates (page 1 caps at 10) and the CLI evaluates `--query` **per page**,
+printing one result per page. A first-page-only read can call the window quiet while a live
+VM sits on page 2, so filter for the non-terminated set and read every page:
+
+```sh
+aws lambda-microvms list-microvms --region us-west-2 \
+  --query 'items[?state!=`TERMINATED`].microvmId' --output text   # expect empty, ALL pages
+```
+
+Observation alone is not a freeze if anything else can queue work. This repo dogfoods its
+own runners (`.github/workflows/ci.yml`), so a PR merged mid-window strands its jobs —
+pause the other writers (agents, merge queues) for the duration, don't just check that it
+looks idle. Recovery from a skewed job is `gh run cancel` + `gh run rerun` once both planes
+agree; see [`VERIFY-DEPLOY-ADR021-M4.md`](VERIFY-DEPLOY-ADR021-M4.md) for a window that was
+hit and failed closed.
 
 ## Phase 3 — orchestrator + GitHub App
 
