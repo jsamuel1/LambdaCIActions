@@ -685,9 +685,9 @@ scoping — acceptable since it returns metadata only.
 
 **Amended by [ADR-037](#adr-037)**: the `UpdateItem` grant now backs a second code path —
 the installation GSI1 index repair. It needed **no IAM change** (same action, same table) and
-changes no observable state: it stamps `gsi1pk`/`gsi1sk` on an installation row the session
-already holds a grant for. "UpdateItem is the only write" still holds; "its only purpose is
-repo config" no longer does.
+writes only index attributes (`gsi1pk`/`gsi1sk`) on an installation row the session already
+holds a grant for — no attribute the console or the control plane reads for behaviour.
+"UpdateItem is the only write" still holds; "its only purpose is repo config" no longer does.
 
 ## ADR-026 — Polling for live run updates in v1 (no WebSocket/SSE) (M4)
 **Status**: Accepted (v1) · resolves [spec 04](specs/04-web-ui.md) OQ-1
@@ -1004,7 +1004,7 @@ repair is idempotent and concurrency-safe (conditional write; a losing racer is 
 `upsertInstallation` now stamps the keys via the shared `installGsi1Keys()` helper, and
 `test/install-store-gsi1.test.mjs` pins that every write path carries them — the regression
 class here is "a new write path forgets the index stamp". The reconciled list is re-sorted by
-account login so a recovered row occupies the same position it will hold on the next poll,
-once the index serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
+account login so a recovered row occupies the same position it will hold once the index alone
+serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
 that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
 the reverse, and the mismatch would be the same row-jump wearing a disguise.

@@ -160,9 +160,9 @@ test('reconcile is additive — indexed rows are preserved alongside recovered o
 });
 
 test('the merged list is ordered by account login, like the index itself', async () => {
-  // Once the repair lands, the next poll (ADR-026) reads the row FROM the index, i.e. in
-  // gsi1sk (account login) order. Appending recovered rows raw would list a legacy account
-  // last on this response and mid-list on the next one — the console row visibly jumps.
+  // Once the repair lands, a later read is served entirely FROM the index, i.e. in gsi1sk
+  // (account login) order. Appending recovered rows raw would list a legacy account last on
+  // this response and mid-list on the next one — the console row visibly jumps on reload.
   const indexed = [
     install({ installationId: 22, accountLogin: 'bravo', gsi1pk: 'INSTALLS' }),
     install({ installationId: 33, accountLogin: 'delta', gsi1pk: 'INSTALLS' }),
@@ -181,8 +181,8 @@ test('the merged list is ordered by account login, like the index itself', async
 test('the merge order is DynamoDB byte order, not locale collation', async () => {
   // gsi1sk is the account login and DynamoDB sorts String sort keys by UTF-8 bytes: `Acme`
   // (uppercase A = 0x41) precedes `abc` (0x61). `localeCompare` reverses that pair, so a
-  // locale sort here would put the recovered row in a DIFFERENT slot than the next
-  // index-served poll — the row-jump this sort exists to prevent, just harder to spot.
+  // locale sort here would put the recovered row in a DIFFERENT slot than a later fully
+  // index-served read — the row-jump this sort exists to prevent, just harder to spot.
   const indexed = [install({ installationId: 22, accountLogin: 'abc', gsi1pk: 'INSTALLS' })];
   const out = await reconcileInstallations(indexed, [22, 11], {
     get: async (id) => (id === 11 ? install({ installationId: 11, accountLogin: 'Acme' }) : undefined),

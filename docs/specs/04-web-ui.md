@@ -262,7 +262,8 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo
   row and emit a structured log line with the actor and the patch.
 - **Config takes effect in the control plane** (ADR-027): the management λ only writes repo
-  config (and the ADR-037 installation index repair, which changes no observable state).
+  config (and the ADR-037 installation index repair, which writes only index attributes —
+  no field the console or control plane reads for behaviour).
   `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
   `defaultFlavor` by `resolveFlavor`'s fallback. Both fail open, so a config read fault
   cannot stop a labeled job.
