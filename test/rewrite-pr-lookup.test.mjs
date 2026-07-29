@@ -17,6 +17,7 @@ import {
   getBranchSha,
   _clearTokenCache,
 } from '../dist/src/shared/github-app.js';
+import { rewritePrBody } from '../dist/src/mgmt/rewrite.js';
 
 const { privateKey } = crypto.generateKeyPairSync('rsa', {
   modulusLength: 2048,
@@ -128,10 +129,7 @@ test('a workflow that no longer exists is skipped, not a DLQ for the whole repo'
 
   // And when EVERY candidate vanished, the no-op reason must say so (naming the paths) instead
   // of claiming no job needs a label — the jobs are gone, not routed.
-  const noop = src.slice(
-    src.indexOf("status: 'nothing-to-do'"),
-    src.indexOf('console.log', src.indexOf("status: 'nothing-to-do'")),
-  );
+  const noop = src.slice(src.indexOf('if (!plans.length) {'), src.indexOf('There ARE edits'));
   assert.match(noop, /missing\.length/);
   assert.match(noop, /deleted or renamed/);
   assert.match(noop, /missing\.join/, 'the reason must name the vanished paths');
@@ -140,10 +138,8 @@ test('a workflow that no longer exists is skipped, not a DLQ for the whole repo'
 
 // A no-op result with NO open PR is only benign on a first run. On a re-run the branch already
 // exists, so the λ plans against IT (never resetting it — that would be a force-push, ADR-031)
-// and `rewriteTargets` skips every already-labelled job. If that branch's PR was closed or
-// merged-and-left-behind, every further click is a permanent no-op while the default branch may
-// still be unrouted — and a bare "no workflow job needs an LCA label" tells the operator
-// nothing. The reason must distinguish the two cases and name the unblocking action.
+// and `rewriteTargets` skips every already-labelled job. The reason must distinguish the cases,
+// and where a PR can still be opened the λ must OPEN it rather than describe the impasse.
 // Source-pinned: the λ reaches GitHub + DynamoDB through module imports, not injectable deps
 // (same idiom as test/provision-config-guard.test.mjs).
 test('the no-change reason distinguishes a fresh branch from a stale one with no PR', () => {
@@ -151,16 +147,61 @@ test('the no-change reason distinguishes a fresh branch from a stale one with no
     path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'rewrite', 'handler.ts'),
     'utf8',
   );
-  const noop = src.slice(src.indexOf("status: 'nothing-to-do'"), src.indexOf('console.log', src.indexOf("status: 'nothing-to-do'")));
+  const noop = src.slice(src.indexOf("if (!plans.length) {"), src.indexOf('There ARE edits'));
   assert.match(noop, /the rewrite PR is already open/, 'the open-PR case must still link the PR');
   assert.match(
     noop,
     /existingSha/,
     'the reason must branch on whether the branch already existed before this run',
   );
-  assert.match(noop, /Delete that branch/, 'the stale-branch case must name the unblocking action');
+  assert.match(noop, /Delete that branch/, 'the unrecoverable case must name the unblocking action');
   // The branch name has to be IN the message: the operator cannot delete a branch we do not name.
   assert.match(noop, /\$\{branch\}/);
+});
+
+// The state that made the old "delete the branch" advice actively harmful: the commits landed
+// and only `ensurePullRequest` failed (a 5xx, or an App granted `contents:write` but not
+// `pull_requests:write`). The retry re-plans against the rewrite branch, whose jobs now all
+// carry LCA labels, so `rewriteTargets` skips every one and the request is a permanent no-op.
+// Telling the operator to delete that branch discards the rewrite AND cannot produce a PR — a
+// fresh branch off the default branch would reach the same state again. So the no-edit path must
+// try to open the PR for the existing branch, and report it as `opened` when it does.
+test('an already-rewritten branch with no PR gets its PR opened, not a delete instruction', () => {
+  const src = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'rewrite', 'handler.ts'),
+    'utf8',
+  );
+  const noop = src.slice(src.indexOf("if (!plans.length) {"), src.indexOf('There ARE edits'));
+  assert.match(noop, /ensurePullRequest\(/, 'the no-edit path must be able to open the PR');
+  assert.match(noop, /!open && existingSha/, 'only when the branch exists and no PR is open');
+  assert.match(noop, /prCreated/, "a newly opened PR must not be reported as 'nothing-to-do'");
+  assert.match(noop, /status: open && prCreated \? 'opened' : 'nothing-to-do'/);
+  // Best-effort: a failed open must degrade to an honest no-op, never DLQ a request that
+  // committed nothing on this delivery.
+  const attempt = noop.slice(noop.indexOf('!open && existingSha'));
+  assert.match(attempt, /try \{[\s\S]*\} catch/, 'the open attempt must not escape as a throw');
+});
+
+// The recovery PR is opened with NO plan (this delivery committed nothing), so the body must not
+// claim "0 job(s) across 0 workflow file(s)" — that reads like an empty PR for a branch that
+// really does carry the rewrite.
+test('a PR body with no plan describes the earlier commits, not "0 job(s)"', () => {
+  const empty = rewritePrBody([]);
+  assert.doesNotMatch(empty.body, /0 job\(s\)/);
+  assert.match(empty.body, /committed to this branch by an earlier request/);
+  // The arm64 warning is the whole point of the body and must survive both shapes.
+  assert.match(empty.body, /arm64 \(Graviton\) Linux only/);
+
+  const planned = rewritePrBody([
+    {
+      path: '.github/workflows/ci.yml',
+      edits: [{ jobId: 'build', line: 4, before: 'a', after: 'b' }],
+      skipped: [],
+      diff: '',
+    },
+  ]);
+  assert.match(planned.body, /rewrites `runs-on` for 1 job\(s\) across 1 workflow file\(s\)/);
+  assert.doesNotMatch(planned.body, /earlier request/);
 });
 
 // GitHub matches `GET /repos/{o}/{r}/git/ref/{ref}` as literal path segments and does NOT decode

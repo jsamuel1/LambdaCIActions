@@ -158,7 +158,7 @@ async function rewriteOne(req: RewriteRequest): Promise<RewriteOutcome> {
     // "nothing to do" would leave the operator hunting for the PR they just asked for, so
     // look for the open PR on our branch and return its URL when there is one. Only look when
     // the branch exists — on a first run with no candidates we never created one.
-    const open = existingSha
+    let open = existingSha
       ? await findOpenPullRequest({ ...creds, branch }).catch((err) => {
           // Best-effort: the outcome is already "no change needed", and failing to decorate it
           // with a link must not turn a successful no-op into an SQS retry.
@@ -166,12 +166,54 @@ async function rewriteOne(req: RewriteRequest): Promise<RewriteOutcome> {
           return undefined;
         })
       : undefined;
+
+    // Branch exists, carries the rewrite, and no PR is open: OPEN ONE. This is not a rare
+    // corner — it is the state the λ lands in whenever the commits succeeded and only the PR
+    // call failed (a 5xx, or an App holding `contents:write` but not `pull_requests:write`).
+    // The retry then re-plans against the rewrite branch, whose jobs now all carry LCA labels,
+    // so `rewriteTargets` skips every one and the request degrades to a permanent no-op. Left
+    // unhandled, the operator is told to DELETE the branch that holds their rewrite — advice
+    // that discards the commits and still cannot produce a PR, because a fresh branch cut from
+    // the default branch would just reach this same state again.
+    //
+    // The gates are already satisfied to get here, and opening the PR is literally the action
+    // that was requested, so completing it is in scope. Best-effort: a failure must leave an
+    // honest no-op rather than DLQ a request that changed nothing.
+    let prCreated = false;
+    if (!open && existingSha) {
+      try {
+        const pr = await ensurePullRequest({
+          ...creds,
+          branch,
+          base: baseBranch,
+          ...rewritePrBody([]),
+        });
+        open = { url: pr.url, number: pr.number };
+        prCreated = pr.created;
+      } catch (err) {
+        // 422 is GitHub's "No commits between <base> and <branch>" — the branch's earlier
+        // rewrite was merged (or is otherwise identical to base), so there is genuinely no PR
+        // to open and deleting the stale branch IS the right advice. Anything else is a real
+        // failure to report.
+        console.error(
+          JSON.stringify({
+            msg: 'rewrite PR open on an existing branch failed',
+            repo: req.repoFullName,
+            branch,
+            error: errMsg(err),
+          }),
+        );
+      }
+    }
+
     const out: RewriteOutcome = {
-      status: 'nothing-to-do',
+      status: open && prCreated ? 'opened' : 'nothing-to-do',
       files: [],
       ...(open ? { prUrl: open.url } : {}),
       reason: open
-        ? 'no workflow job needs an LCA label — the rewrite PR is already open'
+        ? prCreated
+          ? `no workflow job needs an LCA label — branch '${branch}' already carried the rewrite, so its pull request was opened`
+          : 'no workflow job needs an LCA label — the rewrite PR is already open'
         : missing.length
           ? // Every candidate workflow we held an analysis for has since been deleted or renamed.
             // Saying "no job needs a label" would be misleading — the jobs are gone, not routed —
@@ -179,12 +221,12 @@ async function rewriteOne(req: RewriteRequest): Promise<RewriteOutcome> {
             `every rewrite candidate has been deleted or renamed since the last scan (${missing.join(', ')}); re-scan the repo to refresh its workflow analysis`
           : !existingSha
             ? 'no workflow job needs an LCA label'
-            : // No edits, no open PR, and the branch already existed: it still carries an earlier
-              // rewrite whose PR was closed (or merged and the branch left behind). We plan against
-              // that branch and never reset it (resetting would be a force-push, ADR-031), so every
-              // further request is a no-op — say so, with the one action that unblocks it, instead of
-              // reporting a bare "nothing to do" for a repo whose default branch may still be unrouted.
-              `no workflow job needs an LCA label on branch '${branch}', which already carries an earlier rewrite but has no open PR. ` +
+            : // No edits, no open PR, and we could not open one: the branch's rewrite has already
+              // been merged (GitHub refuses a PR with no commits between base and head), or the PR
+              // call itself failed. We plan against that branch and never reset it (resetting would
+              // be a force-push, ADR-031), so deleting it is the action that lets a fresh rewrite be
+              // cut from the default branch.
+              `no workflow job needs an LCA label on branch '${branch}', which already carries an earlier rewrite that could not be turned into a pull request (most likely already merged). ` +
               'Delete that branch in the repo to regenerate the PR from the default branch.',
     };
     console.log(JSON.stringify({ msg: 'rewrite no-op', repo: req.repoFullName, ...out }));

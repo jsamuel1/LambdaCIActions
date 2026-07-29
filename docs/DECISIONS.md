@@ -1130,6 +1130,20 @@ cannot simply exist.
   permanent no-op while the default branch may still be unrouted. The reason names the branch and
   the unblocking action (delete it, so the next request re-plans from the default branch) instead
   of claiming there is nothing to do.
+- **…but where a PR can still be opened, the no-edit path OPENS it** (eighth review fix). The
+  "delete the branch" advice above is only correct when the branch's rewrite has already been
+  merged. It is actively harmful in the state the λ actually lands in when the commits succeeded
+  and only `ensurePullRequest` failed — a 5xx, or an App granted `contents:write` but not
+  `pull_requests:write`. The redelivery re-plans against the rewrite branch, whose jobs now all
+  carry LCA labels, so every job is skipped and the request degrades to a permanent no-op;
+  telling the operator to delete that branch discards the committed rewrite AND cannot produce a
+  PR, because a fresh branch cut from the default branch reaches the same state again. So when
+  the branch exists, has no open PR, and there are no new edits, the λ calls `ensurePullRequest`
+  and reports `opened`. The attempt is best-effort (a failure degrades to the honest no-op
+  reason above, never a DLQ for a delivery that committed nothing), and GitHub's 422 "no commits
+  between base and head" is exactly the already-merged case where deleting the branch IS the
+  right advice. The recovery PR is opened with no plan, so `rewritePrBody` describes the earlier
+  commits rather than claiming "0 job(s) across 0 workflow file(s)".
 **Why the console preview is not a file diff**: the management λ cannot read repo files (no
 credential, by design), so its dry run is derived from the stored parse (`runs_on` per job).
 It shows the exact label change per job — the thing being decided — without pretending to be

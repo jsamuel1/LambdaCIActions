@@ -804,7 +804,13 @@ export function rewritePrBody(files: FileRewrite[]): { title: string; body: stri
     'This PR routes GitHub Actions jobs to **LambdaCIActions** runners — ephemeral,',
     'single-use AWS Lambda microVMs in your own account.',
     '',
-    `It rewrites \`runs-on\` for ${totalEdits} job(s) across ${files.filter((f) => f.edits.length).length} workflow file(s).`,
+    totalEdits
+      ? `It rewrites \`runs-on\` for ${totalEdits} job(s) across ${files.filter((f) => f.edits.length).length} workflow file(s).`
+      : // The recovery case (rewrite/handler.ts): the branch already carried the rewrite from an
+        // earlier request whose PR call failed, so THIS request committed nothing. Claiming
+        // "0 job(s)" would read like an empty PR; the change is real, it just landed earlier.
+        'The `runs-on` changes were committed to this branch by an earlier request whose pull',
+    ...(totalEdits ? [] : ['request could not be opened at the time. Review the branch diff below.']),
     '',
     '**Before you merge:** these runners are **arm64 (Graviton) Linux only**. A job that',
     'depends on x86_64 binaries or images will fail after this change. The console\'s',

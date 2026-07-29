@@ -207,6 +207,13 @@ Auditing what it did: `aws logs filter-log-events --log-group-name /aws/lambda/l
 requested it, and the PR URL. The λ never merges, never force-pushes, and reuses an existing
 open PR rather than opening duplicates.
 
+**No PR appeared but the branch exists**: click "Open rewrite PR" again. If the commits landed
+and only the PR call failed (commonly an App holding `contents:write` but not
+`pull_requests:write`), the re-run finds no new edits and opens the PR for the existing branch —
+look for `"msg": "rewrite no-op"` with `"status": "opened"`. If the reason instead tells you to
+delete the branch, that branch's rewrite is already merged (GitHub refuses a PR with no commits
+between base and head); delete it and re-request to re-plan from the default branch.
+
 To revoke: untick the repo toggle (immediate), or redeploy without `-c rewrite=true`
 (deployment-wide), or remove the App permission (belt and braces).
 
