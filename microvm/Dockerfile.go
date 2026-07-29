@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# Dockerfile.node — the `node` flavor microVM image (docs/specs/02-microvm-runners.md,
-# capabilities: ["node"]). Base runner + a full Node.js LTS toolchain (node/npm/pnpm/yarn)
-# preinstalled so Node jobs skip per-run toolchain setup.
+# Dockerfile.go — the `go` flavor microVM image (docs/specs/02-microvm-runners.md,
+# capabilities: ["go"]). Base runner + a pinned Go toolchain, installed INTO the runner tool
+# cache so `actions/setup-go@v5` resolves from cache instead of downloading (ADR-031).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -15,9 +15,9 @@ FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
-# Pinned Node LTS for the tool-cache entry (must be full semver — tool-cache skips a version
-# dir that isn't valid semver). Keep the major in sync with NODE_MAJOR.
-ARG NODE_VERSION=24.18.0
+# Pinned Go. Bump deliberately (ADR-031) — `latest` would make image rebuilds
+# non-reproducible.
+ARG GO_VERSION=1.25.12
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_DIR=/opt/actions-runner \
     RUN_HOOK_PORT=8080 \
@@ -35,38 +35,32 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo \
       libicu70 lsb-release awscli \
+      # cgo needs a C toolchain; a Go job that imports anything cgo-backed fails without it.
+      build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# --- node flavor extras -----------------------------------------------------------------
-# Enable Corepack (ships with Node) and pin pnpm + yarn so Node jobs get a ready toolchain.
-# arm64 wheels/binaries are used throughout (no x86 assumptions). NODE_MAJOR tracks the
-# current Node LTS (24) so the latest npm/pnpm/yarn install cleanly — do not pin to an EOL
-# major; the toolchain's `@latest`/`@stable` now require a modern Node runtime.
-RUN corepack enable \
-    && corepack prepare pnpm@latest --activate \
-    && corepack prepare yarn@stable --activate \
-    && npm install -g npm@latest \
-    && node --version && npm --version && pnpm --version && yarn --version
-
-# Prebake the runner tool cache so `actions/setup-node@v4` short-circuits instead of
-# re-downloading Node on every job (ADR-031). Without this the apt-installed Node above only
-# helps jobs that use no setup-node step at all. setup-node caches under toolName `node` and
-# arch `arm64` (base-distribution.ts `findVersionInHostedToolCacheDirectory` →
-# tc.find('node', spec, translateArchToDistUrl(arch)); arm64 passes through unchanged), and
-# the entry root holds the CONTENTS of the release tarball — hence --strip-components=1.
-RUN mkdir -p ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64 \
-    && curl -fsSL -o /tmp/node.tar.gz \
-       "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.gz" \
-    && tar -xzf /tmp/node.tar.gz -C ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64 --strip-components=1 \
+# --- go flavor extras -------------------------------------------------------------------
+# setup-go caches under toolName `go` (installer.ts `toolCacheName`) and adds
+# `<cacheEntry>/bin` to PATH, so the cache entry root must hold the CONTENTS of the release
+# tarball's `go/` dir (bin/, pkg/, src/…) — not a nested `go/` dir. Hence --strip-components=1.
+RUN mkdir -p ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64 \
+    && curl -fsSL -o /tmp/go.tar.gz \
+       "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" \
+    && tar -xzf /tmp/go.tar.gz -C ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64 --strip-components=1 \
     # The completion marker is a SIBLING of the arch dir, not a file inside it
     # (@actions/tool-cache `_completeToolPath`). Without it the entry is invisible and every
-    # job re-downloads Node.
-    && touch ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64.complete \
-    && rm /tmp/node.tar.gz \
+    # job re-downloads the toolchain.
+    && touch ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64.complete \
+    && rm /tmp/go.tar.gz \
     # Fail the BUILD (not a job) if the layout is wrong.
-    && ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64/bin/node --version
+    && ${RUNNER_TOOL_CACHE}/go/${GO_VERSION}/arm64/bin/go version
+# Put the cached toolchain on PATH so plain `go build`/`go test` steps work with no setup-*
+# action at all. GOPATH lives under the runner's home so a job can write modules without sudo.
+ENV GOROOT=/opt/hostedtoolcache/go/1.25.12/arm64 \
+    GOPATH=/home/runner/go
+ENV PATH=${GOROOT}/bin:${GOPATH}/bin:$PATH
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
@@ -85,7 +79,8 @@ COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
 # the runner dir and can sudo for job steps that need it.
 RUN useradd -m -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
-    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE}
+    && mkdir -p ${GOPATH} \
+    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE} ${GOPATH}
 
 USER runner
 WORKDIR ${RUNNER_DIR}

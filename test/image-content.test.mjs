@@ -105,6 +105,19 @@ test('extra OS capabilities are scoped to docker-capable flavors (ADR-020)', () 
   assert.match(build, /flavor\.osCapabilities/);
 });
 
+test('the build script requests the catalog memory + arm64 CPU config (ADR-030)', () => {
+  // `memoryMb` was inert until this was sent: run-microvm has NO sizing parameter, and
+  // create-microvm-image takes memory only via --resources minimumMemoryInMiB. Without these
+  // flags every flavor — including the 8 GB ones — builds at the service default.
+  const build = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), 'utf8');
+  assert.match(build, /--resources/);
+  assert.match(build, /minimumMemoryInMiB=\$\{flavor\.memoryMb\}/);
+  assert.match(build, /--cpu-configurations/);
+  assert.match(build, /architecture=ARM_64/);
+  // There is no vCPU knob on the API — don't invent one.
+  assert.doesNotMatch(build, /minimumVcpu|vcpuCount|--vcpu/);
+});
+
 test('only docker-capable flavors ship a pre-run hook', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
@@ -170,5 +183,124 @@ test('flavors install the apt awscli that ADR-028 measured, not a swapped-in CLI
       /aws-cli \*\*v1\*\*/,
       `${flavor.dockerfile} must state why apt awscli (v1) is deliberate — see ADR-028`,
     );
+  }
+});
+
+// --- Expanded standard set (ADR-031) -----------------------------------------
+
+/** Flavors whose toolchain is meant to be resolvable from the runner tool cache. */
+const TOOLCACHE_FLAVORS = ['node', 'python', 'java', 'go'];
+
+test('every catalog flavor has a Dockerfile that exists', () => {
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    assert.doesNotThrow(() => read(flavor.dockerfile), `missing ${flavor.dockerfile}`);
+  }
+});
+
+test('flavor names, labels and dockerfiles are unique', () => {
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const key of ['name', 'label', 'dockerfile']) {
+    const values = catalog.flavors.map((f) => f[key]);
+    assert.equal(new Set(values).size, values.length, `duplicate flavor ${key}`);
+  }
+});
+
+test('every flavor label starts with the base lambda-ci label', () => {
+  // Resolution matches the LONGEST catalog label present in runs-on; a label outside this
+  // namespace would not be recognizable as ours.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    assert.match(flavor.label, /^lambda-ci(-[a-z0-9]+)?$/, `odd label '${flavor.label}'`);
+  }
+});
+
+test('tool-cache flavors set RUNNER_TOOL_CACHE explicitly', () => {
+  // A self-hosted runner does NOT default to /opt/hostedtoolcache — actions/runner resolves
+  // RUNNER_TOOL_CACHE ?? RUNNER_TOOLSDIRECTORY ?? AGENT_TOOLSDIRECTORY and otherwise falls
+  // back to _work/_tool. Without this the prebaked cache is in a directory the agent never
+  // looks at, and every setup-* step silently re-downloads.
+  for (const name of TOOLCACHE_FLAVORS) {
+    const df = read(`Dockerfile.${name}`);
+    assert.match(df, /RUNNER_TOOL_CACHE=\/opt\/hostedtoolcache/, `${name}: must pin RUNNER_TOOL_CACHE`);
+  }
+});
+
+test('every prebaked tool-cache entry writes the sibling .complete marker', () => {
+  // @actions/tool-cache find() requires BOTH <tool>/<version>/<arch>/ and the sibling file
+  // <tool>/<version>/<arch>.complete. Omitting the marker is the classic silent failure:
+  // the toolchain is on disk but the action re-downloads it anyway.
+  for (const name of TOOLCACHE_FLAVORS) {
+    const df = read(`Dockerfile.${name}`);
+    const hasMarker =
+      /arm64\.complete/.test(df) ||
+      // the python flavor delegates to the upstream setup.sh, which writes the marker itself
+      /setup\.sh/.test(df);
+    assert.ok(hasMarker, `${name}: no sibling arm64.complete marker is created`);
+  }
+});
+
+test('tool-cache entries use the exact toolName the setup action looks up', () => {
+  // These strings are case-sensitive filesystem paths. `Python` is capitalized;
+  // `node`/`go` are not; setup-java uses Java_<distribution>_<packageType>.
+  assert.match(read('Dockerfile.python'), /\/Python\//, 'setup-python looks up "Python"');
+  assert.match(read('Dockerfile.node'), /\/node\/\$\{NODE_VERSION\}/, 'setup-node looks up "node"');
+  assert.match(read('Dockerfile.go'), /\/go\/\$\{GO_VERSION\}/, 'setup-go looks up "go"');
+  assert.match(read('Dockerfile.java'), /Java_temurin_jdk/, 'setup-java looks up Java_<distro>_<pkg>');
+});
+
+test('the java tool-cache version dir uses - not + for the build separator', () => {
+  // setup-java stores 21.0.12+8 as `21.0.12-8` (a '+' in JAVA_HOME breaks toolchains) and maps
+  // it back when scanning. A '+' on disk means findAllVersions never sees the entry.
+  const df = read('Dockerfile.java');
+  assert.match(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/);
+  assert.doesNotMatch(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}\+/);
+});
+
+test('toolchain versions are pinned, not latest (reproducible rebuilds)', () => {
+  // ADR-031: a `latest`/`stable` toolchain makes two builds of the same commit differ.
+  const pins = {
+    python: /ARG PYTHON_VERSION=\d+\.\d+\.\d+/,
+    java: /ARG JDK_VERSION=\d+\.\d+\.\d+/,
+    go: /ARG GO_VERSION=\d+\.\d+\.\d+/,
+    rust: /ARG RUST_VERSION=\d+\.\d+\.\d+/,
+    node: /ARG NODE_VERSION=\d+\.\d+\.\d+/,
+  };
+  for (const [name, re] of Object.entries(pins)) {
+    assert.match(read(`Dockerfile.${name}`), re, `${name}: toolchain version must be pinned`);
+  }
+  // The rust toolchain must not be installed as a floating channel.
+  assert.doesNotMatch(read('Dockerfile.rust'), /--default-toolchain stable/);
+});
+
+test('every flavor Dockerfile bakes the run-hook server and exposes its port', () => {
+  // The whole boot contract (ADR-012/016): no run-hook, no job.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    const df = read(flavor.dockerfile);
+    assert.match(df, /COPY bootstrap\/run-hook\.mjs \$\{RUNNER_DIR\}\/run-hook\.mjs/, flavor.name);
+    assert.match(df, /ENTRYPOINT \["node", "\/opt\/actions-runner\/run-hook\.mjs"\]/, flavor.name);
+    assert.match(df, /EXPOSE 8080/, flavor.name);
+  }
+});
+
+test('every flavor pins the same runner agent version', () => {
+  // A flavor that drifts to a different agent version is a support problem that only shows
+  // up on that one flavor's jobs.
+  const catalog = JSON.parse(read('flavors.json'));
+  const versions = new Set(
+    catalog.flavors.map((f) => read(f.dockerfile).match(/ARG RUNNER_VERSION=([\d.]+)/)?.[1]),
+  );
+  assert.equal(versions.size, 1, `runner agent versions diverge across flavors: ${[...versions]}`);
+  assert.ok(!versions.has(undefined), 'a flavor Dockerfile has no pinned RUNNER_VERSION');
+});
+
+test('the catalog memory values are plausible microVM requests', () => {
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    assert.ok(Number.isInteger(flavor.memoryMb), `${flavor.name}: memoryMb must be an integer MiB`);
+    assert.ok(flavor.memoryMb >= 1024, `${flavor.name}: memoryMb too small`);
+    assert.ok(flavor.memoryMb <= 32768, `${flavor.name}: memoryMb beyond a sane per-VM bound`);
+    assert.ok(Number.isInteger(flavor.vcpu) && flavor.vcpu > 0, `${flavor.name}: vcpu`);
   }
 });

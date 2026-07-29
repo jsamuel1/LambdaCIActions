@@ -187,6 +187,49 @@ test('flavor views mark image availability from SSM presence', () => {
   assert.equal(base.arch, 'arm64');
 });
 
+test('GET /api/flavors surfaces every standard flavor with a rate + availability', () => {
+  // Acceptance criterion for the expanded standard set (ADR-031): each new flavor must be
+  // listed, priced, and reported as built once its image ARN is published to SSM.
+  const expected = ['base', 'node', 'python', 'java', 'go', 'rust', 'docker'];
+  const available = Object.fromEntries(expected.map((n) => [n, true]));
+  const views = buildFlavorViews(available);
+  assert.deepEqual(
+    views.map((v) => v.name).sort(),
+    [...expected].sort(),
+    'catalog and expected standard set disagree',
+  );
+  for (const v of views) {
+    assert.equal(v.imageAvailable, true, `${v.name} should report built`);
+    assert.equal(v.arch, 'arm64', `${v.name} must be arm64`);
+    assert.ok(v.usdPerMinute > 0, `${v.name} must be priced`);
+    assert.ok(v.label.startsWith('lambda-ci'), `${v.name} label`);
+    assert.ok(v.description.length > 0, `${v.name} needs an operator-facing description`);
+  }
+});
+
+test('a flavor with no published image ARN reports not-built', () => {
+  // The Flavors screen must distinguish "in the catalog" from "actually buildable" — a new
+  // standard flavor is present in code before its image exists in an environment.
+  const views = buildFlavorViews({});
+  for (const v of views) assert.equal(v.imageAvailable, false, v.name);
+});
+
+test('flavorNames covers the expanded catalog so config writes accept the new flavors', () => {
+  // validateFlavorMap / validateRepoPatch gate on this list; a missing name means the console
+  // rejects a legitimate flavor choice.
+  const names = flavorNames();
+  for (const n of ['python', 'java', 'go', 'rust']) {
+    assert.ok(names.includes(n), `flavorNames() is missing ${n}`);
+  }
+});
+
+test('the java and rust flavors are priced above base (bigger memory footprint)', () => {
+  // Sanity-check the derived rate actually tracks the catalog shape rather than a constant.
+  assert.ok(flavorRatePerMinute('java') > flavorRatePerMinute('base'));
+  assert.ok(flavorRatePerMinute('rust') > flavorRatePerMinute('base'));
+  assert.equal(flavorRatePerMinute('python'), flavorRatePerMinute('base'));
+});
+
 test('secret status carries presence only — never a value', () => {
   const s = toSecretStatus('/lca/dev/github/app-pem', 'PEM', true);
   assert.deepEqual(Object.keys(s).sort(), ['label', 'param', 'present']);

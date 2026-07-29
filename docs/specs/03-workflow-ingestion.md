@@ -92,7 +92,10 @@ routing/compat needs):
 Resolution order (first match wins):
 
 1. **Repo FlavorMap override** (DynamoDB) — explicit `label → flavor`.
-2. **Explicit LCA label** — `lambda-ci`, `lambda-ci-docker`, `lambda-ci-node` → that flavor.
+2. **Explicit LCA label** — `lambda-ci`, `lambda-ci-docker`, `lambda-ci-node`,
+   `lambda-ci-python`, `lambda-ci-java`, `lambda-ci-go`, `lambda-ci-rust` → that flavor.
+   The **most specific** (longest) matching label wins, so `[self-hosted, lambda-ci,
+   lambda-ci-java]` routes to `java`, not `base`.
 3. **Adopt-mode standard-label map** (if adopt enabled for the repo):
    | GitHub label | Default flavor |
    |---|---|
@@ -102,6 +105,17 @@ Resolution order (first match wins):
 4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it.
 5. **Fallback** — the repo's operator-chosen `defaultFlavor` (set from the console, [04](04-web-ui.md))
    if present and valid, else `base`; record a warning if uncertain.
+
+**Language flavors are label-selected, not signal-inferred.** Step signals currently model
+only `needs_docker`, so a job that runs `pytest` does **not** auto-upgrade off `base` — it is
+routed to `python` by an explicit label, a `FlavorMap` entry (e.g. `ubuntu-latest → python`),
+or the repo's `defaultFlavor`. Inferring a runtime from `setup-*` steps needs parser support
+plus a policy for jobs that need two runtimes, and is deliberately out of scope (ADR-031).
+
+A custom flavor (ADR-032) participates in every step above **only once it is `valid`**
+(ADR-033): an unvalidated or `invalid` custom flavor resolves as if it did not exist, so a
+half-configured flavor degrades to a working job on the fallback chain rather than a failed
+one. The reason string records that it was skipped.
 
 The Ingest λ ([01](01-github-app.md)) only *claims* a `workflow_job` if routing says
 `eligible` for that job's labels. Non-eligible jobs are ignored (GitHub-hosted still runs them).
@@ -124,6 +138,15 @@ Because runners are **arm64-only** and single-use, ingestion computes a `compat.
 
 Surfaced in the UI per workflow/job with actionable messages (e.g. "image `foo:amd64` is
 x86-only; publish an arm64 variant or exclude this job").
+
+The docker-capable set the `docker-missing` check uses is **derived from the flavor catalog**
+(`capabilities` includes `docker`), not hard-coded — so adding a language flavor cannot
+accidentally suppress the warning, and a job needing Docker on `python`/`java`/`go`/`rust`
+still warns. Capabilities are drawn from a closed vocabulary (`docker`, `node`, `python`,
+`java`, `go`, `rust`): an unrecognized capability string would be silently inert here and in
+the resolver's upgrade step, which is why custom-flavor registration validates against it
+(ADR-033).
+
 
 ## Onboarding modes
 

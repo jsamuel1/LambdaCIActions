@@ -949,3 +949,161 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
+## ADR-030 — Flavor `vcpu` is descriptive; only `minimumMemoryInMiB` is requestable (M5)
+**Status**: Accepted (v1) · corrects the flavor-size claims in [spec 02](specs/02-microvm-runners.md) and the cost model in [spec 04](specs/04-web-ui.md)
+**Context**: `microvm/flavors.json` carries `vcpu` + `memoryMb` per flavor, spec 02's flavor
+table advertises "2 / 4 GB" and "4 / 8 GB", `docs/VERIFY-M3.md` prices runs off those pairs,
+and `src/mgmt/views.ts` derives `flavorRatePerMinute` from `vcpu * VCPU_USD_PER_MINUTE +
+GB * GB_USD_PER_MINUTE`. Checked against the GA `lambda-microvms` API surface (CLI 2.35.17+,
+API 2025-09-09):
+- **`run-microvm` has no sizing parameter at all** — the full option set is
+  `--ingress/egress-network-connectors --image-identifier --image-version
+  --execution-role-arn --idle-policy --logging --run-hook-payload
+  --maximum-duration-in-seconds --client-token`. A VM's shape is fixed by its **image**.
+- **`create-microvm-image` accepts `--resources minimumMemoryInMiB` (a single-element list,
+  memory only) and `--cpu-configurations architecture=ARM_64`.** There is **no vCPU knob**:
+  `cpu-configurations` carries `architecture` alone, whose only permitted value is `ARM_64`.
+- `scripts/build-images.mjs` passes **neither**. Every flavor is therefore built at the
+  service default shape, and always has been.
+Consequence: `vcpu` has never influenced a real microVM, `memoryMb` was equally inert, and
+the M3 `docker`-vs-`base` boot/cost deltas were attributed to a "4 vCPU / 8 GB snapshot"
+that was never requested. The measured 32–39 s `dockerd` init is real; the "on 4 vCPU
+Graviton" qualifier on it is not established.
+**Decision**:
+1. `build-images.mjs` forwards `--resources minimumMemoryInMiB=<memoryMb>` from the catalog,
+   so `memoryMb` becomes the **actual** floor the service honors, and
+   `--cpu-configurations architecture=ARM_64` to make the arm64-only hard rule explicit at
+   the API rather than implicit in the Dockerfile's `--platform`.
+2. `vcpu` is **retained but redocumented as descriptive** — an operator-facing indication of
+   the shape a flavor is *intended* for and the second sort key in
+   `smallestWithCapability`. It is NOT a request, and no code may present it as provisioned
+   capacity. Renaming it now would churn the catalog, the `FlavorDef` type, the API view and
+   the UI for no behavioral gain; the honest fix is that the one field the API accepts is
+   actually sent.
+3. The cost model keeps its two-term formula (memory *is* requestable, and microVM quota is
+   denominated in total memory of `RUNNING`/`SUSPENDED` VMs per spec 02), but every
+   surfaced figure stays labelled an **estimate** — as `estimateCostUsd` already does.
+**Why**: silently keeping two size fields where the API accepts one is how the M3 cost table
+came to state a shape nobody requested. Sending memory makes the more consequential half
+real (it drives both quota consumption and the OOM behavior of a `docker`/`rust` job) at the
+cost of one CLI flag.
+**Consequences**: the next `npm run build:images` changes the requested memory floor for
+every flavor, so it is a **deploy-touching** change and re-baselines boot latency —
+`docs/VERIFY-M3.md`'s per-flavor figures predate it and its cost floors should be re-measured
+rather than carried forward. `test/image-content.test.mjs` pins that the build script
+forwards both flags. Revisit if the API later exposes a vCPU request, at which point `vcpu`
+becomes requestable and this ADR's point 2 is superseded.
+
+## ADR-031 — Expanded standard flavor set with prebaked runner tool cache (M5)
+**Status**: Accepted (v1) · extends the catalog established in [ADR-020](#adr-020)
+**Context**: The catalog shipped `base`, `node`, `docker`. Any other language runtime meant a
+workflow either used a `setup-*` action (a per-job download on every run) or the repo went
+back to GitHub-hosted runners. Adding a runtime today requires a Dockerfile + a catalog entry
++ a Lambda redeploy, because the catalog is a static `import` in three call sites.
+**Decision**: add **`python`, `java`, `go`, `rust`** as standard flavors, each a
+`Dockerfile.base` clone plus one pinned toolchain layer, and **prebake the GitHub runner tool
+cache** (`/opt/hostedtoolcache`, `RUNNER_TOOL_CACHE`) so `actions/setup-python@v5`,
+`actions/setup-java@v4`, `actions/setup-go@v5` and `actions/setup-node@v4` resolve from cache
+instead of downloading. Deliberately **excluded**:
+- **`dotnet`** — the SDK is the largest of the candidates and no verified consumer asked for
+  it; snapshot size is a boot-latency and storage cost paid by every job of that flavor.
+  Left to the custom-flavor path (ADR-032) until a real workload justifies it.
+- A combined "kitchen sink" flavor — it would pay every toolchain's snapshot cost on every
+  job. One toolchain per flavor keeps the cost proportional to what the job asked for.
+Each new flavor declares a capability equal to its name (`python`, `java`, `go`, `rust`),
+keeps the unprivileged `USER runner` entrypoint and **no** `osCapabilities` (only `docker`
+gets `ALL`, per ADR-020), and pins toolchain versions rather than tracking `latest` so a
+rebuild is reproducible.
+**Why**: the wall-clock win is in the tool cache, not the runtime binary — a `setup-python`
+download+extract dominates a short job. Prebaking the cache is what makes a flavor faster
+than `base` + `setup-*`; without it the flavor only saves the download for jobs that skip the
+setup action entirely. Layering on `base` (rather than a shared registry base image) is
+forced by the build model: `create-microvm-image` builds a snapshot from one staged
+`Dockerfile` in an uploaded context, so each flavor's Dockerfile must be self-contained —
+hence the duplicated base layers, which `test/image-content.test.mjs` guards.
+**Consequences**: four more images to build, and `npm run build:images` gets proportionally
+slower (it is serial per flavor). Signal-driven upgrade still only understands
+`needs_docker` — a job that needs Python does **not** auto-upgrade off `base`; label or
+`FlavorMap`/`defaultFlavor` selects these. Extending signal inference to language runtimes is
+a separate change (it needs parser support for `setup-*` steps and a policy for what to do
+when a job needs two runtimes). The pinned versions are now a **patch-day obligation**: they
+age silently, and a stale pin is invisible until a workflow needs a newer runtime.
+
+## ADR-032 — Custom flavors live in the store and are merged over the built-in catalog (M5)
+**Status**: Accepted (v1) · shapes work deferred from this milestone
+**Context**: An operator cannot bring their own image. The catalog is `import
+flavorsCatalog from '../../microvm/flavors.json'` in `src/provision/flavor.ts`,
+`src/mgmt/views.ts` and `src/ingest/compat.ts` — compiled into each Lambda bundle at build
+time, so it is physically not writable at runtime. Spec 02 has always listed a `custom-*`
+row, and the Phase 3 backlog has "custom per-repo images", but nothing implements it.
+**Decision**:
+1. **Storage** — a per-installation flavor record in the shared table (ADR-009), keyed
+   `pk=INSTALL#<installationId>`, `sk=FLAVOR#<name>`, so it shares the installation
+   partition that already holds `INSTALL` + `REPO#<repoId>` rows and is enumerable with the
+   existing `begins_with` query. The static JSON stays **read-only and build-time**.
+2. **Resolution** — the three static imports move behind a resolver that composes
+   `builtin ++ custom`. Built-in flavors always win a name collision: a custom flavor whose
+   name matches a built-in is **rejected at registration** (not silently shadowed, and not
+   silently shadowing) so an operator cannot redefine what `lambda-ci-node` means for their
+   jobs. Custom flavors are namespaced `custom-<name>` with labels
+   `lambda-ci-custom-<name>`, which makes collision structurally unlikely and keeps the
+   most-specific-label rule in `resolveFlavor` intact.
+3. **Scope** — a custom flavor is visible only to its own installation. Resolution is
+   already per-run (the provisioner knows `installationId`), and cross-tenant flavor
+   visibility would leak one operator's image names to another.
+4. **Bounds** — registration validates `minimumMemoryInMiB` against the region's microVM
+   memory quota (spec 02: quota is total memory of `RUNNING`/`SUSPENDED` VMs) and surfaces
+   the derived `flavorRatePerMinute` before save, so an operator sees the per-minute rate of
+   the shape they are about to request. Per ADR-030 memory is the only requestable
+   dimension, so it is the only one bounds-checked.
+5. **Behavior with no custom flavors registered must be byte-identical** to today — the
+   resolver returns the built-in catalog and performs no I/O when the installation has no
+   flavor rows.
+**Why**: making the JSON writable is impossible (it is bundled), and a second static catalog
+would duplicate the source of truth. The installation partition is the natural home: the same
+partition already carries the config the console writes, and per-installation scoping falls
+out of the key rather than needing an authorization filter.
+**Consequences**: flavor resolution gains a table read on the provision hot path — it must
+degrade to built-in-only on a DynamoDB fault (fail open, matching ADR-027's gates) rather
+than failing the launch. `flavorNames()` (used by `validateFlavorMap`/`validateRepoPatch`) and
+`buildFlavorViews` become async/installation-scoped, which changes the Mgmt API's validation
+surface. Deferred to a follow-up card; this ADR fixes the shape so the standard-set work
+(ADR-031) does not have to guess it.
+
+## ADR-033 — A custom flavor is not routable until a smoke run proves it (M5)
+**Status**: Accepted (v1) · depends on [ADR-032](#adr-032); reuses the broker from [ADR-021](#adr-021)
+**Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
+published its image ARN, resolved correctly from its label, and then failed every single job
+because nothing in the guest could start `dockerd`. `imageAvailability()` probes only that an
+image ARN parameter *exists*. Letting an operator register an arbitrary image and route
+production jobs at it with no stronger evidence reproduces that failure mode on demand, in
+someone else's repo.
+**Decision**: a custom flavor carries a validation state — **`pending → validating → valid |
+invalid(reason)`** — and **only `valid` flavors are selectable in a `FlavorMap`, as a
+`defaultFlavor`, or resolvable from a label.** An unvalidated flavor resolves as if it did not
+exist (falling through to the normal fallback chain) with the reason recorded, so a
+half-configured flavor degrades to a working job rather than a failed one. Validation is two
+gates:
+1. **Static** — `arch === 'arm64'` (AGENTS.md hard rule); the image ARN resolves and is
+   readable by the provisioner's role; declared capabilities are drawn from a **closed
+   vocabulary** (`docker`, `node`, `python`, `java`, `go`, `rust`) because capabilities feed
+   both `smallestWithCapability` upgrades and the `compat` gate — an unknown capability
+   string would be silently inert; `minimumMemoryInMiB` within quota bounds (ADR-032).
+2. **Smoke run** — launch **one** microVM from the image with a synthetic JIT-registered
+   runner and require that the Actions agent registers, executes a trivial job, and the VM
+   self-terminates through the ADR-021 hook broker. Static checks alone would have passed the
+   broken `docker` image; only executing a job distinguishes "image built" from "image
+   works", and only observing self-terminate proves the ADR-021 path is wired.
+Re-validation is triggered automatically **when the image ARN changes** (a new ARN is a new
+artifact and inherits no evidence) and is manually triggerable from the console.
+**Why**: the state machine is the enforcement point rather than advice, because the failure it
+prevents is silent at registration time and only visible as other people's red builds.
+Terminal `invalid(reason)` — rather than an indefinite retry — keeps a deterministically
+broken image from burning microVM quota on a loop.
+**Consequences**: registration is no longer synchronous — the console shows progress and a
+failure reason, so validation needs its own status surface (a Flavors screen or a Settings
+extension). The smoke run **launches a real microVM and registers a real (throwaway) runner**,
+so it consumes quota, costs money, and needs a repo to register against; it is therefore
+**deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
+the static gates; the smoke run itself is verified against a live environment. Deferred to a
+follow-up card together with ADR-032.

@@ -39,20 +39,80 @@ Key numbers (from reference + AWS docs, to validate in [ROADMAP](../ROADMAP.md) 
 - Size: e.g. 2 vCPU / 4 GB ≈ \$0.0044/min, per-second billing.
 - Arch: **arm64 only**.
 
+> **Sizing (ADR-030)**: only **memory** is requestable, and only at *image build* time —
+> `create-microvm-image --resources minimumMemoryInMiB=<memoryMb>` plus
+> `--cpu-configurations architecture=ARM_64` (whose sole permitted value is `ARM_64`).
+> `run-microvm` has **no** sizing parameter at all, so a VM's shape is fixed by its image, and
+> the API exposes **no vCPU knob**. The catalog's `vcpu` is therefore **descriptive** — the
+> shape a flavor is intended for, and the tie-break when picking the smallest flavor with a
+> capability — not a request. Every vCPU-derived cost figure is an estimate.
+
 ## Runner flavors
 
 A **flavor** = a named runner image + resource shape + label. Selected per job from
 `runs-on` labels (see [03](03-workflow-ingestion.md)).
 
-| Flavor | Label | Base | vCPU/Mem | Contents |
+| Flavor | Label | Base | vCPU†/Mem | Contents |
 |---|---|---|---|---|
 | `base` | `lambda-ci` | Ubuntu arm64 + runner agent | 2 / 4 GB | git, curl, common toolchain |
 | `docker` | `lambda-ci-docker` | base + dockerd (DinD) | 4 / 8 GB | Docker daemon, buildx. **Privileged** — built with `additionalOsCapabilities=ALL` + root entrypoint (ADR-020) |
-| `node` | `lambda-ci-node` | base + Node LTS + pnpm | 2 / 4 GB | Node, package managers |
-| `custom-*` | per-repo | per-repo Dockerfile | configurable | repo-specified |
+| `node` | `lambda-ci-node` | base + Node LTS + pnpm | 2 / 4 GB | Node, package managers; tool-cache prebaked |
+| `python` | `lambda-ci-python` | base + CPython 3.12 | 2 / 4 GB | Python + pip; tool-cache prebaked |
+| `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
+| `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
+| `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **must pass validation before it is routable** (ADR-032/031) |
+
+† descriptive only — see the sizing note above.
+
+The standard language set is deliberately **one toolchain per flavor** (ADR-031): a combined
+"kitchen sink" image would make every job pay every toolchain's snapshot cost. `dotnet` is
+intentionally **not** shipped — it is the largest candidate with no verified consumer; it
+belongs on the custom-flavor path until a real workload justifies it.
 
 Flavors are defined once globally; a repo may **override** the mapping (e.g. `ubuntu-latest`
-→ `node`) or register a `custom-*` image. Mapping stored in DynamoDB `FlavorMap`.
+→ `node`) or an operator may register a `custom-*` image for their installation. The
+built-in catalog is `microvm/flavors.json`, compiled into the Lambdas at build time; custom
+flavors live in the shared table and are **merged over** the built-in set, which always wins
+a name collision (ADR-032). Per-repo label mapping is stored in DynamoDB `FlavorMap`.
+
+### Prebaked runner tool cache
+
+The wall-clock win for a language flavor is not the runtime binary — it is skipping the
+`setup-*` download. Each tool-cache flavor installs its toolchain into the layout
+`@actions/tool-cache` `find()` expects, so `actions/setup-node@v4`, `actions/setup-python@v5`,
+`actions/setup-java@v4` and `actions/setup-go@v5` resolve from cache:
+
+```
+${RUNNER_TOOL_CACHE}/<toolName>/<version>/<arch>/      # the toolchain
+${RUNNER_TOOL_CACHE}/<toolName>/<version>/<arch>.complete   # SIBLING marker file
+```
+
+Three details are load-bearing, and each is pinned by `test/image-content.test.mjs`:
+
+1. **`RUNNER_TOOL_CACHE` must be set explicitly** in the image. A self-hosted runner does
+   *not* default to `/opt/hostedtoolcache`: `actions/runner` resolves `RUNNER_TOOL_CACHE ??
+   RUNNER_TOOLSDIRECTORY ?? AGENT_TOOLSDIRECTORY ?? agent.ToolsDirectory` and otherwise falls
+   back to `_work/_tool`. Unset, the prebaked cache sits in a directory the agent never reads.
+2. **The `.complete` marker is a sibling of the arch directory**, not a file inside it.
+   Without it `find()` returns empty and every job re-downloads — silently, at full speed,
+   with no error.
+3. **`toolName` is a case-sensitive path**: `Python` (capitalized), `node`, `go`, and
+   `Java_<distribution>_<packageType>` (e.g. `Java_temurin_jdk`). The Java version directory
+   stores `21.0.12+8` as `21.0.12-8`, because a `+` in `JAVA_HOME` breaks some toolchains.
+
+The `python` flavor installs via the **upstream `setup.sh`** shipped inside the
+`actions/python-versions` tarball — the same artifact `setup-python` downloads — rather than
+reimplementing the layout, symlinks and marker by hand.
+
+`rust` has **no** tool-cache entry on purpose: there is no first-party `setup-rust` that reads
+the runner tool cache; the ecosystem standard (`dtolnay/rust-toolchain`) drives **rustup**,
+which manages its own store. That flavor bakes rustup + the pinned toolchain onto `PATH`
+instead. A job that needs an *additional* rustup toolchain must set a writable `RUSTUP_HOME`
+(the baked one is root-owned and world-readable).
+
+Toolchain versions are **pinned** in each Dockerfile so rebuilds are reproducible — which
+makes them a patch-day obligation: a stale pin ages silently.
 
 ## Image build & snapshot pipeline
 
@@ -63,16 +123,28 @@ microvm/
   Dockerfile.base        # base flavor
   Dockerfile.docker      # DinD flavor
   Dockerfile.node        # node flavor
+  Dockerfile.python      # python flavor
+  Dockerfile.java        # java flavor
+  Dockerfile.go          # go flavor
+  Dockerfile.rust        # rust flavor
   bootstrap/             # runner bootstrap scripts (shared)
   flavors.json           # flavor catalog: name, dockerfile, size, arch, label
 scripts/build-images.ts  # build + snapshot + publish ARNs
 ```
 
+Each `Dockerfile.<flavor>` is **self-contained** — `create-microvm-image` builds a snapshot
+from a single staged `Dockerfile` in an uploaded context, not from a registry base image, so a
+flavor cannot `FROM` the base flavor. The base layers are duplicated in each file and
+`test/image-content.test.mjs` guards that they stay consistent (identical runner agent
+version, run-hook wiring, arm64-only artifacts).
+
 Build steps (per flavor):
 
 1. Stage the flavor's `Dockerfile.<flavor>` as the build `Dockerfile`; zip `microvm/`.
 2. Upload to the microVM **code bucket**.
-3. Trigger microVM image build → snapshot.
+3. Trigger microVM image build → snapshot, requesting the catalog's memory floor
+   (`--resources minimumMemoryInMiB`) and `--cpu-configurations architecture=ARM_64`, plus
+   `--additional-os-capabilities` for flavors that declare `osCapabilities` (ADR-020/028).
 4. Poll to completion; prune old image versions (keep last N).
 5. Write the resulting **image ARN** to config (SSM/DynamoDB): `MICROVM_IMAGE_ARN_<FLAVOR>`.
 
@@ -165,8 +237,30 @@ Transitions written to DynamoDB `Run` rows for the UI.
 The biggest reference win was baking dependencies into the snapshot:
 
 - Pre-install language toolchains, common CLIs, and **Docker layers** into the flavor image → saves minutes/build.
+- Populate the **runner tool cache** so `setup-*` actions short-circuit rather than downloading a toolchain the image already has (see § Prebaked runner tool cache).
 - Optional job-level cache: mount an EFS/S3-backed cache dir for package managers (Phase 3).
 - Warm pool intentionally out of scope for v1 (single-use only); revisit if boot latency proves painful.
+
+## Custom flavors (bring-your-own image)
+
+An operator may register a `custom-*` flavor for their own installation (ADR-032). Storage is
+a per-installation row in the shared table (`pk=INSTALL#<id>`, `sk=FLAVOR#<name>`) — the
+static JSON is compiled into the Lambdas and stays read-only. Resolution composes
+`builtin ++ custom`; built-in names always win, and a custom flavor that collides with one is
+rejected at registration rather than silently shadowing (or being shadowed by) it. Custom
+flavors are visible only to their own installation, and their requested memory is bounds-checked
+against the region's microVM quota with the derived per-minute rate surfaced before save.
+
+A custom flavor is **not routable until it has demonstrably run a job** (ADR-033):
+`pending → validating → valid | invalid(reason)`, and only `valid` flavors are selectable in a
+`FlavorMap`/`defaultFlavor` or resolvable from a label. Validation is (1) static checks — arm64,
+image ARN resolves and is readable by the provisioner, capabilities drawn from the closed
+vocabulary (`docker`, `node`, `python`, `java`, `go`, `rust`), memory within quota — and (2) a
+**smoke run**: one microVM launched from the image with a synthetic JIT-registered runner that
+must register, execute a trivial job, and self-terminate through the hook broker. Static checks
+alone are not sufficient evidence: the `docker` flavor built fine, published its ARN and routed
+correctly while failing *every* job because nothing could start `dockerd` (ADR-019/020).
+Re-validation is automatic when the image ARN changes and manually triggerable from the console.
 
 ## Constraints
 

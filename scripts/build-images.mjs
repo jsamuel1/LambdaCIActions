@@ -191,6 +191,17 @@ function buildFlavor(flavor, ctx) {
     JSON.stringify({ cloudWatch: { logGroup: `/aws/lambda/microvms/lca-${ENV}-${flavor.name}` } }),
   ];
 
+  // Resource + CPU shape (ADR-030). The GA API accepts memory ONLY:
+  // `--resources minimumMemoryInMiB` (single-element list) and `--cpu-configurations
+  // architecture=ARM_64` (whose only permitted value is ARM_64 — there is no vCPU knob, and
+  // `run-microvm` has no sizing parameter at all, so a VM's shape is fixed by its image).
+  // Before this was sent, every flavor was built at the service default and the catalog's
+  // memoryMb was inert — including for the 8 GB flavors.
+  if (flavor.memoryMb) {
+    commonArgs.push('--resources', `minimumMemoryInMiB=${flavor.memoryMb}`);
+  }
+  commonArgs.push('--cpu-configurations', 'architecture=ARM_64');
+
   // Extra OS capabilities for the guest (ADR-020). Default microVMs boot with an empty
   // capability set, a read-only /sys and no writable cgroup hierarchy, so a rootful Docker
   // daemon cannot start ("failed to start daemon: Devices cgroup isn't mounted"). Flavors

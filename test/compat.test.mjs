@@ -120,6 +120,39 @@ test('needs_docker on docker flavor does not warn', () => {
   assert.equal(r.messages.length, 0);
 });
 
+// 8b. The docker-capable set is DERIVED from the catalog, so adding language flavors must not
+// accidentally make one of them count as docker-capable (which would suppress a real warning).
+test('needs_docker warns on every new language flavor', () => {
+  for (const flavor of ['python', 'java', 'go', 'rust', 'node']) {
+    const r = analyzeCompat(job({ needs_docker: true }), res(flavor));
+    assert.equal(r.level, 'warn', `${flavor} should warn`);
+    assert.equal(r.messages[0].code, 'docker-missing', `${flavor} code`);
+    assert.match(r.messages[0].text, new RegExp(`'${flavor}'`), `${flavor} named in message`);
+  }
+});
+
+test('an unknown flavor name is still treated as docker-less', () => {
+  // Fail loud rather than silently assuming a daemon exists.
+  const r = analyzeCompat(job({ needs_docker: true }), res('not-a-flavor'));
+  assert.equal(r.messages[0].code, 'docker-missing');
+});
+
+test('a language job with no docker need is clean on its own flavor', () => {
+  for (const flavor of ['python', 'java', 'go', 'rust']) {
+    const r = analyzeCompat(job({ runs_on: ['self-hosted', `lambda-ci-${flavor}`] }), res(flavor));
+    assert.equal(r.level, 'ok', `${flavor} should be ok`);
+    assert.equal(r.messages.length, 0);
+  }
+});
+
+test('an arm64-hinted language job stays ok; an x86-hinted one is risk', () => {
+  // The compat gate is arch-driven, not flavor-driven — adding flavors must not change it.
+  assert.equal(analyzeCompat(job({ arch_hints: ['arm64'] }), res('rust')).level, 'ok');
+  const x86 = analyzeCompat(job({ arch_hints: ['x86_64'] }), res('rust'));
+  assert.equal(x86.level, 'risk');
+  assert.equal(x86.messages[0].code, 'x86-arch-hint');
+});
+
 // 9. multiple rules → worst level wins, all messages present.
 test('block + docker-missing folds to block with both messages', () => {
   const r = analyzeCompat(

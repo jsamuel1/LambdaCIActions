@@ -11,10 +11,47 @@ microvm/
   flavors.json            Flavor catalog (name, label, dockerfile, arch, size)
   Dockerfile.base         `base` flavor — Ubuntu arm64 + runner agent + run-hook
   Dockerfile.node         `node` flavor — base + Node.js LTS toolchain (npm/pnpm/yarn)
+  Dockerfile.python       `python` flavor — base + CPython 3.12 (arm64)
+  Dockerfile.java         `java` flavor — base + Eclipse Temurin JDK 21 LTS (aarch64)
+  Dockerfile.go           `go` flavor — base + pinned Go + cgo C toolchain
+  Dockerfile.rust         `rust` flavor — base + pinned Rust stable via rustup
   Dockerfile.docker       `docker` flavor — base + Docker engine (arm64, 4 vCPU / 8 GB)
   bootstrap/
     run-hook.mjs          Lifecycle-hook HTTP server (:8080): /run, /terminate, /healthz
 ```
+
+Each `Dockerfile.<flavor>` is **self-contained** and duplicates the base layers — a snapshot
+is built from one staged `Dockerfile` in an uploaded context, so a flavor cannot `FROM` the
+base flavor. Keep the shared layers in sync; `test/image-content.test.mjs` enforces the
+invariants that matter (same runner agent version, run-hook wiring, arm64-only artifacts).
+
+## Prebaked runner tool cache
+
+The `node`, `python`, `java` and `go` flavors install their toolchain into the runner tool
+cache so `actions/setup-*` resolves from cache instead of downloading:
+
+```
+${RUNNER_TOOL_CACHE}/<toolName>/<version>/<arch>/          # toolchain
+${RUNNER_TOOL_CACHE}/<toolName>/<version>/<arch>.complete  # SIBLING marker — required
+```
+
+Gotchas (all three are silent failures — the job just re-downloads at full speed):
+
+- **Set `RUNNER_TOOL_CACHE` in the image.** A self-hosted runner does not default to
+  `/opt/hostedtoolcache`; without the env var the agent uses `_work/_tool` and never sees the
+  prebaked cache.
+- **The `.complete` marker is a sibling of the arch dir**, not a file inside it.
+- **`toolName` is a case-sensitive path**: `Python`, `node`, `go`, `Java_temurin_jdk`. Java's
+  version dir uses `-` where the version uses `+` (`21.0.12-8`).
+
+`python` installs via the upstream `setup.sh` inside the `actions/python-versions` tarball —
+the same artifact `setup-python` downloads — rather than hand-rolling the layout.
+
+`rust` has no tool-cache entry: the Rust actions drive **rustup**, not the runner tool cache,
+so that flavor bakes rustup + the pinned toolchain onto `PATH` instead.
+
+Toolchain versions are pinned via `ARG` in each Dockerfile (reproducible rebuilds) — bump them
+deliberately on patch day.
 
 ## Boot model (ADR-012)
 
@@ -50,8 +87,14 @@ zips this directory, uploads it to the code bucket (from `ImageStack`),
 runs `create-microvm-image`, polls to `CREATED`, and publishes the image ARN to SSM at
 `/lca/<env>/config/image-arn-<flavor>`.
 
+Sizing (ADR-030): the build requests `--resources minimumMemoryInMiB=<memoryMb>` from the
+catalog plus `--cpu-configurations architecture=ARM_64`. **Memory is the only requestable
+dimension** — the GA API has no vCPU knob and `run-microvm` takes no sizing parameter at all,
+so the catalog's `vcpu` is descriptive.
+
 ```sh
 npm run build:images -- --env dev --region us-west-2
 ```
 
-Add `--dry-run` to print the plan without calling AWS.
+Add `--dry-run` to print the plan without calling AWS. Build one flavor with
+`--flavor <name>`.

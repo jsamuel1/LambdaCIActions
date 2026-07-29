@@ -5,7 +5,9 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
  *
  * Resolution order (first match wins), per this slice (M3-S1):
  *   1. Repo FlavorMap override (DynamoDB)   — explicit `label → flavor`.
- *   2. Explicit LCA label                   — `lambda-ci`, `lambda-ci-node`, `lambda-ci-docker`
+ *   2. Explicit LCA label                   — `lambda-ci`, `lambda-ci-node`, `lambda-ci-docker`,
+ *                                             `lambda-ci-python`, `lambda-ci-java`,
+ *                                             `lambda-ci-go`, `lambda-ci-rust`
  *                                             (most-specific label wins).
  *   3. Signal-based upgrade                 — if the job needs a capability the resolved flavor
  *                                             lacks (e.g. Docker), upgrade to the smallest flavor
@@ -26,7 +28,13 @@ export interface FlavorDef {
   name: string;
   label: string;
   arch: string;
+  /**
+   * DESCRIPTIVE only — the GA `lambda-microvms` API exposes no vCPU request (ADR-030).
+   * Indicates the shape a flavor is intended for, and acts as the primary sort key when
+   * picking the smallest flavor with a capability. Never present this as provisioned capacity.
+   */
   vcpu: number;
+  /** Requested at image-build time as `--resources minimumMemoryInMiB` (ADR-030). */
   memoryMb: number;
   capabilities: string[];
   /**
@@ -40,6 +48,32 @@ export interface FlavorDef {
 
 const FLAVORS: FlavorDef[] = (flavorsCatalog as { flavors: FlavorDef[] }).flavors;
 const DEFAULT_FLAVOR = 'base';
+
+/**
+ * The closed capability vocabulary (ADR-033 static gate). Capabilities are not free-form
+ * strings: they drive `smallestWithCapability` upgrades here and the `docker-missing` compat
+ * message in `src/ingest/compat.ts`, so an unrecognized capability would be silently inert.
+ * Registering a custom flavor validates against this list; adding a capability means teaching
+ * the resolver and/or the compat gate what it means.
+ */
+export const KNOWN_CAPABILITIES: readonly string[] = [
+  'docker',
+  'node',
+  'python',
+  'java',
+  'go',
+  'rust',
+];
+
+/** True when every capability in `caps` is drawn from the known vocabulary. */
+export function areCapabilitiesKnown(caps: readonly string[]): boolean {
+  return caps.every((c) => KNOWN_CAPABILITIES.includes(c));
+}
+
+/** Every flavor in the catalog (read-only view; the JSON is compiled in at build time). */
+export function allFlavors(): readonly FlavorDef[] {
+  return FLAVORS;
+}
 
 /** Signals extracted from a job (spec 03 § parsing model → step_signals). */
 export interface JobSignals {

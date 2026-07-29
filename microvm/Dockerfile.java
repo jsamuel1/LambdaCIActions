@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# Dockerfile.node — the `node` flavor microVM image (docs/specs/02-microvm-runners.md,
-# capabilities: ["node"]). Base runner + a full Node.js LTS toolchain (node/npm/pnpm/yarn)
-# preinstalled so Node jobs skip per-run toolchain setup.
+# Dockerfile.java — the `java` flavor microVM image (docs/specs/02-microvm-runners.md,
+# capabilities: ["java"]). Base runner + a pinned Temurin JDK LTS, installed INTO the runner
+# tool cache so `actions/setup-java@v4` resolves from cache instead of downloading (ADR-031).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -15,9 +15,11 @@ FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
-# Pinned Node LTS for the tool-cache entry (must be full semver — tool-cache skips a version
-# dir that isn't valid semver). Keep the major in sync with NODE_MAJOR.
-ARG NODE_VERSION=24.18.0
+# Pinned Eclipse Temurin JDK 21 (LTS), aarch64. JDK_BUILD is the Adoptium build number:
+# the release is `jdk-<JDK_VERSION>+<JDK_BUILD>`. Bump deliberately (ADR-031) — `latest`
+# would make image rebuilds non-reproducible.
+ARG JDK_VERSION=21.0.12
+ARG JDK_BUILD=8
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_DIR=/opt/actions-runner \
     RUN_HOOK_PORT=8080 \
@@ -39,34 +41,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# --- node flavor extras -----------------------------------------------------------------
-# Enable Corepack (ships with Node) and pin pnpm + yarn so Node jobs get a ready toolchain.
-# arm64 wheels/binaries are used throughout (no x86 assumptions). NODE_MAJOR tracks the
-# current Node LTS (24) so the latest npm/pnpm/yarn install cleanly — do not pin to an EOL
-# major; the toolchain's `@latest`/`@stable` now require a modern Node runtime.
-RUN corepack enable \
-    && corepack prepare pnpm@latest --activate \
-    && corepack prepare yarn@stable --activate \
-    && npm install -g npm@latest \
-    && node --version && npm --version && pnpm --version && yarn --version
-
-# Prebake the runner tool cache so `actions/setup-node@v4` short-circuits instead of
-# re-downloading Node on every job (ADR-031). Without this the apt-installed Node above only
-# helps jobs that use no setup-node step at all. setup-node caches under toolName `node` and
-# arch `arm64` (base-distribution.ts `findVersionInHostedToolCacheDirectory` →
-# tc.find('node', spec, translateArchToDistUrl(arch)); arm64 passes through unchanged), and
-# the entry root holds the CONTENTS of the release tarball — hence --strip-components=1.
-RUN mkdir -p ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64 \
-    && curl -fsSL -o /tmp/node.tar.gz \
-       "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.gz" \
-    && tar -xzf /tmp/node.tar.gz -C ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64 --strip-components=1 \
+# --- java flavor extras -----------------------------------------------------------------
+# Lay the JDK out exactly where setup-java looks: it reads
+# ${RUNNER_TOOL_CACHE}/Java_<distribution>_<packageType>/<version>/<arch> (base-installer.ts
+# `toolcacheFolderName` + util.ts `getToolcachePath`), so the folder name is
+# `Java_temurin_jdk` and the arch is `arm64` (os.arch() on Graviton).
+#
+# The version DIRECTORY uses `-` where the JDK version uses `+` (setup-java stores
+# `21.0.12+8` as `21.0.12-8` and maps it back when scanning, because a `+` in JAVA_HOME
+# breaks some toolchains). Getting this wrong means findAllVersions() skips the entry — it
+# must also be valid semver or it is ignored outright.
+RUN mkdir -p ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64 /tmp/jdk \
+    && curl -fsSL -o /tmp/jdk.tar.gz \
+       "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-${JDK_VERSION}%2B${JDK_BUILD}/OpenJDK21U-jdk_aarch64_linux_hotspot_${JDK_VERSION}_${JDK_BUILD}.tar.gz" \
+    && tar -xzf /tmp/jdk.tar.gz -C /tmp/jdk --strip-components=1 \
+    && cp -R /tmp/jdk/. ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64/ \
     # The completion marker is a SIBLING of the arch dir, not a file inside it
     # (@actions/tool-cache `_completeToolPath`). Without it the entry is invisible and every
-    # job re-downloads Node.
-    && touch ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64.complete \
-    && rm /tmp/node.tar.gz \
+    # job re-downloads the JDK.
+    && touch ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64.complete \
+    && rm -rf /tmp/jdk /tmp/jdk.tar.gz \
     # Fail the BUILD (not a job) if the layout is wrong.
-    && ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64/bin/node --version
+    && ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64/bin/java -version
+# Make the cached JDK the default so plain `java`/`javac`/`mvn` steps work with no setup-*
+# action at all. setup-java sets these itself when it runs; these are the no-action defaults.
+ENV JAVA_HOME=/opt/hostedtoolcache/Java_temurin_jdk/21.0.12-8/arm64
+ENV PATH=${JAVA_HOME}/bin:$PATH
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.

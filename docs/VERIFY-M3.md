@@ -129,6 +129,14 @@ the images are rebuilt.
 | `node` (2/4) | 20 s | $0.0044/min | ≈ **$0.0015** |
 | `docker` (4/8) | 95 s | $0.0088/min | ≈ **$0.0139** |
 
+> **Correction (ADR-030, M5).** The vCPU/memory shapes above were never requested. `run-microvm`
+> has no sizing parameter and `create-microvm-image` accepts memory only
+> (`--resources minimumMemoryInMiB`, no vCPU knob) — and the build script passed neither at the
+> time of this run, so every flavor here was built at the **service default shape**. The
+> measured latencies and `dockerd` init times are real; the "4 vCPU / 8 GB" attribution and the
+> rate-per-shape arithmetic are not established. The build script now sends the catalog's memory
+> floor, which re-baselines these numbers — re-measure rather than carrying them forward.
+
 Snapshot boot is not the dominant term for the small flavors (single-digit seconds to the
 in-guest hook); agent handshake and (for `docker`) daemon init are.
 
