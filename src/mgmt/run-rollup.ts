@@ -323,6 +323,23 @@ export function jobRowKey(repoId: number, runId: number, jobId: number): string 
 }
 
 /**
+ * Identity of the window a paged read belongs to: its repo + status filter.
+ *
+ * "Load older" is asynchronous, and a filter change resets the appended pages, their
+ * completeness flags, the cursor and the seam. Without an identity check, a response that was
+ * requested under the OLD filter lands after that reset and appends foreign rows plus a cursor
+ * from the old index into the new window — the screen would then show another repo's jobs under
+ * the selected repo, and further paging would walk the wrong index. The caller stamps each
+ * request with this key and discards the response when the key no longer matches.
+ *
+ * The two fields are joined with a separator that cannot occur in either part (`repo` is a
+ * number, `status` one of the fixed `RunStatus` names), so distinct filters cannot collide.
+ */
+export function pageQueryKey(repo: number | undefined, status: RunStatus | ''): string {
+  return `${repo ?? ''}|${status}`;
+}
+
+/**
  * Server-side completeness verdict for the unfiltered **merged** run view.
  *
  * That view queries every status index for `limit` rows, filters the union to the session's

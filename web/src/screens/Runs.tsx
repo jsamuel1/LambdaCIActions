@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, type Repo, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
-import { durationLabel, flavorLabel, groupRuns, headSeamIntact, jobRowKey, noSeam, seamAfterHop, startedAtLabel, windowComplete, type RunGroup, type SeamState } from '../rollup.js';
+import { durationLabel, flavorLabel, groupRuns, headSeamIntact, jobRowKey, noSeam, pageQueryKey, seamAfterHop, startedAtLabel, windowComplete, type RunGroup, type SeamState } from '../rollup.js';
 import {
   Badge,
   CopyId,
@@ -79,6 +79,19 @@ export function Runs({
    */
   const [seam, setSeam] = useState<SeamState>(noSeam);
   const [loadingMore, setLoadingMore] = useState(false);
+  /**
+   * Which filter the appended pages belong to. "Load older" is async, so a response can land
+   * AFTER the operator changed the repo/status and the effect below reset the window. Applying
+   * it then would append the previous repo's jobs under the new filter and continue paging the
+   * old index; the response is discarded instead (`pageQueryKey`).
+   *
+   * Held in a REF as well, because the in-flight `loadOlder` closure captured the old
+   * `repoFilter`/`status` — comparing those against themselves would always match. The ref is
+   * the one value that reads as of when the response lands.
+   */
+  const queryKey = pageQueryKey(repoFilter, status);
+  const queryKeyRef = useRef(queryKey);
+  queryKeyRef.current = queryKey;
   const [moreErr, setMoreErr] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
 
@@ -135,6 +148,8 @@ export function Runs({
     // by the time the response lands. `seamAfterHop` keeps the first hop's value.
     const last = headRows[headRows.length - 1];
     const headTailKey = last ? jobRowKey(last.repoId, last.runId, last.jobId) : undefined;
+    // The filter this request belongs to, read before the await for the same reason.
+    const requestedFor = queryKey;
     try {
       const page = await api.runs({
         repo: repoFilter,
@@ -142,6 +157,10 @@ export function Runs({
         limit: PAGE,
         cursor: nextCursor,
       });
+      // The operator changed the filter while this was in flight: the window it belongs to no
+      // longer exists, so its rows, completeness flag, cursor and seam are all meaningless
+      // here. Dropping it is safe — the new filter refetched its own head page.
+      if (queryKeyRef.current !== requestedFor) return;
       // Every hop that moved the cursor counts, including one that appended no rows: a repo
       // page can come back empty with a live cursor when `collectVisible` walked its page
       // budget through other tenants' rows, and the head page is no longer adjacent to the
@@ -151,8 +170,11 @@ export function Runs({
       setOlderComplete((prev) => prev && (page.complete ?? false));
       setCursor(page.nextCursor);
     } catch (e) {
+      // A failure that belongs to an abandoned window must not surface on the new one either.
+      if (queryKeyRef.current !== requestedFor) return;
       setMoreErr(e instanceof Error ? e.message : String(e));
     } finally {
+      // `loadingMore` is shared by both windows: the button must not stay stuck on "Loading…".
       setLoadingMore(false);
     }
   }

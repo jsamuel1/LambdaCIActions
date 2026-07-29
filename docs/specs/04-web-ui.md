@@ -106,6 +106,12 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   regardless.
 - **Expansion survives polling** — expansion is component state keyed `repoId-runId`, so the
   5 s poll re-renders rows without collapsing an open run.
+- **A filter change abandons in-flight paging.** "Load older" is asynchronous while the repo /
+  status controls reset the appended pages, the cursor and the seam, so a response can land in a
+  window it does not belong to. Each request is stamped with its filter identity
+  (`pageQueryKey`) and dropped on arrival if the filter has moved on — otherwise the previous
+  repo's jobs would be appended under the newly selected repo and further paging would walk the
+  old index.
 - **No cost column.** Cost belongs on a Reports screen with a time window and grouping, not on
   a history list; `formatCost` / `flavorRatePerMinute` remain for Run detail and Reports (M5).
 - **Repo filter** is an in-screen picker that fans out over the session's installations

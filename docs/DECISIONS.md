@@ -916,6 +916,10 @@ every run row built from it is partial by construction.
   history on every poll was rejected: it would multiply
   the 5 s read cost by the number of pages walked to fix a case the operator resolves by
   reloading.
+  Paging is also asynchronous while the filter controls reset the window, so each older-page
+  request carries its filter identity (`pageQueryKey`) and is discarded if the repo/status
+  changed before it landed — applying it would append the previous repo's jobs under the newly
+  selected one and continue paging the old index.
   Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor
   while history remains, so folding exhaustion into the server's flag would leave such a window
   permanently partial no matter how far the operator paged. The dropped-rows half in turn cannot

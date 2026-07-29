@@ -15,6 +15,7 @@ import {
   seamAfterHop,
   noSeam,
   jobRowKey,
+  pageQueryKey,
   mergedResponseComplete,
   repoResponseComplete,
   groupRuns,
@@ -309,6 +310,23 @@ test('jobRowKey identifies the idempotency triple', () => {
   assert.equal(jobRowKey(1, 100, 2), '1-100-2');
   // Distinct triples never collide into one key (row de-dup + seam identity depend on it).
   assert.notEqual(jobRowKey(1, 100, 2), jobRowKey(1, 1002, 0));
+});
+
+test('a paged read is identified by the filter it was requested under', () => {
+  // A "Load older" response that lands after the operator changed the filter must be
+  // discarded, or it appends the old repo's jobs and the old index's cursor into the new
+  // window. The screen compares this key at request time against the live one on arrival.
+  assert.equal(pageQueryKey(7, ''), pageQueryKey(7, ''));
+  assert.notEqual(pageQueryKey(7, ''), pageQueryKey(8, ''));
+  assert.notEqual(pageQueryKey(7, ''), pageQueryKey(undefined, ''));
+  assert.notEqual(pageQueryKey(7, ''), pageQueryKey(7, 'failed'));
+  assert.notEqual(pageQueryKey(undefined, 'failed'), pageQueryKey(undefined, 'completed'));
+});
+
+test('a repo id cannot be confused with a status by the window key', () => {
+  // The separator must not be producible by either half, or two different filters could
+  // share a key and a stale page would be applied as if it belonged.
+  assert.notEqual(pageQueryKey(1, 'queued'), pageQueryKey(undefined, '1|queued'));
 });
 
 test('the merged view is complete only when no index truncated and nothing was sliced', () => {
