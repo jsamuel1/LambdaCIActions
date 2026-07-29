@@ -129,3 +129,71 @@ test('Object-prototype label names are not adopt labels on ANY surface', () => {
     );
   }
 });
+
+// ---- architecture refusal (arm64 only, ADR-007) -------------------------------
+//
+// microVMs are Graviton-only. GitHub matches a runner to a job on ADVERTISED LABELS ALONE, so
+// passing `x64` through to `generate-jitconfig` mints an arm64 runner that CLAIMS to be x86 —
+// and the job then EXECUTES on the wrong architecture instead of waiting for a runner that
+// could serve it. That is worse than the stranded-job failure the windows/macos refusal
+// prevents, so it is refused by the same gate, above the explicit-label rule.
+const X86 = ['x64', 'x86', 'x86_64', 'x86-64', 'amd64', 'i386', 'i686'];
+
+test('an x86 architecture label is refused in every mode', () => {
+  for (const arch of X86) {
+    for (const mode of ['label', 'adopt', undefined]) {
+      // …alongside an EXPLICIT LCA label: a mistake in the workflow, not consent.
+      const explicit = decideClaim({
+        jobLabels: ['self-hosted', 'linux', arch, 'lambda-ci'],
+        claimedLabels: CLAIMED,
+        mode,
+      });
+      assert.equal(explicit.claim, false, `${arch} claimed in ${mode} mode via explicit label`);
+      assert.match(explicit.reason, new RegExp(arch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+    }
+    // …and mixed with an adoptable hosted label in adopt mode.
+    const adopt = decideClaim({
+      jobLabels: ['ubuntu-latest', arch],
+      claimedLabels: CLAIMED,
+      mode: 'adopt',
+    });
+    assert.equal(adopt.claim, false, `[ubuntu-latest, ${arch}] claimed in adopt mode`);
+  }
+});
+
+test('arch refusal is case-insensitive and matches whole tokens only', () => {
+  assert.equal(
+    decideClaim({ jobLabels: ['self-hosted', 'X64', 'lambda-ci'], claimedLabels: CLAIMED, mode: 'label' }).claim,
+    false,
+  );
+  // arm64/aarch64 are true of us — never refused.
+  for (const ours of ['arm64', 'ARM64', 'aarch64']) {
+    assert.equal(
+      decideClaim({ jobLabels: ['self-hosted', ours, 'lambda-ci'], claimedLabels: CLAIMED, mode: 'label' }).claim,
+      true,
+      `${ours} must still claim`,
+    );
+  }
+  // A custom label that merely CONTAINS an arch token is not an arch assertion.
+  for (const custom of ['x64-cache-warmer', 'amd64builder', 'my-i386-runner']) {
+    assert.equal(
+      decideClaim({ jobLabels: ['self-hosted', custom, 'lambda-ci'], claimedLabels: CLAIMED, mode: 'label' }).claim,
+      true,
+      `${custom} must not be read as an arch label`,
+    );
+  }
+});
+
+test('the rewrite planner agrees with the claim gate about x86 labels', () => {
+  // If the planner rewrote an x86 job, the result would be a selector `decideClaim` refuses
+  // AND that GitHub-hosted can no longer serve (we added `self-hosted`) — a job queued forever.
+  const targets = rewriteTargets([
+    { id: 'ok', runs_on: ['ubuntu-latest'] },
+    { id: 'x86', runs_on: ['ubuntu-latest', 'x64'] },
+    { id: 'amd', runs_on: ['ubuntu-latest', 'amd64'] },
+  ]);
+  assert.deepEqual(
+    targets.map((t) => t.jobId),
+    ['ok'],
+  );
+});

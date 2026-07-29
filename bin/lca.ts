@@ -37,7 +37,7 @@ const ambientAccount = process.env.CDK_DEFAULT_ACCOUNT;
 let account: string | undefined;
 let region: string;
 if (ambientAccount || envLocal) {
-  const target = validateTarget(envLocal, { region: requestedRegion });
+  const target = validateTarget(envLocal, { region: requestedRegion, env: envName });
   if (ambientAccount && ambientAccount !== target.account) {
     throw new Error(
       `Deploy-target mismatch: credentials resolve to account ${ambientAccount}, but .env.local ` +

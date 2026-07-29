@@ -1,8 +1,11 @@
 // JIT runner labels + mint-failure classification (ADR-030, src/provision/labels.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   MAX_JIT_LABELS,
+  IncompatibleRunnerLabelError,
   NoRunnerLabelsError,
   TooManyRunnerLabelsError,
   classifyMintFailure,
@@ -143,4 +146,31 @@ test('a 422 without a hosted label gets the generic permanent message', () => {
   const c = classifyMintFailure('GitHub /x failed HTTP 422: Validation Failed', ['lambda-ci']);
   assert.equal(c.kind, 'permanent');
   assert.match(c.reason, /rejected by GitHub/);
+});
+
+// ---- second gate: architecture refusal before the mint (ADR-030) --------------
+//
+// `decideClaim` refuses x86 selectors at ingest, but the mint is the point where an arm64
+// runner would ACQUIRE the false `x64` label. GitHub matches on advertised labels alone, so a
+// replayed message (queued before the ingest gate existed) would otherwise run the job on the
+// wrong architecture. Two independent gates, like the rewrite capability.
+test('provision refuses to mint a runner advertising an x86 arch label', () => {
+  const src = fs.readFileSync(
+    path.join(import.meta.dirname, '..', 'src', 'provision', 'handler.ts'),
+    'utf8',
+  );
+  const refusal = src.indexOf('IncompatibleRunnerLabelError(bad.label, bad.why)');
+  assert.ok(refusal > 0, 'pre-mint arch refusal not found');
+  // It must precede the mint, or the label is already registered.
+  assert.ok(refusal < src.indexOf('generateJitConfig({'), 'refusal must precede the mint');
+  // …and it shares ingest's predicate, so the two gates cannot drift apart.
+  assert.match(src, /import \{ incompatibleRunnerLabel \} from '\.\.\/ingest\/adopt\.js'/);
+});
+
+test('an arch refusal is classified permanent, not retried into the DLQ', () => {
+  const err = new IncompatibleRunnerLabelError('x64', 'requires an x86 runner');
+  const c = classifyMintFailure(err.message, ['self-hosted', 'x64', 'lambda-ci']);
+  assert.equal(c.kind, 'permanent');
+  assert.match(c.reason, /x64/);
+  assert.match(c.reason, /arm64 Linux/);
 });

@@ -5,7 +5,10 @@ Operational procedures for a deployed environment. Companion docs:
 [specs/05-infrastructure](specs/05-infrastructure.md) (topology, IAM, observability).
 
 Every command assumes `.env.local` pins the intended account+region (ADR-018) and that
-`AWS_PROFILE` resolves there. `<env>` is `dev` or `prod`.
+`AWS_PROFILE` resolves there. `<env>` is `dev` or `prod`. Set **`LCA_DEPLOY_ENV`** in each
+checkout's pin as well: with it, a command whose `-c env=`/`--env` disagrees with the pinned
+environment is refused before any AWS call, so a prod-selected deploy cannot land in the dev
+account (and vice versa). One checkout per environment is the intended shape.
 
 ## Contents
 - [Know your environment](#know-your-environment)

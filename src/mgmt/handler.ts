@@ -548,6 +548,9 @@ async function listRunsRoute(
   q: Record<string, string | undefined>,
 ): Promise<Reply> {
   const limit = parseLimit(q.limit);
+  // One `now` for the whole response so every row's live-cost estimate is measured against the
+  // same instant (and so `.map(toRunView)` can't accidentally pass the array INDEX as `now`).
+  const now = new Date();
   const visible = (runs: RunRecord[]): RunRecord[] =>
     runs.filter((r) => canAdminInstallation(session, r.installationId));
 
@@ -576,7 +579,7 @@ async function listRunsRoute(
     // history remains, and the client ANDs every page's flag, so walking to the end could
     // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
     return json(200, {
-      runs: page.runs.map(toRunView),
+      runs: page.runs.map((r) => toRunView(r, now)),
       nextCursor: page.nextCursor ?? null,
       complete: repoResponseComplete(status !== undefined),
     });
@@ -595,7 +598,7 @@ async function listRunsRoute(
     // A status-filtered page holds only the jobs IN that status, so a run folded from it is
     // partial by construction however far the cursor got.
     return json(200, {
-      runs: page.runs.map(toRunView),
+      runs: page.runs.map((r) => toRunView(r, now)),
       nextCursor: page.nextCursor ?? null,
       complete: false,
     });
@@ -615,7 +618,7 @@ async function listRunsRoute(
   // filled with another tenant's rows looks short while this operator's sibling jobs sit
   // unread past the boundary (ADR-029).
   return json(200, {
-    runs: merged.map(toRunView),
+    runs: merged.map((r) => toRunView(r, now)),
     nextCursor: null,
     complete: mergedResponseComplete({
       anyIndexTruncated: pages.some((p) => p.nextCursor !== undefined),

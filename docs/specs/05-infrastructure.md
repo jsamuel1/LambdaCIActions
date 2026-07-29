@@ -232,14 +232,18 @@ jobs (per-second vs per-minute). Real win is **latency** + **VPC access**, not r
 
 - `dev` and `prod` as separate AWS accounts (or at least separate regions), each with its
   own GitHub App + secrets. One App per account+region in v1 (see [01](01-github-app.md) OQ-3).
-  This is an **operational convention, not a code-enforced invariant**: ADR-018 verifies that a
-  checkout's `.env.local` pin matches the ambient credentials, but nothing stops two env names
-  from pinning the same account. Resource names are `env`-suffixed (`lca-<env>-*`,
-  `/lca/<env>/...`), so co-tenanting would not collide — it would merely forfeit the isolation
-  the separation exists for.
+  ADR-018 verifies that a checkout's `.env.local` pin matches the ambient credentials, and — when
+  the pin sets **`LCA_DEPLOY_ENV`** — that the selected env (`-c env=`, `build:images --env`,
+  `app:create --env`) matches the environment the account is pinned for. Without that key the
+  account+region pin still applies but the env is unconstrained, so **two env names can still
+  pin the same account**: co-tenanting remains an operational choice rather than an error, and
+  resource names are `env`-suffixed (`lca-<env>-*`, `/lca/<env>/...`) so it would not collide —
+  it would merely forfeit the isolation the separation exists for. Setting `LCA_DEPLOY_ENV` in
+  both checkouts is what makes the separation code-enforced.
 - CDK context selects the environment (`-c env=dev|prod`); the deploy target account+region is
-  **pinned** in `.env.local` and verified against the real caller identity (ADR-018). Secrets
-  are namespaced under `/lca/<env>/...`.
+  **pinned** in `.env.local` and verified against the real caller identity (ADR-018), which also
+  refuses a selected env that contradicts `LCA_DEPLOY_ENV`. Secrets are namespaced under
+  `/lca/<env>/...`.
 - Per-environment knobs live in `lib/env-config.ts` (ADR-033) — log retention, log removal
   policy, reserved concurrency, run-row retention, alarm thresholds, tracing, and the
   auto-rewrite flag:

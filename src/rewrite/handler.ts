@@ -7,6 +7,8 @@ import {
   getBranchSha,
   getFileContent,
   getRepoDefaultBranch,
+  githubErrorStatus,
+  isNoCommitsBetween,
   putFileOnBranch,
 } from '../shared/github-app.js';
 import { getRepo } from '../shared/install-store.js';
@@ -165,10 +167,21 @@ async function rewriteOne(req: RewriteRequest): Promise<RewriteOutcome> {
     // the branch exists — on a first run with no candidates we never created one.
     let open = existingSha
       ? await findOpenPullRequest({ ...creds, branch }).catch((err) => {
-          // Best-effort: the outcome is already "no change needed", and failing to decorate it
-          // with a link must not turn a successful no-op into an SQS retry.
-          console.error(JSON.stringify({ msg: 'rewrite PR lookup failed', error: errMsg(err) }));
-          return undefined;
+          // A 404 here is "no such repo/branch visible" and any other status is a real API
+          // failure. Either way we cannot conclude "no PR is open", and the recovery below
+          // would then try to open a SECOND pull request for a branch that may already have
+          // one. Only a genuinely empty result list may be read as "none open", so rethrow
+          // and let SQS retry (the request has changed nothing at this point).
+          console.error(
+            JSON.stringify({
+              msg: 'rewrite PR lookup failed',
+              repo: req.repoFullName,
+              branch,
+              status: githubErrorStatus(err),
+              error: errMsg(err),
+            }),
+          );
+          throw err;
         })
       : undefined;
 
@@ -196,18 +209,28 @@ async function rewriteOne(req: RewriteRequest): Promise<RewriteOutcome> {
         open = { url: pr.url, number: pr.number };
         prCreated = pr.created;
       } catch (err) {
-        // 422 is GitHub's "No commits between <base> and <branch>" — the branch's earlier
-        // rewrite was merged (or is otherwise identical to base), so there is genuinely no PR
-        // to open and deleting the stale branch IS the right advice. Anything else is a real
-        // failure to report.
+        // ONLY GitHub's "No commits between <base> and <head>" 422 is benign: the branch's
+        // earlier rewrite was merged (or is identical to base), so there is genuinely no PR to
+        // open and telling the operator to delete the stale branch IS the right advice.
+        //
+        // Everything else is a real failure and must NOT be reported as a no-op: a 403 means
+        // the App lacks `pull_requests:write`, a 429/secondary-rate-limit means retry later, a
+        // 5xx means GitHub is unwell, and any other 422 is a validation problem we do not
+        // understand. Swallowing those acknowledged the SQS message and told the operator to
+        // DELETE the branch that still holds their un-PR'd rewrite. Rethrow so the message
+        // retries and ultimately DLQs visibly.
+        const status = githubErrorStatus(err);
         console.error(
           JSON.stringify({
             msg: 'rewrite PR open on an existing branch failed',
             repo: req.repoFullName,
             branch,
+            status,
+            benign: isNoCommitsBetween(err),
             error: errMsg(err),
           }),
         );
+        if (!isNoCommitsBetween(err)) throw err;
       }
     }
 
@@ -279,9 +302,9 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * Whether a GitHub helper failure is a 404. `githubJson` throws
- * `GitHub <path> failed HTTP 404: …`, so the status is only available as text — matched on the
- * `HTTP 404` marker the same way `ensureBranch` does for its "branch does not exist" probe.
+ * Whether a GitHub helper failure is a 404. `githubJson` throws a `GithubApiError` whose
+ * message keeps the `HTTP 404` marker, so the text match still holds across a bundle boundary
+ * where `instanceof` would not.
  */
 function isNotFound(err: unknown): boolean {
   return err instanceof Error && err.message.includes('HTTP 404');

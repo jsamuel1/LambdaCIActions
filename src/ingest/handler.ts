@@ -3,7 +3,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { getParam } from '../shared/ssm.js';
 import { verifySignature } from '../shared/hmac.js';
 import { toProvisionRequest, dedupeKey, isRepoOptedOut } from './filter.js';
-import { decideClaim } from './adopt.js';
+import { decideClaim, unreachableRunnerGroup } from './adopt.js';
 import { planInstallation } from './install-filter.js';
 import { matchJobAnalysis } from './job-match.js';
 import {
@@ -191,6 +191,35 @@ async function handleWorkflowJob(
       workflowName: wf.workflow_job.workflow_name,
       jobName: wf.workflow_job.name,
     });
+    // Runner-GROUP gate (ADR-030). `runs-on: { group: X, labels: [...] }` requires a runner
+    // that is in group X *and* carries the labels; we mint into the repo-level default group
+    // only (`runner_group_id: 1`, spec 01 OQ-1). The `workflow_job` webhook carries just the
+    // labels, so the group is invisible at claim time unless the stored analysis holds it —
+    // and claiming such a job strands it forever (GitHub assigns it to nobody we control,
+    // while our added participation stops it going anywhere else).
+    //
+    // Evidence-based, like the compat gate: refuse only when the matched analysis NAMES a
+    // non-default group. With no analysis we cannot see the group at all, so the pre-existing
+    // fail-open posture stands (recorded as the residual gap in ADR-030).
+    const group = match?.job?.runner_group;
+    if (unreachableRunnerGroup(group)) {
+      console.log(
+        JSON.stringify({
+          msg: 'job not claimed — runs-on names a non-default runner group',
+          repo: wf.repository.full_name,
+          job: wf.workflow_job.name,
+          workflow: match?.workflow.path,
+          group,
+        }),
+      );
+      return json(202, {
+        ok: true,
+        claimed: false,
+        reason:
+          `runs-on requests runner group '${group}'; LambdaCIActions registers runners in the ` +
+          'repository default group only, so this job would never be assigned to one',
+      });
+    }
     if (match?.compat && !match.compat.eligible) {
       console.log(
         JSON.stringify({

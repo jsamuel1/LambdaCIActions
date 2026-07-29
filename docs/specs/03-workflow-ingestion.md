@@ -104,6 +104,8 @@ Resolution order (first match wins):
    |---|---|
    | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`, `ubuntu-20.04` | `base`, then signal-upgraded to `docker` when the job's steps need it |
    | `windows-*`, `macos-*` | **never claimed, in any mode** — refused in the claim gate *above* the explicit-label rule, so even `runs-on: [windows-latest, lambda-ci]` stays on GitHub-hosted (compat fails open, so it cannot be the only guard) |
+   | `x64`, `x86`, `x86_64`, `x86-64`, `amd64`, `i386`, `i686` | **never claimed, in any mode** — same gate, same reason, but the failure it prevents is worse: GitHub matches a runner on *advertised labels alone*, so registering a Graviton runner carrying `x64` would make the job **run on the wrong architecture** instead of staying queued. Exact tokens only (`x64-cache-warmer` is a custom label, not an arch claim); `arm64`/`aarch64` are ours and always allowed. Refused a second time pre-mint in Provision (ADR-030) |
+   | `runs-on: { group: X, labels: […] }` where `X` ≠ `default` | **not claimed** — GitHub dispatches only to a runner that is in the requested group *and* carries the labels, and we register into the repo-level default group (`runner_group_id: 1`). The `workflow_job` webhook carries no group, so this is decided from the stored analysis's `runner_group`; with no analysis the group is invisible and the gate fails open, as the compat gate does |
    | `self-hosted` + a non-LCA label | not claimed — that is someone else's runner fleet |
 
    This settles OQ-3 as **signal-driven**: the label itself says nothing about what the job

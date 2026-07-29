@@ -92,6 +92,29 @@ export class TooManyRunnerLabelsError extends Error {
 }
 
 /**
+ * Thrown when a job's `runs-on` demands an architecture/OS we cannot serve.
+ *
+ * `decideClaim` refuses these at ingest (ADR-030), so reaching here means the claim gate was
+ * bypassed — a replayed SQS message from before the gate existed, or a hand-crafted request.
+ * Refusing again pre-mint is the point: GitHub matches runners on advertised labels ALONE, so
+ * minting a JIT config that carries `x64` produces a Graviton runner claiming to be x86, and
+ * the job then EXECUTES on the wrong architecture rather than waiting for a runner that could
+ * serve it. That is a worse failure than a stranded VM, so it must never depend on a single
+ * gate.
+ */
+export class IncompatibleRunnerLabelError extends Error {
+  constructor(label: string, why: string) {
+    super(
+      `this job's runs-on carries '${label}', which ${why}: LambdaCIActions runs arm64 Linux ` +
+        'microVMs only (ADR-007), and GitHub matches runners on advertised labels alone, so ' +
+        'registering it would run the job on the wrong architecture. ' +
+        "Fix: remove the label, or leave this job on a runner that provides it.",
+    );
+    this.name = 'IncompatibleRunnerLabelError';
+  }
+}
+
+/**
  * Normalize a job's `runs-on` into the label set the JIT runner should advertise: trimmed,
  * de-duplicated case-insensitively (GitHub labels are case-insensitive), and unresolved matrix
  * expressions dropped (`${{ matrix.os }}` is not a label — sending it verbatim would create
@@ -174,7 +197,8 @@ export function classifyMintFailure(
   // retried forever.
   if (
     message.includes('runs-on resolves to no usable runner label') ||
-    message.includes('runs-on carries more runner labels than we can register')
+    message.includes('runs-on carries more runner labels than we can register') ||
+    message.includes('LambdaCIActions runs arm64 Linux')
   ) {
     return { kind: 'permanent', reason: message };
   }

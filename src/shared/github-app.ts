@@ -46,6 +46,48 @@ interface CachedToken {
 }
 const tokenCache = new Map<number, CachedToken>();
 
+/**
+ * A non-2xx response from the GitHub REST API, carrying the status as DATA.
+ *
+ * The message is deliberately unchanged (`GitHub <path> failed HTTP <status>: <body>`) because
+ * several callers still match on that text (`isNotFound`, `classifyMintFailure`, the
+ * `ensureBranch` existence probe). The typed `status` exists so the auto-rewrite λ can tell a
+ * benign "no commits between base and head" 422 apart from a 403 (missing
+ * `pull_requests:write`), a 429 (rate limited) or a 5xx — those must fail loudly and retry
+ * rather than be reported to the operator as "nothing to do" (ADR-031).
+ */
+export class GithubApiError extends Error {
+  readonly status: number;
+  readonly responseText: string;
+  readonly responseBody: unknown;
+  constructor(path: string, status: number, responseText: string, responseBody?: unknown) {
+    super(`GitHub ${path} failed HTTP ${status}: ${responseText}`);
+    this.name = 'GithubApiError';
+    this.status = status;
+    this.responseText = responseText;
+    this.responseBody = responseBody;
+  }
+}
+
+/** The HTTP status of a GitHub API failure, or undefined when it was not an API response. */
+export function githubErrorStatus(err: unknown): number | undefined {
+  if (err instanceof GithubApiError) return err.status;
+  // Errors that crossed a module/bundle boundary lose `instanceof`; fall back to the marker.
+  const m = err instanceof Error ? /failed HTTP (\d{3})\b/.exec(err.message) : null;
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Whether a 422 is GitHub's "No commits between <base> and <head>" — the ONE PR-open failure
+ * that genuinely means there is no pull request to open (the head branch is already merged
+ * into, or identical to, the base).
+ */
+export function isNoCommitsBetween(err: unknown): boolean {
+  if (githubErrorStatus(err) !== 422) return false;
+  const text = err instanceof Error ? err.message : String(err);
+  return /no commits between/i.test(text);
+}
+
 async function githubJson<T>(
   path: string,
   init: { method?: string; token: string; tokenType: 'Bearer' | 'token'; body?: unknown },
@@ -69,7 +111,7 @@ async function githubJson<T>(
     throw new Error(`GitHub ${path} returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
   }
   if (res.status >= 400) {
-    throw new Error(`GitHub ${path} failed HTTP ${res.status}: ${text.slice(0, 300)}`);
+    throw new GithubApiError(path, res.status, text.slice(0, 300), body);
   }
   return { status: res.status, body };
 }
@@ -270,7 +312,7 @@ export async function getFileContent(params: {
   const token = await getInstallationToken(params.appId, params.pem, params.installationId);
   const query = params.ref ? `?ref=${encodeURIComponent(params.ref)}` : '';
   const { body } = await githubJson<{ content?: string; encoding?: string; sha: string }>(
-    `/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}${query}`,
+    `/repos/${params.owner}/${params.repo}/contents/${encodeContentPath(params.path)}${query}`,
     { token, tokenType: 'token' },
   );
   if (body.encoding !== 'base64' || typeof body.content !== 'string') {
@@ -324,6 +366,19 @@ export async function getRepoDefaultBranch(params: {
  */
 function encodeRefPath(ref: string): string {
   return ref.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * Percent-encode a repository file path for the contents API, per SEGMENT.
+ *
+ * `encodeURI` is wrong here: it deliberately leaves `#` and `?` unescaped, so a workflow
+ * legitimately named `release#arm.yml` would be sent as a URL fragment (silently dropped
+ * from the request path) and `release?arm.yml` would start a query string — the read 404s
+ * and is misreported as a deleted workflow, and the write targets the wrong resource.
+ * Encode each segment and rejoin on `/`, which must stay a separator.
+ */
+function encodeContentPath(filePath: string): string {
+  return filePath.split('/').map(encodeURIComponent).join('/');
 }
 
 /**
@@ -414,7 +469,7 @@ export async function putFileOnBranch(params: {
   message: string;
 }): Promise<void> {
   const token = await getInstallationToken(params.appId, params.pem, params.installationId);
-  await githubJson(`/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}`, {
+  await githubJson(`/repos/${params.owner}/${params.repo}/contents/${encodeContentPath(params.path)}`, {
     method: 'PUT',
     token,
     tokenType: 'token',

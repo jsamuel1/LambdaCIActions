@@ -15,6 +15,10 @@ import {
   ensurePullRequest,
   findOpenPullRequest,
   getBranchSha,
+  getFileContent,
+  githubErrorStatus,
+  isNoCommitsBetween,
+  putFileOnBranch,
   _clearTokenCache,
 } from '../dist/src/shared/github-app.js';
 import { rewritePrBody } from '../dist/src/mgmt/rewrite.js';
@@ -315,4 +319,101 @@ test('the rewrite gates admit only the exact enabling value, not anything truthy
   );
   assert.match(src, /process\.env\.REWRITE_ENABLED === 'true'/);
   assert.match(src, /repo\?\.rewriteEnabled !== true/);
+});
+
+// ---- structured API errors: only ONE 422 is benign ---------------------------
+//
+// The λ's no-edit recovery path opens a PR for a branch that already carries a rewrite (the
+// state it lands in when the commits succeeded and only the PR call failed). That catch used to
+// swallow EVERY failure and report `nothing-to-do`, whose reason tells the operator to DELETE
+// the branch holding their un-PR'd rewrite. Only GitHub's "No commits between …" 422 means
+// there is genuinely no PR to open; a 403 (App lacks `pull_requests:write`), a 429/secondary
+// rate limit and a 5xx must fail loudly so SQS retries and the request ultimately DLQs.
+test('githubErrorStatus exposes the HTTP status of an API failure', async () => {
+  routes.set('GET /repos/octo/repo/pulls', { status: 403, body: { message: 'Resource not accessible by integration' } });
+  const err = await findOpenPullRequest({ ...AUTH, branch: BRANCH }).then(
+    () => null,
+    (e) => e,
+  );
+  assert.ok(err, 'a 403 must reject');
+  assert.equal(githubErrorStatus(err), 403);
+  assert.equal(err.status, 403);
+  // The legacy message shape is load-bearing: `isNotFound` and `classifyMintFailure` match it.
+  assert.match(err.message, /failed HTTP 403/);
+});
+
+test('only GitHub\'s "no commits between" 422 counts as a benign PR-open failure', async () => {
+  const cases = [
+    { status: 422, message: 'Validation Failed: No commits between main and lambda-ci-actions/adopt-labels-dev', benign: true },
+    { status: 422, message: 'Validation Failed: base branch does not exist', benign: false },
+    { status: 403, message: 'Resource not accessible by integration', benign: false },
+    { status: 403, message: 'You have exceeded a secondary rate limit', benign: false },
+    { status: 429, message: 'Too Many Requests', benign: false },
+    { status: 500, message: 'Server Error', benign: false },
+    { status: 502, message: 'Bad gateway', benign: false },
+  ];
+  for (const c of cases) {
+    routes.set('GET /repos/octo/repo/pulls', { body: [] });
+    routes.set('POST /repos/octo/repo/pulls', { status: c.status, body: { message: c.message } });
+    const err = await ensurePullRequest({ ...AUTH, branch: BRANCH, base: 'main', title: 't', body: 'b' }).then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err, `HTTP ${c.status} must reject`);
+    assert.equal(githubErrorStatus(err), c.status);
+    assert.equal(
+      isNoCommitsBetween(err),
+      c.benign,
+      `HTTP ${c.status} "${c.message}" benign should be ${c.benign}`,
+    );
+  }
+});
+
+test('the recovery path rethrows every PR failure except the benign 422', () => {
+  const src = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'rewrite', 'handler.ts'),
+    'utf8',
+  );
+  // The no-op recovery must rethrow anything that is not the one benign 422 …
+  assert.match(src, /if \(!isNoCommitsBetween\(err\)\) throw err;/);
+  // … and the open-PR LOOKUP must not conclude "no PR is open" from a failed call, or the
+  // recovery below would open a SECOND pull request for a branch that already has one.
+  const lookup = src.indexOf('rewrite PR lookup failed');
+  assert.ok(lookup > 0, 'PR lookup catch not found');
+  assert.match(src.slice(lookup, lookup + 400), /throw err;/);
+});
+
+// ---- contents API path encoding ---------------------------------------------
+//
+// `encodeURI` deliberately leaves `#` and `?` unescaped, so a workflow named
+// `release#arm.yml` was sent as a URL FRAGMENT (dropped from the request path entirely) and
+// `release?arm.yml` started a query string. The read then 404s and the λ misreports the
+// workflow as deleted; the write targets the wrong resource.
+test('workflow paths with #, ?, %, spaces and Unicode are encoded per segment', async () => {
+  const paths = [
+    '.github/workflows/release#arm.yml',
+    '.github/workflows/release?arm.yml',
+    '.github/workflows/100%-cov.yml',
+    '.github/workflows/build ci.yml',
+    '.github/workflows/ビルド.yml',
+  ];
+  for (const p of paths) {
+    calls.length = 0;
+    _clearTokenCache();
+    const expected = `/repos/octo/repo/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
+    routes.set(`GET ${expected}`, {
+      body: { content: Buffer.from('name: x\n').toString('base64'), encoding: 'base64', sha: 'blob1' },
+    });
+    const got = await getFileContent({ ...AUTH, path: p });
+    assert.equal(got.sha, 'blob1', `read failed for ${p}`);
+    const read = calls.find((c) => c.method === 'GET' && c.path.startsWith('/repos/octo/repo/contents/'));
+    // `#`/`?` must be percent-encoded IN THE PATH, never split off as fragment/query.
+    assert.equal(read.path, expected, `wrong request path for ${p}`);
+    assert.equal(read.search, '', `${p} must not leak a query string`);
+
+    routes.set(`PUT ${expected}`, { status: 201, body: { commit: { sha: 'c1' } } });
+    await putFileOnBranch({ ...AUTH, branch: BRANCH, path: p, content: 'name: y\n', sha: 'blob1', message: 'm' });
+    const write = calls.find((c) => c.method === 'PUT');
+    assert.equal(write.path, expected, `wrong write path for ${p}`);
+  }
 });

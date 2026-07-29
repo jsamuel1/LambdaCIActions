@@ -56,3 +56,102 @@ test('a mode change re-scans the repo so stored routes stop being stale', () => 
   // Best-effort: the config write already succeeded, so a failed enqueue must not 5xx it.
   assert.match(patch, /\.catch\(/);
 });
+
+// ---- runner groups (ADR-030) --------------------------------------------------
+//
+// `runs-on: { group: X, labels: [...] }` is a valid selector. GitHub dispatches a job only to
+// a runner that is in the requested GROUP *and* carries every requested label, and we register
+// JIT runners into the repo-level default group only (`runner_group_id: 1`, spec 01 OQ-1).
+//
+// The `workflow_job` webhook carries only the LABELS, so the group is invisible at claim time
+// unless the parsed analysis preserves it. Without that, adopt mode claimed a
+// `{ group: special, labels: [ubuntu-latest] }` job on the strength of `ubuntu-latest`, minted
+// a runner in the default group, and the job waited forever — newly reachable in M5 because
+// adopt mode claims the hosted label with no LCA label present anywhere.
+test('the parser preserves the runner group from the object form', async () => {
+  const { parseWorkflow } = await import('../dist/src/ingest/workflow-parser.js');
+  const wf = parseWorkflow(
+    '.github/workflows/ci.yml',
+    [
+      'name: ci',
+      'on: push',
+      'jobs:',
+      '  grouped:',
+      '    runs-on:',
+      '      group: special',
+      '      labels: [ubuntu-latest]',
+      '  plain:',
+      '    runs-on: ubuntu-latest',
+      '  arrayform:',
+      '    runs-on: [self-hosted, lambda-ci]',
+    ].join('\n'),
+  );
+  const byId = Object.fromEntries(wf.jobs.map((j) => [j.id, j]));
+  // The labels still come through (LCA routing labels can live under `labels`) …
+  assert.deepEqual(byId.grouped.runs_on, ['ubuntu-latest']);
+  // … and the group is recorded separately, because it is a routing REQUIREMENT, not a label.
+  assert.equal(byId.grouped.runner_group, 'special');
+  // Non-object forms have no group.
+  assert.equal(byId.plain.runner_group, null);
+  assert.equal(byId.arrayform.runner_group, null);
+});
+
+test('ingest refuses to claim a job that names a non-default runner group', () => {
+  const ingestSrc = fs.readFileSync(path.join(ROOT, 'src', 'ingest', 'handler.ts'), 'utf8');
+  const gate = ingestSrc.indexOf('runs-on names a non-default runner group');
+  assert.ok(gate > 0, 'runner-group gate not found in ingest');
+  // It reads the group off the MATCHED analysis (the webhook cannot carry it) …
+  assert.match(ingestSrc, /match\?\.job\?\.runner_group/);
+  // … refuses anything that is not the default group, via the SHARED predicate every other
+  // group-aware call site uses …
+  assert.match(ingestSrc, /unreachableRunnerGroup\(group\)/);
+  // … and returns unclaimed rather than enqueuing.
+  assert.match(ingestSrc.slice(gate, gate + 900), /claimed: false/);
+  // The gate must sit BEFORE the enqueue that hands the job to Provision (the LAST
+  // SendMessageCommand in the file; the earlier one belongs to a different route).
+  assert.ok(
+    gate < ingestSrc.lastIndexOf('SendMessageCommand'),
+    'group gate must precede the provision enqueue',
+  );
+});
+
+test('provision mints into the repo-level default group only', () => {
+  // The refusal above is only correct while this stays true: if we ever registered into a
+  // requested group, the claim gate would have to resolve the group id instead of refusing.
+  const gh = fs.readFileSync(path.join(ROOT, 'src', 'shared', 'github-app.ts'), 'utf8');
+  assert.match(gh, /runner_group_id: 1/);
+});
+
+test('every predicate that predicts a claim excludes a non-default group', async () => {
+  // Ingest refuses the claim, so the console's `adoptCandidate` count and the rewrite planner's
+  // target list must agree — otherwise RepoDetail advertises jobs adopt mode always refuses,
+  // and the rewrite PR edits a customer workflow for a job that still cannot run.
+  const { unreachableRunnerGroup } = await import('../dist/src/ingest/adopt.js');
+  const { rewriteTargets } = await import('../dist/src/mgmt/rewrite.js');
+  const { toWorkflowView } = await import('../dist/src/mgmt/views.js');
+
+  assert.equal(unreachableRunnerGroup('special'), true);
+  assert.equal(unreachableRunnerGroup('default'), false);
+  assert.equal(unreachableRunnerGroup('Default'), false);
+  assert.equal(unreachableRunnerGroup(null), false);
+  assert.equal(unreachableRunnerGroup(undefined), false);
+  assert.equal(unreachableRunnerGroup('  '), false);
+
+  const jobs = [
+    { id: 'plain', name: null, runs_on: ['ubuntu-latest'], runner_group: null },
+    { id: 'grouped', name: null, runs_on: ['ubuntu-latest'], runner_group: 'special' },
+    { id: 'defaultgroup', name: null, runs_on: ['ubuntu-latest'], runner_group: 'default' },
+  ];
+  assert.deepEqual(
+    rewriteTargets(jobs).map((t) => t.jobId),
+    ['plain', 'defaultgroup'],
+  );
+  const view = toWorkflowView({
+    path: '.github/workflows/ci.yml',
+    name: 'ci',
+    parsed: { path: '.github/workflows/ci.yml', name: 'ci', on: ['push'], jobs },
+    updatedAt: '2026-07-01T00:00:00.000Z',
+  });
+  assert.equal(view.adoptCandidates, 2);
+  assert.equal(view.jobs.find((j) => j.id === 'grouped').adoptCandidate, false);
+});

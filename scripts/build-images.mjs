@@ -70,7 +70,10 @@ async function guardDeployTarget() {
     process.exit(1);
   }
   try {
-    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION });
+    // `env: ENV` binds the selected environment to the pin (ADR-033): publishing
+    // prod-namespaced image ARNs into the dev account is the same boundary violation as a
+    // cross-account deploy.
+    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION, env: ENV });
     REGION = target.region; // pin wins; all aws() calls get --region <pin>
   } catch (e) {
     console.error(`ERROR: ${e.message}`);

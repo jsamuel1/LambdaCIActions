@@ -22,6 +22,11 @@ import { spawnSync } from 'node:child_process';
 export interface DeployTarget {
   account: string;
   region: string;
+  /**
+   * The environment this account is pinned for (`dev` / `prod`), or undefined when the pin
+   * predates `LCA_DEPLOY_ENV`. See `validateTarget` for why it matters.
+   */
+  env?: string;
 }
 
 export interface EnvLocal {
@@ -61,7 +66,10 @@ export function loadEnvLocal(repoRoot: string): EnvLocal | null {
  * Returns the pinned target; throws with an actionable message otherwise.
  * Exported separately so it is unit-testable without fs/STS.
  */
-export function validateTarget(envLocal: EnvLocal | null, opts: { region?: string | null } = {}): DeployTarget {
+export function validateTarget(
+  envLocal: EnvLocal | null,
+  opts: { region?: string | null; env?: string | null } = {},
+): DeployTarget {
   if (!envLocal) {
     throw new Error(
       '.env.local is missing. Deploys require an explicit target pin (ADR-018).\n' +
@@ -70,6 +78,7 @@ export function validateTarget(envLocal: EnvLocal | null, opts: { region?: strin
   }
   const account = envLocal.LCA_DEPLOY_ACCOUNT;
   const pinnedRegion = envLocal.LCA_DEPLOY_REGION;
+  const pinnedEnv = envLocal.LCA_DEPLOY_ENV?.trim() || undefined;
   if (!/^\d{12}$/.test(account ?? '')) {
     throw new Error(
       `.env.local: LCA_DEPLOY_ACCOUNT must be a 12-digit AWS account id (got "${account ?? ''}").`,
@@ -80,13 +89,34 @@ export function validateTarget(envLocal: EnvLocal | null, opts: { region?: strin
       `.env.local: LCA_DEPLOY_REGION must be a region like us-west-2 (got "${pinnedRegion ?? ''}").`,
     );
   }
+  if (pinnedEnv && !/^(dev|prod)$/.test(pinnedEnv)) {
+    throw new Error(
+      `.env.local: LCA_DEPLOY_ENV must be 'dev' or 'prod' (got "${pinnedEnv}").`,
+    );
+  }
+  // Bind the SELECTED environment to the pinned one (ADR-033). `-c env=prod` /
+  // `build-images --env prod` chooses resource names, retention, concurrency and alarm
+  // thresholds; the account comes from a separate pin. With nothing tying the two together, a
+  // pin for the dev account plus `env=prod` deployed `lca-prod-*` resources — and published
+  // prod-namespaced image ARNs — into the DEV account, and the reciprocal was equally
+  // possible. dev and prod are separate ACCOUNTS by design (spec 05), so the pin is the only
+  // authority on which one this checkout may build.
+  if (pinnedEnv && opts.env && opts.env !== pinnedEnv) {
+    throw new Error(
+      `Deploy-env mismatch: command selected env "${opts.env}" but .env.local pins ` +
+        `LCA_DEPLOY_ENV=${pinnedEnv} (account ${account}).\n` +
+        `dev and prod are separate accounts (spec 05): deploying "${opts.env}" resources into ` +
+        `the ${pinnedEnv} account would cross the boundary.\n` +
+        `Fix: use a checkout whose .env.local pins ${opts.env}, or drop the env selector.`,
+    );
+  }
   if (opts.region && opts.region !== pinnedRegion) {
     throw new Error(
       `Region mismatch: command requested "${opts.region}" but .env.local pins LCA_DEPLOY_REGION=${pinnedRegion}.\n` +
         'Drop the --region/-c region flag (the pin wins) or update .env.local deliberately.',
     );
   }
-  return { account, region: pinnedRegion };
+  return { account, region: pinnedRegion, ...(pinnedEnv ? { env: pinnedEnv } : {}) };
 }
 
 /** Resolve the ACTUAL caller account via STS (aws CLI). Throws on failure. */
@@ -113,13 +143,14 @@ export function stsCallerAccount(): string {
 export function assertDeployTarget(opts: {
   repoRoot: string;
   region?: string | null;
+  env?: string | null;
   dryRun?: boolean;
   getCaller?: () => string;
 }): DeployTarget | null {
-  const { repoRoot, region = null, dryRun = false, getCaller = stsCallerAccount } = opts;
+  const { repoRoot, region = null, env = null, dryRun = false, getCaller = stsCallerAccount } = opts;
   if (dryRun) return null;
   const envLocal = loadEnvLocal(repoRoot);
-  const target = validateTarget(envLocal, { region });
+  const target = validateTarget(envLocal, { region, env });
   if (envLocal && envLocal.AWS_PROFILE && !process.env.AWS_PROFILE) {
     process.env.AWS_PROFILE = envLocal.AWS_PROFILE;
   }
@@ -131,6 +162,6 @@ export function assertDeployTarget(opts: {
         'Switch AWS_PROFILE/credentials to the pinned account, or update .env.local deliberately.',
     );
   }
-  console.log(`✓ deploy target verified: account ${target.account}, region ${target.region}`);
+  console.log(`✓ deploy target verified: account ${target.account}, region ${target.region}${target.env ? `, env ${target.env}` : ''}`);
   return target;
 }

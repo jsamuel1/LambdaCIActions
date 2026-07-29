@@ -285,6 +285,26 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   those would bill wall-clock for compute that never existed and inflate the estimate exactly
   when provisioning is broken.
 
+  Two review fixes make the *per-run* figure agree with that:
+  - **The eligibility gate lives in the estimator, not the rollup.** It was applied only by
+    `summarizeCost`, so Run detail priced a job that never launched — the same page printing
+    “microVM: (not launched)” showed a non-zero estimated cost, and it disagreed with the
+    Dashboard total for the same job. Eligibility is now one predicate (`isCostEligible`) inside
+    `estimateCostUsd`, which both callers share, so the two cannot diverge again. The predicate
+    takes **two** signals, because `microvmId` alone is not sufficient in either direction:
+    `stampMicrovmId` is best-effort by design (ADR-019 — the VM is already up when it runs, and
+    a failed stamp must not abort the launch), so requiring it would silently drop real billable
+    runs; a **post-launch status** (`running` / `completed`) is therefore accepted as evidence
+    too. `failed` / `timed_out` are not: those are exactly the mint- and launch-failure rows
+    that carry a flavor but no VM.
+  - **A live run's estimate advances with `now`.** `updatedAt` is written only on a status
+    **transition**, so a job sitting in `running` kept reporting the seconds it took to *reach*
+    `running`: polling Run detail reprojected the same row and the figure was frozen, materially
+    understating active spend. A non-terminal row is now measured `createdAt → now` (terminal
+    rows stay pinned to `updatedAt`, since their billing window is closed), with `now` injected
+    so it is deterministic in tests and one instant per API response. It remains an upper bound
+    — OQ-5 is what would make it exact.
+
 ## Open questions
 
 - **OQ-4**: custom domain + ACM cert for the console (currently the CloudFront domain) — M5.

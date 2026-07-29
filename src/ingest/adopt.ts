@@ -64,6 +64,54 @@ export function nonLinuxHostedLabel(label: string): boolean {
   return l.startsWith('windows') || l.startsWith('macos');
 }
 
+/**
+ * Architecture labels that assert x86. Refused in EVERY mode for the same reason as the
+ * non-Linux labels: microVMs are Graviton-only (ADR-007), so `runs-on: [self-hosted, linux,
+ * x64, lambda-ci]` is a job that cannot run here.
+ *
+ * GitHub's runner matching is purely declarative — a runner is assigned a job when it
+ * advertises every requested label. Passing `x64` through to `generate-jitconfig` therefore
+ * mints an arm64 runner that CLAIMS to be x86, and the job executes on the wrong architecture
+ * instead of staying queued for a runner that could actually serve it. Refusing the claim
+ * leaves the job with GitHub-hosted / the repo's own x86 fleet, which is the correct outcome.
+ *
+ * Only exact arch tokens are listed. A substring test would catch unrelated custom labels
+ * (`x64-cache-warmer`), and `arm64`/`aarch64` are deliberately absent — those are true of us.
+ */
+const X86_ARCH_LABELS = new Set(['x64', 'x86', 'x86_64', 'x86-64', 'amd64', 'i386', 'i686']);
+
+/**
+ * Whether a `runs-on` label asserts an x86 architecture (case-insensitive, exact token).
+ *
+ * Exported for the same reason as `nonLinuxHostedLabel`: the auto-rewrite planner (ADR-031)
+ * must not add an LCA label to a job whose selector demands x86, because that produces a
+ * selector `decideClaim` refuses and GitHub-hosted can no longer serve — a job that queues
+ * forever.
+ */
+export function x86ArchLabel(label: string): boolean {
+  return X86_ARCH_LABELS.has(label.trim().toLowerCase());
+}
+
+/**
+ * Any label that makes a job unrunnable on an arm64 Linux microVM, in every mode.
+ * Returns the offending label (for the operator-facing reason) or undefined.
+ */
+export function incompatibleRunnerLabel(
+  labels: string[],
+): { label: string; why: string } | undefined {
+  for (const raw of labels) {
+    const l = raw.trim().toLowerCase();
+    if (!l) continue;
+    if (nonLinuxHostedLabel(l)) {
+      return { label: l, why: 'is not a Linux runner label' };
+    }
+    if (x86ArchLabel(l)) {
+      return { label: l, why: 'requires an x86 runner' };
+    }
+  }
+  return undefined;
+}
+
 /** Whether a single `runs-on` label is one adopt mode maps (case-insensitive). */
 export function isAdoptLabel(label: string): boolean {
   return ADOPT_LABELS.has(label.trim().toLowerCase());
@@ -84,6 +132,23 @@ export function adoptFlavorForLabel(label: string): string | undefined {
     : undefined;
 }
 
+/**
+ * Whether a parsed job's runner GROUP puts it out of reach.
+ *
+ * `runs-on: { group: X, labels: […] }` requires a runner that is in group X *and* carries the
+ * labels; we register JIT runners into the repo-level default group only
+ * (`runner_group_id: 1`, spec 01 OQ-1). Ingest refuses to claim such a job (ADR-030), so every
+ * predicate that PREDICTS a claim — the console's `adoptCandidate` count and the auto-rewrite
+ * planner's target list — has to agree, or the console advertises jobs adopt mode will always
+ * refuse and the rewrite PR edits a job that still cannot run.
+ *
+ * `null`/absent (any non-object `runs-on`) and an explicit `default` are fine.
+ */
+export function unreachableRunnerGroup(group: string | null | undefined): boolean {
+  const g = (group ?? '').trim().toLowerCase();
+  return g !== '' && g !== 'default';
+}
+
 /** How a job came to be claimed — recorded on the run + logged for support. */
 export type ClaimVia = 'label' | 'adopt';
 
@@ -99,11 +164,14 @@ export interface ClaimDecision {
  * Decide whether to claim a `workflow_job`, given the repo's onboarding mode.
  *
  * Precedence:
- *   1. **Non-Linux hosted labels are refused first, in every mode.** A `windows-latest` job
- *      cannot run on an arm64 Linux microVM, and claiming it strands the job — GitHub assigns
- *      it to us and then nothing can execute it. This must sit ABOVE the explicit-label rule:
- *      a job labelled `[windows-latest, lambda-ci]` is a mistake in the workflow, not consent,
- *      and the compat gate that would otherwise catch it fails open by design (ADR-030).
+ *   1. **Labels we cannot honor are refused first, in every mode.** A `windows-latest` job
+ *      cannot run on an arm64 Linux microVM, and neither can an `x64`/`amd64` one — claiming
+ *      either strands the job (GitHub assigns it to us and then nothing can execute it) or,
+ *      worse for the arch case, runs it on the wrong architecture, because GitHub matches
+ *      runners on advertised labels alone. This must sit ABOVE the explicit-label rule: a job
+ *      labelled `[windows-latest, lambda-ci]` or `[x64, lambda-ci]` is a mistake in the
+ *      workflow, not consent, and the compat gate that would otherwise catch it fails open by
+ *      design (ADR-030).
  *   2. An explicit LCA label wins over adopt mode (a repo in adopt mode that ALSO labels a job
  *      explicitly is honored as a `label` claim — the operator asked for it by name).
  *   3. Only then does adopt mode widen the net to standard hosted labels.
@@ -122,11 +190,11 @@ export function decideClaim(params: {
   const claims = new Set(params.claimedLabels.map((l) => l.trim().toLowerCase()).filter(Boolean));
 
   // Refuse anything that isn't arm64-Linux-shaped, in EVERY mode and before any claim rule.
-  const nonLinux = jobLabels.find(nonLinuxHostedLabel);
-  if (nonLinux) {
+  const bad = incompatibleRunnerLabel(jobLabels);
+  if (bad) {
     return {
       claim: false,
-      reason: `'${nonLinux}' is not a Linux runner label (LambdaCIActions runs arm64 Linux only)`,
+      reason: `'${bad.label}' ${bad.why} (LambdaCIActions runs arm64 Linux only)`,
     };
   }
 

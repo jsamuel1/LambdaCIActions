@@ -24,7 +24,7 @@
  * with a reason so the console can tell the operator what to hand-edit, instead of guessing
  * and corrupting a workflow.
  */
-import { isAdoptLabel, nonLinuxHostedLabel } from '../ingest/adopt.js';
+import { isAdoptLabel, incompatibleRunnerLabel, unreachableRunnerGroup } from '../ingest/adopt.js';
 import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
 
 interface FlavorLabel {
@@ -570,15 +570,15 @@ export function rewriteRunsOnValue(
     };
   }
 
-  // A MIXED selector (`[ubuntu-latest, windows-latest]`) must be refused too, even though it
-  // does carry an adoptable label. Rewriting it would keep the non-Linux label — and
-  // `decideClaim` refuses any job carrying one — while the added `self-hosted` stops
-  // GitHub-hosted runners taking it. The job would queue forever.
-  const nonLinux = labels.find((l) => nonLinuxHostedLabel(l));
-  if (nonLinux) {
+  // A MIXED selector (`[ubuntu-latest, windows-latest]`, `[ubuntu-latest, x64]`) must be
+  // refused too, even though it does carry an adoptable label. Rewriting it would keep the
+  // incompatible label — and `decideClaim` refuses any job carrying one — while the added
+  // `self-hosted` stops GitHub-hosted runners taking it. The job would queue forever.
+  const bad = incompatibleRunnerLabel(labels);
+  if (bad) {
     return {
       ok: false,
-      reason: `runs-on also targets '${nonLinux}', which LambdaCIActions never claims (arm64 Linux only); split the job or drop that label by hand`,
+      reason: `runs-on also targets '${bad.label}', which ${bad.why} — LambdaCIActions never claims it (arm64 Linux only); split the job or drop that label by hand`,
     };
   }
 
@@ -696,7 +696,7 @@ export function planFileRewrite(
  * defaulting to `base` — the same answer the resolver's adopt map gives.
  */
 export function rewriteTargets(
-  jobs: { id: string; runs_on: string[] }[],
+  jobs: { id: string; runs_on: string[]; runner_group?: string | null }[],
   routes: Record<string, { flavor: string }> = {},
 ): RewriteTarget[] {
   const out: RewriteTarget[] = [];
@@ -708,9 +708,14 @@ export function rewriteTargets(
     // adopt candidate here while `decideClaim` and `views.ts` (both Set-based) refused it. The
     // three predicates have to agree — the console states this count as fact.
     if (!lower.some((l) => isAdoptLabel(l))) continue;
-    // A job that also targets windows/macos is not a candidate: we never claim those, so
-    // rewriting it would strand it (see rewriteRunsOnValue).
-    if (lower.some((l) => nonLinuxHostedLabel(l))) continue;
+    // A job that also targets windows/macos, or demands x86, is not a candidate: we never
+    // claim those, so rewriting it would strand it (see rewriteRunsOnValue).
+    if (incompatibleRunnerLabel(lower)) continue;
+    // Nor is a job that names a non-default runner GROUP: Ingest refuses to claim it (we only
+    // register into the repo default group), so adding an LCA label would edit a customer's
+    // workflow for a job that still cannot run — and the file-level planner refuses the
+    // object-form selector anyway, so counting it here only overstated the preview.
+    if (unreachableRunnerGroup(job.runner_group)) continue;
     out.push({ jobId: job.id, flavor: routes[job.id]?.flavor ?? 'base' });
   }
   return out;

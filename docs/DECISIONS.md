@@ -299,6 +299,21 @@ convention, and one TS module shared via `dist/` avoids two divergent implementa
 .env.local` + editing two values (deliberate one-time friction). Dev/prod account
 separation (M5) becomes trivial: each checkout/env pins its own account.
 
+**M5 review fix — the pin also binds the ENVIRONMENT, not just the account.** The paragraph
+above was optimistic: `-c env=prod` / `--env prod` selected resource names, retention,
+concurrency and alarm thresholds, while the account came from an independent pin, and *nothing
+tied the two together*. A pin for the dev account plus `env=prod` therefore deployed
+`lca-prod-*` resources into the **dev** account, published prod-namespaced image ARNs to
+`/lca/prod/image-arn/*` there, and let `app:create --env prod` write GitHub App SecureStrings to
+`/lca/prod/github/*` in the wrong account — the reciprocal was equally possible. Since dev and
+prod are separate **accounts** by design (spec 05), the pin is the only authority on which
+environment a checkout may build. `.env.local` now also carries **`LCA_DEPLOY_ENV`** (`dev` |
+`prod`), and `validateTarget` refuses a command whose selected env contradicts it — before any
+STS call, in the CDK app and in both scripts. The key is **optional** so existing
+single-account checkouts keep working: with no `LCA_DEPLOY_ENV` there is no env claim to
+contradict, and only the account+region pin applies. Pinned by `test/deploy-env.test.mjs`,
+which also asserts each entrypoint actually passes its selector through.
+
 ## ADR-019 — Self-terminate via run-row readback (no in-guest microVM id source) (M3)
 **Status**: Accepted (v1) · amends [ADR-016](#adr-016) (teardown path)
 **Context**: The `/run` hook is supposed to call `terminate-microvm` on ITSELF at job end
@@ -1005,6 +1020,41 @@ the retry would never reach the mint again. The row stays `provisioning` and the
 backstops a run that never recovers. **Adopt mode must not be advertised as GA until a real
 adopt-mode job has been observed green end to end**; the M5 exit criterion is what closes this.
 `test/adopt.test.mjs` and `test/jit-labels.test.mjs` pin the behaviour either way.
+**Seventh-review fixes (two ways a claimed job could never run, or ran on the wrong machine)**:
+- **An x86 architecture label is refused, in every mode.** `decideClaim` refused only
+  `windows*`/`macos*`, so `runs-on: [self-hosted, linux, x64, lambda-ci]` was claimed and `x64`
+  was passed straight through to `generate-jitconfig`. GitHub matches a runner to a job on
+  **advertised labels alone**, so this registers a Graviton runner that CLAIMS to be x86 — and
+  the job is then assigned and **executes on the wrong architecture**, rather than staying
+  queued for a runner that could serve it. That is strictly worse than the stranded-job outcome
+  the non-Linux refusal prevents, and compat analysis does not contain it (x86 hints are `risk`,
+  and the analysis lookup fails open by design). The refusal is now a shared predicate,
+  `incompatibleRunnerLabel`, applied by `decideClaim`, by `rewriteTargets` /
+  `rewriteRunsOnValue` (rewriting such a job would produce a selector we refuse AND that
+  GitHub-hosted can no longer serve), by the console's `adoptCandidate` flag, and **again**
+  pre-mint in Provision (`IncompatibleRunnerLabelError`, classified permanent) so a message
+  queued before the gate existed cannot mint the false label. Exact tokens only
+  (`x64`, `x86`, `x86_64`, `x86-64`, `amd64`, `i386`, `i686`) — a substring test would catch
+  custom labels like `x64-cache-warmer`, and `arm64`/`aarch64` are true of us.
+- **A job naming a non-default runner group is not claimed.** `runs-on: { group: X, labels:
+  [...] }` requires a runner that is in group X **and** carries the labels. We register into the
+  repo-level default group only (`runner_group_id: 1`, spec 01 OQ-1), and the `workflow_job`
+  webhook carries only the labels — so adopt mode claimed a
+  `{ group: special, labels: [ubuntu-latest] }` job on the strength of `ubuntu-latest`, minted a
+  runner in the default group, and the job waited forever. This is newly reachable in M5
+  precisely because adopt mode claims the hosted label with no LCA label present anywhere. The
+  parser now records `runner_group` on the parsed job (kept separate from `runs_on`: a group is
+  not a label), and Ingest refuses the claim when the matched analysis names a group other than
+  `default`. Consistent with the compat gate, the refusal is **evidence-based**: with no stored
+  analysis the group is invisible and the pre-existing fail-open posture stands — the residual
+  gap, closed only by resolving group ids at mint time, which v1 does not do. The refusal is a
+  shared predicate (`unreachableRunnerGroup`) applied by the Ingest gate, by the console's
+  `adoptCandidate` flag and by `rewriteTargets`: a predicate that *predicts* a claim must agree
+  with the gate, or RepoDetail advertises jobs adopt mode always refuses and the rewrite PR edits
+  a customer workflow for a job that still cannot run.
+  `test/adopt.test.mjs`, `test/adopt-routing-consistency.test.mjs` and
+  `test/jit-labels.test.mjs` pin all of it.
+
 **Sixth-review fix**: a **rate-limit 403 is transient**, not permanent. `generate-jitconfig`
 is a POST, so GitHub's **secondary** rate limits meter it and GitHub refuses with **403**, not
 429 — for both the primary limit and the secondary/abuse limit. The blanket "non-429 4xx is permanent" rule therefore
@@ -1220,6 +1270,29 @@ remaining value empty, and `rewriteRunsOnValue` refuses it with a reason naming 
 labels are on the following lines — hand-edit) rather than the generic block-sequence message.
 Pinned by `test/rewrite.test.mjs`, which asserts the original file parses, the plan produces NO
 edits and NO `content`, and the skip reason names the operator action.
+
+**Twelfth-review fixes (the recovery path was reporting failures as success)**:
+- **Only GitHub's "No commits between…" 422 is benign.** The eighth-review fix taught the
+  no-edit path to OPEN a PR for a branch that already carries a rewrite — the state the λ lands
+  in when the commits succeeded and only the PR call failed. Its catch, however, swallowed
+  *every* failure and returned `nothing-to-do`, whose reason tells the operator to **delete the
+  branch holding their un-PR'd rewrite**. A 403 (App holds `contents:write` but not
+  `pull_requests:write` — exactly the case the comment cites), a rate-limit 403/429, a 5xx and
+  any other 422 were all reported as "nothing to do" while the SQS message was acknowledged, so
+  the operator had a `202`, no PR, and destructive advice. `githubJson` now throws a typed
+  `GithubApiError` carrying the **status** (the message text is unchanged — `isNotFound` and
+  `classifyMintFailure` match on it), and the recovery rethrows everything except a 422 whose
+  body says "no commits between", so a real failure retries and ultimately DLQs visibly. The
+  open-PR **lookup** also stopped swallowing: concluding "no PR is open" from a *failed* call
+  would let the recovery open a SECOND pull request for a branch that already has one.
+- **Workflow paths are encoded per segment.** Both the contents read and the write used
+  `encodeURI`, which deliberately leaves `#` and `?` unescaped. A legitimately named
+  `.github/workflows/release#arm.yml` was therefore sent as a URL **fragment** (dropped from the
+  request entirely) and `release?arm.yml` started a query string — the read 404s and the λ
+  misreports the workflow as deleted, and the write targets the wrong resource. Both now encode
+  each segment with `encodeURIComponent` and rejoin on `/`, matching what `encodeRefPath`
+  already did for branch names. `test/rewrite-pr-lookup.test.mjs` pins the status
+  discrimination, the rethrow, and the request paths for `#`, `?`, `%`, spaces and Unicode.
 
 **Eleventh-review fix**: both opt-in gates admit only the **exact** enabling value, and the
 gate ordering is pinned by a test. `validateRepoPatch` accepts only a boolean for

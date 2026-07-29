@@ -301,6 +301,15 @@ export interface ParsedJob {
    * `{ group, labels }` contributes its `labels` (where LCA routing labels live).
    */
   runs_on: string[];
+  /**
+   * The runner GROUP requested by the object form `runs-on: { group: X, labels: [...] }`,
+   * else null. Recorded because it is part of the job's routing requirement, not decoration:
+   * GitHub only dispatches a job to a runner that is BOTH in the requested group AND carries
+   * every requested label. We register JIT runners in the repo-level default group
+   * (`runner_group_id: 1`, spec 01 OQ-1), so a job naming any other group can never be served
+   * by us and must not be claimed (ADR-030) — it would queue forever.
+   */
+  runner_group: string | null;
   /** `job.container.image` (accepts string or `{ image }` object form); null if absent. */
   container: string | null;
   /** Keys of `job.services`; empty if none. */

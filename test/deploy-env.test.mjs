@@ -152,3 +152,79 @@ test('assertDeployTarget: shell AWS_PROFILE wins over pin', () => {
     else process.env.AWS_PROFILE = prev;
   }
 });
+
+// --- env binding (ADR-033: dev and prod are separate ACCOUNTS) ---------------
+//
+// `-c env=prod` / `--env prod` selects resource NAMES, retention, concurrency and alarm
+// thresholds; the account came from an independent pin. With nothing tying the two together, a
+// pin for the dev account plus `env=prod` deployed `lca-prod-*` resources — and published
+// prod-namespaced image ARNs, and wrote App secrets to `/lca/prod/github/*` — into the DEV
+// account. The reciprocal was equally possible. The pin is the only authority on which
+// environment a checkout may build.
+const PINNED_DEV = { ...GOOD, LCA_DEPLOY_ENV: 'dev' };
+
+test('validateTarget: pinned env is returned and matching selection passes', () => {
+  assert.deepEqual(validateTarget(PINNED_DEV, { env: 'dev' }), {
+    account: GOOD.LCA_DEPLOY_ACCOUNT,
+    region: GOOD.LCA_DEPLOY_REGION,
+    env: 'dev',
+  });
+});
+
+test('validateTarget: selecting prod against a dev pin is refused (and vice versa)', () => {
+  assert.throws(() => validateTarget(PINNED_DEV, { env: 'prod' }), /Deploy-env mismatch/);
+  assert.throws(
+    () => validateTarget({ ...GOOD, LCA_DEPLOY_ENV: 'prod' }, { env: 'dev' }),
+    /Deploy-env mismatch/,
+  );
+});
+
+test('validateTarget: a bogus pinned env is rejected outright', () => {
+  assert.throws(() => validateTarget({ ...GOOD, LCA_DEPLOY_ENV: 'staging' }), /must be 'dev' or 'prod'/);
+});
+
+test('validateTarget: an unpinned env stays permissive (legacy single-account setup)', () => {
+  // Omitting LCA_DEPLOY_ENV must not break existing checkouts — the account+region pin still
+  // applies, and no env claim exists to contradict.
+  const t = validateTarget(GOOD, { env: 'prod' });
+  assert.equal(t.env, undefined);
+  assert.equal(t.account, GOOD.LCA_DEPLOY_ACCOUNT);
+});
+
+test('assertDeployTarget: env mismatch is refused before STS is called', () => {
+  const repoRoot = tmpRepo(
+    `LCA_DEPLOY_ACCOUNT=${GOOD.LCA_DEPLOY_ACCOUNT}\nLCA_DEPLOY_REGION=${GOOD.LCA_DEPLOY_REGION}\nLCA_DEPLOY_ENV=dev\n`,
+  );
+  let stsCalls = 0;
+  assert.throws(
+    () =>
+      assertDeployTarget({
+        repoRoot,
+        env: 'prod',
+        getCaller: () => {
+          stsCalls += 1;
+          return GOOD.LCA_DEPLOY_ACCOUNT;
+        },
+      }),
+    /Deploy-env mismatch/,
+  );
+  assert.equal(stsCalls, 0, 'the pin must be validated before any AWS call');
+});
+
+test('every deploy-touching entrypoint binds its env selector to the pin', () => {
+  const root = path.join(import.meta.dirname, '..');
+  // cdk app
+  assert.match(
+    fs.readFileSync(path.join(root, 'bin', 'lca.ts'), 'utf8'),
+    /validateTarget\(envLocal, \{ region: requestedRegion, env: envName \}\)/,
+  );
+  // image build (publishes image ARNs under /lca/<env>/) and app:create (writes App secrets
+  // under /lca/<env>/github/) are the same boundary.
+  for (const script of ['build-images.mjs', 'create-github-app.mjs']) {
+    assert.match(
+      fs.readFileSync(path.join(root, 'scripts', script), 'utf8'),
+      /assertDeployTarget\(\{ repoRoot: REPO_ROOT, region: REGION, env: ENV \}\)/,
+      `${script} must bind its --env to the pin`,
+    );
+  }
+});

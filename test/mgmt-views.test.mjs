@@ -63,10 +63,65 @@ test('flavor rates come from the catalog footprint, every flavor priced', () => 
 });
 
 test('cost estimate scales with duration; unknown flavor has no estimate', () => {
-  const two = estimateCostUsd(run());
-  const four = estimateCostUsd(run({ updatedAt: '2026-07-01T00:04:00.000Z' }));
+  // A priced row needs BOTH a known flavor and evidence a microVM ran (`microvmId`).
+  const launched = (over = {}) => run({ microvmId: 'mv-1', ...over });
+  const two = estimateCostUsd(launched());
+  const four = estimateCostUsd(launched({ updatedAt: '2026-07-01T00:04:00.000Z' }));
   assert.ok(four > two);
-  assert.equal(estimateCostUsd(run({ flavor: undefined })), undefined);
+  assert.equal(estimateCostUsd(launched({ flavor: undefined })), undefined);
+});
+
+test('a launched VM whose microvmId stamp failed is still priced', () => {
+  // `stampMicrovmId` is best-effort by design (ADR-019): the VM is already up when it runs, and
+  // a failed stamp is logged and the launch continues. Requiring `microvmId` as the SOLE proof
+  // of compute therefore dropped real, billable runs out of both the per-run figure and the
+  // dashboard total — understating spend. A post-launch STATUS is the second signal.
+  for (const status of ['running', 'completed']) {
+    const stampFailed = run({ status, flavor: 'base', microvmId: undefined });
+    assert.ok(estimateCostUsd(stampFailed) > 0, `${status} must still be priced`);
+    assert.equal(summarizeCost([stampFailed]).jobs, 1);
+  }
+  // …but a pre-launch failure still has no evidence and stays unpriced.
+  for (const status of ['queued', 'provisioning', 'failed', 'timed_out']) {
+    assert.equal(
+      estimateCostUsd(run({ status, flavor: 'base', microvmId: undefined })),
+      undefined,
+      `${status} without a microvmId must not be priced`,
+    );
+  }
+});
+
+test('a run that never launched a microVM is not priced, even with a flavor', () => {
+  // Provision stamps the intended `flavor` on a mint/launch FAILURE for support, so flavor is
+  // not evidence of compute. Run detail showed "microVM: (not launched)" next to a non-zero
+  // estimated cost, billing queue wall-clock for a VM that never existed. `summarizeCost`
+  // already gated on `microvmId`; the per-run projection must agree or the dashboard total and
+  // the Run detail page disagree about the same job.
+  const failedBeforeLaunch = run({ status: 'failed', flavor: 'base', microvmId: undefined });
+  assert.equal(estimateCostUsd(failedBeforeLaunch), undefined);
+  assert.equal(toRunView(failedBeforeLaunch).costUsd, undefined);
+  // …and one that DID launch is still priced.
+  assert.ok(toRunView(run({ microvmId: 'mv-7' })).costUsd > 0);
+});
+
+test("a running job's estimate advances with now; terminal rows stay pinned to updatedAt", () => {
+  // `updatedAt` is only written on a status TRANSITION, so a live row's timestamp is when it
+  // reached `running`. Measuring to `updatedAt` froze the estimate there: an hour-old running
+  // microVM kept reporting the seconds it took to start, understating live spend.
+  const live = run({ status: 'running', microvmId: 'mv-1' });
+  const atStart = estimateCostUsd(live, new Date('2026-07-01T00:02:00.000Z'));
+  const anHourIn = estimateCostUsd(live, new Date('2026-07-01T01:00:00.000Z'));
+  assert.ok(anHourIn > atStart, `${anHourIn} should exceed ${atStart}`);
+
+  // A terminal row is unaffected by `now` — its billing window closed.
+  const done = run({ status: 'completed', microvmId: 'mv-1' });
+  assert.equal(
+    estimateCostUsd(done, new Date('2026-07-01T00:02:00.000Z')),
+    estimateCostUsd(done, new Date('2026-07-01T09:00:00.000Z')),
+  );
+
+  // Clock skew (now before createdAt) must not invent negative spend.
+  assert.ok(estimateCostUsd(live, new Date('2026-06-30T00:00:00.000Z')) >= 0);
 });
 
 test('run view exposes only run fields (no jit config, no secrets)', () => {

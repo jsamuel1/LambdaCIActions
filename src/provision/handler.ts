@@ -10,9 +10,10 @@ import { redactSecret } from '../shared/redact.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
+import { incompatibleRunnerLabel } from '../ingest/adopt.js';
 import type { ProvisionRequest, RunHookPayload } from '../shared/types.js';
 import { resolveFlavor, type ResolveOptions } from './flavor.js';
-import { jitRunnerLabels, classifyMintFailure, NoRunnerLabelsError, TooManyRunnerLabelsError, MAX_JIT_LABELS } from './labels.js';
+import { jitRunnerLabels, classifyMintFailure, NoRunnerLabelsError, TooManyRunnerLabelsError, IncompatibleRunnerLabelError, MAX_JIT_LABELS } from './labels.js';
 import { emitMetrics, isQuotaError } from '../shared/metrics.js';
 
 const LCA_ENV = process.env.LCA_ENV ?? 'dev';
@@ -125,6 +126,12 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     // only GitHub's automatic defaults, can never match the job, and would strand a booted
     // VM plus a consumed single-use JIT config (see NoRunnerLabelsError).
     if (!runnerLabels.length) throw new NoRunnerLabelsError(req.labels ?? []);
+    // …and refuse a selector that demands an architecture/OS we cannot serve. Ingest already
+    // refuses to claim these, so this is a second, independent gate: GitHub matches runners on
+    // advertised labels alone, so minting `x64` on Graviton would run the job on the wrong
+    // architecture instead of leaving it queued (see IncompatibleRunnerLabelError).
+    const bad = incompatibleRunnerLabel(runnerLabels);
+    if (bad) throw new IncompatibleRunnerLabelError(bad.label, bad.why);
     // …and refuse an over-cap set for the mirror-image reason: we cannot DROP a label either.
     // GitHub assigns a job only to a runner advertising every label in `runs-on`, so a
     // truncated set produces a VM the claimed job can never be assigned to.
