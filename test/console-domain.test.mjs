@@ -101,6 +101,50 @@ test('an override is still validated as a DNS hostname', () => {
   }
 });
 
+test('an override is size-capped like any DNS name (63/octet label, 253 total)', () => {
+  // The derived path caps its env label, but LCA_CONSOLE_DOMAIN bypasses that entirely —
+  // so the shape regex alone would accept an oversized name and let ACM reject it at deploy.
+  const zone = 'example.com';
+  const overlongLabel = `${'a'.repeat(64)}.${zone}`;
+  const overlongFqdn = `${Array.from({ length: 5 }, () => 'x'.repeat(60)).join('.')}.${zone}`;
+  for (const bad of [overlongLabel, overlongFqdn]) {
+    assert.throws(
+      () =>
+        resolveConsoleDomain({
+          envName: 'dev',
+          envLocal: { ...ZONE, LCA_CONSOLE_DOMAIN: bad },
+        }),
+      /not a valid DNS hostname/,
+      `expected an oversized override (${bad.length} octets) to be rejected`,
+    );
+  }
+  // A 63-octet label is legal and must still pass.
+  const maxLabel = `${'a'.repeat(63)}.${zone}`;
+  assert.equal(
+    resolveConsoleDomain({ envName: 'dev', envLocal: { ...ZONE, LCA_CONSOLE_DOMAIN: maxLabel } })
+      .hostname,
+    maxLabel,
+  );
+});
+
+test('a zone name long enough to overflow the derived FQDN is rejected at synth', () => {
+  // The zone name is legal on its own (247 octets) and the env label passes too, but
+  // `<env>.lambdaciactions.<zone>` pushes the assembled name past 253 — caught on the
+  // derived path, not by the zone check.
+  const hugeZone = `${Array.from({ length: 4 }, () => 'z'.repeat(60)).join('.')}.com`;
+  assert.ok(hugeZone.length <= 253, 'the zone itself must be legal for this test to mean anything');
+  assert.equal(normalizeZoneName(hugeZone), hugeZone);
+  assert.throws(
+    () =>
+      resolveConsoleDomain({
+        envName: 'dev',
+        envLocal: { ...ZONE, LCA_CONSOLE_ZONE_NAME: hugeZone },
+      }),
+    /derived hostname .* is not a valid DNS hostname/,
+    'an assembled hostname over 253 octets must fail at synth, not at ACM',
+  );
+});
+
 test('the zone apex itself is accepted', () => {
   const d = resolveConsoleDomain({
     envName: 'prod',

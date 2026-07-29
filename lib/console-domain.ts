@@ -72,9 +72,19 @@ export function normalizeZoneName(zoneName: string): string {
   return z;
 }
 
-/** Every label is alphanumeric-with-inner-hyphens, and there are at least two of them. */
+/**
+ * Every label is alphanumeric-with-inner-hyphens, there are at least two of them, and the
+ * RFC 1035 size limits hold: 63 octets per label, 253 for the whole name.
+ *
+ * The caps live HERE rather than only on the derived path because `LCA_CONSOLE_DOMAIN`
+ * bypasses the scheme: a shape-valid but oversized hostname would otherwise reach ACM +
+ * CloudFront + Route53 verbatim and fail mid-deploy, which is exactly the failure this
+ * validator exists to move to synth time.
+ */
 function isDnsName(name: string): boolean {
-  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(name);
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(name)) return false;
+  if (name.length > 253) return false;
+  return name.split('.').every((label) => label.length <= 63);
 }
 
 export interface ResolveConsoleDomainInput {
@@ -151,9 +161,10 @@ export function resolveConsoleDomain(input: ResolveConsoleDomainInput): ConsoleD
     }
   } else {
     hostname = consoleHostname(envName, zoneName);
-    // Belt-and-braces: the label check above cannot see the assembled name, and a zone name
-    // long enough to push the FQDN past 253 octets is rejected here rather than at ACM.
-    if (!isDnsName(hostname) || hostname.length > 253) {
+    // Belt-and-braces: the env-label check inside consoleHostname cannot see the assembled
+    // name, and a zone name long enough to push the FQDN past 253 octets is rejected here
+    // (by isDnsName's size caps) rather than at ACM.
+    if (!isDnsName(hostname)) {
       throw new Error(
         `Console domain: derived hostname "${hostname}" is not a valid DNS hostname.`,
       );
