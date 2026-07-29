@@ -13,6 +13,8 @@ export {
   flavorLabel,
   runDurations,
   windowComplete,
+  headSeamIntact,
+  jobRowKey,
   groupRuns,
   runGroupKey,
   type RunGroup,

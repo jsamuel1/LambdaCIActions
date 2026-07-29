@@ -73,18 +73,23 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   partial window a duration renders as `≥ 4m 10s`; a run with no elapsed span yet keeps the
   plain em dash, since `≥ —` would read as "at least unknown".
 - **Partial rollups** — grouping is client-side over an index **page**, so a run's jobs can
-  straddle the page boundary. Completeness is therefore two halves. `GET /api/runs` returns
+  straddle the page boundary. Completeness is therefore three signals. `GET /api/runs` returns
   **`complete`**, the server's answer to *were any job rows dropped from this response?* — it
   deliberately does **not** mean "the index is exhausted", which the client already knows from
   the cursor. The server half has to be server-side because truncation is judged on the raw
   index pages *before* the installation-visibility filter — a page filled with another tenant's
   rows comes back short while this operator's sibling jobs sit unread past the boundary. The
-  client folds whole runs only when `complete` held for every loaded page **and** the cursor is
-  exhausted; otherwise every run in the window is badged `partial` and its status, job count,
-  flavor and durations render as lower bounds. A repo-filtered page drops nothing, so paging it
-  to the end yields exact rollups. A `status=` filter selects *jobs*, so it always reports
-  `complete: false` (including alongside `repo=`, where it applies as a post-query predicate) —
-  the screen says so inline.
+  third signal is the client's own head/older **seam**: the head page is re-polled every 5 s
+  while appended older pages stay in state, and GSI2 sorts on the immutable `createdAt`, so a
+  newly queued job pushes a row off the bottom of the head page into a gap the older pages
+  start below. The client remembers the key of the head row directly above the first older row
+  and marks the window partial once it is gone (`headSeamIntact`). Whole runs are folded only
+  when `complete` held for every loaded page, the cursor is exhausted, and the seam is intact;
+  otherwise every run in the window is badged `partial` and its status, job count, flavor and
+  durations render as lower bounds. A repo-filtered page drops nothing, so paging it to the end
+  yields exact rollups — until new jobs arrive and shift the seam, when the badge returns. A
+  `status=` filter selects *jobs*, so it always reports `complete: false` (including alongside
+  `repo=`, where it applies as a post-query predicate) — the screen says so inline.
 - **Ids** — run/job ids are small dim text at the end of their column with a copy button
   (`CopyId`): an accessible label, a polite live region for both the copied and the
   could-not-copy outcome, and `stopPropagation` so copying does not trigger the row's

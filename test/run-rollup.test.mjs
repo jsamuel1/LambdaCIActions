@@ -9,6 +9,8 @@ import {
   flavorLabel,
   runDurations,
   windowComplete,
+  headSeamIntact,
+  jobRowKey,
   mergedResponseComplete,
   repoResponseComplete,
   groupRuns,
@@ -138,29 +140,97 @@ test('a status filter can never prove completeness', () => {
   // status=failed returns only failed JOBS, so a run row from it is partial by construction —
   // even if the server somehow claimed otherwise.
   assert.equal(
-    windowComplete({ statusFiltered: true, nextCursor: null, serverComplete: true }),
+    windowComplete({
+      statusFiltered: true,
+      nextCursor: null,
+      seamIntact: true,
+      serverComplete: true,
+    }),
     false,
   );
 });
 
 test('an unexhausted cursor makes every run in the window partial', () => {
   assert.equal(
-    windowComplete({ statusFiltered: false, nextCursor: 'abc', serverComplete: true }),
+    windowComplete({
+      statusFiltered: false,
+      nextCursor: 'abc',
+      seamIntact: true,
+      serverComplete: true,
+    }),
     false,
   );
 });
 
 test('an exhausted unfiltered window follows the server verdict', () => {
   assert.equal(
-    windowComplete({ statusFiltered: false, nextCursor: null, serverComplete: true }),
+    windowComplete({
+      statusFiltered: false,
+      nextCursor: null,
+      seamIntact: true,
+      serverComplete: true,
+    }),
     true,
   );
   // Completeness is NOT inferable client-side: the server may know an index was truncated
   // upstream of the visibility filter even though the response came back short.
   assert.equal(
-    windowComplete({ statusFiltered: false, nextCursor: null, serverComplete: false }),
+    windowComplete({
+      statusFiltered: false,
+      nextCursor: null,
+      seamIntact: true,
+      serverComplete: false,
+    }),
     false,
   );
+});
+
+test('a drifted head/older seam makes an otherwise-exact window partial', () => {
+  // Every other signal says exact — cursor spent, server dropped nothing — but the loaded
+  // window has a hole where the polled head page shifted past the held older pages.
+  assert.equal(
+    windowComplete({
+      statusFiltered: false,
+      nextCursor: null,
+      seamIntact: false,
+      serverComplete: true,
+    }),
+    false,
+  );
+});
+
+test('the head/older seam holds only while the boundary row is still on the head page', () => {
+  // No older pages ⇒ no seam to break, whatever the head page looks like.
+  assert.equal(headSeamIntact({ headKeys: [], hasOlderPages: false }), true);
+  assert.equal(
+    headSeamIntact({ boundaryKey: undefined, headKeys: ['1-1-1'], hasOlderPages: false }),
+    true,
+  );
+
+  // The boundary row (the head row directly above older[0]) is still loaded ⇒ adjacent.
+  assert.equal(
+    headSeamIntact({ boundaryKey: '1-100-2', headKeys: ['1-101-1', '1-100-2'], hasOlderPages: true }),
+    true,
+  );
+
+  // A newly queued job pushed the boundary row off the fixed-size head page: the row is in
+  // neither half, so the window has a gap in the middle.
+  assert.equal(
+    headSeamIntact({ boundaryKey: '1-100-2', headKeys: ['1-102-1', '1-101-1'], hasOlderPages: true }),
+    false,
+  );
+
+  // Older rows present but no boundary recorded ⇒ adjacency cannot be shown, so not exact.
+  assert.equal(
+    headSeamIntact({ boundaryKey: undefined, headKeys: ['1-101-1'], hasOlderPages: true }),
+    false,
+  );
+});
+
+test('jobRowKey identifies the idempotency triple', () => {
+  assert.equal(jobRowKey(1, 100, 2), '1-100-2');
+  // Distinct triples never collide into one key (row de-dup + seam identity depend on it).
+  assert.notEqual(jobRowKey(1, 100, 2), jobRowKey(1, 1002, 0));
 });
 
 test('the merged view is complete only when no index truncated and nothing was sliced', () => {
@@ -199,6 +269,7 @@ test('an exhausted repo window folds exactly, matching ADR-029', () => {
     windowComplete({
       statusFiltered: false,
       nextCursor: null,
+      seamIntact: true,
       serverComplete: repoResponseComplete(false),
     }),
     true,
@@ -208,6 +279,7 @@ test('an exhausted repo window folds exactly, matching ADR-029', () => {
     windowComplete({
       statusFiltered: false,
       nextCursor: 'c1',
+      seamIntact: true,
       serverComplete: repoResponseComplete(false),
     }),
     false,

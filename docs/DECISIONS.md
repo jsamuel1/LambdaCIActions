@@ -894,9 +894,20 @@ every run row built from it is partial by construction.
 - **Completeness** is split into two halves, so neither side can lie on its own. The **server**
   returns `complete` on `GET /api/runs`, answering only *were any job rows dropped from this
   response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
-  cursor. Whole runs are folded only when every loaded page said `complete` **and** the cursor
-  is spent; otherwise **every** group in the window is stamped `partial`, badged in the UI, and
-  its status/job count/flavor/durations render as lower bounds.
+  cursor, plus the integrity of the join between its live head page and its appended older
+  pages. Whole runs are folded only when every loaded page said `complete`, the cursor is
+  spent, **and** that join is intact; otherwise **every** group in the window is stamped
+  `partial`, badged in the UI, and its status/job count/flavor/durations render as lower bounds.
+  The head/older join is the third signal because the head page is re-polled every 5 s while
+  the older pages sit in client state, and GSI2 is sorted by the immutable `createdAt`: a newly
+  queued job pushes a row off the bottom of the fixed-size head page into a gap the older pages
+  begin below, so the window develops a hole in the middle while the cursor and server verdict
+  both still say exact. The client therefore remembers the key of the head row directly above
+  the first older row and treats the window as partial once that row is no longer on the head
+  page (`headSeamIntact`) — identity, not a row count, because the count is unchanged by the
+  shift. Re-fetching the whole appended history on every poll was rejected: it would multiply
+  the 5 s read cost by the number of pages walked to fix a case the operator resolves by
+  reloading.
   Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor
   while history remains, so folding exhaustion into the server's flag would leave such a window
   permanently partial no matter how far the operator paged. The dropped-rows half in turn cannot

@@ -168,6 +168,12 @@ export interface WindowShape {
   /** The API's cursor for the next older page, `null` when the index is exhausted. */
   nextCursor: string | null;
   /**
+   * False when the join between the live head page and the appended older pages may have
+   * lost a row — see `headSeamIntact`. A gapped window cannot be exact even with an
+   * exhausted cursor and a clean server verdict.
+   */
+  seamIntact: boolean;
+  /**
    * The `complete` flag from every page the client loaded, ANDed. It answers a narrow
    * question — *did this response drop any job row that the client can never page back to?*
    * — and NOT "is the index exhausted", which is `nextCursor`'s job. Splitting the verdict
@@ -193,6 +199,9 @@ export interface WindowShape {
  *   `createdAt`, not grouped, so any run in the window may continue past the boundary.
  *   Flagging only the run that owns the boundary row would be unsound: a straddling run's
  *   oldest LOADED job need not be the boundary row.
+ * - **broken head/older seam** ⇒ never. The head page is re-polled while the older pages are
+ *   held in state, so a newly queued job can shift the head window and drop the row at the
+ *   join (`headSeamIntact`).
  * - otherwise the server's own verdict decides: no row was dropped on the way out
  *   (`mergedResponseComplete` for the merged view; unconditionally true for a repo-filtered
  *   page, which never slices).
@@ -200,7 +209,44 @@ export interface WindowShape {
 export function windowComplete(w: WindowShape): boolean {
   if (w.statusFiltered) return false;
   if (w.nextCursor !== null) return false;
+  if (!w.seamIntact) return false;
   return w.serverComplete;
+}
+
+/**
+ * Is the join between the polled head page and the appended older pages still gap-free?
+ *
+ * The head page is re-fetched every 5 s while the older pages are held in client state, so
+ * the two halves are snapshots of the index taken at different times. GSI2's sort key is the
+ * immutable `createdAt` (`repoGsiKeys`), so a newly queued job pushes a row OFF the bottom of
+ * the fixed-size head page — and that row is not in the older pages either, because those
+ * begin one position further down. The loaded window then has a hole in the middle while
+ * every other completeness signal still says exact: the cursor is spent and the server
+ * dropped nothing. A run owning the lost job would report a wrong job count, status, flavor
+ * and duration as FACT, which is the one outcome ADR-029 rules out.
+ *
+ * The seam is checked by identity rather than by counting: the client remembers the key of
+ * the oldest head row at the moment it paged past it (`boundaryKey`, the row directly above
+ * `older[0]`), and while that row is still in the head page the two halves remain adjacent.
+ * Once it is gone the window is treated as partial. Only this one seam can drift — the older
+ * pages chain off opaque index-position cursors, which are stable.
+ *
+ * With no older pages there is no seam and nothing to check.
+ */
+export function headSeamIntact(input: {
+  boundaryKey?: string;
+  headKeys: string[];
+  hasOlderPages: boolean;
+}): boolean {
+  if (!input.hasOlderPages) return true;
+  // Older rows appended without a recorded boundary: adjacency cannot be shown.
+  if (!input.boundaryKey) return false;
+  return input.headKeys.includes(input.boundaryKey);
+}
+
+/** Per-job identity used for de-duplication and for the head/older seam check. */
+export function jobRowKey(repoId: number, runId: number, jobId: number): string {
+  return `${repoId}-${runId}-${jobId}`;
 }
 
 /**

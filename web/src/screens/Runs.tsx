@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Repo, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
-import { flavorLabel, groupRuns, windowComplete, type RunGroup } from '../rollup.js';
+import { flavorLabel, groupRuns, headSeamIntact, jobRowKey, windowComplete, type RunGroup } from '../rollup.js';
 import {
   Badge,
   CopyId,
@@ -69,6 +69,15 @@ export function Runs({
    * re-walk the same pages forever.
    */
   const [cursor, setCursor] = useState<string | null | undefined>(undefined);
+  /**
+   * Key of the head row that sat directly above `older[0]` when the first older page was
+   * appended — the head/older seam. The head page is re-polled every 5 s while the older
+   * pages stay in state, and GSI2 is sorted by the immutable `createdAt`, so a newly queued
+   * job pushes a row off the bottom of the head page into a gap the older pages do not
+   * cover. While this key is still in the head page the two halves are adjacent; once it is
+   * gone the window has a hole and its rollups are only lower bounds (`headSeamIntact`).
+   */
+  const [boundaryKey, setBoundaryKey] = useState<string | undefined>(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreErr, setMoreErr] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
@@ -78,6 +87,7 @@ export function Runs({
     setOlder([]);
     setOlderComplete(true);
     setCursor(undefined);
+    setBoundaryKey(undefined);
     setMoreErr(undefined);
   }, [repoFilter, status]);
 
@@ -85,9 +95,10 @@ export function Runs({
 
   const headCursor = runs.data?.nextCursor ?? null;
   const nextCursor = cursor === undefined ? headCursor : cursor;
+  const headRows = runs.data?.runs ?? [];
   const seen = new Set<string>();
-  const rows = [...(runs.data?.runs ?? []), ...older].filter((r) => {
-    const key = `${r.repoId}-${r.runId}-${r.jobId}`;
+  const rows = [...headRows, ...older].filter((r) => {
+    const key = jobRowKey(r.repoId, r.runId, r.jobId);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -102,6 +113,13 @@ export function Runs({
   const complete = windowComplete({
     statusFiltered: status !== '',
     nextCursor,
+    // The polled head page and the held older pages are snapshots taken at different times,
+    // so their join can silently lose a row when new jobs are queued.
+    seamIntact: headSeamIntact({
+      boundaryKey,
+      headKeys: headRows.map((r) => jobRowKey(r.repoId, r.runId, r.jobId)),
+      hasOlderPages: older.length > 0,
+    }),
     // Absent `complete` (older API) ⇒ false: partial is the safe default. `olderComplete`
     // ANDs every appended page, since one page that dropped rows poisons the whole window.
     serverComplete: (runs.data?.complete ?? false) && olderComplete,
@@ -119,6 +137,13 @@ export function Runs({
         limit: PAGE,
         cursor: nextCursor,
       });
+      // Record the seam on the FIRST older page only: the row above it is the last head row
+      // at the moment of the append, and later pages chain off stable index cursors. Computed
+      // outside the state updater, which must stay a pure function of previous state.
+      if (!older.length) {
+        const last = headRows[headRows.length - 1];
+        setBoundaryKey(last ? jobRowKey(last.repoId, last.runId, last.jobId) : undefined);
+      }
       setOlder((prev) => [...prev, ...page.runs]);
       setOlderComplete((prev) => prev && (page.complete ?? false));
       setCursor(page.nextCursor);
@@ -264,7 +289,7 @@ function RunRows({
             {group.partial && (
               <span
                 className="badge warn"
-                title="Some of this run's jobs are outside the loaded page or excluded by the status filter — status, flavor and totals are lower bounds."
+                title="Some of this run's jobs are outside the loaded window — excluded by the status filter, past the page boundary, or lost where the live head page has shifted past the older pages. Status, flavor and totals are lower bounds."
               >
                 partial
               </span>
