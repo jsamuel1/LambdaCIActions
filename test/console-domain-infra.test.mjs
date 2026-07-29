@@ -150,6 +150,25 @@ test('a half-wired domain/certificate pair throws at synth', () => {
       }),
     /without a certificate/,
   );
+  // The reverse: a cert with no domain would be paid for and referenced by nothing, and the
+  // distribution would still serve the raw CloudFront name — an origin mismatch with
+  // PUBLIC_ORIGIN that only shows up as a broken login.
+  const app2 = new App();
+  const cert = new CertStack(app2, 'Cert', {
+    env: { account: ACCOUNT, region: 'us-east-1' },
+    envName: 'dev',
+    domain: DOMAIN,
+  });
+  assert.throws(
+    () =>
+      new WebStack(app2, 'WebNoDomain', {
+        env: { account: ACCOUNT, region: 'us-west-2' },
+        envName: 'dev',
+        apiHost: 'abc.execute-api.us-west-2.amazonaws.com',
+        certificate: cert.certificate,
+      }),
+    /with no console domain/,
+  );
 });
 
 test('the security posture is unchanged by the alias (ADR-024 invariants hold)', () => {

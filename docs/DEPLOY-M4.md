@@ -82,6 +82,20 @@ so do not skip this step before deploying.
 
 ## Phase 2 — deploy
 
+### One-time: bootstrap us-east-1 (vanity-domain path only)
+
+`LCA-Cert-<env>` is the repo's only stack outside `LCA_DEPLOY_REGION`, so it needs the CDK
+bootstrap stack in **us-east-1** as well. Without it the deploy aborts immediately —
+`SSM parameter /cdk-bootstrap/hnb659fds/version not found` / "has not been bootstrapped" —
+before ACM is touched. Do it once per account:
+
+```sh
+npx cdk bootstrap aws://<LCA_DEPLOY_ACCOUNT>/us-east-1
+```
+
+(The deploy region was bootstrapped back in M1. Skip this entirely on the no-domain path —
+no stack leaves the deploy region there.)
+
 With a **vanity domain** configured, deploy the certificate first (or let `--all` order it —
 WebStack declares the dependency):
 
@@ -169,7 +183,8 @@ Two facts drive the ordering:
 - Changing the GitHub App callback is **browser-only** (no API), so the new callback must be
   registered *before* the origin flip, and the old one removed only *after* it.
 
-1. Add `LCA_CONSOLE_HOSTED_ZONE_ID` + `LCA_CONSOLE_ZONE_NAME` to `.env.local`.
+1. Add `LCA_CONSOLE_HOSTED_ZONE_ID` + `LCA_CONSOLE_ZONE_NAME` to `.env.local`, and bootstrap
+   us-east-1 if you have not already (Phase 2) — the cert stack lands there.
 2. Deploy the cert + alias while **keeping the old origin authoritative** — pin it explicitly
    so `PUBLIC_ORIGIN` does not move yet:
    ```sh
@@ -214,6 +229,7 @@ only — the hot path (webhook → ingest → provision) keeps running.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Login → 500 | `PUBLIC_ORIGIN` unset (no-domain path) | Phase 3 (re-deploy with `-c publicOrigin=...`), or configure a vanity domain (ADR-028) |
+| `LCA-Cert-<env>` fails instantly: bootstrap version SSM parameter not found | account not bootstrapped in **us-east-1** (the cert stack's region) | `npx cdk bootstrap aws://<account>/us-east-1` — see Phase 2 |
 | Deploy hangs on `LCA-Cert-<env>` | ACM validation CNAME not resolving publicly | Check the `_<hash>` CNAME exists in the zone and that the zone is authoritative for the apex; a private zone can never validate |
 | `cdk deploy` fails on the distribution with a certificate error | cert not in us-east-1 | Cannot happen via `LCA-Cert-<env>` (it asserts the region) — a manually-supplied ARN must be us-east-1 |
 | `Console domain is partially configured` | only some `LCA_CONSOLE_*` keys set | Set the zone id AND zone name together, or clear all of them |

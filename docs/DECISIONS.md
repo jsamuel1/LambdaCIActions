@@ -997,6 +997,11 @@ fails at `cdk deploy` on the distribution update, *after* the cert has been issu
   dangerous case — the distribution would come up with no alias while `PUBLIC_ORIGIN`
   pointed at the vanity name, and login would fail with a misleading `invalid OAuth state`
   that reads like a cookie bug.
+- The cert stack is the repo's **first** stack outside `LCA_DEPLOY_REGION`, so a domained env
+  needs the CDK bootstrap stack in **us-east-1** too. Missing it fails the deploy instantly
+  (bootstrap-version SSM parameter not found) before ACM does anything; docs/DEPLOY-M4.md
+  Phase 2 carries the one-time `cdk bootstrap aws://<account>/us-east-1`. The no-domain path
+  keeps every stack in one region and needs no extra bootstrap.
 - First deploy of a new hostname is **slower**: ACM writes a `_<hash>` CNAME and polls, and
   CloudFormation blocks the cert until `ISSUED`, so the distribution can never come up with
   an alias whose cert is pending. A cert stuck in `PENDING_VALIDATION` means the CNAME never
