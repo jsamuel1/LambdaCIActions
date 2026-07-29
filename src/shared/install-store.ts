@@ -262,10 +262,14 @@ export async function getRepo(
  * only ever sees rows it is authorized for anyway) and, if found unindexed, repaired in
  * place so the next read hits the index.
  *
+ * `reconcileIds` is REQUIRED, deliberately: a default of `[]` would let a future caller
+ * write `listInstallations()` and silently reintroduce the exact M2→M4 blindness this
+ * fixes. Pass `[]` only where a caller genuinely wants the raw index.
+ *
  * Includes soft-deleted/suspended rows — the UI shows their state.
  */
 export async function listInstallations(
-  reconcileIds: readonly number[] = [],
+  reconcileIds: readonly number[],
 ): Promise<InstallationRecord[]> {
   const res = await requireDoc().send(
     new QueryCommand({

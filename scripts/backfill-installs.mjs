@@ -176,8 +176,11 @@ async function main() {
     const login = item.accountLogin?.S;
     if (!login) {
       // gsi1sk is the account login; a row without one cannot be indexed meaningfully.
-      // Leave it for the next lifecycle webhook (which rewrites the whole row) and say so.
-      console.warn(`  ! ${pk} has no accountLogin — skipped (needs a lifecycle webhook)`);
+      // Nothing re-writes it automatically: only `installation.created` calls
+      // upsertInstallation (which rewrites the whole row), and GitHub never re-sends that
+      // for an existing install — suspend/unsuspend only flip flags. Uninstall/reinstall
+      // the App for that account, or repair accountLogin by hand.
+      console.warn(`  ! ${pk} has no accountLogin — skipped (needs a reinstall to rewrite)`);
       skipped++;
       continue;
     }

@@ -9,6 +9,7 @@
 //      repaired on the way out.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   buildInstallUpsert,
   installGsi1Keys,
@@ -16,6 +17,7 @@ import {
   missingInstallationIds,
   reconcileInstallations,
   installPk,
+  listInstallations,
   INSTALL_SK,
   INSTALLS_GSI1PK,
 } from '../dist/src/shared/install-store.js';
@@ -219,4 +221,21 @@ test('reconcile cannot widen authorization beyond the session grants', async () 
   );
   assert.deepEqual(fetched, [11], 'only granted ids are read by primary key');
   assert.ok(out.every((i) => canAdminInstallation(session, i.installationId)));
+});
+
+test('listInstallations requires an explicit grant list (no silent zero-arg regression)', () => {
+  // A default of [] would let a future caller write `listInstallations()` and get the exact
+  // pre-ADR-028 behaviour back — index-only, legacy rows invisible — with no compile error.
+  // Pinned on the source because the arity is the contract, not runtime behaviour.
+  const src = readFileSync(
+    new URL('../src/shared/install-store.ts', import.meta.url),
+    'utf8',
+  );
+  const sig =
+    /export async function listInstallations\(\s*reconcileIds: readonly number\[\](\s*=[^,)]*)?,?\s*\)/.exec(
+      src,
+    );
+  assert.ok(sig, 'listInstallations signature not found');
+  assert.equal(sig[1], undefined, 'reconcileIds must NOT have a default value');
+  assert.equal(listInstallations.length, 1, 'the grant list is a required parameter');
 });
