@@ -121,6 +121,12 @@ const BROKER_CALL_TIMEOUT_MS = 15000;
 // attempts 1 AND 2 fail `spawnSync aws ETIMEDOUT` on all three flavors — every boot survived on
 // its LAST attempt, burning ~22 s of a 30 s hook deadline for one success, i.e. zero margin.
 //
+// The CLI in question is apt's aws-cli **v1** (1.22.34 / botocore 1.23.34 — see
+// microvm/Dockerfile.base), NOT the deploy host's v2: the ≥2.35.17 floor in spec 05 is a
+// deployer requirement for the `lambda-microvms` model, while the guest only calls plain
+// `lambda invoke`. Reproduced in ubuntu:22.04: 6.36 s cold vs 2.50 s repeated — the cold figure
+// sits right on the old 6 s bound, which is exactly why attempts 1 and 2 expired.
+//
 // The hook timeout is NOT ours to pick freely: the API caps
 // `microvmHooks.runTimeoutInSeconds` at 60 s (`MicrovmHooksRunTimeoutInSecondsInteger`:
 // min 1, max 60, in the lambda-microvms 2025-09-09 model — note this is a much tighter cap

@@ -741,9 +741,10 @@ backoff = 24 s against a 30 s hook timeout.
 
 The cost model was wrong. The dominant term is the **cold `aws` CLI** in a freshly
 snapshot-resumed guest — Python interpreter start, botocore service-model load, endpoint
-resolution — not the broker. The 2026-07-28 dev verification (run `30407823249`, see the
-deploy-verification record) shows attempts 1 **and** 2 failing identically on **all three**
-flavors:
+resolution — not the broker. The 2026-07-28 dev verification (run `30407823249`) shows attempts 1 **and** 2 failing
+identically on **all three** flavors (recorded in `docs/VERIFY-DEPLOY-ADR021-M4.md`, which
+lands on its own branch — not an ancestor of this one, so the evidence is reproduced here
+rather than only cited):
 
 ```json
 {"msg":"broker invoke failed","action":"jitconfig","attempt":1,"status":null,"error":"spawnSync aws ETIMEDOUT","stderr":""}
@@ -766,18 +767,33 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
    elapsed time is interesting, and it is logged. It is best-effort and wrapped — a non-200
    from `/ready` fails the entire image build ("Ready hook check failed").
 
+   **Which CLI this is about.** The guest is not running the deploy host's CLI. All three
+   Dockerfiles install Ubuntu 22.04's apt `awscli`, which is **aws-cli v1 (1.22.34 /
+   botocore 1.23.34)** — the `≥ 2.35.17` floor in `docs/specs/05-infrastructure.md` applies to
+   the *deployer*, which needs the `lambda-microvms` service model; the guest only calls
+   `lambda invoke` from the long-standing base service, which v1 has. This matters because v1
+   is the slower cold path of the two, so it is the binary any future tuning must measure.
+   Reproduced in an `ubuntu:22.04` container (x86 host, so treat the absolute numbers as
+   corroborating rather than authoritative — the guest is arm64 and snapshot-resumed):
+   **6.36 s cold** for the prewarm invocation vs **2.50 s** for an immediately repeated one.
+   The cold figure lands directly on top of the old 6 s bound, which is what made attempts 1
+   and 2 time out; the ~3.9 s the repeat saves is what the pre-warm moves to build time.
+
    It must reach the **connect attempt** to be worth anything. A region is therefore passed
    explicitly (`PREWARM_REGION`, defaulted — the guest images set no `AWS_REGION`): without
    one the CLI aborts at parameter validation with `NoRegion`, *before* endpoint resolution
-   and HTTP-stack construction, i.e. before the expensive half of the cold path. Measured on
-   aws-cli 2.36.8: **0.60 s** and zero endpoint/HTTP work with no region, vs **1.05 s**
-   reaching `Could not connect to the endpoint URL` with one. The log line reports `warmed`
+   and HTTP-stack construction, i.e. before the expensive half of the cold path. Confirmed on
+   the guest's own v1 CLI: with a region it reaches `Could not connect to the endpoint URL`
+   (exit 255, the expected outcome); without one it exits at `You must specify a region`
+   having done none of the endpoint/HTTP work. The log line reports `warmed`
    (the connect attempt was reached) separately from `ran` (the process started), so an early
    exit reads as a failed warmup instead of a successful one — a `ran`-only signal would have
    reported success for a warmup that did nothing. `warmed` accepts **either** botocore
    connect-phase error — `EndpointConnectionError` (port refused, the normal case) or
    `ConnectTimeoutError` (SYN dropped, e.g. a loopback firewall rule) — since both are raised
-   only after the expensive work is done; matching one wording would report a failed warmup on
+   only after the expensive work is done (both format strings verified present in the guest's
+   botocore 1.23.34, not just in a current release); matching one wording would report a
+   failed warmup on
    a fully warm CLI.
 
    What it does **not** warm: `--no-sign-request` plus disabled IMDS means the

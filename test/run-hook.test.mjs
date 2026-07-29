@@ -328,9 +328,12 @@ test('the ready hook pre-warms the AWS CLI without credentials or egress', () =>
   assert.match(endpoint, /^http:\/\/127\.0\.0\.1:/, `prewarm endpoint ${endpoint} is not loopback`);
   // A region must be passed EXPLICITLY. Without one the CLI aborts with `NoRegion` during
   // parameter validation — before endpoint resolution and HTTP-stack construction, which is
-  // the expensive half of the cold path the warmup exists to pay. Measured on aws-cli 2.36.8:
-  // 0.60 s and zero endpoint/urllib3 work with no region, vs 1.05 s reaching the connect
-  // attempt with one. The guest images set no AWS_REGION, so inheriting it is not enough.
+  // the expensive half of the cold path the warmup exists to pay. Verified against the CLI the
+  // GUEST actually runs — Ubuntu 22.04's apt `awscli`, i.e. aws-cli **v1** 1.22.34 /
+  // botocore 1.23.34, NOT the deploy host's v2 (the ≥2.35.17 floor in spec 05 is a deployer
+  // requirement for the `lambda-microvms` model; the guest only needs plain `lambda invoke`).
+  // With a region: reaches `Could not connect to the endpoint URL`, 6.36 s cold vs 2.50 s
+  // repeated. Without: exits at `You must specify a region` having done none of that work.
   assert.match(fn, /'--region', PREWARM_REGION/, 'the warmup must pass a region or it exits early');
   assert.match(
     src,
