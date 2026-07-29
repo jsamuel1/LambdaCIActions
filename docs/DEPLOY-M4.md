@@ -107,6 +107,36 @@ The callback URL must match exactly — GitHub rejects mismatches. Until it is a
 `/auth/login` correctly 302s to GitHub's authorize page and GitHub then refuses the
 redirect back, so Phase 5 cannot start.
 
+### Verifying the callback without signing in
+
+Do **not** try to confirm registration by fetching the authorize URL anonymously. GitHub
+defers all `redirect_uri` validation until after sign-in, so `GET /login/oauth/authorize`
+returns the same `302 → /login?return_to=…` whether the callback is registered, still the
+bootstrap `localhost` one, or complete nonsense. That probe proves nothing.
+
+The **token exchange** does discriminate, and needs no browser session. Drive your own
+callback with a genuine `state`/cookie pair and a deliberately invalid `code`:
+
+```sh
+curl -c jar -D - -o /dev/null https://<console-domain>/auth/login
+# capture `state` from the Location header; the lca_oauth_state cookie is now in `jar`
+curl -b jar "https://<console-domain>/auth/callback?code=bogus&state=<state>"
+# → 500 {"error":"internal error"} — the useful detail is in the λ log:
+aws logs filter-log-events --log-group-name /aws/lambda/lca-<env>-mgmt \
+  --start-time $(( ($(date +%s) - 300) * 1000 )) --query 'events[].message' --output text
+```
+
+Read the `authCallback` error line:
+
+| λ log says | Meaning |
+|---|---|
+| `bad_verification_code` | **Callback IS registered.** GitHub accepted the client_id + redirect_uri pair and rejected only the fake code. |
+| `redirect_uri_mismatch` | Callback is NOT registered (or does not match exactly). Redo Phase 4. |
+| `400 invalid OAuth state` | You lost the cookie/state pair — re-run both curls in the same shell with the same jar. |
+
+A `bad_verification_code` result also proves, in one request, that the signed-state check,
+the state-cookie round-trip, and the SecureString client-secret read all work.
+
 ## Phase 5 — verify (M4 exit criterion)
 
 1. Open `https://<console-domain>` → "Sign in with GitHub" → authorize.
@@ -137,7 +167,7 @@ only — the hot path (webhook → ingest → provision) keeps running.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Login → 500 | `PUBLIC_ORIGIN` unset — first deploy, **or** a later Mgmt deploy that omitted `-c publicOrigin` (context is not persisted) | Phase 3 (re-deploy with `-c publicOrigin=...`) |
-| GitHub refuses the redirect after authorize | callback URL not on the App | Phase 4 (browser-only; no API for it) |
+| GitHub refuses the redirect after authorize | callback URL not on the App | Phase 4 (browser-only; no API for it) — confirm with the [exchange probe](#verifying-the-callback-without-signing-in) |
 | Repo history shorter than expected | GSI2 is sparse — only runs queued after the index was created appear (ADR-023) | expected on an env upgraded in place; Dashboard/`?status=` views are unaffected |
 | `invalid OAuth state` | state cookie lost (different host, or >10 min on the GitHub page) | Retry from the console origin |
 | Redirected to Setup with `reason=no-installations` | GitHub returned no installations for this user | Install the App on an org/account you can admin |

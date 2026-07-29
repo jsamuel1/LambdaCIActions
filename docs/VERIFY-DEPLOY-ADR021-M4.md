@@ -1,7 +1,9 @@
 # Deploy verification — ADR-021 brokered run-hook + M4 management plane
 
-**Verdict: ADR-021 posture PASSED live. M4 stacks UP, OAuth login BLOCKED on one
-human-only GitHub setting (see [Outstanding](#outstanding--one-human-step).)**
+**Verdict: ADR-021 posture PASSED live. M4 stacks UP; the OAuth callback is now registered
+and verified, with the login flow confirmed working up to the credential prompt — the
+authenticated phase-5 screens still need an interactive human sign-in (see
+[OAuth callback](#oauth-callback--registered-and-verified-decisively)).**
 
 Deployed and verified against the live `dev` environment on **2026-07-28**. Both PR #14
 (ADR-021 brokered run-hook, `409aba9`) and PR #15 (M4 console + management API, `63069ff`)
@@ -268,33 +270,79 @@ Verified live:
   hash-routed (`#/runs/…`) precisely because a distribution-wide CloudFront error rewrite
   would corrupt the API's own 401/403/404 responses (ADR-024 / web-stack.ts class doc).
 
-## Outstanding — one human step
+## OAuth callback — registered, and verified decisively
 
-**The OAuth callback URL is not registered on the GitHub App, and cannot be set by this
-agent.** GitHub exposes no REST endpoint to modify a GitHub App's callback URLs (`PATCH
-/app` does not exist; `GET /app` is read-only), so this is browser-only.
+**Resolved 2026-07-29.** The operator added the callback URL by hand:
 
-Root cause: `scripts/create-github-app.mjs` registers the app with
+- **Callback URL**: `https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback`
+
+This could not be automated. GitHub exposes no REST endpoint to modify a GitHub App's
+callback URLs (`PATCH /app` does not exist; `GET /app` is read-only), so it is browser-only.
+Root cause of the omission: `scripts/create-github-app.mjs` registers the app with
 `redirect_url: http://localhost:8976/callback` — the local one-shot listener it uses to
-capture credentials at bootstrap. The console origin did not exist then and was never
-added afterwards.
+capture credentials at bootstrap. The console origin did not exist then and was never added
+afterwards.
 
-Fix (Developer settings → GitHub Apps → `lambdaciactions-dev` → General):
+### The pre-auth probe carries no signal (confirmed)
 
-- **Callback URL**: add `https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback`
+As the review pass established, `GET /login/oauth/authorize` returns the **same**
+`302 → /login?return_to=…` for the console callback, for the App's registered
+`http://localhost:8976/callback`, and for a bogus `https://example.invalid/nope` — GitHub
+defers all `redirect_uri` validation until after sign-in. So the earlier note correctly
+refused to claim a refusal it had not observed.
 
-Everything on the LCA side of that flow is confirmed correct (correct `client_id`, correct
-`redirect_uri`, CSRF state present — see above). The consequence is **expected, not
-observed**: GitHub documents that an OAuth `redirect_uri` must match a registered callback,
-so clicking "Sign in with GitHub" is expected to reach the authorize page and then be
-refused on redirect back. Confirming the refusal itself requires an authenticated browser
-session, which this verification did not have — the same reason the setting cannot be
-automated. An unauthenticated probe cannot substitute: `GET /login/oauth/authorize` returns
-the **same** `302 → /login?return_to=…` for the console callback, for the App's registered
-`http://localhost:8976/callback`, and for a deliberately bogus `https://example.invalid/nope`
-— GitHub defers all `redirect_uri` validation until after sign-in, so the pre-auth response
-carries no signal either way. Either way console login (and therefore M4 phase-5 steps 1–7)
-cannot complete until the callback is registered.
+### The token exchange DOES discriminate — and it passes
+
+The `/login/oauth/access_token` step validates the `client_id` + `redirect_uri` pair
+without needing a signed-in browser. Driving our own callback with a real `state`/cookie
+pair and a deliberately invalid `code`:
+
+```sh
+curl -c jar -D - -o /dev/null https://d2x4qcl1ibd2ax.cloudfront.net/auth/login
+# → 302 to GitHub; capture `state` from Location and the lca_oauth_state cookie into `jar`
+curl -b jar "https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback?code=bogus_probe_code&state=<state>"
+# → 500 {"error":"internal error"}   (generic by design — the detail is in the λ log)
+```
+
+The request got **past** state validation (no `400 invalid OAuth state`) into the exchange,
+and `/aws/lambda/lca-dev-mgmt` recorded GitHub's verdict:
+
+```json
+{"msg":"mgmt request failed","route":"authCallback","path":"/auth/callback",
+ "error":"GitHub OAuth token exchange failed: bad_verification_code — The code passed is incorrect or expired."}
+```
+
+`bad_verification_code` — **not** `redirect_uri_mismatch`. GitHub accepted the
+client_id + redirect_uri pair and rejected only the fake code, which is the response a
+correctly-registered callback gives and an unregistered one cannot. One request therefore
+exercised the signed-state check, the state-cookie round-trip, the SecureString
+client-secret read, and GitHub's acceptance of the redirect URI.
+
+### Browser confirmation (headless chromium)
+
+`GET /` renders the SPA — title `LambdaCIActions Console`, one `Sign in with GitHub` link
+to `/auth/login`. Only console errors are the expected unauthenticated `401 /api/me` and a
+`403 /favicon.ico` (no favicon shipped). Clicking through lands on GitHub showing:
+
+> Sign in to GitHub **to continue to LambdaCIActions-dev**
+
+GitHub resolved the client id to our App and staged the authorize — the flow is intact up
+to the credential prompt.
+
+### Still not verified: authenticated console screens
+
+DEPLOY-M4 phase-5 steps 1–7 (Setup / Repos / Repo detail / Dashboard / Run detail /
+Settings) need a real sign-in as a user who administers installation `146431062` — an
+interactive human credential entry, deliberately not automated. The pre-auth boundary IS
+verified: `/api/repos`, `/api/runs`, `/api/settings` all return
+`401 {"error":"not authenticated"}` without a session cookie.
+
+## Follow-up cards filed
+
+| Card | Why |
+|---|---|
+| `task-1785282148-3aa2` | Boot `jitconfig` burns 2/3 retries on cold-CLI `ETIMEDOUT` (see [Defect found](#defect-found--boot-broker-call-burns-retries-on-cold-cli-timeout)) |
+| `task-1785294933-3462` | Vanity URL for the console — the raw CloudFront domain is load-bearing in `PUBLIC_ORIGIN`, in the OAuth callback (browser-only to change), and as the first-party cookie origin |
 
 ## Reproduction
 

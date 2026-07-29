@@ -42,13 +42,15 @@ Operator visibility + control. **Shipped + deployed to `dev`** — see [spec 04]
 - `MgmtStack` API + `WebStack` SPA + GitHub OAuth.
 - Screens: Setup, Dashboard, Repos, Repo/Workflow detail, Runs, Run detail (logs), Flavors, Settings.
 - Run history (GSI2, ADR-023) + CloudWatch log viewer; live status via polling (ADR-026).
-- 🎯 An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI. **Not yet verified** — `LCA-Mgmt-dev`/`LCA-Web-dev` are live and the OAuth redirect is correct, but the App's callback URL is unregistered (browser-only setting), so login cannot complete. Deploy evidence: [`docs/VERIFY-DEPLOY-ADR021-M4.md`](VERIFY-DEPLOY-ADR021-M4.md).
+- 🎯 An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI. **Partially verified** — `LCA-Mgmt-dev`/`LCA-Web-dev` are live, the App's callback URL is registered, and the OAuth flow is confirmed correct up to GitHub's credential prompt (token exchange returns `bad_verification_code`, not `redirect_uri_mismatch`). The authenticated screens still need an interactive human sign-in. Deploy evidence: [`docs/VERIFY-DEPLOY-ADR021-M4.md`](VERIFY-DEPLOY-ADR021-M4.md).
 
 ## M5 — Drop-in & polish
 True zero-edit adoption + hardening.
 - `adopt` mode (standard-label mapping); opt-in auto-rewrite PR.
 - Compat guidance surfaced with actionable fixes.
 - Metrics/alarms/X-Ray; cost estimates in Run detail.
+- Console **custom domain + ACM cert** (promised by ADR-024) so the OAuth callback and
+  `PUBLIC_ORIGIN` stop depending on the generated CloudFront domain.
 - `dev`/`prod` account separation; runbook + quotas doc.
 - 🎯 A brand-new repo runs unchanged in `adopt` mode; dashboard shows health + cost.
 
