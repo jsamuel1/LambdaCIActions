@@ -1058,6 +1058,12 @@ The pin rule covers **package managers too**, not just the language runtime: `co
 pnpm@latest` / `npm install -g npm@latest` resolve at build time, so a floating tag beside a
 pinned runtime is a half-kept promise — `test/image-content.test.mjs` now rejects any `@latest`
 /`@stable`/`@next` install in a flavor Dockerfile.
+A prebaked runtime is also not a self-sufficient job environment: `python`, `go` and `rust`
+carry `build-essential`, because a source-only sdist (arm64 wheels are still commonly absent),
+cgo, and cargo's link step all shell out to `cc`, which the shared apt line does not install.
+Without it the failure surfaces mid-job as `command 'gcc' failed`, after the download cost is
+already paid. `base`/`node`/`java`/`docker` skip it deliberately — not compile-from-source
+paths, and ~200 MB of snapshot each.
 And a new flavor is **not reachable from its label until
 `/lca/<env>/config/runner-labels` lists it**: `shouldClaim` is an allowlist consulted *before*
 resolution, seeded by hand per DEPLOY-M1, so an omitted label makes those jobs sit queued on

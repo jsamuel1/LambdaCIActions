@@ -39,6 +39,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo \
       libicu70 lsb-release awscli \
+      # A C toolchain, for the same reason the go/rust flavors carry one: any `pip install`
+      # that has to build a source-only sdist (no arm64 manylinux wheel — still common on
+      # aarch64) shells out to `cc`, and the shared apt line above ships none. Verified: a bare
+      # ubuntu:22.04 plus that line has no gcc/cc/make/ld, so such a build fails with
+      # "error: command 'gcc' failed: No such file or directory" — after the download, deep
+      # inside a job. The prebuilt CPython ships its own headers (include/python3.12/Python.h),
+      # so python3-dev is NOT needed on top of this.
+      build-essential pkg-config \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

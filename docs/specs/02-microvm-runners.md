@@ -122,6 +122,15 @@ The `go` flavor deliberately does **not** export a global `GOROOT`. `actions/set
 baked version's stdlib — so only the toolchain's `bin` goes on `PATH`, and each `go` derives
 its own `GOROOT`. `JAVA_HOME` is safe to bake by contrast: `setup-java` `exportVariable`s it.
 
+The `python`, `go` and `rust` flavors also carry a **C toolchain** (`build-essential`). A
+prebaked runtime does not make a job self-sufficient: a `pip install` of a source-only sdist
+(arm64 wheels are still missing for plenty of packages), a `go build` touching cgo, and every
+`cargo` link step all shell out to `cc`, which the shared apt line does not provide. Without it
+the failure lands mid-job (`command 'gcc' failed: No such file or directory`) after the
+download has already been paid. `base`/`node`/`java`/`docker` deliberately skip it — they are
+not compile-from-source paths and it is ~200 MB of snapshot each. The prebuilt CPython ships
+its own headers, so no `python3-dev` is needed on top.
+
 Toolchain versions are **pinned** in each Dockerfile so rebuilds are reproducible — which
 makes them a patch-day obligation: a stale pin ages silently.
 

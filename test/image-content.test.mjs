@@ -17,7 +17,7 @@ const MICROVM = path.join(REPO_ROOT, 'microvm');
 const read = (p) => fs.readFileSync(path.join(MICROVM, p), 'utf8');
 
 test('run-hook runs ${RUNNER_DIR}/pre-run.sh before the runner agent', () => {
-  const hook = read('bootstrap/run-hook.mjs');
+  const hook = instructions('bootstrap/run-hook.mjs');
   assert.match(hook, /\$\{RUNNER_DIR\}\/pre-run\.sh/);
   // The hook must be invoked before run.sh --jitconfig is spawned.
   assert.ok(
@@ -27,13 +27,13 @@ test('run-hook runs ${RUNNER_DIR}/pre-run.sh before the runner agent', () => {
 });
 
 test('docker flavor bakes the dockerd pre-run hook in at pre-run.sh', () => {
-  const df = read('Dockerfile.docker');
+  const df = instructions('Dockerfile.docker');
   assert.match(df, /COPY bootstrap\/pre-run\.docker\.sh \$\{RUNNER_DIR\}\/pre-run\.sh/);
   assert.match(df, /chmod 0755 \$\{RUNNER_DIR\}\/pre-run\.sh/);
 });
 
 test('the dockerd pre-run hook starts dockerd and waits for the API', () => {
-  const sh = read('bootstrap/pre-run.docker.sh');
+  const sh = instructions('bootstrap/pre-run.docker.sh');
   assert.match(sh, /nohup dockerd/, 'must start dockerd in the background');
   assert.match(sh, /docker version --format/, 'must poll the daemon API for readiness');
   // The snapshot has no init: dockerd needs the unified cgroup hierarchy mounted or it dies
@@ -43,7 +43,7 @@ test('the dockerd pre-run hook starts dockerd and waits for the API', () => {
   const commands = sh
     .split('\n')
     .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('#'));
+    .filter(Boolean);
   assert.ok(
     !commands.some((l) => /^sudo\s/.test(l)),
     'must not invoke sudo (it cannot escalate under no_new_privs)',
@@ -54,7 +54,7 @@ test('the dockerd pre-run hook starts dockerd and waits for the API', () => {
 });
 
 test('run-hook drops root to the runner user with setpriv (agent refuses root)', () => {
-  const hook = read('bootstrap/run-hook.mjs');
+  const hook = instructions('bootstrap/run-hook.mjs');
   assert.match(hook, /setpriv/, 'must use setpriv for the downward privilege change');
   assert.match(hook, /--init-groups/, 'must keep supplementary groups (docker)');
   assert.match(hook, /process\.getuid\(\) === 0/, 'must only drop privileges when running as root');
@@ -63,7 +63,7 @@ test('run-hook drops root to the runner user with setpriv (agent refuses root)',
 test('docker flavor keeps a root entrypoint; base/node stay unprivileged', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const df = read(flavor.dockerfile);
+    const df = instructions(flavor.dockerfile);
     const rootEntrypoint = !/^USER runner$/m.test(df);
     assert.equal(
       rootEntrypoint,
@@ -121,7 +121,7 @@ test('the build script requests the catalog memory + arm64 CPU config (ADR-038)'
 test('only docker-capable flavors ship a pre-run hook', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const df = read(flavor.dockerfile);
+    const df = instructions(flavor.dockerfile);
     const shipsHook = /pre-run\.\w+\.sh \$\{RUNNER_DIR\}\/pre-run\.sh/.test(df);
     assert.equal(
       shipsHook,
@@ -132,7 +132,7 @@ test('only docker-capable flavors ship a pre-run hook', () => {
 });
 
 test('the pre-run hook failure path still starts the agent so GitHub reports the failure', () => {
-  const hook = read('bootstrap/run-hook.mjs');
+  const hook = instructions('bootstrap/run-hook.mjs');
   // A nonzero pre-hook must be LOGGED, not fatal: the agent still starts and the job fails
   // at its first `docker` step. Bailing here would leave the GitHub job hanging until its
   // own timeout with no runner attached.
@@ -143,7 +143,7 @@ test('every flavor Dockerfile is arm64-only (AGENTS.md hard rule)', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
     assert.equal(flavor.arch, 'arm64', `flavor ${flavor.name} must be arm64`);
-    const df = read(flavor.dockerfile);
+    const df = instructions(flavor.dockerfile);
     assert.match(df, /FROM --platform=linux\/arm64 /, `${flavor.dockerfile} must pin linux/arm64`);
     assert.doesNotMatch(df, /arch=amd64|linux\/amd64|x86_64\.tar\.gz/, `${flavor.dockerfile} has an x86 artifact`);
   }
@@ -164,7 +164,7 @@ test('every flavor Dockerfile is arm64-only (AGENTS.md hard rule)', () => {
 test('flavors install the apt awscli that ADR-028 measured, not a swapped-in CLI v2', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const df = read(flavor.dockerfile);
+    const df = instructions(flavor.dockerfile);
     assert.match(
       df,
       /^\s+libicu70 lsb-release awscli \\$/m,
@@ -178,8 +178,9 @@ test('flavors install the apt awscli that ADR-028 measured, not a swapped-in CLI
         'prewarm warmed regex before allowing this',
     );
     // ...and the reason must travel with the line, or the next reader deletes it as noise.
+    // Deliberately against the RAW file: this one asserts the presence of a COMMENT.
     assert.match(
-      df,
+      read(flavor.dockerfile),
       /aws-cli \*\*v1\*\*/,
       `${flavor.dockerfile} must state why apt awscli (v1) is deliberate — see ADR-028`,
     );
@@ -190,6 +191,23 @@ test('flavors install the apt awscli that ADR-028 measured, not a swapped-in CLI
 
 /** Flavors whose toolchain is meant to be resolvable from the runner tool cache. */
 const TOOLCACHE_FLAVORS = ['node', 'python', 'java', 'go'];
+
+/**
+ * A file with every comment line stripped, i.e. only what is actually EXECUTED.
+ *
+ * Every assertion about image content must run against this, not the raw text. These
+ * Dockerfiles document their own pitfalls in prose ("the marker is a SIBLING...", "setup-python
+ * looks up Python"), so a whole-file `assert.match` can be satisfied by the COMMENT that
+ * explains a requirement and stay green even when the instruction implementing it is deleted.
+ * Verified: replacing python's `bash ./setup.sh` with a hand-rolled `cp -R` (which writes no
+ * `arm64.complete`) left the marker guard passing, because the paragraph above it still said
+ * "setup.sh". `#` covers Dockerfiles + shell; `//` covers run-hook.mjs.
+ */
+const instructions = (p) =>
+  read(p)
+    .split('\n')
+    .filter((l) => !/^\s*(#|\/\/)/.test(l))
+    .join('\n');
 
 test('every catalog flavor has a Dockerfile that exists', () => {
   const catalog = JSON.parse(read('flavors.json'));
@@ -221,7 +239,7 @@ test('tool-cache flavors set RUNNER_TOOL_CACHE explicitly', () => {
   // back to _work/_tool. Without this the prebaked cache is in a directory the agent never
   // looks at, and every setup-* step silently re-downloads.
   for (const name of TOOLCACHE_FLAVORS) {
-    const df = read(`Dockerfile.${name}`);
+    const df = instructions(`Dockerfile.${name}`);
     assert.match(df, /RUNNER_TOOL_CACHE=\/opt\/hostedtoolcache/, `${name}: must pin RUNNER_TOOL_CACHE`);
   }
 });
@@ -231,11 +249,15 @@ test('every prebaked tool-cache entry writes the sibling .complete marker', () =
   // <tool>/<version>/<arch>.complete. Omitting the marker is the classic silent failure:
   // the toolchain is on disk but the action re-downloads it anyway.
   for (const name of TOOLCACHE_FLAVORS) {
-    const df = read(`Dockerfile.${name}`);
+    const df = instructions(`Dockerfile.${name}`);
     const hasMarker =
+      // either the Dockerfile creates the marker itself...
       /arm64\.complete/.test(df) ||
-      // the python flavor delegates to the upstream setup.sh, which writes the marker itself
-      /setup\.sh/.test(df);
+      // ...or it EXECUTES the upstream actions/python-versions installer, which writes the
+      // marker itself (`touch $PYTHON_TOOLCACHE_VERSION_PATH/$ARCH.complete`). Match the
+      // invocation, not the word: this is comment-stripped text, so a prose mention of
+      // setup.sh can no longer stand in for running it.
+      /\bbash\s+\.?\/?setup\.sh\b/.test(df);
     assert.ok(hasMarker, `${name}: no sibling arm64.complete marker is created`);
   }
 });
@@ -243,16 +265,25 @@ test('every prebaked tool-cache entry writes the sibling .complete marker', () =
 test('tool-cache entries use the exact toolName the setup action looks up', () => {
   // These strings are case-sensitive filesystem paths. `Python` is capitalized;
   // `node`/`go` are not; setup-java uses Java_<distribution>_<packageType>.
-  assert.match(read('Dockerfile.python'), /\/Python\//, 'setup-python looks up "Python"');
-  assert.match(read('Dockerfile.node'), /\/node\/\$\{NODE_VERSION\}/, 'setup-node looks up "node"');
-  assert.match(read('Dockerfile.go'), /\/go\/\$\{GO_VERSION\}/, 'setup-go looks up "go"');
-  assert.match(read('Dockerfile.java'), /Java_temurin_jdk/, 'setup-java looks up Java_<distro>_<pkg>');
+  const py = instructions('Dockerfile.python');
+  assert.match(py, /\/Python\//, 'setup-python looks up "Python"');
+  assert.match(
+    instructions('Dockerfile.node'),
+    /\/node\/\$\{NODE_VERSION\}/,
+    'setup-node looks up "node"',
+  );
+  assert.match(instructions('Dockerfile.go'), /\/go\/\$\{GO_VERSION\}/, 'setup-go looks up "go"');
+  assert.match(
+    instructions('Dockerfile.java'),
+    /Java_temurin_jdk/,
+    'setup-java looks up Java_<distro>_<pkg>',
+  );
 });
 
 test('the java tool-cache version dir uses - not + for the build separator', () => {
   // setup-java stores 21.0.12+8 as `21.0.12-8` (a '+' in JAVA_HOME breaks toolchains) and maps
   // it back when scanning. A '+' on disk means findAllVersions never sees the entry.
-  const df = read('Dockerfile.java');
+  const df = instructions('Dockerfile.java');
   assert.match(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/);
   assert.doesNotMatch(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}\+/);
 });
@@ -267,10 +298,14 @@ test('toolchain versions are pinned, not latest (reproducible rebuilds)', () => 
     node: /ARG NODE_VERSION=\d+\.\d+\.\d+/,
   };
   for (const [name, re] of Object.entries(pins)) {
-    assert.match(read(`Dockerfile.${name}`), re, `${name}: toolchain version must be pinned`);
+    assert.match(
+      instructions(`Dockerfile.${name}`),
+      re,
+      `${name}: toolchain version must be pinned`,
+    );
   }
   // The rust toolchain must not be installed as a floating channel.
-  assert.doesNotMatch(read('Dockerfile.rust'), /--default-toolchain stable/);
+  assert.doesNotMatch(instructions('Dockerfile.rust'), /--default-toolchain stable/);
 });
 
 test('no flavor installs a floating @latest / @stable package version', () => {
@@ -281,11 +316,7 @@ test('no flavor installs a floating @latest / @stable package version', () => {
   // beside a floating package manager is a half-kept promise.
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const instructions = read(flavor.dockerfile)
-      .split('\n')
-      .filter((l) => !/^\s*#/.test(l))
-      .join('\n');
-    const floating = [...instructions.matchAll(/[A-Za-z0-9@/._-]+@(?:latest|stable|next)\b/g)].map(
+    const floating = [...instructions(flavor.dockerfile).matchAll(/[A-Za-z0-9@/._-]+@(?:latest|stable|next)\b/g)].map(
       (m) => m[0],
     );
     assert.deepEqual(
@@ -299,7 +330,7 @@ test('no flavor installs a floating @latest / @stable package version', () => {
 
 test('the node flavor pins its package managers via ARGs it actually uses', () => {
   // A pin that is declared but not referenced is decoration — the RUN line must consume it.
-  const df = read('Dockerfile.node');
+  const df = instructions('Dockerfile.node');
   for (const [arg, tool] of [
     ['PNPM_VERSION', 'pnpm'],
     ['YARN_VERSION', 'yarn'],
@@ -318,7 +349,7 @@ test('every flavor Dockerfile bakes the run-hook server and exposes its port', (
   // The whole boot contract (ADR-012/016): no run-hook, no job.
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const df = read(flavor.dockerfile);
+    const df = instructions(flavor.dockerfile);
     assert.match(df, /COPY bootstrap\/run-hook\.mjs \$\{RUNNER_DIR\}\/run-hook\.mjs/, flavor.name);
     assert.match(df, /ENTRYPOINT \["node", "\/opt\/actions-runner\/run-hook\.mjs"\]/, flavor.name);
     assert.match(df, /EXPOSE 8080/, flavor.name);
@@ -330,7 +361,9 @@ test('every flavor pins the same runner agent version', () => {
   // up on that one flavor's jobs.
   const catalog = JSON.parse(read('flavors.json'));
   const versions = new Set(
-    catalog.flavors.map((f) => read(f.dockerfile).match(/ARG RUNNER_VERSION=([\d.]+)/)?.[1]),
+    catalog.flavors.map(
+      (f) => instructions(f.dockerfile).match(/ARG RUNNER_VERSION=([\d.]+)/)?.[1],
+    ),
   );
   assert.equal(versions.size, 1, `runner agent versions diverge across flavors: ${[...versions]}`);
   assert.ok(!versions.has(undefined), 'a flavor Dockerfile has no pinned RUNNER_VERSION');
@@ -343,7 +376,7 @@ test('no flavor chowns a directory nothing created (image build would fail)', ()
   // created earlier in the same Dockerfile.
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const df = read(flavor.dockerfile);
+    const df = instructions(flavor.dockerfile);
     const chowned = new Set(
       [...df.matchAll(/chown -R runner:runner ([^\n\\]+)/g)].flatMap((m) => m[1].trim().split(/\s+/)),
     );
@@ -365,13 +398,8 @@ test('rustup-init passes one --component per occurrence', () => {
   // rustup-init's clap parser takes a SINGLE value per --component: `--component clippy rustfmt`
   // exits with "unexpected argument 'rustfmt' found" and fails the image build. Verified against
   // a real rustup-init run.
-  const df = read('Dockerfile.rust');
   // Comment lines document the wrong form on purpose — only inspect real instructions.
-  const instructions = df
-    .split('\n')
-    .filter((l) => !/^\s*#/.test(l))
-    .join('\n');
-  const components = [...instructions.matchAll(/--component[ \t]+([^\s\\]+)([ \t]+[^\s\\-][^\s\\]*)?/g)];
+  const components = [...instructions('Dockerfile.rust').matchAll(/--component[ \t]+([^\s\\]+)([ \t]+[^\s\\-][^\s\\]*)?/g)];
   assert.ok(components.length >= 2, 'rust must install clippy + rustfmt');
   for (const m of components) {
     assert.equal(
@@ -390,10 +418,7 @@ test('no flavor bakes a global GOROOT (it would override a setup-go install)', (
   // `go` derives its own GOROOT from its own path, which is right for both cases.
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
-    const instructions = read(flavor.dockerfile)
-      .split('\n')
-      .filter((l) => !/^\s*#/.test(l));
-    for (const line of instructions) {
+    for (const line of instructions(flavor.dockerfile).split('\n')) {
       assert.doesNotMatch(
         line,
         /^\s*(?:ENV\s+)?GOROOT=/,
@@ -403,7 +428,7 @@ test('no flavor bakes a global GOROOT (it would override a setup-go install)', (
   }
   // ...and the go flavor must still reach its prebaked toolchain.
   assert.match(
-    read('Dockerfile.go'),
+    instructions('Dockerfile.go'),
     /PATH=\$\{RUNNER_TOOL_CACHE\}\/go\/\$\{GO_VERSION\}\/arm64\/bin:/,
     'the go flavor must put the cached toolchain bin on PATH',
   );
@@ -414,7 +439,7 @@ test('the rust flavor gives the job a WRITABLE RUSTUP_HOME', () => {
   // `rustup toolchain install` + `rustup default`, both of which WRITE into RUSTUP_HOME
   // (toolchains/, settings.toml). Root-owned, every workflow that pins a toolchain fails with a
   // permission error. The VM is single-use and runs one job, so there is no later job to poison.
-  const df = read('Dockerfile.rust');
+  const df = instructions('Dockerfile.rust');
   const home = df.match(/^ *(?:ENV )?RUSTUP_HOME=(\S+)/m)?.[1];
   assert.ok(home, 'rust must set RUSTUP_HOME');
   const chowned = [...df.matchAll(/chown -R runner:runner ([^\n\\]+)/g)]
@@ -433,7 +458,7 @@ test('the rust flavor gives the job a WRITABLE CARGO_HOME', () => {
   // /opt/rust/cargo, every dependency fetch fails with "failed to download replaced source
   // registry `crates-io`: Permission denied (os error 13)" — verified in a container as the
   // unprivileged runner user. The final CARGO_HOME must be under the runner's home.
-  const df = read('Dockerfile.rust');
+  const df = instructions('Dockerfile.rust');
   const values = [...df.matchAll(/^ *(?:ENV )?CARGO_HOME=(\S+)/gm)].map((m) => m[1]);
   assert.ok(values.length >= 1, 'rust must set CARGO_HOME');
   assert.match(
@@ -451,9 +476,8 @@ test('tool-cache paths are derived from the version pin, never a repeated litera
   // the flavor ships with a broken default toolchain.
   let inspected = 0;
   for (const name of TOOLCACHE_FLAVORS) {
-    const df = read(`Dockerfile.${name}`);
+    const df = instructions(`Dockerfile.${name}`);
     for (const line of df.split('\n')) {
-      if (/^\s*#/.test(line)) continue;
       // Match the cache root in EVERY form it is written: the Dockerfiles reference it as
       // ${RUNNER_TOOL_CACHE}, so a filter that only looked for the literal `hostedtoolcache`
       // string skipped every real instruction and the assertion below could never fire.
@@ -487,7 +511,7 @@ test('the node flavor\'s tool-cache pin agrees with its apt NODE_MAJOR', () => {
   // setup-node resolves. If they drift, a `setup-node` with `node-version: 24` gets a cache hit
   // on a major the rest of the image does not have — a comment asking to keep them in sync does
   // not enforce anything.
-  const df = read('Dockerfile.node');
+  const df = instructions('Dockerfile.node');
   const major = df.match(/ARG NODE_MAJOR=(\d+)/)?.[1];
   const version = df.match(/ARG NODE_VERSION=(\d+)\.\d+\.\d+/)?.[1];
   assert.ok(major && version, 'node must pin both NODE_MAJOR and NODE_VERSION');
@@ -500,7 +524,7 @@ test('this repo\'s own CI asks setup-node for the major the node flavor prebaked
   // major the image did not bake is a SILENT cache miss: the job downloads Node at full speed
   // and our own CI stops exercising the prebaked cache that ADR-039 exists to provide. Nothing
   // else catches this — the workflow still passes, just slower.
-  const baked = read('Dockerfile.node').match(/ARG NODE_MAJOR=(\d+)/)?.[1];
+  const baked = instructions('Dockerfile.node').match(/ARG NODE_MAJOR=(\d+)/)?.[1];
   const ci = fs.readFileSync(path.join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
   const requested = [...ci.matchAll(/node-version:\s*'?"?(\d+)/g)].map((m) => m[1]);
   assert.ok(requested.length > 0, 'ci.yml should pin a node-version for setup-node');
@@ -512,6 +536,42 @@ test('this repo\'s own CI asks setup-node for the major the node flavor prebaked
         'silent tool-cache miss; bump one to match the other',
     );
   }
+});
+
+test('flavors whose jobs compile native code ship a C toolchain', () => {
+  // A prebaked interpreter/toolchain is not a self-sufficient job environment: any
+  // `pip install` of a source-only sdist (arm64 manylinux wheels are still commonly absent),
+  // any `go build` touching cgo, and every `cargo` link step shell out to `cc`. Verified in a
+  // container that a bare ubuntu:22.04 plus the shared apt line has NO gcc/cc/make/ld, so
+  // without this the failure lands mid-job as "command 'gcc' failed: No such file or
+  // directory" — after the download cost is already paid, in someone else's build.
+  // `base`/`node`/`java`/`docker` are excluded deliberately: not compile-from-source paths,
+  // and build-essential is ~200 MB of snapshot per flavor.
+  for (const name of ['python', 'go', 'rust']) {
+    assert.match(
+      instructions(`Dockerfile.${name}`),
+      /^\s+build-essential\b/m,
+      `${name}: needs build-essential — its jobs compile native code`,
+    );
+  }
+});
+
+test('image-content assertions read EXECUTED instructions, not comments', () => {
+  // These Dockerfiles document their own pitfalls in prose, so a whole-file `assert.match` can
+  // be satisfied by the comment EXPLAINING a requirement while the instruction implementing it
+  // is gone. That was real: python's `.complete` marker guard accepted the word "setup.sh" from
+  // a comment paragraph, so replacing `bash ./setup.sh` with a hand-rolled `cp -R` (which
+  // writes no marker) stayed green. Pin the helper that closes it.
+  const df = 'Dockerfile.python';
+  const raw = read(df);
+  const exec = instructions(df);
+  assert.ok(raw.length > exec.length, 'the stripper must actually remove comment lines');
+  assert.doesNotMatch(exec, /^\s*#/m, 'no comment line may survive');
+  // A distinctive phrase that exists ONLY in a comment must be invisible to assertions.
+  assert.match(raw, /KNOWN GAP \(deliberate\)/);
+  assert.doesNotMatch(exec, /KNOWN GAP \(deliberate\)/);
+  // ...while the instructions the guards care about are still there.
+  assert.match(exec, /\bbash\s+\.?\/?setup\.sh\b/);
 });
 
 test('the catalog memory values are plausible microVM requests', () => {
