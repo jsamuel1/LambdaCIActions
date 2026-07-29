@@ -1189,6 +1189,24 @@ superset of the parser. Pinned by `test/rewrite.test.mjs` in both directions —
 `windows`/`macos`/LCA spellings are refused, and an escaped `ubuntu-latest` is still recognized
 as the label we may replace.
 
+**Tenth-review fix**: a **comment-only `runs-on` value is refused**, not tokenized as labels.
+`RUNS_ON_RE` consumes the whitespace after `runs-on:`, so a line whose whole value is a comment
+(`runs-on: # options: self-hosted, ubuntu-latest`, with the real labels in the block sequence on
+the following lines) reaches `splitComment` as a string whose FIRST character is `#`. The comment
+scanner required a preceding whitespace character, so it found no comment and handed the comment
+TEXT to the label tokenizer. A comment that happens to name a hosted label therefore passed the
+hosted-label gate, and the emitted line was
+`runs-on: [self-hosted, # options: self-hosted, lambda-ci]` — which **does not parse at all**
+(`missed comma between flow collection entries`), leaves the block sequence below it dangling,
+and would have been committed to the customer's repository by a PR we opened. That is exactly the
+failure the line-level design exists to prevent, and neither the unterminated-quote refusal nor
+the escape-decode work above could see it: the value is well-formed, it simply is not a value.
+`splitComment` now treats a `#` at position 0 as a comment (matching YAML), which leaves the
+remaining value empty, and `rewriteRunsOnValue` refuses it with a reason naming the shape (the
+labels are on the following lines — hand-edit) rather than the generic block-sequence message.
+Pinned by `test/rewrite.test.mjs`, which asserts the original file parses, the plan produces NO
+edits and NO `content`, and the skip reason names the operator action.
+
 **Consequences**: an extra queue + λ, both inert in a default deployment. The rewriter's
 coverage is deliberately partial; `skipped` entries are a first-class output surfaced in the
 UI and repeated in the PR body, alongside an explicit arm64 warning for the reviewer.

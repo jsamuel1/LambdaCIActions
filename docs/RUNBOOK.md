@@ -236,8 +236,10 @@ every image available, and a test push completes green.
 ## Break-glass
 
 **Stop all claiming immediately** (platform-wide, no deploy): point the runner-labels config
-at a label nothing uses. Ingest reads it per invocation, so it takes effect on the next
-webhook.
+at a label nothing uses. Ingest re-reads it from SSM on a 5-minute per-container cache
+(`src/shared/ssm.ts`), so it takes effect within **~5 minutes** — warm containers keep using
+the old value until their cache entry expires. If you need it to be instant, also zero
+Provision's concurrency (below) so nothing launches while the change propagates.
 ```bash
 aws ssm put-parameter --name /lca/<env>/config/runner-labels \
   --value 'lambda-ci-DISABLED' --type String --overwrite

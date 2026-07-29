@@ -613,6 +613,65 @@ jobs:
   assert.deepEqual(parsed.jobs[0].runs_on, ['self-hosted', 'team: infra', 'lambda-ci']);
 });
 
+// A `#` at position 0 opens a comment just as ` #` does mid-line: `RUNS_ON_RE` has already
+// consumed the whitespace after `runs-on:`, so `runs-on: # labels below` reaches the value
+// splitter as a string whose FIRST character is `#`. The comment scanner required a preceding
+// whitespace character, so it found no comment at all and handed the comment TEXT to the label
+// tokenizer. A comment that happens to mention a hosted label then passed the hosted-label gate
+// and the rewriter emitted a flow sequence containing the comment:
+//
+//   runs-on: # options: self-hosted, ubuntu-latest
+//     becomes  runs-on: [self-hosted, # options: self-hosted, lambda-ci]
+//
+// which does not parse (`missed comma between flow collection entries`) - and the job's REAL
+// labels were in the block sequence on the following lines, so this is a broken workflow
+// committed to a customer's repository by a PR we opened. In YAML the line carries no inline
+// value, so it must be refused like any other block sequence.
+test('a comment-ONLY runs-on value is refused, never tokenized as labels', () => {
+  for (const value of [
+    '# options: self-hosted, ubuntu-latest',
+    '#ubuntu-latest',
+    '# see ubuntu-latest, big-disk below',
+    '#',
+  ]) {
+    const r = rewriteRunsOnValue(value, 'lambda-ci');
+    assert.equal(r.ok, false, `${value} must be refused, got ${r.ok ? r.value : ''}`);
+    assert.match(r.reason, /only a comment|block sequence/, value);
+  }
+});
+
+test('a block sequence introduced by a comment line is skipped, and the file is untouched', () => {
+  const src = `name: CI
+on: push
+jobs:
+  build:
+    runs-on: # options: self-hosted, ubuntu-latest
+      - ubuntu-latest
+    steps:
+      - run: make
+`;
+  // The ORIGINAL is valid and its real selector is the block sequence.
+  assert.deepEqual(parseWorkflow('.github/workflows/ci.yml', src).jobs[0].runs_on, [
+    'ubuntu-latest',
+  ]);
+  const plan = planFileRewrite('.github/workflows/ci.yml', src, [
+    { jobId: 'build', flavor: 'base' },
+  ]);
+  assert.deepEqual(plan.edits, []);
+  assert.equal(plan.content, undefined, 'a refused job must not rewrite the file');
+  assert.equal(plan.diff, '');
+  assert.equal(plan.skipped.length, 1);
+  assert.match(plan.skipped[0].reason, /only a comment/);
+  assert.match(plan.skipped[0].reason, /by hand/, 'the reason must name the operator action');
+});
+
+test('a bare comment-free block sequence is still reported as a block sequence', () => {
+  // Same unrewritable shape, no comment: the original message must survive the new branch.
+  const r = rewriteRunsOnValue('', 'lambda-ci');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /block sequence/);
+});
+
 test('the dry run re-quotes labels the analysis stored unquoted', () => {
   // Discovery stores PARSED (unquoted) labels, so the preview must re-quote what needs it —
   // otherwise the operator is shown a mapping-shaped selector the λ would never write.

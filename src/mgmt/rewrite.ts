@@ -250,6 +250,17 @@ export function findRunsOnLines(yamlText: string): Map<string, number> {
  * state early, so a later ` #` inside the same label reads as a comment and the value is cut
  * mid-token. Single-quoted scalars have no backslash escapes (`''` is the only escape, and it
  * naturally reads as close-then-reopen), so the backslash rule applies to `"` only.
+ *
+ * A `#` at position 0 starts a comment too — `RUNS_ON_RE` has already eaten the whitespace
+ * after `runs-on:`, so `runs-on: # labels below` arrives here as a value whose FIRST character
+ * is `#`. Requiring a preceding whitespace character therefore misread a comment-ONLY value as
+ * a label list: `runs-on: # options: self-hosted, ubuntu-latest` tokenized into
+ * `# options: self-hosted` + `ubuntu-latest`, passed the hosted-label gate on the second, and
+ * emitted `runs-on: [self-hosted, # options: self-hosted, lambda-ci]` — which does not parse
+ * at all (`missed comma between flow collection entries`) and, because the real labels sat in
+ * the block sequence on the FOLLOWING lines, would have been committed to a customer's
+ * repository as a broken workflow. In YAML such a line carries no value (the scalar is the
+ * following block sequence, or nothing), so the caller must refuse it.
  */
 function splitComment(value: string): { value: string; comment: string } {
   let quote: "'" | '"' | undefined;
@@ -267,7 +278,7 @@ function splitComment(value: string): { value: string; comment: string } {
       quote = ch;
       continue;
     }
-    if (ch === '#' && i > 0 && /\s/.test(value[i - 1])) {
+    if (ch === '#' && (i === 0 || /\s/.test(value[i - 1]))) {
       // Walk back over ALL the whitespace before `#` so the comment (and the column it sits
       // in) is reproduced byte-for-byte; cutting at a single space silently reflowed a
       // deliberately aligned trailing comment.
@@ -518,8 +529,11 @@ export function rewriteRunsOnValue(
   if (!value) {
     return {
       ok: false,
-      reason:
-        'runs-on uses a block sequence (labels on following lines); rewrite it by hand to keep the diff reviewable',
+      reason: comment
+        ? // The whole value was a comment, so the labels (if any) live in a block sequence on the
+          // following lines — the same unrewritable shape, reached by a different spelling.
+          `runs-on carries no inline value (the line is only a comment: ${comment.trim()}); its labels are on the following lines — rewrite it by hand to keep the diff reviewable`
+        : 'runs-on uses a block sequence (labels on following lines); rewrite it by hand to keep the diff reviewable',
     };
   }
   if (value.includes('${{')) {

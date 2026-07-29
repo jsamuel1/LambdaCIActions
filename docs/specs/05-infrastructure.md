@@ -190,9 +190,14 @@ template, so re-widening the role fails the build.
   with no subscriber is a silent alarm, but a committed address would be wrong for every other
   deployment).
 - **Tracing**: X-Ray **active tracing on the Lambdas** on the hot path (per-env, ADR-033:
-  Ingest, Provision, Discovery, Reaper, hook broker, rewrite, mgmt). API Gateway and SQS are
-  *not* separately instrumented in v1 — SQS propagates the trace header, so a webhook→launch
-  trace links across the queue, but the HTTP API itself contributes no segment.
+  Ingest, Provision, Discovery, Reaper, hook broker, rewrite, mgmt). Each function's invocation
+  gets its own segment, which is what makes a slow provision or a failing handler visible.
+  API Gateway and SQS are *not* instrumented, and v1 ships **no X-Ray SDK / ADOT layer**, so
+  outbound SDK calls produce no subsegments and nothing writes SQS's `AWSTraceHeader` — a
+  webhook and the launch it caused are therefore **separate traces**, not one linked trace
+  across the queue. Correlating them today means the run's `(repoId, runId, jobId)` in the
+  structured logs, not a trace id. End-to-end trace linking needs sender-side instrumentation
+  and is deliberately out of v1.
 - **Cost**: the console's Dashboard shows a rolling spend estimate over recently finished runs,
   broken down per flavor, derived from the same per-run estimate as Run detail (no Cost Explorer
   call). It is an upper bound (wall-clock × flavor rate) and labelled as an estimate.
