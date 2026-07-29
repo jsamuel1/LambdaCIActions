@@ -49,6 +49,8 @@ True zero-edit adoption + hardening.
 - `adopt` mode (standard-label mapping); opt-in auto-rewrite PR.
 - Compat guidance surfaced with actionable fixes.
 - Metrics/alarms/X-Ray; cost estimates in Run detail.
+- **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
+  (cost left Runs per ADR-029; see spec 04 OQ-6).
 - `dev`/`prod` account separation; runbook + quotas doc.
 - 🎯 A brand-new repo runs unchanged in `adopt` mode; dashboard shows health + cost.
 

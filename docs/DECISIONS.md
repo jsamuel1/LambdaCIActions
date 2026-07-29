@@ -874,6 +874,92 @@ pre-warm adds one CLI invocation to each image build. Boot logs gain an `aws cli
 and an `ms` field per broker attempt; neither carries payload content (the capability token and
 the JIT config stay redacted per ADR-021).
 
+## ADR-029 — Runs is run-primary with client-side grouping and an explicit partial flag (M4)
+**Status**: Accepted (v1) · refines [ADR-023](#adr-023) · [spec 04](specs/04-web-ui.md) § Runs
+**Context**: the Runs screen listed one row per **job**, because that is what the store holds:
+a run row is keyed by the `(repoId, runId, jobId)` triple (ADR-009) and both indexes (GSI1
+status/time, GSI2 repo/time) page over job rows. An operator thinks in **workflow runs**, so a
+matrix of 8 jobs read as 8 unrelated lines. Making the run the primary row needs a fold — and
+the fold can lie: `GET /api/runs` returns an index **page**, so a run's jobs can straddle the
+page boundary and a rollup computed from a partial job set reports a wrong duration and a
+wrong status. A `status=` filter makes it worse: it returns only the jobs *in that status*, so
+every run row built from it is partial by construction.
+**Decision**: group **client-side**, and carry completeness explicitly rather than assuming it.
+- The fold lives in one pure module, `src/mgmt/run-rollup.ts`, re-exported to the SPA via
+  `web/src/rollup.ts` and unit-tested against `dist/` (`test/run-rollup.test.mjs`) — not
+  inline in the React component, where it could not be tested.
+- **Status fold**: failure dominates (any `failed` → `failed`, then `timed_out`); otherwise the
+  most advanced active status wins (`running` > `provisioning` > `queued`); `completed` only
+  when every job completed. An empty job set folds to `queued`, never `completed`.
+- **Flavor rollup**: the single name when all jobs agree, else `<most common> +<n>` with the
+  full breakdown on expand. Jobs with no flavor yet are ignored, not folded in. On a partial
+  window the label is weakened (`node +?` / `node +2?`) because an unread job may use an
+  unseen flavor — "all jobs agree" is exactly the claim a partial window cannot make.
+- **Duration**: **wall clock** (earliest job queued → latest transition) is the primary figure
+  because it answers "how long did this run take". The **sum of job durations** is shown on
+  expand as **job time** — deliberately not "compute": each job's `durationSeconds` is itself
+  queue → last transition, so queued time is included and the sum is an upper bound on billed
+  microVM runtime, not a cost basis (v1 stores no per-phase timestamps — spec 04 OQ-5). It
+  exceeds wall clock whenever jobs run in parallel, which is the question it answers.
+- **Completeness** is split into two halves, so neither side can lie on its own. The **server**
+  returns `complete` on `GET /api/runs`, answering only *were any job rows dropped from this
+  response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
+  cursor, plus the integrity of the join between its live head page and its appended older
+  pages. Whole runs are folded only when every loaded page said `complete`, the cursor is
+  spent, **and** that join is intact; otherwise **every** group in the window is stamped
+  `partial`, badged in the UI, and its status/job count/flavor/durations render as lower bounds,
+  while its **start time** renders as an *upper* bound (`≤`) — the earliest LOADED job's queue
+  time, which an unread earlier sibling would push back. Bounding the durations but not the
+  start time would leave one value on the row still asserted as fact.
+  The head/older join is the third signal because the head page is re-polled every 5 s while
+  the older pages sit in client state, and GSI2 is sorted by the immutable `createdAt`: a newly
+  queued job pushes a row off the bottom of the fixed-size head page into a gap the older pages
+  begin below, so the window develops a hole in the middle while the cursor and server verdict
+  both still say exact. The client therefore remembers the key of the head row directly above
+  the first older row and treats the window as partial once that row is no longer on the head
+  page (`headSeamIntact`) — identity, not a row count, because the count is unchanged by the
+  shift. The seam is armed by the paging **hop**, not by the arrival of appended rows: a repo
+  page can come back empty with a live cursor when `collectVisible` spent its page budget on
+  another tenant's rows, and that hop moved the cursor off the head page just the same. It is
+  also captured from the head snapshot the cursor was read from, before the request, so the
+  recorded row and the resume point belong to one snapshot. Re-fetching the whole appended
+  history on every poll was rejected: it would multiply
+  the 5 s read cost by the number of pages walked to fix a case the operator resolves by
+  reloading.
+  Paging is also asynchronous while the filter controls reset the window, so each older-page
+  request carries its filter identity (`pageQueryKey`) and is discarded if the repo/status
+  changed before it landed — applying it would append the previous repo's jobs under the newly
+  selected one and continue paging the old index.
+  Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor
+  while history remains, so folding exhaustion into the server's flag would leave such a window
+  permanently partial no matter how far the operator paged. The dropped-rows half in turn cannot
+  be computed client-side: the merged multi-status view queries each status index for `limit`
+  rows and applies the installation-visibility filter *afterwards*, so a response shortened by
+  filtering out another tenant's rows would look like proof of exhaustion while this operator's
+  sibling jobs sit unread past the boundary. Only the route sees the raw per-status cursors
+  (`mergedResponseComplete`); the repo path never slices, so it reports
+  `repoResponseComplete`.
+  A `status=` filter drops sibling jobs by construction and therefore always reports
+  `complete: false`, including when combined with `repo=` — in which case `repo` picks the index
+  and `status` rides along as a post-query predicate rather than being ignored.
+**Why**: no new API surface — `complete` is one added response field on an existing read, so
+the change needs no infrastructure and no schema change. Server-side **grouping** was rejected
+for v1: it would mean a run-keyed index (GSI3) or a fan-out read per run, i.e. a hot-path
+schema change to fix a presentation problem. Per-run job fetch on expand was rejected as
+insufficient on its own: it fixes the *expanded* view but the collapsed row still shows a
+rollup, so completeness would still have to be labelled. Flagging only the run that owns the
+page-boundary row would be unsound — a straddling run's oldest *loaded* job need not be the
+boundary row — so the flag is per window, deliberately conservative.
+**Consequences**: a truncated window marks runs partial even when most are in fact whole; that
+is the accepted direction of error (a labelled lower bound over a confident wrong number).
+Clearing the status filter or exhausting the cursor with a repo filter yields exact rollups.
+Run/job ids move to small dim text with a copy button (`CopyId`), which must
+`stopPropagation` because it sits inside a click-through row. **Est. cost leaves this screen**:
+a cost figure belongs on a Reports screen with a window and grouping, so `formatCost` and
+`flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
+If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
+ADR is the place to record the reversal.
+
 ## ADR-037 — Installation enumeration reconciles unindexed rows on read (M4 fix)
 **Status**: Accepted (v1) · follows [ADR-009](#adr-009), [ADR-022](#adr-022)
 **Context**: `listInstallations()` enumerates installations from the GSI1 `INSTALLS`

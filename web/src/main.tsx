@@ -105,7 +105,12 @@ function App(): JSX.Element {
             Sign out
           </button>
         </header>
-        {renderRoute(segments, { installationId, navigate, repoFilter })}
+        {renderRoute(segments, {
+          installationId,
+          navigate,
+          repoFilter,
+          installations: me.data.installations,
+        })}
       </main>
     </div>
   );
@@ -132,7 +137,12 @@ function titleFor(segments: string[]): string {
 
 function renderRoute(
   segments: string[],
-  ctx: { installationId?: number; navigate: (to: string) => void; repoFilter: string | null },
+  ctx: {
+    installationId?: number;
+    navigate: (to: string) => void;
+    repoFilter: string | null;
+    installations: { installationId: number; accountLogin: string }[];
+  },
 ): JSX.Element {
   const [head, a, b, c] = segments;
   switch (head) {
@@ -150,6 +160,7 @@ function renderRoute(
       ) : (
         <Runs
           repoFilter={ctx.repoFilter ? Number(ctx.repoFilter) : undefined}
+          installations={ctx.installations}
           navigate={ctx.navigate}
         />
       );
