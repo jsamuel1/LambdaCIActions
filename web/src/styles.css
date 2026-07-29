@@ -97,6 +97,31 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .gap-top { margin-top: 10px; }
 .workflow { margin-bottom: 18px; }
 
+/* De-emphasized ids + copy affordance (Runs / Run detail). */
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.idcell { display: inline-flex; align-items: center; gap: 4px; }
+button.copy {
+  padding: 0 4px; font-size: 11px; line-height: 1.6;
+  background: transparent; border-color: transparent; color: var(--muted);
+}
+button.copy:hover { color: var(--fg); border-color: var(--line); }
+
+/* Run-primary rows: the expander toggle and the nested job rows it reveals. */
+button.expander {
+  padding: 0 6px; min-width: 24px; font-family: ui-monospace, Menlo, monospace;
+  background: transparent; border-color: transparent; color: var(--muted);
+}
+button.expander:hover { color: var(--fg); border-color: var(--line); }
+tr.jobrow > td { background: var(--panel-2); font-size: 13px; }
+tr.jobrow > td:first-child { padding-left: 34px; }
+td.jobs-head { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* Visually hidden, still announced — live regions + labels for icon-only buttons. */
+.sronly {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
 pre.logs {
   background: #0b0d12;
   border: 1px solid var(--line);

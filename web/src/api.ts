@@ -188,7 +188,15 @@ export const api = {
     if (query.limit) p.set('limit', String(query.limit));
     if (query.cursor) p.set('cursor', query.cursor);
     const qs = p.toString();
-    return request<{ runs: Run[]; nextCursor: string | null }>(`/api/runs${qs ? `?${qs}` : ''}`);
+    /**
+     * `complete` is the server's verdict on whether this page holds every job of every run
+     * it mentions — the client cannot work that out, because truncation happens on the raw
+     * index pages before the installation-visibility filter (ADR-029). Absent (older API)
+     * is treated as `false` by the caller: partial is the safe default.
+     */
+    return request<{ runs: Run[]; nextCursor: string | null; complete?: boolean }>(
+      `/api/runs${qs ? `?${qs}` : ''}`,
+    );
   },
   run: (repoId: number, runId: number, jobId: number) =>
     request<{ run: Run }>(`/api/runs/${repoId}/${runId}/${jobId}`),

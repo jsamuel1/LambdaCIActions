@@ -1,4 +1,4 @@
-import { type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { CompatLevel, CompatRollup, RunStatus } from './api.js';
 
 export function Badge({ kind, children }: { kind: string; children: ReactNode }): JSX.Element {
@@ -53,6 +53,56 @@ export function ErrorBox({ message }: { message: string }): JSX.Element {
     <div className="card">
       <p className="error">{message}</p>
     </div>
+  );
+}
+
+/**
+ * A de-emphasized identifier with a copy button (spec 04 § Runs). Ids are for correlating
+ * with GitHub/CloudWatch, not for scanning, so they render small + dim at the end of the
+ * column they belong to rather than as a column of their own.
+ *
+ * The button lives inside a clickable table row, so it must stop propagation — otherwise
+ * copying an id also navigates away from the list. Accessibility: the button carries an
+ * explicit `aria-label` (its glyph is decorative) and the copied state is announced through
+ * a polite live region rather than colour alone.
+ */
+export function CopyId({ label, value }: { label: string; value: string }): JSX.Element {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  async function copy(): Promise<void> {
+    try {
+      // `navigator.clipboard` needs a secure context; the console is HTTPS-only behind
+      // CloudFront (ADR-024), but a plain-HTTP dev origin would leave it undefined.
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+      else return;
+      setCopied(true);
+      window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // A denied clipboard permission is not worth an error banner — the id is on screen.
+    }
+  }
+
+  return (
+    <span className="idcell">
+      <span className="muted mono">{value}</span>
+      <button
+        type="button"
+        className="copy"
+        aria-label={`Copy ${label} ${value}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          void copy();
+        }}
+      >
+        <span aria-hidden="true">{copied ? '✓' : '⧉'}</span>
+      </button>
+      <span className="sronly" role="status" aria-live="polite">
+        {copied ? `${label} ${value} copied` : ''}
+      </span>
+    </span>
   );
 }
 

@@ -34,6 +34,7 @@ import {
 } from './views.js';
 import { parseLimit, parseEpochMs, validateFlavorMap, validateRepoPatch } from './validate.js';
 import { collectVisible } from './paging.js';
+import { mergedResponseComplete } from './run-rollup.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -492,7 +493,13 @@ async function listRunsRoute(
       limit,
       q.cursor,
     );
-    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
+    // GSI2 is repo/time, so an exhausted cursor means every job of every run in this window
+    // was read — the client may fold whole runs (ADR-029).
+    return json(200, {
+      runs: page.runs.map(toRunView),
+      nextCursor: page.nextCursor ?? null,
+      complete: page.nextCursor === undefined,
+    });
   }
   if (q.status !== undefined) {
     if (!ALL_STATUSES.includes(q.status as RunStatus)) {
@@ -505,15 +512,35 @@ async function listRunsRoute(
       limit,
       q.cursor,
     );
-    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
+    // A status-filtered page holds only the jobs IN that status, so a run folded from it is
+    // partial by construction however far the cursor got.
+    return json(200, {
+      runs: page.runs.map(toRunView),
+      nextCursor: page.nextCursor ?? null,
+      complete: false,
+    });
   }
   const pages = await Promise.all(
     ALL_STATUSES.map((s) => listRunsByStatusPaged(s, { limit })),
   );
-  const merged = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs))).slice(0, limit);
+  const visibleRuns = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs)));
+  const merged = visibleRuns.slice(0, limit);
   // A merged multi-index view has no single coherent cursor — the client narrows by
   // status or repo to paginate deeper.
-  return json(200, { runs: merged.map(toRunView), nextCursor: null });
+  //
+  // `complete` tells the client whether it may fold these job rows into whole-run rollups.
+  // It is decided HERE because only this code sees the raw per-status pages: truncation must
+  // be judged before the visibility filter, since a page filled with another tenant's rows
+  // looks short while this operator's sibling jobs sit unread past the boundary (ADR-029).
+  return json(200, {
+    runs: merged.map(toRunView),
+    nextCursor: null,
+    complete: mergedResponseComplete({
+      anyIndexTruncated: pages.some((p) => p.nextCursor !== undefined),
+      visibleRows: visibleRuns.length,
+      returnedRows: merged.length,
+    }),
+  });
 }
 
 /**

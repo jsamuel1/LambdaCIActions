@@ -7,7 +7,8 @@ Status: **Implemented (M4)** · Plane: Management
 > [ADR-023](../DECISIONS.md#adr-021) (run-history index), [ADR-024](../DECISIONS.md#adr-022)
 > (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-023) (mgmt IAM boundary),
 > [ADR-026](../DECISIONS.md#adr-024) (polling), [ADR-027](../DECISIONS.md#adr-025) (where
-> console config is enforced). Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
+> console config is enforced), [ADR-029](../DECISIONS.md#adr-029) (run-primary Runs screen).
+> Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
 
 The operator console: install/manage the GitHub App, see which repos + workflows are
 onboarded, inspect live and historical runs with logs, and tune flavor mappings. Backed by
@@ -40,7 +41,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Repos** | List installed repos; enable/disable; set mode + default flavor | full_name, mode, default flavor, compat rollup, last change + actor | `#/repos` |
 | **Repo detail** | Per-repo workflows + flavor map | workflows[], per-job routing, compat findings, override editor, re-scan | `#/repos/{repoId}` |
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
-| **Runs** | Filterable run history | status, repo, run/job, flavor, duration, est. cost, started | `#/runs` (`?repo=<id>`) |
+| **Runs** | Filterable, run-primary history | run + folded status, flavor rollup, duration, job count, expandable jobs | `#/runs` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
 | **Settings** | Secret/config presence, env identity | SSM param presence (**not values**), env, region | `#/settings` |
@@ -48,6 +49,45 @@ a management API over the same DynamoDB the control/compute planes write to.
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has
 a handful of workflow files, and the operator's question ("which job goes where, and what's
 incompatible?") is answered by one table per file without a navigation hop.
+
+### Runs screen — run-primary rows and rollup rules
+
+The run store is per **job** (key = `(repoId, runId, jobId)`, ADR-009) but an operator thinks
+in workflow **runs**, so the screen's primary row is a run and its jobs are nested behind an
+expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to the SPA as
+`web/src/rollup.ts`, tested in `test/run-rollup.test.mjs`) — **ADR-029**:
+
+- **Status fold** — failure dominates: any `failed` → `failed`, then `timed_out`; otherwise
+  the most advanced active status wins (`running` > `provisioning` > `queued`); `completed`
+  only when every job completed. An empty job set folds to `queued`, never `completed`.
+- **Flavor rollup** — the single name when all jobs agree, else `<most common> +<n>` (e.g.
+  `node +2`) with the full breakdown shown on expand. Jobs with no flavor yet are ignored.
+- **Duration** — the run row shows **wall clock** (earliest job queued → latest transition),
+  which answers "how long did the run take". The **sum of job durations** appears on expand as
+  **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
+  time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
+  basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point.
+- **Partial rollups** — grouping is client-side over an index **page**, so a run's jobs can
+  straddle the page boundary. `GET /api/runs` therefore returns **`complete`**: the server's
+  verdict on whether the page holds every job of every run it mentions. It has to be decided
+  server-side, because truncation is judged on the raw index pages *before* the
+  installation-visibility filter — a page filled with another tenant's rows comes back short
+  while this operator's sibling jobs sit unread past the boundary. The client folds whole runs
+  only when `complete` is true for every loaded page **and** the cursor is exhausted;
+  otherwise every run in the window is badged `partial` and its status, job count and
+  durations render as `≥` lower bounds. A `status=` filter selects *jobs*, so it always
+  reports `complete: false` — the screen says so inline.
+- **Ids** — run/job ids are small dim text at the end of their column with a copy button
+  (`CopyId`): an accessible label, a polite live region for the copied state, and
+  `stopPropagation` so copying does not trigger the row's navigation.
+- **Expansion survives polling** — expansion is component state keyed `repoId-runId`, so the
+  5 s poll re-renders rows without collapsing an open run.
+- **No cost column.** Cost belongs on a Reports screen with a time window and grouping, not on
+  a history list; `formatCost` / `flavorRatePerMinute` remain for Run detail and Reports (M5).
+- **Repo filter** is an in-screen picker that fans out over the session's installations
+  client-side (`GET /api/repos` is installation-scoped; no aggregated repos read was added).
+  The selection lives in the URL (`#/runs?repo=<id>`), keeping the
+  Repo-detail deep link and shareable filtered views working.
 
 Wireframe (Repo detail):
 
@@ -83,7 +123,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
-| `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`) | ✅ |
+| `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`); returns `complete` (may these rows be folded into whole runs?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
@@ -213,3 +253,8 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - **OQ-4**: custom domain + ACM cert for the console (currently the CloudFront domain) — M5.
 - **OQ-5**: per-phase run timestamps (`provisioningAt`/`runningAt`) would make the cost
   estimate exact and enable boot-latency charts. Worth a run-row schema addition in M5?
+- **OQ-6**: **Reports screen** — cost/utilisation over a time window, grouped by repo, flavor
+  or workflow, using `formatCost` / `flavorRatePerMinute` (removed from Runs per ADR-029).
+  Whether that needs a run-keyed index or an aggregation job is the open part — a per-run cost
+  total over an arbitrary window cannot be served by the current per-job indexes without a
+  scan. Tracked as its own M5 card, not part of the Runs work.

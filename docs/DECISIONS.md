@@ -863,3 +863,55 @@ the new hook timeout and the pre-warm both live in the **image**, so they need a
 pre-warm adds one CLI invocation to each image build. Boot logs gain an `aws cli prewarm` line
 and an `ms` field per broker attempt; neither carries payload content (the capability token and
 the JIT config stay redacted per ADR-021).
+
+## ADR-029 — Runs is run-primary with client-side grouping and an explicit partial flag (M4)
+**Status**: Accepted (v1) · refines [ADR-023](#adr-023) · [spec 04](specs/04-web-ui.md) § Runs
+**Context**: the Runs screen listed one row per **job**, because that is what the store holds:
+a run row is keyed by the `(repoId, runId, jobId)` triple (ADR-009) and both indexes (GSI1
+status/time, GSI2 repo/time) page over job rows. An operator thinks in **workflow runs**, so a
+matrix of 8 jobs read as 8 unrelated lines. Making the run the primary row needs a fold — and
+the fold can lie: `GET /api/runs` returns an index **page**, so a run's jobs can straddle the
+page boundary and a rollup computed from a partial job set reports a wrong duration and a
+wrong status. A `status=` filter makes it worse: it returns only the jobs *in that status*, so
+every run row built from it is partial by construction.
+**Decision**: group **client-side**, and carry completeness explicitly rather than assuming it.
+- The fold lives in one pure module, `src/mgmt/run-rollup.ts`, re-exported to the SPA via
+  `web/src/rollup.ts` and unit-tested against `dist/` (`test/run-rollup.test.mjs`) — not
+  inline in the React component, where it could not be tested.
+- **Status fold**: failure dominates (any `failed` → `failed`, then `timed_out`); otherwise the
+  most advanced active status wins (`running` > `provisioning` > `queued`); `completed` only
+  when every job completed. An empty job set folds to `queued`, never `completed`.
+- **Flavor rollup**: the single name when all jobs agree, else `<most common> +<n>` with the
+  full breakdown on expand. Jobs with no flavor yet are ignored, not folded in.
+- **Duration**: **wall clock** (earliest job queued → latest transition) is the primary figure
+  because it answers "how long did this run take". The **sum of job durations** is shown on
+  expand as **job time** — deliberately not "compute": each job's `durationSeconds` is itself
+  queue → last transition, so queued time is included and the sum is an upper bound on billed
+  microVM runtime, not a cost basis (v1 stores no per-phase timestamps — spec 04 OQ-5). It
+  exceeds wall clock whenever jobs run in parallel, which is the question it answers.
+- **Completeness** is decided by the **server**, not the client, and returned as `complete` on
+  `GET /api/runs`. The client folds whole runs only when every loaded page said `complete` and
+  the cursor is exhausted; otherwise **every** group in the window is stamped `partial`, badged
+  in the UI, and its status/job count/durations render as `≥` lower bounds.
+  The verdict cannot be computed client-side: the merged multi-status view queries each status
+  index for `limit` rows and applies the installation-visibility filter *afterwards*, so a
+  response shortened by filtering out another tenant's rows would look like proof of
+  exhaustion while this operator's sibling jobs sit unread past the boundary. Only the route
+  sees the raw per-status cursors (`mergedResponseComplete`).
+**Why**: no new API surface — `complete` is one added response field on an existing read, so
+the change needs no infrastructure and no schema change. Server-side **grouping** was rejected
+for v1: it would mean a run-keyed index (GSI3) or a fan-out read per run, i.e. a hot-path
+schema change to fix a presentation problem. Per-run job fetch on expand was rejected as
+insufficient on its own: it fixes the *expanded* view but the collapsed row still shows a
+rollup, so completeness would still have to be labelled. Flagging only the run that owns the
+page-boundary row would be unsound — a straddling run's oldest *loaded* job need not be the
+boundary row — so the flag is per window, deliberately conservative.
+**Consequences**: a truncated window marks runs partial even when most are in fact whole; that
+is the accepted direction of error (a labelled lower bound over a confident wrong number).
+Clearing the status filter or exhausting the cursor with a repo filter yields exact rollups.
+Run/job ids move to small dim text with a copy button (`CopyId`), which must
+`stopPropagation` because it sits inside a click-through row. **Est. cost leaves this screen**:
+a cost figure belongs on a Reports screen with a window and grouping, so `formatCost` and
+`flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
+If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
+ADR is the place to record the reversal.
