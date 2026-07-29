@@ -1175,6 +1175,13 @@ CloudWatch alarm reads **one exact dimension set** — it does not aggregate acr
   wall-clock (including the queued wait) for compute that never existed. The estimate therefore
   grew every time provisioning broke — exactly when an operator is reading the dashboard.
   `microvmId` is the only evidence a VM existed, so it gates the sample.
+- **The dashboard total does not pre-empt the Reports screen** ([ADR-029](#adr-029) moved cost
+  off Runs on the grounds that a cost figure needs a window and grouping). This is deliberately
+  the weaker artefact ADR-029 does not defer: a fixed, bounded sample of the most recent
+  terminal runs, labelled as such, reachable with no new index and no new read pattern — it
+  answers "is spend roughly what I expect" for the M5 exit criterion ("dashboard shows health
+  + cost"). The windowed, groupable report remains open on the Reports screen (spec 04 OQ-6);
+  when it lands, this sample is a candidate for removal rather than a second source of truth.
 **Consequences**: metric emission cannot fail a provision (`emitMetrics` swallows everything —
 telemetry is best-effort by construction). Alarm thresholds and λ error tolerances differ per
 environment (ADR-033). Anyone adding a metric must keep the emitter's dimension set and the

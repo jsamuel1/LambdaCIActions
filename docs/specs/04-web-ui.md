@@ -294,4 +294,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   or workflow, using `formatCost` / `flavorRatePerMinute` (removed from Runs per ADR-029).
   Whether that needs a run-keyed index or an aggregation job is the open part — a per-run cost
   total over an arbitrary window cannot be served by the current per-job indexes without a
-  scan. Tracked as its own M5 card, not part of the Runs work.
+  scan. Tracked as its own M5 card, not part of the Runs work. **Still open after M5's
+  observability slice**: the Dashboard's rolling total is a fixed bounded sample of recent
+  terminal runs (no window, no grouping), which is what a health screen can serve from the
+  existing per-status indexes — it is not the windowed report this OQ asks for.
