@@ -167,7 +167,7 @@ export function canAdminInstallation(session: SessionPayload, installationId: nu
 /**
  * Whether the session may perform **platform-wide** mutations (re-link the GitHub App,
  * change the environment's runner labels, trigger a webhook redelivery) — spec 04 § Settings,
- * ADR-028.
+ * ADR-029.
  *
  * Installation admin rights are NOT sufficient. GitHub's access model answers "may this
  * person administer this installation", which is the right question for repo config but the

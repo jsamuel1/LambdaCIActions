@@ -57,7 +57,7 @@ export async function paramExists(name: string): Promise<boolean> {
 /**
  * Current version number of a parameter, or undefined when it doesn't exist. Version
  * numbers are metadata, not secrets — they are the rollback handle for a credential relink
- * (ADR-028): SSM's parameter history holds the previous VALUES, so we never copy one.
+ * (ADR-029): SSM's parameter history holds the previous VALUES, so we never copy one.
  */
 export async function paramVersion(name: string): Promise<number | undefined> {
   try {
@@ -71,7 +71,7 @@ export async function paramVersion(name: string): Promise<number | undefined> {
 
 /**
  * Read a specific historical version of a parameter (`Name:version`). Only the App-config
- * broker holds the IAM grant for this on secret paths (ADR-028) — it is how rollback
+ * broker holds the IAM grant for this on secret paths (ADR-029) — it is how rollback
  * restores the pre-relink credentials without the platform ever storing a second copy.
  */
 export async function getParamVersion(name: string, version: number): Promise<string> {
@@ -85,7 +85,7 @@ export async function getParamVersion(name: string, version: number): Promise<st
 
 /**
  * Write a parameter, returning the new version. Reserved for the App-config broker; the
- * management λ has NO `ssm:PutParameter` grant of any kind (ADR-025 + ADR-028).
+ * management λ has NO `ssm:PutParameter` grant of any kind (ADR-025 + ADR-029).
  *
  * The per-container read cache is invalidated for the name so a subsequent verification read
  * in the same container can't observe the pre-write value.
@@ -113,7 +113,7 @@ export async function putParam(
 /**
  * Delete a parameter. Used ONLY to undo a failed first-link: a parameter this attempt created
  * has no prior version to restore, so leaving it behind would strand a partial credential set
- * (ADR-028). A missing parameter is treated as already-undone.
+ * (ADR-029). A missing parameter is treated as already-undone.
  */
 export async function deleteParam(name: string): Promise<void> {
   try {

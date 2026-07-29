@@ -126,7 +126,7 @@ so a large history reads as a labelled lower bound rather than a wrong total.
 ## Settings
 
 The Settings screen answers four operator questions with **evidence**, not with SSM parameter
-paths (ADR-028). SSM is an implementation detail: knowing that `/lca/dev/github/app-pem`
+paths (ADR-029). SSM is an implementation detail: knowing that `/lca/dev/github/app-pem`
 exists tells an operator nothing about whether their platform works.
 
 ### 1. GitHub App linkage
@@ -169,7 +169,9 @@ the scan drops opted-out repos with Ingest's own `isRepoOptedOut` (`enabled === 
 `mode === 'off'`), and `buildLabelImpact` skips jobs whose stored compat result is
 `eligible: false` — those never move whatever the labels say. A job with no stored analysis IS
 counted, because Ingest fails open there. The scan is bounded to 50 repos and reports
-`truncated`.
+`truncated`; the *enumeration* stops as soon as it holds more repos than it will scan, so a
+many-installation environment does not pay one `listRepos` query per installation inside the
+console's 29 s API Gateway integration cap.
 
 "Very next delivery" is enforced, not assumed: Ingest reads the label parameter with a 30 s cache
 TTL (`RUNNER_LABELS_TTL_MS`) rather than `getParam`'s 5-minute default, which would otherwise
@@ -250,7 +252,7 @@ and validation errors never quote a submitted credential.
 
 Critically, **the management λ performs none of this itself.** It holds no App PEM read and no
 `ssm:PutParameter` grant at all; it invokes a control-plane **App-config broker** λ
-(`src/appcfg/`) and can reach nothing else (ADR-028). Secret-read and secret-write authority
+(`src/appcfg/`) and can reach nothing else (ADR-029). Secret-read and secret-write authority
 stay in the control plane, behind one function whose only caller is the console λ.
 
 ### Who may change platform settings
@@ -322,7 +324,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - Secrets are **never** exposed as values. Presence is read via `ssm:DescribeParameters`
   (which cannot return a value) and demoted to a collapsed diagnostics section; the Mgmt λ has
   no IAM permission to read the App PEM or webhook secret at all, and no `ssm:PutParameter`
-  grant of any kind (ADR-025, ADR-028). The relink intake accepts credentials write-only and
+  grant of any kind (ADR-025, ADR-029). The relink intake accepts credentials write-only and
   answers with presence + verification outcome. A `assertNoSecrets` guard
   (`src/shared/redact.ts`) scans every settings/broker payload for secret-shaped content
   (PEM blocks, `ghp_*`/`v1.<40 hex>` tokens) and throws rather than serving it, so a future
@@ -364,7 +366,7 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   (ADR-023).
 - **No secret exposure**: presence via `DescribeParameters`; the λ holds no IAM grant for
   secret paths beyond its own OAuth/session credentials (ADR-025), no `ssm:PutParameter`, and
-  every settings payload passes the `assertNoSecrets` shape guard (ADR-028).
+  every settings payload passes the `assertNoSecrets` shape guard (ADR-029).
 - **Least privilege**: read-mostly. `dynamodb:UpdateItem` is the only write (no
   Put/Delete), `sqs:SendMessage` only on the discovery queue, `lambda:InvokeFunction` only on
   the App-config broker's exact ARN, log read-only on one group, and **no** microVM

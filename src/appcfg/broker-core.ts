@@ -1,5 +1,5 @@
 /**
- * Pure logic for the GitHub App config broker (ADR-028).
+ * Pure logic for the GitHub App config broker (ADR-029).
  *
  * The management plane must be able to (a) show the operator which GitHub App this
  * environment is actually linked to and whether GitHub can reach our webhook, and (b)

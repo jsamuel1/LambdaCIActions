@@ -113,7 +113,7 @@ const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM ?? `${SSM_PREFIX}/co
 const PLATFORM_ADMINS_PARAM =
   process.env.PLATFORM_ADMINS_PARAM ?? `${SSM_PREFIX}/config/platform-admins`;
 /**
- * The App-config broker (ADR-028). The Mgmt λ holds `lambda:InvokeFunction` on this ARN and
+ * The App-config broker (ADR-029). The Mgmt λ holds `lambda:InvokeFunction` on this ARN and
  * nothing else — no App PEM read, no `ssm:PutParameter` on any secret path.
  */
 const APPCFG_BROKER_NAME = process.env.APPCFG_BROKER_NAME ?? '';
@@ -608,7 +608,7 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
 }
 
 /**
- * Settings (spec 04 § Settings, ADR-028). Answers the operator's real questions — *is this
+ * Settings (spec 04 § Settings, ADR-029). Answers the operator's real questions — *is this
  * environment linked to a GitHub App, which one, what does it claim, and is GitHub actually
  * reaching us* — rather than listing SSM paths.
  *
@@ -698,7 +698,7 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
   // it are partly forwarded from GitHub/AWS; fail loudly rather than serve tainted content.
   assertNoSecrets(view, 'GET /api/settings');
   const isPlatformAdmin = canAdminPlatform(session, parsePlatformAdmins(adminsRaw));
-  // Cross-tenant scoping (ADR-029): installation identities and the operator audit trail are
+  // Cross-tenant scoping (ADR-030): installation identities and the operator audit trail are
   // not environment-level facts. Settings itself stays readable for everyone so a fresh
   // environment can show its state.
   const scoped = scopeSettingsView(view, {
@@ -753,7 +753,7 @@ async function invokeAppcfg(payload: Record<string, unknown>): Promise<AppcfgRes
     );
   } catch (err) {
     // A throttle is a retryable "busy", not a fault. The broker is not concurrency-capped
-    // (write serialization is its own DynamoDB lock, ADR-028), but an account-level Lambda
+    // (write serialization is its own DynamoDB lock, ADR-029), but an account-level Lambda
     // throttle can still surface here. The raw SDK error must never be surfaced either: on
     // the relink path the request payload it may quote contains the submitted credentials.
     if ((err as { name?: string }).name === 'TooManyRequestsException') {
@@ -889,18 +889,31 @@ async function putRunnerLabelsRoute(
 }
 
 /**
- * Which stored workflow jobs change claim status under a proposed label set. Bounded: the
- * scan walks installations → repos → analyses, so it is capped at `MAX_IMPACT_REPOS` repos and
- * reports `truncated` rather than fanning out unboundedly inside a 29 s API timeout.
+ * Which stored workflow jobs change claim status under a proposed label set. Bounded at both
+ * levels — the repo enumeration (`collectImpactRepos`) and the analysis fetch — so it reports
+ * `truncated` rather than fanning out unboundedly inside a 29 s API timeout.
  */
 const MAX_IMPACT_REPOS = 50;
 
-async function labelImpact(current: string[], proposed: string[]): Promise<LabelImpactView> {
-  const installs = await listInstallations().catch(() => []);
+/**
+ * Enumerate the repos a label-impact scan will consider, bounded.
+ *
+ * Pure of AWS (the two listers are injected) so the BOUND is testable: this route shares the
+ * console's 29 s API Gateway cap, and an environment with many installations would otherwise
+ * issue one `listRepos` query per installation before `MAX_IMPACT_REPOS` ever applied. It stops
+ * as soon as it holds more repos than will be scanned — one surplus repo is all `truncated`
+ * needs, and that flag is the only thing the surplus affects.
+ */
+export async function collectImpactRepos(
+  installs: { installationId: number; deleted?: boolean }[],
+  listReposFor: (installationId: number) => Promise<RepoRecord[]>,
+  cap = MAX_IMPACT_REPOS,
+): Promise<{ repoId: number; repoFullName: string }[]> {
   const repos: { repoId: number; repoFullName: string }[] = [];
   for (const inst of installs) {
     if (inst.deleted) continue;
-    const list = await listRepos(inst.installationId).catch(() => []);
+    if (repos.length > cap) break;
+    const list = await listReposFor(inst.installationId).catch(() => []);
     // `isRepoOptedOut` (not just `enabled !== false`): Ingest refuses a repo whose `mode` is
     // `off` as well, so counting its jobs here would claim a label change moves work that the
     // control plane will keep refusing either way. Reusing Ingest's own predicate keeps the two
@@ -910,6 +923,12 @@ async function labelImpact(current: string[], proposed: string[]): Promise<Label
       repos.push({ repoId: r.repoId, repoFullName: r.repoFullName });
     }
   }
+  return repos;
+}
+
+async function labelImpact(current: string[], proposed: string[]): Promise<LabelImpactView> {
+  const installs = await listInstallations().catch(() => []);
+  const repos = await collectImpactRepos(installs, (id) => listRepos(id));
   const truncated = repos.length > MAX_IMPACT_REPOS;
   const scanned = repos.slice(0, MAX_IMPACT_REPOS);
   const withAnalyses = await Promise.all(

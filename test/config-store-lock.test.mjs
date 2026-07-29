@@ -1,4 +1,4 @@
-// The config store's two write-safety behaviours (ADR-028 review follow-up):
+// The config store's two write-safety behaviours (ADR-029 review follow-up):
 //
 //   1. `recordWebhookRejection` is the ONE heartbeat write reachable before authentication
 //      (the /webhook endpoint is public; the signature check is what rejects an anonymous
@@ -137,7 +137,7 @@ test('release is conditional on still being the holder', async () => {
 // ---- shared status cache (review follow-up) --------------------------------
 //
 // The broker's in-memory `status` cache does not bound GitHub spend on its own: `GET
-// /api/settings` is readable by ANY authenticated session (ADR-029), and concurrent reads scale
+// /api/settings` is readable by ANY authenticated session (ADR-030), and concurrent reads scale
 // the broker out to fresh containers whose caches are all cold. `status` costs four App-JWT
 // calls against the App's 5,000/h budget — the same budget Provision spends minting a token per
 // job — so the bound has to be platform-wide.

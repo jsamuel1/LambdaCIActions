@@ -63,7 +63,7 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'listFlavors', method: 'GET', template: '/api/flavors', authRequired: true },
   { id: 'health', method: 'GET', template: '/api/health', authRequired: true },
   { id: 'settings', method: 'GET', template: '/api/settings', authRequired: true },
-  // --- settings mutations (spec 04 § Settings, ADR-028) ---
+  // --- settings mutations (spec 04 § Settings, ADR-029) ---
   {
     id: 'putRunnerLabels',
     method: 'PUT',

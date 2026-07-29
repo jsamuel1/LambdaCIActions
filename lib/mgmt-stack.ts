@@ -34,7 +34,7 @@ export interface MgmtStackProps extends StackProps {
    */
   publicOrigin?: string;
   /**
-   * App-config broker (ControlStack, ADR-028). The console λ invokes it to verify the GitHub
+   * App-config broker (ControlStack, ADR-029). The console λ invokes it to verify the GitHub
    * App linkage, read webhook delivery evidence, and apply relink / runner-label changes — it
    * holds NO App PEM read and NO `ssm:PutParameter` grant of its own.
    */
@@ -62,7 +62,7 @@ export interface MgmtStackProps extends StackProps {
  *     (its own client creds) and `/user/*` with the operator's token.
  *   - NO `ssm:PutParameter` — not even for non-secret config. Platform config writes and
  *     every App-PEM-requiring GitHub call go through the App-config broker in the control
- *     plane, reachable only via `lambda:InvokeFunction` on that one ARN (ADR-028).
+ *     plane, reachable only via `lambda:InvokeFunction` on that one ARN (ADR-029).
  */
 export class MgmtStack extends Stack {
   public readonly httpApi: apigw.HttpApi;
@@ -174,7 +174,7 @@ export class MgmtStack extends Stack {
       queue.grantSendMessages(fn);
     }
 
-    // App-config broker (ADR-028): the console's ONLY route to App-PEM-requiring GitHub calls
+    // App-config broker (ADR-029): the console's ONLY route to App-PEM-requiring GitHub calls
     // and to platform config writes. One action, one ARN — the console cannot read the PEM, and
     // cannot write any parameter directly.
     if (props.appcfgBrokerArn) {

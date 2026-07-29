@@ -9,7 +9,7 @@ import { DynamoDBDocumentClient, UpdateCommand, GetCommand, QueryCommand } from 
  *   PK=`CONFIG#AUDIT`    SK=`<iso>#<nonce>`    → operator config-change audit trail
  *
  * The heartbeat exists because "the webhook secret parameter is present" is not evidence
- * that GitHub can reach us (ADR-028). It is written by Ingest on every accepted delivery as
+ * that GitHub can reach us (ADR-029). It is written by Ingest on every accepted delivery as
  * a single idempotent UpdateItem — a fixed-key row, so it costs one WCU per delivery and
  * never grows.
  *
@@ -240,7 +240,7 @@ export async function releaseConfigLock(holder: string): Promise<void> {
  * Shared (cross-container) cache of the verified App linkage.
  *
  * A per-container cache alone does not bound the GitHub spend: `GET /api/settings` is readable
- * by ANY authenticated session (ADR-029 keeps it readable on purpose), each read invokes the
+ * by ANY authenticated session (ADR-030 keeps it readable on purpose), each read invokes the
  * broker, and concurrent reads scale the broker out to fresh containers whose caches are all
  * cold. Since `status` costs four App-JWT calls against the App's 5,000/h budget — the same
  * budget Provision spends minting an installation token per job — an unprivileged poller could

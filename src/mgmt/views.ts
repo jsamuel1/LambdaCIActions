@@ -571,7 +571,7 @@ export function hostedLabelsIn(labels: string[], hosted: readonly string[]): str
 }
 
 /**
- * Narrow a settings view to what THIS session may see (ADR-029).
+ * Narrow a settings view to what THIS session may see (ADR-030).
  *
  * Everything else on the screen is environment-level (which App this deployment authenticates
  * as, what it claims, whether GitHub reaches it) and stays readable — spec 04 requires a fresh

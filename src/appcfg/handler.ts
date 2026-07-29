@@ -24,7 +24,7 @@ import {
 } from './broker-core.js';
 
 /**
- * GitHub App config broker λ (ADR-028) — control plane.
+ * GitHub App config broker λ (ADR-029) — control plane.
  *
  * The Settings screen needs two things the management λ deliberately cannot do:
  *
@@ -65,7 +65,7 @@ const RUNNER_LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
  * (`web/src/screens/Settings.tsx`), so a 30 s TTL serves every other poll from cache.
  *
  * Cached in TWO places, because a per-container cache alone does not bound the spend: any
- * authenticated session may read `GET /api/settings` (ADR-029), and concurrent reads scale the
+ * authenticated session may read `GET /api/settings` (ADR-030), and concurrent reads scale the
  * broker out to fresh containers whose in-memory caches are all cold. The shared `CONFIG#STATUS`
  * row makes the bound platform-wide; the in-memory copy avoids a DynamoDB read per poll.
  */

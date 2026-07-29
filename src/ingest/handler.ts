@@ -49,7 +49,7 @@ const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM!;
 
 /**
  * Cache TTL for the claimed-label config, deliberately much shorter than `getParam`'s 5-minute
- * default (ADR-028).
+ * default (ADR-029).
  *
  * A label change from the Settings screen is presented as taking effect on the very NEXT
  * `workflow_job` delivery — that is what the mandatory impact preview describes, and the whole
@@ -126,7 +126,7 @@ const SECRET_RECHECK_MS = 30_000;
 let lastSecretRecheck = 0;
 
 /**
- * Verify a delivery, tolerating an in-flight webhook-secret rotation (ADR-028).
+ * Verify a delivery, tolerating an in-flight webhook-secret rotation (ADR-029).
  *
  * `getParam` caches for 5 minutes, so a WARM container keeps verifying against the PREVIOUS
  * secret for up to that long after a relink rotated it — while GitHub already signs with the new

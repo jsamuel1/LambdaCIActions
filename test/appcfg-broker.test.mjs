@@ -1,4 +1,4 @@
-// Behavioural tests for the App-config broker's write path (ADR-028). The pure request
+// Behavioural tests for the App-config broker's write path (ADR-029). The pure request
 // contract + credential validation live in mgmt-settings.test.mjs; this pins the decisions the
 // λ makes with real (faked) SSM + GitHub seams:
 //
@@ -547,7 +547,7 @@ test('an unverifiable rollback leaves the slug alone rather than guessing', asyn
 // ---- shared (cross-container) status cache ---------------------------------
 //
 // The in-memory cache above only bounds ONE container. `GET /api/settings` is readable by any
-// authenticated session (ADR-029) and concurrent reads scale the broker out, so a cold container
+// authenticated session (ADR-030) and concurrent reads scale the broker out, so a cold container
 // must be able to reuse an answer another container already paid four App-JWT calls for.
 
 test('a cold container reuses a warm shared cache row instead of calling GitHub', async () => {

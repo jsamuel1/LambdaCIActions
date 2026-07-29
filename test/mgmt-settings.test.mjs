@@ -1,4 +1,4 @@
-// Settings surface tests (spec 04 § Settings, ADR-028).
+// Settings surface tests (spec 04 § Settings, ADR-029).
 //
 // Three things are load-bearing here and each is asserted against behavior, not prose:
 //   1. runner-label validation — a bad label set silently breaks claiming for every repo,
@@ -39,6 +39,7 @@ import {
   validateVersionSnapshot,
 } from '../dist/src/appcfg/broker-core.js';
 import { isRepoOptedOut, shouldClaim } from '../dist/src/ingest/filter.js';
+import { collectImpactRepos } from '../dist/src/mgmt/handler.js';
 
 // ---- runner labels ---------------------------------------------------------
 
@@ -212,6 +213,48 @@ test('the impact scan drops the same repos Ingest refuses (mode off, not just di
 
 test('hostedLabelsIn flags claimed GitHub-hosted names', () => {
   assert.deepEqual(hostedLabelsIn(['lca-base', 'Ubuntu-Latest'], HOSTED_LABELS), ['Ubuntu-Latest']);
+});
+
+test('the impact repo enumeration stops querying once the scan cap is exceeded', async () => {
+  // The cap has to bound the ENUMERATION, not only the analysis fetch. This route runs inside
+  // the console's 29 s API Gateway integration cap, so an environment with many installations
+  // must not pay one `listRepos` query per installation before the cap applies.
+  const installs = Array.from({ length: 40 }, (_, i) => ({ installationId: i + 1 }));
+  const queried = [];
+  const repos = await collectImpactRepos(
+    installs,
+    async (installationId) => {
+      queried.push(installationId);
+      return [
+        { repoId: installationId * 10, repoFullName: `org${installationId}/a`, enabled: true },
+        { repoId: installationId * 10 + 1, repoFullName: `org${installationId}/b`, enabled: true },
+      ];
+    },
+    4,
+  );
+  assert.ok(queried.length <= 4, `queried ${queried.length} installations for a cap of 4`);
+  // One surplus repo beyond the cap is retained on purpose: `truncated` is reported from
+  // `repos.length > cap`, so stopping exactly AT the cap would under-report truncation.
+  assert.ok(repos.length > 4, 'the surplus repo that proves truncation must survive');
+});
+
+test('the impact enumeration still skips deleted installations and opted-out repos', async () => {
+  const repos = await collectImpactRepos(
+    [{ installationId: 1 }, { installationId: 2, deleted: true }],
+    async (id) =>
+      id === 1
+        ? [
+            { repoId: 11, repoFullName: 'org/on', enabled: true, mode: 'label' },
+            { repoId: 12, repoFullName: 'org/off', enabled: true, mode: 'off' },
+            { repoId: 13, repoFullName: 'org/disabled', enabled: false },
+          ]
+        : [{ repoId: 21, repoFullName: 'gone/repo', enabled: true }],
+    50,
+  );
+  assert.deepEqual(
+    repos.map((r) => r.repoFullName),
+    ['org/on'],
+  );
 });
 
 // ---- webhook health --------------------------------------------------------
@@ -481,7 +524,7 @@ test('broker redeliver accepts an optional positive delivery id', () => {
   assert.throws(() => parseAppcfgRequest({ action: 'redeliver', actor: 'a', deliveryId: 0 }), /positive/);
 });
 
-// ---- cross-tenant scoping of the settings payload (ADR-029) ----------------
+// ---- cross-tenant scoping of the settings payload (ADR-030) ----------------
 
 const SETTINGS_FIXTURE = {
   envName: 'dev',
