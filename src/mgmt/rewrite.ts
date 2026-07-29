@@ -244,12 +244,22 @@ export function findRunsOnLines(yamlText: string): Map<string, number> {
  * label, not a comment. Cutting there truncated the value mid-token, so the selector no longer
  * looked like it carried a hosted label and the job was skipped as "no longer targets a
  * standard GitHub-hosted label" — a wrong reason for a perfectly rewritable job.
+ *
+ * ESCAPE-AWARE too: inside a DOUBLE-quoted YAML scalar `\"` is an escaped quote, not the
+ * closing one (YAML 1.1 § double-quoted style). Treating it as a terminator ends the quote
+ * state early, so a later ` #` inside the same label reads as a comment and the value is cut
+ * mid-token. Single-quoted scalars have no backslash escapes (`''` is the only escape, and it
+ * naturally reads as close-then-reopen), so the backslash rule applies to `"` only.
  */
 function splitComment(value: string): { value: string; comment: string } {
   let quote: "'" | '"' | undefined;
   for (let i = 0; i < value.length; i++) {
     const ch = value[i];
     if (quote) {
+      if (quote === '"' && ch === '\\') {
+        i++; // skip the escaped character — `\"` does not close the scalar
+        continue;
+      }
       if (ch === quote) quote = undefined;
       continue;
     }
@@ -289,6 +299,15 @@ interface LabelToken {
  *
  * Returns undefined when the sequence cannot be tokenized confidently (an unterminated
  * quote), so the caller refuses instead of guessing.
+ *
+ * ESCAPE-AWARE inside a DOUBLE-quoted scalar: `\"` is an escaped quote, not the closing one,
+ * so the quote state must skip the escaped character. Reading `\"` as a terminator put the
+ * scanner back in "outside a quote" state mid-label, where a following `,` split ONE label
+ * into two — `["a\"x,y"]` became `a\"x` + `y`, which re-emits as `"a\"x, y"`: a DIFFERENT
+ * label, silently, in the customer's pull request. (A `,` count that happens to be even also
+ * re-balances the state, so this is not detectable by refusing unbalanced input.)
+ * Single-quoted scalars have no backslash escapes — `''` is the only escape and reads
+ * correctly as close-then-reopen — so the rule applies to `"` only.
  */
 function splitInlineLabels(inner: string): LabelToken[] | undefined {
   const tokens: LabelToken[] = [];
@@ -300,9 +319,17 @@ function splitInlineLabels(inner: string): LabelToken[] | undefined {
     if (!raw) return;
     tokens.push({ raw, value: unquoteLabel(raw) });
   };
-  for (const ch of inner) {
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
     if (quote) {
       current += ch;
+      if (quote === '"' && ch === '\\') {
+        const next = inner[i + 1];
+        if (next === undefined) return undefined; // dangling escape — do not guess
+        current += next;
+        i++;
+        continue;
+      }
       if (ch === quote) quote = undefined;
       continue;
     }
@@ -322,10 +349,24 @@ function splitInlineLabels(inner: string): LabelToken[] | undefined {
   return tokens;
 }
 
-/** Strip one layer of matching surrounding quotes from a label token. */
+/**
+ * Strip one layer of matching surrounding quotes from a label token AND decode the escapes
+ * that quoting introduced, so `value` is the label the YAML parser would produce.
+ *
+ * Comparison correctness depends on this: the claim/adopt/LCA predicates all match on `value`,
+ * while `raw` is what gets re-emitted. Leaving `\"` or `''` undecoded made `value` a string
+ * that no parser ever yields, so a label spelled `'lambda-ci'`-with-escapes could dodge a
+ * predicate that is supposed to catch it. Only the escapes that can appear in a label we
+ * would keep are decoded (`\\`, `\"`, and single-quoted `''`); any other escape sequence is
+ * left verbatim, which can only make a comparison MISS — the conservative direction, since a
+ * miss keeps the label as-is instead of dropping or rewriting it.
+ */
 function unquoteLabel(raw: string): string {
-  if (raw.length >= 2 && (raw[0] === "'" || raw[0] === '"') && raw[raw.length - 1] === raw[0]) {
-    return raw.slice(1, -1);
+  if (raw.length >= 2 && raw[0] === "'" && raw[raw.length - 1] === "'") {
+    return raw.slice(1, -1).replace(/''/g, "'");
+  }
+  if (raw.length >= 2 && raw[0] === '"' && raw[raw.length - 1] === '"') {
+    return raw.slice(1, -1).replace(/\\([\\"])/g, '$1');
   }
   return raw;
 }

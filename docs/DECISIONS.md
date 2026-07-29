@@ -1143,6 +1143,25 @@ A job whose body is an **inline flow mapping** (`build: {runs-on: ubuntu-latest}
 the same reason: there is no line to edit without re-flowing the mapping, and treating its
 interior lines as body keys would drop their separators. Pinned by `test/rewrite.test.mjs`.
 
+**Eighth-review fix**: the inline-sequence tokenizer is now **escape-aware**, because it was
+silently rewriting a label into a DIFFERENT label. Inside a double-quoted YAML scalar `\"` is an
+escaped quote, not the closing one, but the scanner treated any `"` as a terminator — so it
+dropped out of "inside a quote" state MID-LABEL. A following `,` then split one label in two and
+the halves were re-emitted joined by `, `: `[ubuntu-latest, "a\"x,y\"z"]` became
+`[self-hosted, "a\"x, y\"z", lambda-ci]`, i.e. the runner is asked for a label the workflow never
+named — committed to the customer's repo, and shown identically in the console dry run. The
+existing unterminated-quote refusal could not catch it: an even number of escaped quotes
+re-balances the state. The same early exit made a later ` #` inside the label read as a comment
+and truncate the value, which surfaced as a wrong "no longer targets a standard GitHub-hosted
+label" refusal. Two consequences fixed together: the scanner skips the character after a
+backslash inside a double-quoted token (and refuses a dangling trailing escape rather than
+guessing), and `unquoteLabel` now DECODES `\\`/`\"` and single-quoted `''` so every comparison
+predicate (`already carries an LCA label`, `isAdoptLabel`, `nonLinuxHostedLabel`) sees the label
+the parser would produce rather than its escaped spelling — otherwise a label written
+`"lambda-ci"` dodged the already-routed check. Single-quoted scalars have no backslash escapes,
+so the backslash rule is scoped to `"`. `test/rewrite.test.mjs` pins each case by semantic round
+trip through the production parser, not by output string.
+
 **Consequences**: an extra queue + λ, both inert in a default deployment. The rewriter's
 coverage is deliberately partial; `skipped` entries are a first-class output surfaced in the
 UI and repeated in the PR body, alongside an explicit arm64 warning for the reviewer.

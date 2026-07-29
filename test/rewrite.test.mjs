@@ -491,6 +491,62 @@ test('an unterminated quote is refused rather than guessed at', () => {
   assert.match(r.reason, /could not be parsed as a label list/);
 });
 
+// Inside a DOUBLE-quoted YAML scalar `\"` is an escaped quote, not the closing one. The
+// tokenizer used to treat it as a terminator, which put it back in "outside a quote" state
+// MID-LABEL — so a following `,` split one label into two and the halves were re-emitted as
+// `"a\"x, y"`: a different label, silently, in a customer's pull request. An even number of
+// escaped quotes re-balances the state, so refusing unbalanced input never caught it. The same
+// early exit made a following ` #` read as a comment and truncated the value.
+test('an escaped quote inside a double-quoted label does not end the quote', () => {
+  for (const [input, expected] of [
+    ['[ubuntu-latest, "a\\"x,y"]', ['self-hosted', 'a"x,y', 'lambda-ci']],
+    ['[ubuntu-latest, "a\\"x,y\\"z"]', ['self-hosted', 'a"x,y"z', 'lambda-ci']],
+    ['[ubuntu-latest, "a\\" # not a comment"]', ['self-hosted', 'a" # not a comment', 'lambda-ci']],
+    ['[ubuntu-latest, "x\\", keep"]', ['self-hosted', 'x", keep', 'lambda-ci']],
+    ['["a\\"b", ubuntu-latest]', ['self-hosted', 'a"b', 'lambda-ci']],
+  ]) {
+    const r = rewriteRunsOnValue(input, 'lambda-ci');
+    assert.equal(r.ok, true, r.ok ? '' : `${input}: ${r.reason}`);
+    // Semantic round trip through the production parser — the label set must be preserved
+    // exactly, not merely look similar.
+    assert.deepEqual(parsedLabels(r.value), expected, input);
+  }
+});
+
+test('an escaped backslash does not swallow the closing quote', () => {
+  // `"tail\\\\"` ends in an escaped BACKSLASH, so the next `"` really is the terminator.
+  const r = rewriteRunsOnValue('[ubuntu-latest, "tail\\\\", keep]', 'lambda-ci');
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.deepEqual(parsedLabels(r.value), ['self-hosted', 'tail\\', 'keep', 'lambda-ci']);
+});
+
+test('a dangling escape at the end of a quoted label is refused, not guessed', () => {
+  const r = rewriteRunsOnValue('[ubuntu-latest, "oops\\', 'lambda-ci');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /could not be parsed as a label list/);
+});
+
+test('a comparison predicate sees the DECODED label, not its escaped spelling', () => {
+  // The LCA/adopt/non-Linux predicates all match on the decoded value. If escapes were left
+  // in, a label written `"lambda-ci"` (or `'lambda-ci'`) could dodge the already-routed check
+  // and get a duplicate LCA label appended.
+  for (const spelling of ['"lambda-ci"', "'lambda-ci'"]) {
+    const r = rewriteRunsOnValue(`[ubuntu-latest, ${spelling}]`, 'lambda-ci');
+    assert.equal(r.ok, false, `${spelling} should be recognised as already routed`);
+    assert.match(r.reason, /already carries an LCA label/);
+  }
+  // …and a quoted hosted label is still recognised as the one we may replace.
+  const quoted = rewriteRunsOnValue('["ubuntu-latest"]', 'lambda-ci');
+  assert.equal(quoted.ok, true, quoted.ok ? '' : quoted.reason);
+  assert.deepEqual(parsedLabels(quoted.value), ['self-hosted', 'lambda-ci']);
+});
+
+test("a single-quoted label's '' escape survives the round trip", () => {
+  const r = rewriteRunsOnValue("[ubuntu-latest, 'a''x,y''z']", 'lambda-ci');
+  assert.equal(r.ok, true, r.ok ? '' : r.reason);
+  assert.deepEqual(parsedLabels(r.value), ['self-hosted', "a'x,y'z", 'lambda-ci']);
+});
+
 test('the whole-file rewrite emits a workflow that still parses', () => {
   const src = `name: CI
 on: push
