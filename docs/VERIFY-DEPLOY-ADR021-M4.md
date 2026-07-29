@@ -48,7 +48,8 @@ decision as ADR-020; it is ADR-021, one of the stale cross-references the ADR-02
 left behind, tracked on its own card and deliberately not touched here). Sequence used:
 
 1. Confirmed the window was quiet: zero open PRs, zero non-`TERMINATED` microVMs
-   (`list-microvms` → 12/12 `TERMINATED`).
+   (`list-microvms` → 12/12 `TERMINATED`, read across **all** pages — see the pagination
+   gotcha below, which makes a first-page-only read an unsafe freeze gate).
 2. `npm run build:images -- --env dev --region us-west-2` (all three flavors).
 3. `npx cdk deploy LCA-Control-dev -c env=dev` — **74.8 s**, closing the window. This also
    updated `LCA-Data-dev` (declared dependency, `bin/lca.ts`), which is where GSI2
@@ -158,11 +159,14 @@ terminated it; the VM never learns any microvmId:
 
 - **Run rows** carry `hookTokenHash` (sha256 hex) and no plaintext; no token in any
   `reason`/status field.
-- **Log groups** scanned with `filter-log-events --filter-pattern '"token"'` over the
-  window: `lca-dev-hook-broker` 0, `lca-dev-provision` 0, `microvms/lca-dev-{base,node,docker}` 0.
-  `microvms/runs/lca-dev` had 2 hits — both the *literal error string* `"run payload
-  missing ref/broker/token"` from the skew failure above, whose payloads were the old
-  contract and contained no token at all.
+- **Log groups** scanned with `filter-log-events --filter-pattern '"token"'`. Over the
+  **E2E window** (`2026-07-28T23:23Z`–`23:27Z`) every group is 0, including
+  `microvms/runs/lca-dev`. Widening to the whole **deploy window** (`23:00Z`–`01:00Z`)
+  keeps `lca-dev-hook-broker` 0, `lca-dev-provision` 0,
+  `microvms/lca-dev-{base,node,docker}` 0, and surfaces 2 hits in
+  `microvms/runs/lca-dev` at `23:20:51Z` / `23:20:54Z` — both the *literal error string*
+  `"run payload missing ref/broker/token"` from the skew failure above, whose payloads
+  were the old contract and contained no token at all.
 
 ### Defect found — boot broker call burns retries on cold-CLI timeout
 
@@ -255,13 +259,21 @@ Fix (Developer settings → GitHub Apps → `lambdaciactions-dev` → General):
 
 - **Callback URL**: add `https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback`
 
-Until then, clicking "Sign in with GitHub" reaches GitHub's authorize page and GitHub
-refuses the redirect back, so console login (and therefore M4 phase-5 verification steps
-1–7) cannot complete. Everything on the LCA side of that flow is confirmed correct.
+Everything on the LCA side of that flow is confirmed correct (correct `client_id`, correct
+`redirect_uri`, CSRF state present — see above). The consequence is **expected, not
+observed**: GitHub documents that an OAuth `redirect_uri` must match a registered callback,
+so clicking "Sign in with GitHub" is expected to reach the authorize page and then be
+refused on redirect back. Confirming the refusal itself requires an authenticated browser
+session, which this verification did not have — the same reason the setting cannot be
+automated. Either way console login (and therefore M4 phase-5 steps 1–7) cannot complete
+until the callback is registered.
 
 ## Reproduction
 
 ```sh
+# NOTE: `list-microvms` paginates (page 1 caps at 10) and the CLI applies `--query` per
+# page, so a first-page read can miss a live VM. Read every page before declaring quiet.
+
 # preflight (worktree needs its own copy of the gitignored pin)
 cp ../../.env.local .env.local
 ada credentials update --account=863638663908 --provider=isengard --role=Admin \
@@ -269,7 +281,8 @@ ada credentials update --account=863638663908 --provider=isengard --role=Admin \
 npm ci && npm run build && npm test && npx cdk synth -c env=dev
 
 # skew window — verify quiet, then move both planes together
-aws lambda-microvms list-microvms --region us-west-2      # expect 0 non-TERMINATED
+aws lambda-microvms list-microvms --region us-west-2 \
+  --query 'items[?state!=`TERMINATED`].microvmId' --output text   # expect empty, ALL pages
 npm run build:images -- --env dev --region us-west-2
 npx cdk deploy LCA-Control-dev -c env=dev
 
@@ -296,6 +309,16 @@ npx cdk deploy LCA-Mgmt-dev -c env=dev -c publicOrigin=https://d2x4qcl1ibd2ax.cl
 `aws_access_key_id`/`aws_session_token` entries for the same profile name in
 `~/.aws/credentials`, which take precedence over the `credential_process` in
 `~/.aws/config`. `ada credentials update … --once` rewrites those entries and fixes it.
+
+### Gotcha: `list-microvms` paginates, and `--query` runs per page
+
+The account already holds more terminated VMs than one page: at review time
+`list-microvms` returns **17** VMs across 2 pages (page 1 caps at 10). The CLI
+auto-paginates but evaluates `--query` **per page** and prints one result per page, so
+`--query 'length(items)'` emits `10` then `7` rather than `17`, and any pipeline ending in
+`head` silently truncates. This matters because the pre-deploy freeze gate is "zero
+non-`TERMINATED` VMs": a first-page-only read can call the window quiet while a live VM
+sits on page 2. Filter for the non-terminated set and read every page.
 
 ### Gotcha: `list-microvm-image-versions` wants an ARN, and its payload is `items`
 
@@ -330,7 +353,22 @@ the six `ETIMEDOUT` jitconfig attempts, the 97 → 164 byte payload transition, 
 token-pattern log scan (2 hits, both the literal error string), M4's `PUBLIC_ORIGIN` / 302 /
 401s / 403, and `npm test` → 281/281 with a credential-less `cdk synth` clean.
 
-Two refinements from that pass:
+A **second independent review pass** (2026-07-29) re-ran the same checks from the pinned
+account and matched again: all five stack statuses/timestamps, the six `lca-dev-*`
+functions (all `nodejs22.x`/arm64), Provision's exact env-var set including
+`HOOK_BROKER_NAME`, the deployed exec-role policy statement-for-statement (one inline
+policy, zero attached), the broker role's two statements, `ReservedConcurrentExecutions:
+20`, per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with `ALL` on docker only, run
+`30407823249` green ×3 with matching job timings, the run row's 64-hex `hookTokenHash` and
+empty `reason`, three brokered `self-terminate` lines, exactly 6 broker `START` records,
+six `ETIMEDOUT` jitconfig attempts spanning `23:23:39`→`23:23:55` (~22 s to first success),
+`totalBytes: 164` vs a recomputed 97-byte old payload, `asRoot` true on docker only, GSI2
+counts (104 `sk=RUN` rows, 7 indexed, earliest `23:23:28.786Z`; the extra 5 `RUN#` rows are
+`JITCONFIG` items), table TTL enabled, M4 outputs/`PUBLIC_ORIGIN`/302/401s/403, and
+`npm test` 281/281 with a credential-less `cdk synth` clean. It corrected the token-scan
+window, the pagination gate, and the unverified GitHub-refusal claim above.
+
+Two refinements from the first pass:
 
 - **The 6-invocation count is right, and the evidence is stronger than stated.** The broker
   log shows exactly 6 `START` lines in the E2E window (8 only if `INIT_START` is miscounted).
