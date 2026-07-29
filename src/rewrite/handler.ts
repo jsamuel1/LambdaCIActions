@@ -89,7 +89,12 @@ async function rewriteOne(req: RewriteRequest): Promise<RewriteOutcome> {
   }
 
   const repo = await getRepo(req.installationId, req.repoId);
-  if (!repo?.rewriteEnabled) {
+  // Strict `=== true`, matching the management API's own gate (`repoOptedIn` in
+  // src/mgmt/handler.ts). The validator only admits a boolean, but this λ is the ENFORCEMENT
+  // point for a `contents:write` capability and reads a row that a break-glass
+  // `dynamodb update-item` can write directly — a truthiness test would accept a stray
+  // `"false"` / `1` and open a PR on a repo the console still shows as opted out.
+  if (repo?.rewriteEnabled !== true) {
     const out: RewriteOutcome = {
       status: 'not-opted-in',
       files: [],

@@ -456,7 +456,10 @@ async function route_(
           fix: 'Redeploy with `-c rewrite=true` after granting the GitHub App `contents:write` (off by default).',
         });
       }
-      if (!repo.record.rewriteEnabled) {
+      // Strict `=== true`, matching `repoOptedIn` below and the λ's own gate. The row is
+      // writable out of band (RUNBOOK's break-glass `update-item`), so a stray `"false"` must
+      // not enqueue a request the λ will refuse anyway — the operator would get a 202 and no PR.
+      if (repo.record.rewriteEnabled !== true) {
         return problem(409, 'repo has not opted into the auto-rewrite PR', {
           fix: 'PATCH /api/repos/{repoId} with {"rewriteEnabled": true} (Repos screen toggle) first.',
         });

@@ -265,3 +265,54 @@ test('the λ probes the branch before planning and only creates it once there ar
   assert.ok(create < write, 'the branch must exist before the first commit');
   assert.match(src, /const planRef = existingSha \? branch : baseBranch;/);
 });
+
+// The gates of ADR-031 are only worth anything if they sit AHEAD of every side effect. This λ
+// is the enforcement point for the `contents:write` capability the project rule keeps off by
+// default (AGENTS.md), and test/observability.test.mjs only proves the env var is WIRED —
+// nothing pinned that a refused request reaches neither the App private key nor GitHub.
+// Source-pinned: the λ reaches SSM/GitHub/DynamoDB through module imports, not injectable deps
+// (same idiom as test/provision-config-guard.test.mjs).
+test('both rewrite gates refuse BEFORE the App credentials or any GitHub call', () => {
+  const src = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'rewrite', 'handler.ts'),
+    'utf8',
+  );
+  const deploymentGate = src.indexOf('if (!REWRITE_ENABLED) {');
+  const repoGate = src.indexOf('if (repo?.rewriteEnabled !== true) {');
+  const readPem = src.indexOf('getParam(APP_PEM_PARAM)');
+  assert.ok(deploymentGate > 0, 'deployment gate not found');
+  assert.ok(repoGate > 0, 'per-repo gate not found');
+  assert.ok(readPem > 0, 'the App PEM read not found');
+  assert.ok(deploymentGate < repoGate, 'the deployment kill switch must be checked first');
+  assert.ok(repoGate < readPem, 'both gates must precede reading the App private key');
+
+  // …and ahead of every call that touches the customer's repository, read or write.
+  for (const call of [
+    'getRepoDefaultBranch(',
+    'getBranchSha(',
+    'getFileContent(',
+    'ensureBranch(',
+    'putFileOnBranch(',
+    'ensurePullRequest(',
+    'findOpenPullRequest(',
+  ]) {
+    const at = src.indexOf(call);
+    assert.ok(at > 0, `${call} not found`);
+    assert.ok(repoGate < at, `both gates must precede ${call}`);
+  }
+});
+
+// A capability that writes to a customer repository must not be enabled by a merely TRUTHY
+// value. `validateRepoPatch` admits only a boolean, but this row is also writable out of band —
+// RUNBOOK documents a break-glass `dynamodb update-item` on exactly this item for `mode` — so a
+// stray `"false"` / `1` must not open a PR on a repo whose console toggle reads off. Both
+// `toRepoView` and the management API's `repoOptedIn` test `=== true`; the enforcement point has
+// to agree, or the console and the λ disagree about whether the repo consented.
+test('the rewrite gates admit only the exact enabling value, not anything truthy', () => {
+  const src = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'rewrite', 'handler.ts'),
+    'utf8',
+  );
+  assert.match(src, /process\.env\.REWRITE_ENABLED === 'true'/);
+  assert.match(src, /repo\?\.rewriteEnabled !== true/);
+});

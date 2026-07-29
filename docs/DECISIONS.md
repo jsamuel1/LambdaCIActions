@@ -1221,6 +1221,21 @@ labels are on the following lines — hand-edit) rather than the generic block-s
 Pinned by `test/rewrite.test.mjs`, which asserts the original file parses, the plan produces NO
 edits and NO `content`, and the skip reason names the operator action.
 
+**Eleventh-review fix**: both opt-in gates admit only the **exact** enabling value, and the
+gate ordering is pinned by a test. `validateRepoPatch` accepts only a boolean for
+`rewriteEnabled`, but the repo row is also writable out of band — RUNBOOK documents a
+break-glass `dynamodb update-item` on exactly that item for `mode` — so the λ's truthiness test
+(`!repo?.rewriteEnabled`) would have treated a stray `"false"` or `1` as consent, while
+`toRepoView` and the management API's `repoOptedIn` both report `=== true`: the console would
+show the toggle OFF for a repo the writer was willing to open a PR on. Both the λ and the API
+now test `!== true` / `=== true`. Separately, the gates' *position* was unpinned: the CDK test
+only proved `REWRITE_ENABLED` reaches the function's environment, so nothing stopped a future
+edit from moving a gate below the `getParam(APP_PEM_PARAM)` read or a repo call.
+`test/rewrite-pr-lookup.test.mjs` now asserts the deployment gate precedes the per-repo gate,
+and both precede the App private-key read and every GitHub call (`getRepoDefaultBranch`,
+`getBranchSha`, `getFileContent`, `ensureBranch`, `putFileOnBranch`, `ensurePullRequest`,
+`findOpenPullRequest`) — a refused request must reach neither the credential nor the repo.
+
 **Consequences**: an extra queue + λ, both inert in a default deployment. The rewriter's
 coverage is deliberately partial; `skipped` entries are a first-class output surfaced in the
 UI and repeated in the PR body, alongside an explicit arm64 warning for the reviewer.
