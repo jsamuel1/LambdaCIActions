@@ -199,8 +199,16 @@ test('the boot fetch budget fits inside the platform /run hook timeout', () => {
   const build = fs.readFileSync(new URL('../scripts/build-images.mjs', import.meta.url), 'utf8');
   const hookTimeoutS = Number(build.match(/runTimeoutInSeconds: (\d+)/)[1]);
   assert.ok(hookTimeoutS > 0, 'no runTimeoutInSeconds declared for the run hook');
-  // Service constraint on microvmHooks.runTimeoutInSeconds (lambda-microvms 2025-09-09).
-  assert.ok(hookTimeoutS <= 600, `runTimeoutInSeconds ${hookTimeoutS}s exceeds the 600s API max`);
+  // The API's OWN cap on microvmHooks.runTimeoutInSeconds: `min 1, max 60`
+  // (`MicrovmHooksRunTimeoutInSecondsInteger`, lambda-microvms 2025-09-09). This is NOT a
+  // style preference — a larger value is rejected with a ValidationException at
+  // create/update-microvm-image, i.e. the image build fails and no VM ever boots. A previous
+  // cut of this change declared 120 s against an assumed 600 s cap and would have broken the
+  // build, so assert the real number: it is also the ceiling every budget below divides up.
+  assert.ok(
+    hookTimeoutS >= 1 && hookTimeoutS <= 60,
+    `runTimeoutInSeconds ${hookTimeoutS}s is outside the API's 1-60s range (build would fail)`,
+  );
 
   const bootMs = Number(src.match(/const BOOT_CALL_TIMEOUT_MS = (\d+);/)[1]);
   const bootAttempts = Number(src.match(/const BOOT_CALL_ATTEMPTS = (\d+);/)[1]);
@@ -229,7 +237,8 @@ test('the boot fetch budget fits inside the platform /run hook timeout', () => {
 // attempt landed — one more slow attempt would have blown the platform deadline, leaving `/run`
 // un-ACKed, traffic gated and the VM stranded until the Reaper. So pin the margin itself: after
 // the whole retry budget is spent, at least one further full-length invoke must still fit
-// inside the hook deadline.
+// inside the hook deadline. Note the deadline cannot simply be raised to buy this — 60 s is the
+// API maximum (asserted above), so the margin has to come out of the budget's own arithmetic.
 test('the boot budget leaves room for one more full-length attempt (no zero-margin boot)', () => {
   const src = fs.readFileSync(
     new URL('../microvm/bootstrap/run-hook.mjs', import.meta.url),
@@ -252,8 +261,12 @@ test('the boot budget leaves room for one more full-length attempt (no zero-marg
     `boot budget ${worstMs}ms leaves no room for another ${bootMs}ms attempt inside ${hookTimeoutMs}ms`,
   );
   // The per-invoke bound must also exceed the MEASURED cold-CLI cost with headroom. Observed
-  // in-guest: >6 s, consistently. 15 s is the floor that makes a cold call a non-event.
+  // in-guest: >6 s, consistently. 15 s is the floor that makes a cold call a non-event, and
+  // against the API's 60 s hook ceiling it is also close to the most we can afford while
+  // keeping a retry plus real margin — which is why the attempt count came down to 2.
   assert.ok(bootMs >= 15000, `per-invoke boot bound ${bootMs}ms is under the measured cold-CLI cost`);
+  // A retry must still exist: a single attempt has no margin to spend, it just fails.
+  assert.ok(bootAttempts >= 2, `boot must retry at least once (attempts=${bootAttempts})`);
 });
 
 // Every attempt's duration is logged — including the SUCCESSFUL one, which is the number that

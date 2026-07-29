@@ -468,10 +468,11 @@ boot call bounded *twice*: the image declares `microvmHooks.run` with a
 `runTimeoutInSeconds`, so the whole boot retry budget (invokes + backoff) has to fit
 inside that deadline — a bigger budget cannot help, because the platform abandons `/run`
 while the hook is still sleeping between attempts and the VM strands for the Reaper with the
-job unstarted. Boot therefore uses a per-invoke bound × 3 attempts with 2 s/4 s backoff
-(originally 6 s/24 s — **resized in [ADR-028](#adr-028)** after live measurement showed the
-cost is the cold `aws` CLI, not the broker); terminate keeps a 15 s per-invoke bound and a
-larger attempt budget (no
+job unstarted. Boot therefore uses a per-invoke bound × a small attempt count with exponential
+backoff (originally 6 s × 3 + 2 s/4 s = 24 s — **resized in [ADR-028](#adr-028)** to 15 s × 2 +
+2 s after live measurement showed the cost is the cold `aws` CLI, not the broker, and that the
+hook deadline is itself capped at 60 s by the API); terminate keeps a 15 s per-invoke bound and
+a larger attempt budget (no
 platform deadline behind it). The bound exists at all because the AWS CLI otherwise blocks
 `spawnSync` forever if the guest's network is broken, which would strand the VM with no ACK
 and no retry; the backoff is exponential across attempts, since the reserved-concurrency cap
@@ -784,10 +785,21 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
    no role to resolve. A real boot call signs, so attempt 1 still pays that fraction — a second
    reason the per-invoke bound below is sized for a cold-ish call rather than a warm one.
 2. **Resize the budget for a cold call anyway**, because a pre-warm can regress silently (a
-   base-image change, a CLI upgrade, a rebuilt snapshot) and the guest must not depend on it:
-   per-invoke bound **6 s → 20 s**, and the image's `runTimeoutInSeconds` **30 s → 120 s**
-   (service constraint is 1–600 s). Worst case is now `3 × 20 s + 2 s + 4 s = 66 s`, which
-   leaves room for a **further full-length attempt** inside the deadline.
+   base-image change, a CLI upgrade, a rebuilt snapshot) and the guest must not depend on it.
+   The deadline is not a free variable: the API caps `microvmHooks.runTimeoutInSeconds` at
+   **60 s** (`MicrovmHooksRunTimeoutInSecondsInteger`: min 1, max 60, lambda-microvms
+   `2025-09-09` — the image hooks' `readyTimeoutInSeconds` is a separate shape allowing
+   3600 s, which is easy to confuse with it). So the image takes the whole ceiling, **30 s →
+   60 s**, and the budget is derived down from it: per-invoke bound **6 s → 15 s** and attempts
+   **3 → 2**, giving `2 × 15 s + 2 s = 32 s` worst case with a further full-length attempt
+   (`+ 4 s backoff + 15 s`) still fitting inside 60 s.
+
+   Dropping an attempt is deliberate. The observed failure is one **slow** call, not three
+   flaky ones — every logged failure was the 6 s bound expiring, never a broker refusal — so
+   per-invoke headroom buys more than a third try. Against a 60 s ceiling the two cannot both
+   be had: `3 × 15 s + 2 s + 4 s = 51 s` would re-create exactly the zero margin this ADR
+   exists to remove. Terminate is unaffected and keeps its larger attempt count (no platform
+   deadline behind it).
 3. **Measure, don't assume.** Every broker attempt logs its own `ms` — on success (`broker
    invoke ok`, action/attempt/duration only, never the response body) as well as on failure, so
    a healthy boot proves attempt 1 clears the bound and a regressed pre-warm shows up as a slow
@@ -795,14 +807,16 @@ idle time. A cold-start blip or a throttled broker turns that into intermittent 
    verification reads the real cold-call duration out of the run's log stream instead of
    re-deriving it from a timeout.
 4. **Pin it in tests.** `test/run-hook.test.mjs` keeps the original "budget < hook timeout"
-   invariant (which the 6 s budget satisfied while still having no margin) and adds: budget +
-   one more full-length attempt ≤ hook timeout, a floor on the per-invoke bound above the
-   measured cold cost, the presence of per-attempt duration logging, the pre-warm's
-   credential-free/loopback/bounded properties, that its bound fits the `ready` hook deadline,
-   that it passes a region, and that `warmed` is false on an early exit but true on a connect
-   timeout. Both budget invariants read the backoff from the **jitconfig call site**, not from
-   `callBroker`'s parameter default — boot passes its own literal, so sizing off the default
-   would let a call-site change blow the deadline with the tests still green.
+   invariant (which the 6 s budget satisfied while still having no margin) and adds: the API's
+   real **1–60 s** range for the declared hook timeout (a value above it fails the image build
+   with a `ValidationException`, so this is a build-breaking invariant, not a style one),
+   budget + one more full-length attempt ≤ hook timeout, a floor on the per-invoke bound above
+   the measured cold cost, a floor of one retry, the presence of per-attempt duration logging,
+   the pre-warm's credential-free/loopback/bounded properties, that its bound fits the `ready`
+   hook deadline, that it passes a region, and that `warmed` is false on an early exit but true
+   on a connect timeout. Both budget invariants read the backoff from the **jitconfig call
+   site**, not from `callBroker`'s parameter default — boot passes its own literal, so sizing
+   off the default would let a call-site change blow the deadline with the tests still green.
 
 **Why**: the two halves cover each other. The pre-warm removes the latency, so the raised
 bound is dead headroom on a healthy boot rather than added boot time; the raised bound means a
@@ -810,20 +824,26 @@ bound is dead headroom on a healthy boot rather than added boot time; the raised
 *margin* rather than just the budget is the part that would have caught this: the shipped 6 s
 budget passed the pre-existing invariant.
 
-Alternatives rejected: **raising only the timeouts** (leaves ~20 s of cold-CLI latency on
-every boot, and every boot one blip from the wall); **only pre-warming** (a silent regression
-puts us straight back to a no-margin budget); **replacing the CLI with a hand-rolled signed
-HTTPS call from Node** — it removes the startup cost entirely, but it means implementing SigV4
-plus credential-provider-chain resolution in an image that deliberately carries **no npm
-deps**, and re-deriving the two security properties the current file-based handling already
-gives us (the capability token stays off `argv`, and the credential-bearing response stays out
-of shared `/tmp`). That is a large, security-sensitive surface for a latency win the pre-warm
-already delivers; revisit only if the CLI's cold cost becomes structural.
+Alternatives rejected: **raising only the timeout** — not available past 60 s anyway (API cap),
+and even at the cap it leaves ~20 s of cold-CLI latency on every boot with every boot one blip
+from the wall; **only pre-warming** (a silent regression puts us straight back to a no-margin
+budget); **keeping 3 attempts** (see decision 2 — it spends the 60 s ceiling on retries instead
+of on per-attempt headroom, for a failure mode that is slowness rather than flakiness);
+**replacing the CLI with a hand-rolled signed HTTPS call from Node** — it removes the startup
+cost entirely, but it means implementing SigV4 plus credential-provider-chain resolution in an
+image that deliberately carries **no npm deps**, and re-deriving the two security properties the
+current file-based handling already gives us (the capability token stays off `argv`, and the
+credential-bearing response stays out of shared `/tmp`). That is a large, security-sensitive
+surface for a latency win the pre-warm already delivers; revisit only if the CLI's cold cost
+becomes structural — the 60 s cap means there is no headroom left to buy a second time.
 
-**Consequences**: a wedged boot now occupies its VM for up to 120 s instead of 30 s before the
+**Consequences**: a wedged boot now occupies its VM for up to 60 s instead of 30 s before the
 platform gives up — bounded, and small against the Reaper's 2 h lifetime cap that actually
-bounds paid idle time. Deploy-touching: the new hook timeout and the pre-warm both live in the
-**image**, so they need an image rebuild (`npm run build:images`) and the ADR-021 skew-window
-discipline in `docs/DEPLOY-M1.md`. The pre-warm adds one CLI invocation to each image build.
-Boot logs gain an `aws cli prewarm` line and an `ms` field per broker attempt; neither carries
-payload content (the capability token and the JIT config stay redacted per ADR-021).
+bounds paid idle time. A boot that needs more than two broker attempts now fails where it
+previously had a third try; that is the accepted trade for per-attempt headroom, and the
+pre-warm plus the 15 s bound make a single attempt succeed in the measured case. Deploy-touching:
+the new hook timeout and the pre-warm both live in the **image**, so they need an image rebuild
+(`npm run build:images`) and the ADR-021 skew-window discipline in `docs/DEPLOY-M1.md`. The
+pre-warm adds one CLI invocation to each image build. Boot logs gain an `aws cli prewarm` line
+and an `ms` field per broker attempt; neither carries payload content (the capability token and
+the JIT config stay redacted per ADR-021).

@@ -173,16 +173,18 @@ function buildFlavor(flavor, ctx) {
     JSON.stringify({
       port: Number(flavor.runHookPort ?? 8080),
       microvmImageHooks: { ready: 'ENABLED', readyTimeoutInSeconds: 120 },
-      // 120 s, NOT 30 s. The boot path's first act is a `jitconfig` call through the AWS CLI,
-      // and in a snapshot-resumed guest that CLI is cold: the 2026-07-28 dev verification saw
-      // attempts 1 and 2 time out on all three flavors and burn ~22 s of a 30 s deadline to
-      // get one success — i.e. the retry loop had no margin left for a single slow attempt.
-      // The hook's job is bounded work with retries, so give the retry budget real headroom
-      // (run-hook.mjs: 3 × 20 s + 2 s + 4 s = 66 s worst case, pinned by
-      // test/run-hook.test.mjs). This is a CEILING, not a delay: a healthy boot still ACKs in
-      // ~1 s, and an unhealthy VM is still capped — by the Reaper's own lifetime cap, which
-      // is what bounds the paid idle time. Service constraint: 1–600 s.
-      microvmHooks: { run: 'ENABLED', runTimeoutInSeconds: 120 },
+      // 60 s, NOT 30 s — and 60 is the API MAXIMUM, not a preference
+      // (`MicrovmHooksRunTimeoutInSecondsInteger`: min 1, max 60, lambda-microvms 2025-09-09;
+      // the image hooks' readyTimeoutInSeconds is separate and allows up to 3600 s). The boot
+      // path's first act is a `jitconfig` call through the AWS CLI, and in a snapshot-resumed
+      // guest that CLI is cold: the 2026-07-28 dev verification saw attempts 1 and 2 time out
+      // on all three flavors and burn ~22 s of a 30 s deadline to get one success — i.e. the
+      // retry loop had no margin left for a single slow attempt. Take the whole ceiling and
+      // derive the retry budget down from it (run-hook.mjs: 2 × 15 s + 2 s = 32 s worst case,
+      // pinned by test/run-hook.test.mjs, which also pins this 60 s cap). This is a CEILING,
+      // not a delay: a healthy boot still ACKs in ~1 s, and an unhealthy VM is still capped —
+      // by the Reaper's own 2 h lifetime cap, which is what bounds the paid idle time.
+      microvmHooks: { run: 'ENABLED', runTimeoutInSeconds: 60 },
     }),
     // Capture build + hook logs to CloudWatch so ready/run hook failures are diagnosable.
     '--logging',

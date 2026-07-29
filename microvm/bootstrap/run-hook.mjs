@@ -121,19 +121,31 @@ const BROKER_CALL_TIMEOUT_MS = 15000;
 // attempts 1 AND 2 fail `spawnSync aws ETIMEDOUT` on all three flavors — every boot survived on
 // its LAST attempt, burning ~22 s of a 30 s hook deadline for one success, i.e. zero margin.
 //
+// The hook timeout is NOT ours to pick freely: the API caps
+// `microvmHooks.runTimeoutInSeconds` at 60 s (`MicrovmHooksRunTimeoutInSecondsInteger`:
+// min 1, max 60, in the lambda-microvms 2025-09-09 model — note this is a much tighter cap
+// than the image hooks' `readyTimeoutInSeconds`, which allows 3600 s). So the image asks for
+// the maximum 60 s and the retry budget is derived DOWN from that ceiling; we cannot buy our
+// way out of a slow cold call with a bigger deadline.
+//
 // Two changes, because either alone is fragile:
-//   * the image now declares a 120 s run-hook timeout (the API allows 1–600 s) and the
-//     per-invoke bound is 20 s, so the worst case is
-//       3 × 20 s invoke + 2 s + 4 s backoff = 66 s,
-//     which leaves room for a further full-length attempt plus the request/JSON handling.
-//     test/run-hook.test.mjs pins both that arithmetic AND the margin, so a future edit can't
-//     quietly return to a no-retry-margin budget.
+//   * the image now declares the 60 s API maximum (was 30 s) and the budget is sized to leave
+//     real margin inside it: a 15 s per-invoke bound × 2 attempts + 2 s backoff = 32 s worst
+//     case, so a further full-length attempt (4 s backoff + 15 s invoke = 51 s total) still
+//     fits. Attempts drop 3 → 2 deliberately: against a 60 s ceiling, per-invoke headroom for
+//     a cold call is worth more than a third attempt, because the failure this fixes is one
+//     SLOW call, not three flaky ones (each observed failure was the 6 s bound expiring, not
+//     the broker refusing). 3 × 15 s would consume 51 s of the 60 s ceiling and leave the same
+//     zero margin we are removing. test/run-hook.test.mjs pins the arithmetic, the margin AND
+//     the 60 s API cap, so a future edit can't quietly return to a no-retry-margin budget or
+//     declare a timeout the service will reject.
 //   * `prewarmAwsCli()` pays the CLI's cold cost during the image build (see /ready below), so
 //     a normal boot should resolve on attempt 1 and the raised bound is dead headroom rather
 //     than added boot latency.
-// Terminate keeps its own budget: it fires after the job, with no platform deadline behind it.
-const BOOT_CALL_TIMEOUT_MS = 20000;
-const BOOT_CALL_ATTEMPTS = 3;
+// Terminate keeps its own budget: it fires after the job, with no platform deadline behind it,
+// so it keeps the larger attempt count the post-launch stamp race needs.
+const BOOT_CALL_TIMEOUT_MS = 15000;
+const BOOT_CALL_ATTEMPTS = 2;
 
 // Cold-CLI pre-warm knobs (see prewarmAwsCli below). The warmup runs in the `ready` IMAGE hook,
 // i.e. during the image build, before the snapshot is captured — so its cost is paid once at
