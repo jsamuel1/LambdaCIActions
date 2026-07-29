@@ -314,6 +314,12 @@ function RunnerLabelsCard({ data, reload }: { data: SettingsData; reload: () => 
   const [draft, setDraft] = useState(data.runnerLabels.labels.join(', '));
   const [allowHosted, setAllowHosted] = useState(false);
   const [impact, setImpact] = useState<LabelImpact | undefined>();
+  /**
+   * The exact label set the displayed `impact` was computed for. Apply is gated on this
+   * matching the current draft — otherwise an operator could preview `lca-base`, edit the field
+   * to `ubuntu-latest`, and apply the second while reading the first one's impact.
+   */
+  const [previewedFor, setPreviewedFor] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const [details, setDetails] = useState<string[] | undefined>();
@@ -324,19 +330,28 @@ function RunnerLabelsCard({ data, reload }: { data: SettingsData; reload: () => 
     .filter(Boolean);
   const changed =
     parsed.join(',') !== data.runnerLabels.labels.map((l) => l.toLowerCase()).join(',');
+  /** Canonical identity of a preview: the labels AND the hosted-label confirmation. */
+  const draftKey = `${parsed.join(',')}|${allowHosted}`;
+  const previewCurrent = impact !== undefined && previewedFor === draftKey;
 
   async function run(dryRun: boolean): Promise<void> {
     setBusy(true);
     setError(undefined);
     setDetails(undefined);
+    const key = draftKey;
     try {
       const res = await api.putRunnerLabels({ labels: parsed, allowHostedLabels: allowHosted, dryRun });
-      setImpact(res.impact);
       if (res.applied) {
         setImpact(undefined);
+        setPreviewedFor(undefined);
         reload();
+      } else {
+        setImpact(res.impact);
+        setPreviewedFor(key);
       }
     } catch (err) {
+      setImpact(undefined);
+      setPreviewedFor(undefined);
       const e = err as { message?: string; details?: unknown };
       setError(e.message ?? String(err));
       if (Array.isArray(e.details)) setDetails(e.details as string[]);
@@ -395,11 +410,15 @@ function RunnerLabelsCard({ data, reload }: { data: SettingsData; reload: () => 
             <button disabled={busy || !changed} onClick={() => run(true)}>
               Preview impact
             </button>
-            <button className="primary" disabled={busy || !changed || !impact} onClick={() => run(false)}>
+            <button
+              className="primary"
+              disabled={busy || !changed || !previewCurrent}
+              onClick={() => run(false)}
+            >
               Apply
             </button>
           </div>
-          {!impact && changed && (
+          {!previewCurrent && changed && (
             <p className="muted">Preview the impact before applying.</p>
           )}
           {error && <p className="error">{error}</p>}
@@ -408,7 +427,7 @@ function RunnerLabelsCard({ data, reload }: { data: SettingsData; reload: () => 
               {d}
             </p>
           ))}
-          {impact && <ImpactView impact={impact} />}
+          {previewCurrent && impact && <ImpactView impact={impact} />}
         </>
       )}
     </div>

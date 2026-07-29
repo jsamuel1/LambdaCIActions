@@ -559,4 +559,3 @@ export function hostedLabelsIn(labels: string[], hosted: readonly string[]): str
   const set = new Set(hosted.map((l) => l.toLowerCase()));
   return labels.filter((l) => set.has(l.toLowerCase()));
 }
-

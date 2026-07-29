@@ -211,9 +211,17 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
 
     return toResult(await route_(result.match, event, session));
   } catch (err) {
-    // Never echo internals to the browser; the detail goes to CloudWatch.
+    // Never echo internals to the browser; the detail goes to CloudWatch. Sanitized even
+    // there: the relink route carries an App PEM + webhook/client secrets in its request body,
+    // and an SDK or middleware error can quote a request payload back (AGENTS.md hard rule —
+    // a secret value must not reach a log either).
     console.error(
-      JSON.stringify({ msg: 'mgmt request failed', route: route.id, path, error: errMsg(err) }),
+      JSON.stringify({
+        msg: 'mgmt request failed',
+        route: route.id,
+        path,
+        error: scrubForOperator(errMsg(err)),
+      }),
     );
     return toResult(problem(500, 'internal error'));
   }
@@ -722,13 +730,24 @@ async function appLinkage(): Promise<
  */
 async function invokeAppcfg(payload: Record<string, unknown>): Promise<AppcfgResult> {
   if (!APPCFG_BROKER_NAME) throw new Error('App-config broker not configured');
-  const res = await lambdaClient.send(
-    new InvokeCommand({
-      FunctionName: APPCFG_BROKER_NAME,
-      InvocationType: 'RequestResponse',
-      Payload: Buffer.from(JSON.stringify(payload), 'utf8'),
-    }),
-  );
+  let res;
+  try {
+    res = await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: APPCFG_BROKER_NAME,
+        InvocationType: 'RequestResponse',
+        Payload: Buffer.from(JSON.stringify(payload), 'utf8'),
+      }),
+    );
+  } catch (err) {
+    // The broker is concurrency-capped so config changes serialize (ADR-028). A throttle is a
+    // retryable "busy", not a fault — and the raw SDK error must never be surfaced: on the
+    // relink path the request payload it may quote contains the submitted credentials.
+    if ((err as { name?: string }).name === 'TooManyRequestsException') {
+      throw new BrokerBusyError('another platform configuration change is in progress');
+    }
+    throw new Error(`App-config broker invoke failed: ${(err as { name?: string }).name ?? 'error'}`);
+  }
   if (res.FunctionError) {
     throw new Error(`App-config broker returned ${res.FunctionError}`);
   }
@@ -741,6 +760,14 @@ async function invokeAppcfg(payload: Record<string, unknown>): Promise<AppcfgRes
   }
   assertNoSecrets(parsed, 'App-config broker response');
   return parsed;
+}
+
+/** Broker at capacity — surfaced as a retryable 503, never as an internal error. */
+class BrokerBusyError extends Error {}
+
+/** Map a broker fault to a Reply: busy ⇒ 503 (retry), anything else ⇒ rethrow. */
+function brokerBusyReply(err: unknown): Reply | undefined {
+  return err instanceof BrokerBusyError ? problem(503, err.message) : undefined;
 }
 
 /**
@@ -790,11 +817,18 @@ async function putRunnerLabelsRoute(
   }
 
   // The Mgmt λ has no PutParameter grant at all (ADR-025/028) — the broker owns config writes.
-  const res = await invokeAppcfg({
-    action: 'setRunnerLabels',
-    actor: session.login,
-    labels: serializeRunnerLabels(parsed.value.labels),
-  });
+  let res: AppcfgResult;
+  try {
+    res = await invokeAppcfg({
+      action: 'setRunnerLabels',
+      actor: session.login,
+      labels: serializeRunnerLabels(parsed.value.labels),
+    });
+  } catch (err) {
+    const busy = brokerBusyReply(err);
+    if (busy) return busy;
+    throw err;
+  }
   if (!res.ok) return problem(502, res.error ?? 'runner label write failed');
 
   console.log(
@@ -868,11 +902,18 @@ async function relinkGithubAppRoute(
   const parsed = validateRelinkBody(raw);
   if (!parsed.ok) return problem(400, 'invalid credentials payload', parsed.errors);
 
-  const res = await invokeAppcfg({
-    action: 'relink',
-    actor: session.login,
-    credentials: parsed.value,
-  });
+  let res: AppcfgResult;
+  try {
+    res = await invokeAppcfg({
+      action: 'relink',
+      actor: session.login,
+      credentials: parsed.value,
+    });
+  } catch (err) {
+    const busy = brokerBusyReply(err);
+    if (busy) return busy;
+    throw err;
+  }
   if (!res.ok) {
     // Deliberately NOT echoing the body. `rolledBack` tells the operator whether the
     // environment is back on its previous credentials.
@@ -913,7 +954,14 @@ async function rollbackGithubAppRoute(
   const parsed = validateRollbackBody(raw);
   if (!parsed.ok) return problem(400, 'invalid rollback payload', parsed.errors);
 
-  const res = await invokeAppcfg({ action: 'rollback', actor: session.login, restore: parsed.value });
+  let res: AppcfgResult;
+  try {
+    res = await invokeAppcfg({ action: 'rollback', actor: session.login, restore: parsed.value });
+  } catch (err) {
+    const busy = brokerBusyReply(err);
+    if (busy) return busy;
+    throw err;
+  }
   if (!res.ok) return problem(502, res.error ?? 'rollback failed');
   return json(200, { rolledBack: true, verified: res.verified === true, appId: res.appId });
 }
@@ -937,11 +985,18 @@ async function testWebhookRoute(
   if (!parsed.ok) return problem(400, 'invalid body', parsed.errors);
 
   const before = await getWebhookHeartbeat().catch(() => undefined);
-  const res = await invokeAppcfg({
-    action: 'redeliver',
-    actor: session.login,
-    ...(parsed.value.deliveryId ? { deliveryId: parsed.value.deliveryId } : {}),
-  });
+  let res: AppcfgResult;
+  try {
+    res = await invokeAppcfg({
+      action: 'redeliver',
+      actor: session.login,
+      ...(parsed.value.deliveryId ? { deliveryId: parsed.value.deliveryId } : {}),
+    });
+  } catch (err) {
+    const busy = brokerBusyReply(err);
+    if (busy) return busy;
+    throw err;
+  }
   if (!res.ok) return problem(502, res.error ?? 'redelivery failed');
   return json(202, {
     requested: true,

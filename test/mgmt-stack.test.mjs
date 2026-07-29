@@ -276,12 +276,40 @@ test('the App-config broker cannot launch compute or destroy data', () => {
   assert.ok(actions.includes('lambda:RunMicrovm'));
 });
 
-test('the App-config broker is single-concurrency and arm64', () => {
+test('the App-config broker is arm64 and finishes inside the console integration timeout', () => {
   synthControl().hasResourceProperties('AWS::Lambda::Function', {
     FunctionName: 'lca-test-appcfg',
     Architectures: ['arm64'],
-    // Concurrent relinks could interleave writes into a credential set no snapshot describes.
-    ReservedConcurrentExecutions: 1,
+    // MUST stay below the Mgmt λ's 29 s API Gateway cap: a broker that outlived it would
+    // complete a relink whose `replacedVersions` rollback handle the operator never received.
+    Timeout: 25,
+  });
+});
+
+test('the broker is NOT concurrency-capped (that would serialize the polled read path)', () => {
+  // Write serialization is a conditional DynamoDB lock around the mutating actions. A
+  // function-level cap would also throttle `status`, which Settings polls every 15 s — two
+  // operators with the screen open would block each other into a blank view.
+  const fns = synthControl().findResources('AWS::Lambda::Function');
+  const appcfg = Object.values(fns).find(
+    (f) => f.Properties.FunctionName === 'lca-test-appcfg',
+  );
+  assert.ok(appcfg, 'appcfg function not synthesized');
+  assert.equal(appcfg.Properties.ReservedConcurrentExecutions, undefined);
+});
+
+test("the broker's DynamoDB write is scoped to CONFIG# leading keys", () => {
+  // It writes audit rows + the config lock. Without a LeadingKeys condition an UpdateItem
+  // grant on the whole table could patch run rows or installation config.
+  const t = synthControl();
+  const policies = Object.values(t.findResources('AWS::IAM::Policy')).filter((p) =>
+    JSON.stringify(p.Properties.Roles ?? '').includes('AppConfigFnServiceRole'),
+  );
+  const stmts = policies.flatMap((p) => p.Properties.PolicyDocument.Statement);
+  const ddb = stmts.find((s) => JSON.stringify(s.Action).includes('dynamodb:UpdateItem'));
+  assert.ok(ddb, 'broker has no DynamoDB write grant');
+  assert.deepEqual(ddb.Condition, {
+    'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['CONFIG#*'] },
   });
 });
 

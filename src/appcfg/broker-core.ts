@@ -15,9 +15,9 @@
  * Everything here is AWS-free + side-effect-free so the request contract, the credential
  * validation and (critically) the response redaction are unit-testable.
  */
-import { assertNoSecrets, safeForLog, scrubForOperator } from '../shared/redact.js';
+import { assertNoSecrets, redactLiterals, safeForLog, scrubForOperator } from '../shared/redact.js';
 
-export { assertNoSecrets, safeForLog, scrubForOperator };
+export { assertNoSecrets, redactLiterals, safeForLog, scrubForOperator };
 
 /** Operations the management plane may ask the broker to perform. */
 export const APPCFG_ACTIONS = [
@@ -206,7 +206,8 @@ export function validateVersionSnapshot(input: unknown): Validated<ParameterVers
  * Response shapes. Note what is ABSENT: no PEM, no webhook secret, no client secret, no
  * masked-secret placeholder from GitHub. The broker's contract is that a relink answers with
  * *presence + verification outcome* only (AGENTS.md hard rule).
- */export interface AppLinkageView {
+ */
+export interface AppLinkageView {
   /** Verified live from GitHub with the stored credentials, or null when that failed. */
   app: {
     appId: number;
@@ -268,4 +269,3 @@ export interface AppcfgResult {
   /** action=setRunnerLabels — the labels now in effect. */
   labels?: string[];
 }
-

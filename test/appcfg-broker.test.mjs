@@ -33,9 +33,9 @@ const CRED_SUFFIXES = [
  * A fake SSM + GitHub environment. `existing` seeds parameter versions (so we can model both a
  * rotation and a fresh first-link); `failOn` makes one PutParameter throw.
  */
-function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = false } = {}) {
+function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = false, hookError, lockHeld = false } = {}) {
   const store = new Map(Object.entries(existing)); // name → { value, version }
-  const calls = { puts: [], deletes: [], audits: [], hookUpdates: [], identities: [] };
+  const calls = { puts: [], deletes: [], audits: [], hookUpdates: [], identities: [], locks: [], releases: [] };
 
   const deps = {
     getParam: async (name) => {
@@ -96,12 +96,20 @@ function harness({ existing = {}, failOn, identityAppId = 424242, hookFails = fa
     }),
     updateAppHookConfig: async (appId, pem, config) => {
       calls.hookUpdates.push({ appId, config });
+      if (hookError) throw new Error(hookError);
       if (hookFails) throw new Error('403 app does not own its hook config');
     },
     listAppHookDeliveries: async () => [
       { id: 77, event: 'push', action: null, status: 'OK', statusCode: 202, deliveredAt: 'now', durationMs: 5, redelivery: false },
     ],
     redeliverAppHook: async () => {},
+    acquireConfigLock: async (holder) => {
+      calls.locks.push(holder);
+      return !lockHeld;
+    },
+    releaseConfigLock: async (holder) => {
+      calls.releases.push(holder);
+    },
   };
   return { deps, store, calls, handle: createHandler(deps) };
 }
@@ -280,4 +288,68 @@ test('operator-driven rollback restores the requested versions and re-verifies',
   assert.equal(res.ok, true);
   assert.equal(res.rolledBack, true);
   assert.equal(h.store.get(`${PREFIX}/github/app-id`).value, 'old-github/app-id');
+});
+
+// ---- literal-secret redaction (submitted values have no recognizable shape) --------------
+
+test('a GitHub error quoting the submitted webhook secret never reaches the result', async () => {
+  // GitHub's 422 bodies quote the offending request value back, and a webhook secret is an
+  // opaque high-entropy string — the shape guard cannot recognize it, so the broker must
+  // redact it by literal value.
+  const h = harness({
+    existing: linkedStore(),
+    hookError: `Invalid request. "${CREDS.webhookSecret}" is not a valid secret.`,
+  });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, true);
+  const serialized = JSON.stringify(res);
+  assert.ok(!serialized.includes(CREDS.webhookSecret), 'webhook secret leaked into the result');
+  assert.ok(res.hookError.includes('[redacted]'), 'expected the value to be masked');
+});
+
+test('a thrown error quoting the submitted client secret is redacted from the error field', async () => {
+  const h = harness({ existing: linkedStore() });
+  // The verification call itself failing is the realistic case: GitHub 422s and quotes the
+  // rejected value back, and this error is what the operator sees.
+  h.deps.getAppIdentity = async () => {
+    throw new Error(`upstream rejected client_secret=${CREDS.clientSecret}`);
+  };
+  const handle = createHandler(h.deps);
+  const res = await handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  const serialized = JSON.stringify(res);
+  assert.ok(!serialized.includes(CREDS.clientSecret), 'client secret leaked into the error');
+  assert.ok(res.error.includes('[redacted]'), 'expected the value to be masked');
+});
+
+// ---- write serialization (lock, not a concurrency cap) -----------------------------------
+
+test('a mutating action is refused when the config lock is already held', async () => {
+  const h = harness({ existing: linkedStore(), lockHeld: true });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /in progress/);
+  assert.deepEqual(h.calls.puts, [], 'nothing may be written without the lock');
+});
+
+test('the lock is released even when the action fails', async () => {
+  const h = harness({ existing: linkedStore(), failOn: 'github/client-id' });
+  const res = await h.handle({ action: 'relink', actor: 'alice', credentials: CREDS });
+  assert.equal(res.ok, false);
+  assert.equal(h.calls.locks.length, 1);
+  assert.deepEqual(h.calls.releases, h.calls.locks, 'a failed relink must not wedge the lock');
+});
+
+test('status runs WITHOUT the lock so a polling Settings screen cannot block a write', async () => {
+  const h = harness({ existing: linkedStore(), lockHeld: true });
+  const res = await h.handle({ action: 'status', actor: 'system' });
+  assert.equal(res.ok, true);
+  assert.deepEqual(h.calls.locks, [], 'the read path must not take the config lock');
+});
+
+test('setRunnerLabels is serialized by the same lock', async () => {
+  const h = harness({ existing: linkedStore(), lockHeld: true });
+  const res = await h.handle({ action: 'setRunnerLabels', actor: 'alice', labels: 'lca-base' });
+  assert.equal(res.ok, false);
+  assert.deepEqual(h.calls.puts, []);
 });

@@ -7,13 +7,14 @@ import {
   updateAppHookConfig,
 } from '../shared/github-app.js';
 import { deleteParam, getParam, getParamVersion, paramVersion, putParam } from '../shared/ssm.js';
-import { appendAudit } from '../shared/config-store.js';
+import { appendAudit, acquireConfigLock, releaseConfigLock } from '../shared/config-store.js';
 import {
   APP_CREDENTIAL_PARAMS,
   SECURE_CREDENTIAL_PARAMS,
   AppcfgRequestError,
   assertNoSecrets,
   parseAppcfgRequest,
+  redactLiterals,
   scrubForOperator,
   type AppLinkageView,
   type AppcfgResult,
@@ -71,6 +72,8 @@ export interface AppcfgDeps {
   updateAppHookConfig: typeof updateAppHookConfig;
   listAppHookDeliveries: typeof listAppHookDeliveries;
   redeliverAppHook: typeof redeliverAppHook;
+  acquireConfigLock: typeof acquireConfigLock;
+  releaseConfigLock: typeof releaseConfigLock;
 }
 
 const defaultDeps: AppcfgDeps = {
@@ -86,6 +89,8 @@ const defaultDeps: AppcfgDeps = {
   updateAppHookConfig,
   listAppHookDeliveries,
   redeliverAppHook,
+  acquireConfigLock,
+  releaseConfigLock,
 };
 
 export function createHandler(deps: AppcfgDeps = defaultDeps) {
@@ -101,21 +106,43 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
       return { ok: false, error: scrubForOperator(message) };
     }
 
+    // Plaintexts THIS request carries. The shape guard cannot recognize an opaque webhook or
+    // client secret, so every error string on the relink path is literal-redacted against the
+    // submitted values before it is logged or returned.
+    const submitted = req.credentials
+      ? [req.credentials.pem, req.credentials.webhookSecret, req.credentials.clientSecret]
+      : [];
+    const clean = (text: string): string =>
+      scrubForOperator(redactLiterals(text, submitted));
+
     try {
       switch (req.action) {
         case 'status':
           return finish(await statusAction(deps));
         case 'relink':
-          return finish(await relinkAction(deps, req.credentials!, req.actor));
+          return finish(
+            await withConfigLock(deps, req.actor, () =>
+              relinkAction(deps, req.credentials!, req.actor),
+            ),
+            submitted,
+          );
         case 'rollback':
-          return finish(await rollbackAction(deps, req.restore!, req.actor));
+          return finish(
+            await withConfigLock(deps, req.actor, () =>
+              rollbackAction(deps, req.restore!, req.actor),
+            ),
+          );
         case 'redeliver':
           return finish(await redeliverAction(deps, req.deliveryId, req.actor));
         case 'setRunnerLabels':
-          return finish(await setRunnerLabelsAction(deps, req.labels!, req.actor));
+          return finish(
+            await withConfigLock(deps, req.actor, () =>
+              setRunnerLabelsAction(deps, req.labels!, req.actor),
+            ),
+          );
       }
     } catch (err) {
-      const detail = scrubForOperator(errMsg(err));
+      const detail = clean(errMsg(err));
       console.error(
         JSON.stringify({ msg: 'appcfg broker failed', action: req.action, error: detail }),
       );
@@ -126,10 +153,41 @@ export function createHandler(deps: AppcfgDeps = defaultDeps) {
 
 export const handler = createHandler();
 
-/** Last gate before anything leaves the broker (see the module invariant). */
-function finish(result: AppcfgResult): AppcfgResult {
-  assertNoSecrets(result, 'appcfg broker');
-  return result;
+/**
+ * Last gate before anything leaves the broker (see the module invariant). `submitted` carries
+ * the request's known plaintexts so an opaque secret — invisible to the shape guard — cannot
+ * ride out inside an error string it was quoted into.
+ */
+function finish(result: AppcfgResult, submitted: readonly string[] = []): AppcfgResult {
+  const out = submitted.length ? redactResult(result, submitted) : result;
+  if (submitted.length && containsLiteral(out, submitted)) {
+    throw new Error('refusing to return a submitted credential from appcfg broker');
+  }
+  assertNoSecrets(out, 'appcfg broker');
+  return out;
+}
+
+/**
+ * Literal-redact EVERY string in a result, not just `error`. Any operator-facing field can
+ * carry forwarded GitHub text — `hookError` is the live example: GitHub's 422 body quotes the
+ * rejected webhook secret back, and the shape guard cannot recognize an opaque secret.
+ */
+function redactResult(result: AppcfgResult, submitted: readonly string[]): AppcfgResult {
+  const walk = (v: unknown): unknown => {
+    if (typeof v === 'string') return redactLiterals(v, submitted);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') {
+      return Object.fromEntries(Object.entries(v).map(([k, val]) => [k, walk(val)]));
+    }
+    return v;
+  };
+  return walk(result) as AppcfgResult;
+}
+
+/** Whether a serialized result still contains any submitted plaintext verbatim. */
+function containsLiteral(payload: unknown, secrets: readonly string[]): boolean {
+  const json = JSON.stringify(payload ?? {});
+  return secrets.some((s) => s && s.length >= 8 && json.includes(s));
 }
 
 // ---- status ----------------------------------------------------------------
@@ -528,6 +586,48 @@ async function redeliverAction(
 }
 
 // ---- helpers --------------------------------------------------------------
+
+/**
+ * Run a MUTATING action under the platform config lock.
+ *
+ * Only the writes are serialized. `status` (which the Settings screen polls) deliberately runs
+ * unlocked and concurrently — gating reads behind the same mutual exclusion would let two
+ * operators with Settings open block each other, and a stale read is harmless where a mixed
+ * credential set is not.
+ */
+async function withConfigLock(
+  deps: AppcfgDeps,
+  actor: string,
+  fn: () => Promise<AppcfgResult>,
+): Promise<AppcfgResult> {
+  const holder = `${actor}:${Date.now()}`;
+  let held = false;
+  try {
+    held = await deps.acquireConfigLock(holder);
+  } catch (err) {
+    // A lock-store fault must not silently drop the mutex and allow interleaved credential
+    // writes; refuse instead.
+    return {
+      ok: false,
+      error: `could not acquire the platform config lock: ${scrubForOperator(errMsg(err))}`,
+    };
+  }
+  if (!held) {
+    return {
+      ok: false,
+      error: 'another platform configuration change is in progress — retry in a moment',
+    };
+  }
+  try {
+    return await fn();
+  } finally {
+    await deps.releaseConfigLock(holder).catch((err) =>
+      console.error(
+        JSON.stringify({ msg: 'config lock release failed', error: scrubForOperator(errMsg(err)) }),
+      ),
+    );
+  }
+}
 
 /** Audit rows are operator-facing text; scrub + assert before persisting. */
 async function audit(

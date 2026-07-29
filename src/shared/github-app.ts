@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { redactLiterals } from './redact.js';
 
 /**
  * GitHub App authentication chain (spec 01):
@@ -48,8 +49,20 @@ const tokenCache = new Map<number, CachedToken>();
 
 async function githubJson<T>(
   path: string,
-  init: { method?: string; token: string; tokenType: 'Bearer' | 'token'; body?: unknown },
+  init: {
+    method?: string;
+    token: string;
+    tokenType: 'Bearer' | 'token';
+    body?: unknown;
+    /**
+     * Plaintext secrets present in THIS request, redacted by literal value from any error
+     * text. GitHub (or a proxy in front of it) can quote a rejected request value back, and an
+     * opaque secret like a webhook secret has no shape the pattern guard can recognize.
+     */
+    redactValues?: readonly (string | undefined)[];
+  },
 ): Promise<{ status: number; body: T }> {
+  const clean = (text: string): string => redactLiterals(text, init.redactValues ?? []);
   const res = await fetch(`${GITHUB_API}${path}`, {
     method: init.method ?? 'GET',
     headers: {
@@ -63,15 +76,35 @@ async function githubJson<T>(
   });
   const text = await res.text();
   let body: T;
+  let parsed = true;
   try {
     body = text ? (JSON.parse(text) as T) : ({} as T);
   } catch {
-    throw new Error(`GitHub ${path} returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    parsed = false;
+    body = {} as T;
+  }
+  if (!parsed) {
+    // Do NOT echo the raw body: a non-JSON response comes from an intermediary (proxy, WAF,
+    // error page) which may reflect the request — including a submitted credential.
+    throw new Error(
+      `GitHub ${path} returned non-JSON (HTTP ${res.status}, ${text.length} bytes)` +
+        requestIdOf(res),
+    );
   }
   if (res.status >= 400) {
-    throw new Error(`GitHub ${path} failed HTTP ${res.status}: ${text.slice(0, 300)}`);
+    // Only GitHub's own `message` field, never the raw body, and literal-redacted on top:
+    // 422 validation errors quote the offending request value back.
+    const message = (body as { message?: unknown }).message;
+    const detail = typeof message === 'string' ? `: ${clean(message).slice(0, 200)}` : '';
+    throw new Error(`GitHub ${path} failed HTTP ${res.status}${requestIdOf(res)}${detail}`);
   }
   return { status: res.status, body };
+}
+
+/** GitHub's request id, so an operator-facing error is still traceable in a support ticket. */
+function requestIdOf(res: { headers: { get(name: string): string | null } }): string {
+  const id = res.headers?.get?.('x-github-request-id');
+  return id ? ` (request ${id.replace(/[^\x20-\x7e]/g, '').slice(0, 64)})` : '';
 }
 
 /**
@@ -327,6 +360,9 @@ export async function updateAppHookConfig(
     token: jwt,
     tokenType: 'Bearer',
     body,
+    // The webhook secret is the one plaintext we send to GitHub on this path; if GitHub
+    // rejects the request and quotes it back, it must not survive into `hookError`.
+    redactValues: [config.secret],
   });
 }
 

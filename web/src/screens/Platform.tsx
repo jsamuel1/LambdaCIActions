@@ -53,4 +53,3 @@ export function Flavors(): JSX.Element {
     </div>
   );
 }
-

@@ -66,6 +66,31 @@ export function scrubForOperator(text: string, max = 300): string {
   return out.length > max ? `${out.slice(0, max)}…` : out;
 }
 
+/**
+ * Redact KNOWN plaintext secrets out of arbitrary text by literal match.
+ *
+ * The shape guard above only recognizes *structured* secrets (PEM blocks, `ghp_…` prefixes).
+ * A GitHub App webhook secret and an OAuth client secret are opaque high-entropy strings with
+ * no recognizable shape, so nothing in `SECRET_SHAPES` can catch them — but on the relink path
+ * we DO hold their plaintext, and GitHub (or an intermediary proxy) can quote a submitted value
+ * back inside an error body. Literal redaction closes that gap; the shape guard remains as
+ * defense in depth for values we never held.
+ *
+ * Values shorter than 8 chars are skipped: masking a short string would corrupt unrelated
+ * substrings of the message and tell an attacker nothing useful anyway.
+ */
+export function redactLiterals(text: string, secrets: readonly (string | undefined)[]): string {
+  let out = String(text);
+  for (const s of secrets) {
+    if (!s || s.length < 8) continue;
+    out = out.split(s).join('[redacted]');
+    // GitHub echoes values inside JSON, so a secret containing " or \ arrives escaped.
+    const escaped = JSON.stringify(s).slice(1, -1);
+    if (escaped !== s) out = out.split(escaped).join('[redacted]');
+  }
+  return out;
+}
+
 /** True when a payload serializes to something containing a secret-shaped value. */
 export function containsSecretShape(payload: unknown): boolean {
   const json = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {});

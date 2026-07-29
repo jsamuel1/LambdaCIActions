@@ -30,6 +30,7 @@ import {
   assertNoSecrets,
   containsSecretShape,
   scrubForOperator,
+  redactLiterals,
 } from '../dist/src/shared/redact.js';
 import {
   parseAppcfgRequest,
@@ -316,6 +317,25 @@ test('scrubForOperator redacts secrets, flattens newlines and bounds length', ()
   assert.ok(out.includes('[redacted]'));
   assert.equal(out.includes('\n'), false);
   assert.ok(scrubForOperator('x'.repeat(1000)).length <= 301);
+});
+
+test('redactLiterals masks opaque secrets the shape guard cannot recognize', () => {
+  // A webhook secret and an OAuth client secret are unstructured high-entropy strings: no
+  // pattern can identify them, so the only defense on the relink path is literal redaction
+  // against the values we were just handed.
+  const secret = 'w'.repeat(24);
+  const out = redactLiterals(`GitHub rejected "${secret}" as invalid`, [secret]);
+  assert.equal(out.includes(secret), false);
+  assert.ok(out.includes('[redacted]'));
+  // Escaped-in-JSON occurrences are covered too (GitHub echoes values inside JSON bodies).
+  const quoted = 'ab"cd' + 'e'.repeat(20);
+  assert.equal(
+    redactLiterals(JSON.stringify({ message: quoted }), [quoted]).includes('cd'),
+    false,
+  );
+  // Short values are skipped: masking them would corrupt unrelated text.
+  assert.equal(redactLiterals('the id is 42', ['42']), 'the id is 42');
+  assert.equal(redactLiterals('untouched', [undefined]), 'untouched');
 });
 
 // ---- relink intake ---------------------------------------------------------

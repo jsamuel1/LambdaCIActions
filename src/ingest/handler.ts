@@ -79,13 +79,30 @@ export async function handler(
   // Delivery heartbeat (spec 04 § webhook health): real evidence that GitHub is delivering
   // to THIS environment, recorded for every verified delivery regardless of event type.
   // One fixed-key UpdateItem, and best-effort — a failed heartbeat must never drop a webhook.
-  await recordWebhookDelivery({
+  //
+  // NOT awaited before the claim decision: Ingest must ack GitHub fast (a slow ack means
+  // redelivery), and this write is diagnostics. It is awaited at the END of the request via
+  // `heartbeat`, so the Lambda is not frozen mid-write, but it never sits in front of the
+  // enqueue latency.
+  const heartbeat = recordWebhookDelivery({
     event: ghEvent ?? 'unknown',
     deliveryId: headers['x-github-delivery'] ?? headers['X-GitHub-Delivery'],
   }).catch((err) =>
     console.error(JSON.stringify({ msg: 'webhook heartbeat failed', error: errMsg(err) })),
   );
 
+  try {
+    return await dispatch(rawBody, ghEvent);
+  } finally {
+    await heartbeat;
+  }
+}
+
+/** Route a signature-verified delivery to its handler. */
+async function dispatch(
+  rawBody: string,
+  ghEvent: string | undefined,
+): Promise<APIGatewayProxyResultV2> {
   let payload: unknown;
   try {
     payload = JSON.parse(rawBody);

@@ -801,13 +801,30 @@ scope is pinned in the synthesized template (`test/mgmt-stack.test.mjs`) to exac
 credential parameters plus `app-slug` and `config/runner-labels` — specifically **not**
 `mgmt/session-secret` (writing it would let the broker forge operator sessions) and **not** the
 image ARNs. `ssm:DeleteParameter` is scoped to the same set (needed for the create-then-fail undo
-above). The broker is `reservedConcurrentExecutions: 1`, because concurrent relinks could
-interleave writes into a credential set no rollback snapshot describes, and its log group keeps
+above). The broker's mutating actions are serialized by a conditional-write lock row
+(`CONFIG#LOCK`, `acquireConfigLock`), because concurrent relinks could interleave writes into a
+credential set no rollback snapshot describes. A `reservedConcurrentExecutions: 1` cap was
+considered and **rejected**: it would also serialize the read path (`status`), which the Settings
+screen polls every 15 s, so two operators with the screen open would throttle each other into a
+blank view. The lock carries a TTL above the broker's timeout so a crashed holder cannot wedge
+config changes, and the broker's `dynamodb:UpdateItem` grant is condition-scoped to `CONFIG#*`
+leading keys so it can reach only audit + lock rows. The broker's timeout (25 s) is deliberately
+below the Mgmt λ's 29 s API Gateway cap: a broker that outlived the caller would complete a
+relink whose `replacedVersions` rollback handle the operator never received. Its log group keeps
 3 months (credential changes are audit-relevant). A `assertNoSecrets` shape guard
 (`src/shared/redact.ts`) scans every broker/settings payload for PEM blocks and GitHub token
 shapes and **throws** rather than serving them, so a future field addition cannot quietly
-become a leak. Ingest takes one extra fixed-key `UpdateItem` per delivery for the heartbeat,
-best-effort — a failed heartbeat degrades the screen, never a webhook. `/app/hook/config` and
+become a leak. Because the shape guard cannot recognize an *opaque* secret (a webhook secret or
+OAuth client secret is just a high-entropy string), the relink path additionally redacts the
+submitted plaintexts by **literal value** from every response string and log line
+(`redactLiterals`), and `githubJson` no longer echoes GitHub response bodies into error text —
+only the HTTP status, GitHub's request id, and GitHub's own `message` field, itself
+literal-redacted. Ingest takes one extra fixed-key `UpdateItem` per delivery for the heartbeat,
+best-effort and off the enqueue critical path — a failed heartbeat degrades the screen, never a
+webhook. The *rejection* counter is the one heartbeat write reachable before authentication (the
+webhook endpoint is public and the signature check is what rejects an anonymous caller), so it is
+rate-bounded to one write per minute by a condition on the row — enough to make a secret mismatch
+visible without giving an anonymous caller a write amplifier. `/app/hook/config` and
 `/app/hook/deliveries` require the App to own its hook config; where it does not (some
 Enterprise/org-hook setups) the screen degrades to heartbeat-only evidence and says why.
 

@@ -25,6 +25,8 @@ const TABLE = process.env.TABLE_NAME;
 export const WEBHOOK_PK = 'CONFIG#WEBHOOK';
 export const WEBHOOK_LAST_SK = 'LAST';
 export const AUDIT_PK = 'CONFIG#AUDIT';
+export const LOCK_PK = 'CONFIG#LOCK';
+export const LOCK_SK = 'PLATFORM';
 
 function requireDoc(): DynamoDBDocumentClient {
   if (!doc || !TABLE) {
@@ -82,17 +84,39 @@ export async function recordWebhookDelivery(input: {
  * Record a delivery that failed HMAC verification. Distinct from an accepted delivery on
  * purpose: "GitHub is reaching us but the signature doesn't match" is the exact symptom of a
  * half-finished credential rotation, and it must not look like silence.
+ *
+ * **Rate-bounded on purpose.** This is the one heartbeat write reachable BEFORE authentication:
+ * the webhook endpoint is public and the signature check is what rejects an unauthenticated
+ * caller, so an unconditional write here would let anyone drive unbounded WCUs by POSTing junk.
+ * The conditional restricts it to one write per `windowMs` — enough to make the symptom visible
+ * on the Settings screen (an operator needs "it is happening now", not a precise count) without
+ * giving an anonymous caller a write amplifier.
  */
-export async function recordWebhookRejection(at?: string): Promise<void> {
-  const iso = at ?? new Date().toISOString();
-  await requireDoc().send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { pk: WEBHOOK_PK, sk: WEBHOOK_LAST_SK },
-      UpdateExpression: 'SET entity = :e, lastRejectedAt = :now ADD rejections :one',
-      ExpressionAttributeValues: { ':e': 'WEBHOOK_HEARTBEAT', ':now': iso, ':one': 1 },
-    }),
-  );
+export async function recordWebhookRejection(at?: string, windowMs = 60_000): Promise<void> {
+  const now = at ? Date.parse(at) : Date.now();
+  const nowMs = Number.isFinite(now) ? now : Date.now();
+  const iso = new Date(nowMs).toISOString();
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: WEBHOOK_PK, sk: WEBHOOK_LAST_SK },
+        UpdateExpression:
+          'SET entity = :e, lastRejectedAt = :now, lastRejectedMs = :ms ADD rejections :one',
+        ConditionExpression: 'attribute_not_exists(lastRejectedMs) OR lastRejectedMs < :cutoff',
+        ExpressionAttributeValues: {
+          ':e': 'WEBHOOK_HEARTBEAT',
+          ':now': iso,
+          ':ms': nowMs,
+          ':one': 1,
+          ':cutoff': nowMs - windowMs,
+        },
+      }),
+    );
+  } catch (err) {
+    // Condition failure = already recorded inside the window; that is the throttle working.
+    if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
+  }
 }
 
 /** Read the heartbeat row (undefined when no delivery has ever been accepted). */
@@ -142,6 +166,67 @@ export async function appendAudit(rec: AuditRecord & { nonce?: string }): Promis
       },
     }),
   );
+}
+
+/**
+ * Serialize platform config MUTATIONS with a short-lived conditional lock.
+ *
+ * Concurrent relinks could interleave `PutParameter` calls and leave a mixed credential set
+ * that no rollback snapshot describes. A Lambda-level concurrency cap of 1 would also serialize
+ * the read path (`status`), which the Settings screen polls — two operators with the screen open
+ * would throttle each other into a blank view. So mutual exclusion lives here, on the writes
+ * only, as a conditional `UpdateItem`: acquired when no lock row exists or the existing one has
+ * expired.
+ *
+ * `ttlMs` bounds a crashed holder: a broker that dies mid-relink must not wedge config changes
+ * forever. It is set above the broker's own timeout so a still-running holder keeps the lock.
+ */
+export async function acquireConfigLock(
+  holder: string,
+  ttlMs = 90_000,
+  now = Date.now(),
+): Promise<boolean> {
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: LOCK_PK, sk: LOCK_SK },
+        UpdateExpression: 'SET entity = :e, holder = :h, expiresAt = :exp, acquiredAt = :at',
+        ConditionExpression: 'attribute_not_exists(expiresAt) OR expiresAt < :now',
+        ExpressionAttributeValues: {
+          ':e': 'CONFIG_LOCK',
+          ':h': holder,
+          ':exp': now + ttlMs,
+          ':at': new Date(now).toISOString(),
+          ':now': now,
+        },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Release the lock, but only if WE still hold it — a holder whose TTL already lapsed and whose
+ * lock was taken over must not release someone else's.
+ */
+export async function releaseConfigLock(holder: string): Promise<void> {
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: LOCK_PK, sk: LOCK_SK },
+        UpdateExpression: 'SET expiresAt = :zero',
+        ConditionExpression: 'holder = :h',
+        ExpressionAttributeValues: { ':zero': 0, ':h': holder },
+      }),
+    );
+  } catch (err) {
+    if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
+  }
 }
 
 /** Most recent config changes, newest first. */

@@ -472,12 +472,16 @@ export class ControlStack extends Stack {
       architecture: lambda.Architecture.ARM_64,
       entry: path.join(SRC, 'appcfg', 'handler.ts'),
       handler: 'handler',
-      // Several sequential GitHub calls plus up to 6 SSM writes; the console waits on it.
-      timeout: Duration.seconds(60),
+      // Several sequential GitHub calls plus up to 6 SSM writes; the console waits on it, and
+      // the console's own integration is capped at API Gateway's 29 s. A broker that outlived
+      // that would finish a relink whose `replacedVersions` rollback handle the operator never
+      // received — so it must fail FIRST, leaving its own verify→rollback path to clean up.
+      timeout: Duration.seconds(25),
       memorySize: 256,
-      // One credential change at a time. Concurrent relinks could interleave PutParameter
-      // calls and leave a mixed credential set that no rollback snapshot describes.
-      reservedConcurrentExecutions: 1,
+      // One credential change at a time is enforced by a conditional DynamoDB lock around the
+      // MUTATING actions (`acquireConfigLock`), not by a concurrency cap: capping the function
+      // would also serialize `status`, which the Settings screen polls every 15 s — two
+      // operators with the screen open would throttle each other into a blank view.
       logGroup: appcfgLogGroup,
       bundling,
       environment: {
@@ -530,13 +534,17 @@ export class ControlStack extends Stack {
         resources: credentialParams,
       }),
     );
-    // Audit rows only (CONFIG#AUDIT). UpdateItem, not Put/Delete — it cannot destroy history
-    // or forge run rows.
+    // Audit rows + the config lock (`CONFIG#AUDIT`, `CONFIG#LOCK`) only — scoped by leading key
+    // so the broker cannot touch run rows or installation config. UpdateItem, not Put/Delete:
+    // it cannot destroy history either.
     appcfg.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'WriteConfigAudit',
         actions: ['dynamodb:UpdateItem'],
         resources: [table.tableArn],
+        conditions: {
+          'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['CONFIG#*'] },
+        },
       }),
     );
 
