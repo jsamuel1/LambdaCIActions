@@ -49,21 +49,12 @@ export function installGsi1Keys(accountLogin: string): { gsi1pk: string; gsi1sk:
   return { gsi1pk: INSTALLS_GSI1PK, gsi1sk: accountLogin };
 }
 
-/** True when a row is an installation that predates the M4 GSI1 stamp (ADR-037). */
-export function isUnindexedInstall(row: {
-  entity?: string;
-  gsi1pk?: string;
-  accountLogin?: string;
-}): boolean {
-  return row.entity === 'INSTALL' && row.gsi1pk !== INSTALLS_GSI1PK;
-}
-
 /**
  * Whether a row fetched BY PRIMARY KEY (`INSTALL#<id>` / `INSTALL`) still needs its GSI1
- * stamp. Deliberately does NOT re-check `entity`: the key already proves the row is an
+ * stamp. Deliberately does NOT check `entity`: the key already proves the row is an
  * installation, and `entity` is an optional attribute on the record type — gating the repair
- * on it would leave a row that lacks it unrepairable by BOTH this path and the backfill
- * script (whose scan DOES filter on `entity`, because a scan has no key to prove identity).
+ * on it would leave a row that lacks it permanently invisible. The backfill script selects
+ * on the same signal (key shape, not `entity`) so the two paths repair the same row set.
  * `accountLogin` IS the `gsi1sk`, so a row without one cannot be indexed meaningfully.
  */
 export function needsIndexRepair(row: { gsi1pk?: string; accountLogin?: string }): boolean {
@@ -322,6 +313,8 @@ export async function reconcileInstallations(
   if (missing.length === 0) return indexed;
 
   const recovered: InstallationRecord[] = [];
+  const byLogin = (a: InstallationRecord, b: InstallationRecord): number =>
+    (a.accountLogin ?? '').localeCompare(b.accountLogin ?? '');
   for (const id of missing) {
     const row = await deps.get(id);
     if (!row) continue; // a grant for an installation we never stored — nothing to show
@@ -357,7 +350,10 @@ export async function reconcileInstallations(
       );
     }
   }
-  return [...indexed, ...recovered];
+  // Sort the merged list by account login — the order GSI1 already returns. Appending
+  // recovered rows raw would put a legacy installation last, then move it once the repair
+  // lands and the next poll (ADR-026) reads it from the index: the console row would jump.
+  return [...indexed, ...recovered].sort(byLogin);
 }
 
 /**

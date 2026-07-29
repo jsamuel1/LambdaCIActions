@@ -981,8 +981,10 @@ activity" was wrong — job activity never touches the installation row.
    exactly the installations the operator is *already* authorized to see (ADR-022 freezes
    these at login from GitHub, independent of our table).
 2. **A one-shot backfill** — `npm run backfill:installs` (`scripts/backfill-installs.mjs`,
-   dry-run by default) stamps every unindexed INSTALL row, so an existing environment is
-   fully repaired in one command rather than lazily per operator login.
+   dry-run by default) stamps every unindexed installation row, so an existing environment is
+   fully repaired in one command rather than lazily per operator login. Both paths select on
+   the same signal — the key shape (`INSTALL#<id>` / `INSTALL`) plus a missing `gsi1pk`, not
+   the optional `entity` attribute — so neither can repair a row the other cannot.
 **Why not a fallback scan**: the obvious alternative — "if the GSI query comes back empty,
 scan with a filter" — is triggered by the wrong signal. Empty-index is not the failure mode;
 *partially* indexed is (one M4-era install indexed, one M2-era install not), and a scan that
@@ -1001,4 +1003,6 @@ logged and swallowed: the row is already in the response, so the read must not f
 repair is idempotent and concurrency-safe (conditional write; a losing racer is a no-op).
 `upsertInstallation` now stamps the keys via the shared `installGsi1Keys()` helper, and
 `test/install-store-gsi1.test.mjs` pins that every write path carries them — the regression
-class here is "a new write path forgets the index stamp".
+class here is "a new write path forgets the index stamp". The reconciled list is re-sorted by
+account login so a recovered row occupies the same position it will hold on the next poll,
+once the index serves it.

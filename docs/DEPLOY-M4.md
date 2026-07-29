@@ -143,8 +143,9 @@ npm run backfill:installs                 # dry run — lists the rows it would 
 npm run backfill:installs -- --apply      # write
 ```
 
-The script (`scripts/backfill-installs.mjs`, ADR-037) scans for `entity=INSTALL` rows missing
-`gsi1pk` and stamps `gsi1pk=INSTALLS`, `gsi1sk=<accountLogin>`. It is idempotent (conditional
+The script (`scripts/backfill-installs.mjs`, ADR-037) scans for installation rows (keyed
+`INSTALL#<id>` / `INSTALL`) missing `gsi1pk` and stamps `gsi1pk=INSTALLS`,
+`gsi1sk=<accountLogin>`. It is idempotent (conditional
 on `attribute_not_exists(gsi1pk)`) — a second run reports nothing to do. It requires the
 same `.env.local` deploy-target pin as every other account-touching command (ADR-018), for
 the **dry run too**, since the dry run reads the live table and an unpinned run would report

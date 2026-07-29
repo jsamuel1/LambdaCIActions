@@ -9,9 +9,9 @@
  * Setup screen renders the empty state for an installation the platform is actively serving.
  * GitHub never re-sends `installation.created`, so it does not self-heal. See ADR-037.
  *
- * This stamps `gsi1pk=INSTALLS`, `gsi1sk=<accountLogin>` on every `entity=INSTALL` row that
- * lacks `gsi1pk`. Idempotent: the update is conditional on `attribute_not_exists(gsi1pk)`,
- * and a second run finds nothing to do.
+ * This stamps `gsi1pk=INSTALLS`, `gsi1sk=<accountLogin>` on every installation row (keyed
+ * `INSTALL#<id>` / `INSTALL`) that lacks `gsi1pk`. Idempotent: the update is conditional on
+ * `attribute_not_exists(gsi1pk)`, and a second run finds nothing to do.
  *
  * A `Scan` with a filter is acceptable here: one-shot, and installations are one row per
  * GitHub account that installed the App (tens, not millions).
@@ -39,8 +39,9 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 
-// Must match install-store.ts INSTALLS_GSI1PK.
+// Must match install-store.ts INSTALLS_GSI1PK / INSTALL_SK.
 const INSTALLS_GSI1PK = 'INSTALLS';
+const INSTALL_SK = 'INSTALL';
 
 function parseArgs(argv) {
   const args = {};
@@ -109,7 +110,14 @@ function resolveTableName() {
   return r.stdout.trim();
 }
 
-/** Scan (paged) for INSTALL rows with no gsi1pk. Returns raw DDB items. */
+/**
+ * Scan (paged) for installation rows with no gsi1pk. Selects on the KEY SHAPE
+ * (`pk` begins with `INSTALL#` AND `sk = INSTALL`) rather than on `entity`: the key is what
+ * proves the row is an installation, `entity` is an optional attribute, and the
+ * reconcile-on-read path repairs on the same signal. Filtering on `entity` here would leave
+ * an entity-less row unrepairable by this script while the read path happily fixed it.
+ * `sk = INSTALL` excludes the `REPO#<id>` rows that share the partition. Returns raw DDB items.
+ */
 function findUnindexedInstalls(table) {
   const items = [];
   let startKey = null;
@@ -120,9 +128,9 @@ function findUnindexedInstalls(table) {
       '--table-name',
       table,
       '--filter-expression',
-      'entity = :e AND attribute_not_exists(gsi1pk)',
+      'begins_with(pk, :pkprefix) AND sk = :sk AND attribute_not_exists(gsi1pk)',
       '--expression-attribute-values',
-      JSON.stringify({ ':e': { S: 'INSTALL' } }),
+      JSON.stringify({ ':pkprefix': { S: 'INSTALL#' }, ':sk': { S: INSTALL_SK } }),
       '--output',
       'json',
     ];
@@ -165,7 +173,7 @@ async function main() {
 
   const rows = findUnindexedInstalls(table);
   if (rows.length === 0) {
-    console.log('✓ nothing to do — every INSTALL row already carries gsi1pk=INSTALLS');
+    console.log('✓ nothing to do — every installation row already carries gsi1pk=INSTALLS');
     return;
   }
 

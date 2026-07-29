@@ -13,7 +13,6 @@ import { readFileSync } from 'node:fs';
 import {
   buildInstallUpsert,
   installGsi1Keys,
-  isUnindexedInstall,
   missingInstallationIds,
   needsIndexRepair,
   reconcileInstallations,
@@ -84,25 +83,28 @@ test('the upsert never resets createdAt (re-install keeps first-seen)', () => {
   assert.match(cmd.UpdateExpression, /createdAt = if_not_exists\(createdAt, :now\)/);
 });
 
-test('a legacy row is recognised as unindexed, an M4 row is not', () => {
-  assert.equal(isUnindexedInstall(install()), true); // no gsi1pk — the live dev row
-  assert.equal(isUnindexedInstall(install({ gsi1pk: 'INSTALLS' })), false);
-  assert.equal(isUnindexedInstall({ entity: 'REPO', repoId: 1 }), false);
-});
-
 test('the repair gate keys off the missing stamp, not the optional entity attribute', () => {
   // A row fetched by primary key (`INSTALL#<id>` / `INSTALL`) is an installation by
   // construction. `entity` is optional on the record type, so gating the repair on it would
-  // leave such a row invisible to the console forever: this path would skip the write and
-  // the backfill script's `entity = :e` scan filter would never see it either.
+  // leave such a row invisible to the console forever. The backfill script selects on the
+  // same signal (key shape), so both paths repair the same row set.
   const row = install();
   delete row.entity;
   assert.equal(needsIndexRepair(row), true, 'an entity-less legacy row is still repairable');
-  assert.equal(needsIndexRepair(install()), true);
+  assert.equal(needsIndexRepair(install()), true); // no gsi1pk — the live dev row
   assert.equal(needsIndexRepair(install({ gsi1pk: 'INSTALLS' })), false, 'already stamped');
   const noLogin = install();
   delete noLogin.accountLogin;
   assert.equal(needsIndexRepair(noLogin), false, 'gsi1sk would be undefined');
+});
+
+test('the backfill scan selects installations by key shape, not by the entity attribute', () => {
+  // Regression guard for the two repair paths diverging: if this scan filtered on
+  // `entity = INSTALL` it would skip exactly the entity-less rows the read path repairs,
+  // leaving them unfixable for any account nobody logs in for.
+  const src = readFileSync(new URL('../scripts/backfill-installs.mjs', import.meta.url), 'utf8');
+  assert.match(src, /begins_with\(pk, :pkprefix\) AND sk = :sk AND attribute_not_exists\(gsi1pk\)/);
+  assert.doesNotMatch(src, /entity = :e/, 'must not gate the scan on the optional attribute');
 });
 
 // ---- invariant 2: the read path surfaces unindexed rows ---------------------
@@ -153,6 +155,25 @@ test('reconcile is additive — indexed rows are preserved alongside recovered o
     out.map((i) => i.installationId).sort(),
     [11, 22],
     'a partially-indexed table must return BOTH rows',
+  );
+});
+
+test('the merged list is ordered by account login, like the index itself', async () => {
+  // Once the repair lands, the next poll (ADR-026) reads the row FROM the index, i.e. in
+  // gsi1sk (account login) order. Appending recovered rows raw would list a legacy account
+  // last on this response and mid-list on the next one — the console row visibly jumps.
+  const indexed = [
+    install({ installationId: 22, accountLogin: 'bravo', gsi1pk: 'INSTALLS' }),
+    install({ installationId: 33, accountLogin: 'delta', gsi1pk: 'INSTALLS' }),
+  ];
+  const out = await reconcileInstallations(indexed, [22, 33, 11], {
+    get: async (id) => (id === 11 ? install({ installationId: 11, accountLogin: 'charlie' }) : undefined),
+    repair: async () => true,
+  });
+  assert.deepEqual(
+    out.map((i) => i.accountLogin),
+    ['bravo', 'charlie', 'delta'],
+    'a recovered row sorts into place rather than being appended',
   );
 });
 
@@ -216,8 +237,7 @@ test('a row with no accountLogin is surfaced but not stamped with an undefined s
 
 test('an entity-less legacy row is still repaired through the read path', async () => {
   // Regression: an earlier revision gated the repair on `entity === 'INSTALL'`. A row keyed
-  // `INSTALL#<id>`/`INSTALL` is an installation whether or not it carries that attribute,
-  // and the backfill script cannot rescue it (its scan filters on `entity`).
+  // `INSTALL#<id>`/`INSTALL` is an installation whether or not it carries that attribute.
   const legacy = install({ installationId: 11 });
   delete legacy.entity;
   const repairs = [];
