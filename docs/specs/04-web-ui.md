@@ -239,6 +239,12 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   makes the fallback unnecessary. The app shell is served with a `self`-only CSP
   (`frame-ancestors 'none'`), HSTS, `nosniff`, and `Referrer-Policy: same-origin`
   (`test/web-stack.test.mjs`).
+- **Console origin**: a **vanity domain** when configured (ADR-028) — `lambdaciactions.<zone>`
+  for prod, `<env>.lambdaciactions.<zone>` otherwise — with a us-east-1 ACM cert
+  (`LCA-Cert-<env>`, CloudFront's only accepted cert region) and A+AAAA Route53 aliases.
+  Because the origin is then known at synth time, `PUBLIC_ORIGIN` is plain config and the
+  ADR-024 two-pass deploy disappears. With no domain configured the raw `*.cloudfront.net`
+  origin and the two-pass bootstrap still apply.
 - **API**: API Gateway (HTTP API) + one Lambda (TypeScript, arm64, Node 22), same toolchain
   as the orchestrator.
 - **State**: DynamoDB (shared single table) + GSI2 for per-repo run history (ADR-023).
@@ -280,7 +286,9 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 
 ## Open questions
 
-- **OQ-4**: custom domain + ACM cert for the console (currently the CloudFront domain) — M5.
+- **OQ-4**: ~~custom domain + ACM cert for the console~~ — **resolved** by
+  [ADR-028](../DECISIONS.md#adr-028) (M5): config-derived vanity origin + a us-east-1 cert
+  stack, with the raw-CloudFront path kept for accounts owning no domain.
 - **OQ-5**: per-phase run timestamps (`provisioningAt`/`runningAt`) would make the cost
   estimate exact and enable boot-latency charts. Worth a run-row schema addition in M5?
 - **OQ-6**: **Reports screen** — cost/utilisation over a time window, grouped by repo, flavor

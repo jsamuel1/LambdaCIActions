@@ -118,13 +118,16 @@ Same three-step shape as the reference, generalized:
                            upload, build, snapshot, poll, prune, write image ARN → SSM)
 
 3. deploy orchestrator  →  cdk deploy ControlStack MgmtStack WebStack
-                          (now image ARNs exist in SSM; Ingest/Provision/Discovery/Reaper λ,
+                          (+ CertStack in us-east-1 when a vanity domain is configured;
+                           now image ARNs exist in SSM — Ingest/Provision/Discovery/Reaper λ,
                            API GWs, and the console all come up)
 
 4. console origin pass  →  npm run build:web
                           cdk deploy MgmtStack -c publicOrigin=https://<cloudfront-domain>
-                          (the management API can't know its own public origin until the
-                           distribution exists — two-pass by design, ADR-024)
+                          (ONLY when no vanity domain is configured: the management API
+                           can't know CloudFront's generated origin until the distribution
+                           exists — two-pass by design, ADR-024. With LCA_CONSOLE_* set the
+                           origin comes from config and this step disappears, ADR-028)
 ```
 
 Re-running step 2 rebuilds images (e.g. patch day); steps 3–4 are idempotent. Full console

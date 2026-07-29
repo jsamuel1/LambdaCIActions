@@ -949,3 +949,72 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
+## ADR-028 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
+**Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
+[ADR-024](#adr-024)
+**Context**: The dev console shipped on CloudFront's generated name
+(`https://<id>.cloudfront.net`). That name is not cosmetic — it is load-bearing in three
+coupled places, all of which break if the distribution is ever replaced:
+1. `PUBLIC_ORIGIN` on the Mgmt λ (OAuth redirect URI + post-login redirect),
+2. the GitHub App's OAuth **callback URL**, and
+3. the first-party session cookie's origin (ADR-024).
+(2) is the expensive one: GitHub exposes **no REST endpoint for App settings** (verified
+2026-07-28 — `PATCH /app` does not exist), so a domain change is a browser-only edit and
+login stays broken until a human performs it. The generated name is also only knowable
+*after* WebStack's first deploy, which is the sole reason ADR-024 required a second
+`-c publicOrigin=...` deploy pass.
+**Decision**: give the console a **stable vanity hostname** and make the origin a
+**config input resolved at synth time**.
+- **Scheme** (`lib/console-domain.ts`): prod owns the bare project label, other envs are
+  prefixed — `lambdaciactions.<zone>` for prod, `<env>.lambdaciactions.<zone>` otherwise.
+  Prod therefore gets its permanent name on its **first** deploy, so a raw-CloudFront
+  callback URL is never registered for prod at all. `LCA_CONSOLE_DOMAIN` overrides the
+  scheme when a hostname must be exact.
+- **Config location**: `.env.local` (the same machine-local, gitignored file as the ADR-018
+  deploy pin), keys `LCA_CONSOLE_HOSTED_ZONE_ID` + `LCA_CONSOLE_ZONE_NAME`, each overridable
+  by `-c consoleHostedZoneId=` / `-c consoleZoneName=` / `-c consoleDomain=`. Not checked in:
+  a hosted zone is an account-specific resource.
+- **Certificate**: its own stack, `LCA-Cert-<env>`, with `env.region` **hard-pinned to
+  us-east-1** and a constructor assertion that refuses any other region. CloudFront accepts
+  viewer certs only from us-east-1 regardless of where the distribution's stack lives.
+  WebStack consumes the ARN via `crossRegionReferences: true` on both stacks. Validation is
+  DNS against the same public zone that holds the alias, so issuance is hands-off.
+- **Alias**: `domainNames` + `certificate` on the distribution, plus **A *and* AAAA** alias
+  records. Both zone references use `fromHostedZoneAttributes` (id + name), never
+  `fromLookup`, so credential-less `cdk synth` keeps working (ADR-018's CI exemption).
+- **Fallback**: with no `LCA_CONSOLE_*` config, `resolveConsoleDomain` returns `null` and
+  every custom-domain resource is skipped — a fresh account owning no domain still deploys
+  on the raw CloudFront name, and the ADR-024 two-pass bootstrap still applies there.
+**Why**: the origin becomes knowable before any resource exists, which (a) removes the
+two-pass deploy for domained envs — `PUBLIC_ORIGIN` is just config now — and (b) decouples
+all three coupling points from CloudFront's generated name, so a future distribution
+replacement no longer requires a browser edit to restore login. The us-east-1 pin is
+enforced in code because the wrong region is the classic trap here: it synths cleanly and
+fails at `cdk deploy` on the distribution update, *after* the cert has been issued.
+**Consequences**:
+- Config is **all-or-nothing**: a half-configured domain (zone id without zone name, or a
+  hostname outside the zone) **throws** rather than falling back. A silent fallback is the
+  dangerous case — the distribution would come up with no alias while `PUBLIC_ORIGIN`
+  pointed at the vanity name, and login would fail with a misleading `invalid OAuth state`
+  that reads like a cookie bug.
+- First deploy of a new hostname is **slower**: ACM writes a `_<hash>` CNAME and polls, and
+  CloudFormation blocks the cert until `ISSUED`, so the distribution can never come up with
+  an alias whose cert is pending. A cert stuck in `PENDING_VALIDATION` means the CNAME never
+  resolved publicly (wrong zone, or a zone that is not authoritative).
+- Migration off an existing raw-CloudFront origin requires **both** callbacks registered on
+  the App simultaneously — add the vanity one, flip `PUBLIC_ORIGIN`, verify, then remove the
+  old one. `-c publicOrigin=` still wins over config precisely so an operator can pin a
+  transitional origin mid-flip. Removing the old entry first breaks login instantly.
+- During that flip the console is reachable on **two** hosts but only **one** can complete
+  OAuth: the `state` cookie is host-only (no `Domain` attribute) and `redirect_uri` is built
+  from the single `PUBLIC_ORIGIN`, so a login started on the other host returns to a callback
+  that never received the cookie → `invalid OAuth state`. Operators must stay on whichever
+  host `PUBLIC_ORIGIN` names until the flip completes; docs/DEPLOY-M4.md orders the steps
+  accordingly. Widening the cookie to the parent domain would fix the window at the cost of
+  scoping the session above the console — rejected.
+- Existing sessions do not survive the origin flip: the session cookie is scoped to the old
+  host, so operators re-authenticate once. That is the same revocation lever as rotating the
+  session secret (ADR-022), not a new failure mode.
+- `test/console-domain.test.mjs` pins the scheme + the refuse-on-partial-config behavior;
+  `test/console-domain-infra.test.mjs` pins the us-east-1 assertion, the A+AAAA pair, and
+  the no-domain fallback (no alias, no cert, no records).
