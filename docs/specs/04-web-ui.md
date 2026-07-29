@@ -70,8 +70,8 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
   time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
   basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point. On a
-  partial window a duration renders as `≥ 4m 10s`; a run with no elapsed span yet keeps the
-  plain em dash, since `≥ —` would read as "at least unknown".
+  partial window a duration renders as `≥ 4m 10s` (`durationLabel`); a run with no elapsed span
+  yet keeps the plain em dash, since `≥ —` would read as "at least unknown".
 - **Started** — the earliest job queue time. On a **partial** window it is an *upper* bound and
   renders as `≤ 01/07/2026, 09:14`: an unread job of the same run may have been queued earlier,
   so the run started at or before the figure shown. It is the one run-row value bounded the

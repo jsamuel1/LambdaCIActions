@@ -12,6 +12,7 @@ export {
   rollupFlavor,
   flavorLabel,
   startedAtLabel,
+  durationLabel,
   runDurations,
   windowComplete,
   headSeamIntact,

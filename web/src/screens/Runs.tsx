@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Repo, type Run, type RunStatus } from '../api.js';
 import { useApi } from '../hooks.js';
-import { flavorLabel, groupRuns, headSeamIntact, jobRowKey, startedAtLabel, windowComplete, type RunGroup } from '../rollup.js';
+import { durationLabel, flavorLabel, groupRuns, headSeamIntact, jobRowKey, startedAtLabel, windowComplete, type RunGroup } from '../rollup.js';
 import {
   Badge,
   CopyId,
@@ -17,14 +17,12 @@ const PAGE = 50;
 const COLS = 6;
 
 /**
- * Duration with a lower-bound marker on a partial window. `formatDuration` renders a
- * zero/unknown duration as an em dash, and `≥ —` is nonsense — "at least unknown" — so the
- * marker is only attached to an actual figure. A run whose jobs are all still queued has no
- * elapsed span yet, partial or not.
+ * Duration with a lower-bound marker on a partial window. The bound rule itself lives in the
+ * tested rollup module (`durationLabel`) alongside its `flavorLabel` / `startedAtLabel`
+ * siblings; this only supplies the locale/format half.
  */
 function lowerBound(seconds: number, partial: boolean): string {
-  const text = formatDuration(seconds);
-  return partial && seconds > 0 ? `≥ ${text}` : text;
+  return durationLabel(seconds, formatDuration(seconds), partial);
 }
 
 /**

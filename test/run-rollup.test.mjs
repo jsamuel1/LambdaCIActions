@@ -8,6 +8,7 @@ import {
   rollupFlavor,
   flavorLabel,
   startedAtLabel,
+  durationLabel,
   runDurations,
   windowComplete,
   headSeamIntact,
@@ -120,6 +121,22 @@ test('an unparsable start time keeps its raw text on a partial window', () => {
 });
 
 // ---- durations -------------------------------------------------------------
+
+test('a partial window renders a duration as a lower bound', () => {
+  // Both totals fold only the LOADED jobs, so an unread sibling can only widen the span and
+  // raise the sum: the figure shown is a floor.
+  assert.equal(durationLabel(250, '4m 10s', false), '4m 10s');
+  assert.equal(durationLabel(250, '4m 10s', true), '≥ 4m 10s');
+});
+
+test('a zero/unknown duration keeps its em dash even on a partial window', () => {
+  // `formatDuration(0)` is an em dash and `≥ —` reads as "at least unknown". A run whose jobs
+  // are all still queued has no elapsed span yet, partial or not.
+  assert.equal(durationLabel(0, '—', true), '—');
+  assert.equal(durationLabel(0, '—', false), '—');
+  // A negative can only arrive from a corrupt row; it must not acquire a bound marker either.
+  assert.equal(durationLabel(-5, '—', true), '—');
+});
 
 test('wall clock is the span, job time is the sum — parallel jobs diverge', () => {
   // Two jobs, each 60 s, started together: 60 s wall clock but 120 s of summed job time.

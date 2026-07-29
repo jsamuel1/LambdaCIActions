@@ -119,6 +119,24 @@ export function startedAtLabel(startedAt: string, formatted: string, partial: bo
   return Number.isFinite(Date.parse(startedAt)) ? `≤ ${formatted}` : formatted;
 }
 
+/**
+ * Display label for a rolled-up duration, honouring window completeness.
+ *
+ * Both totals are summed/spanned over the jobs actually LOADED, so on a partial window they
+ * are lower bounds: an unread job of the same run can only push a wall-clock span wider and a
+ * job-time sum higher. Hence the `≥`.
+ *
+ * The marker is attached only to an actual figure. `formatDuration` renders a zero/unknown
+ * duration as an em dash, and `≥ —` reads as "at least unknown", which is nonsense — a run
+ * whose jobs are all still queued has no elapsed span yet, partial or not.
+ *
+ * As with `startedAtLabel`, the caller supplies the already-formatted text: this module owns
+ * the bound semantics, not the duration formatting.
+ */
+export function durationLabel(seconds: number, formatted: string, partial: boolean): string {
+  return partial && seconds > 0 ? `≥ ${formatted}` : formatted;
+}
+
 export interface RunDurations {
   /**
    * Earliest job queue → latest job transition. This is the human-visible "how long did the
