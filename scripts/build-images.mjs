@@ -135,7 +135,13 @@ function cpDir(from, to) {
 }
 
 function buildFlavor(flavor, ctx) {
-  console.log(`\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.vcpu}vCPU/${flavor.memoryMb}MB) ===`);
+  // The operator-facing shape line. `vcpu` is DESCRIPTIVE only (ADR-038) — the API takes no
+  // vCPU request — so label it, or this log reads as "provisioned 4 vCPU" and re-creates the
+  // exact misattribution ADR-038 corrects in docs/VERIFY-M3.md.
+  console.log(
+    `\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.memoryMb}MB requested; ` +
+      `${flavor.vcpu} vCPU descriptive-only) ===`,
+  );
   if (flavor.arch !== 'arm64') {
     // AGENTS.md hard rule — microVMs are Graviton only.
     throw new Error(`flavor ${flavor.name} arch=${flavor.arch}; microVMs are arm64 only`);

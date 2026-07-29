@@ -434,6 +434,26 @@ test('the node flavor\'s tool-cache pin agrees with its apt NODE_MAJOR', () => {
   assert.equal(version, major, `NODE_VERSION major (${version}) must match NODE_MAJOR (${major})`);
 });
 
+test('this repo\'s own CI asks setup-node for the major the node flavor prebaked', () => {
+  // The dogfood workflow runs on `lambda-ci-node` and then calls actions/setup-node. setup-node
+  // resolves `node-version` against ${RUNNER_TOOL_CACHE}/node/<semver>/arm64, so a request for a
+  // major the image did not bake is a SILENT cache miss: the job downloads Node at full speed
+  // and our own CI stops exercising the prebaked cache that ADR-039 exists to provide. Nothing
+  // else catches this — the workflow still passes, just slower.
+  const baked = read('Dockerfile.node').match(/ARG NODE_MAJOR=(\d+)/)?.[1];
+  const ci = fs.readFileSync(path.join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const requested = [...ci.matchAll(/node-version:\s*'?"?(\d+)/g)].map((m) => m[1]);
+  assert.ok(requested.length > 0, 'ci.yml should pin a node-version for setup-node');
+  for (const want of requested) {
+    assert.equal(
+      want,
+      baked,
+      `ci.yml asks setup-node for Node ${want} but the node flavor prebakes ${baked} — that is a ` +
+        'silent tool-cache miss; bump one to match the other',
+    );
+  }
+});
+
 test('the catalog memory values are plausible microVM requests', () => {
   const catalog = JSON.parse(read('flavors.json'));
   for (const flavor of catalog.flavors) {
