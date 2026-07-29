@@ -40,6 +40,24 @@ export function repoSk(repoId: number): string {
  */
 export const INSTALLS_GSI1PK = 'INSTALLS';
 
+/**
+ * GSI1 keys for an installation row. Pure so a test can assert every write path stamps
+ * them — an unstamped row is invisible to `listInstallations` and the console shows an
+ * empty Setup screen while the platform happily runs that installation's jobs.
+ */
+export function installGsi1Keys(accountLogin: string): { gsi1pk: string; gsi1sk: string } {
+  return { gsi1pk: INSTALLS_GSI1PK, gsi1sk: accountLogin };
+}
+
+/** True when a row is an installation that predates the M4 GSI1 stamp (ADR-029). */
+export function isUnindexedInstall(row: {
+  entity?: string;
+  gsi1pk?: string;
+  accountLogin?: string;
+}): boolean {
+  return row.entity === 'INSTALL' && row.gsi1pk !== INSTALLS_GSI1PK;
+}
+
 function requireDoc(): DynamoDBDocumentClient {
   if (!doc || !TABLE) {
     throw new Error('install-store not configured: TABLE_NAME env + DynamoDB SDK required');
@@ -57,27 +75,78 @@ export async function upsertInstallation(input: {
   suspended?: boolean;
   deleted?: boolean;
 }): Promise<void> {
-  const iso = new Date().toISOString();
-  await requireDoc().send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { pk: installPk(input.installationId), sk: INSTALL_SK },
-      UpdateExpression:
-        'SET entity = :e, installationId = :iid, accountLogin = :login, accountId = :aid, ' +
-        'suspended = :susp, deleted = :del, updatedAt = :now, createdAt = if_not_exists(createdAt, :now), ' +
-        'gsi1pk = :gpk, gsi1sk = :login',
-      ExpressionAttributeValues: {
-        ':e': 'INSTALL',
-        ':iid': input.installationId,
-        ':login': input.accountLogin,
-        ':aid': input.accountId,
-        ':susp': input.suspended ?? false,
-        ':del': input.deleted ?? false,
-        ':now': iso,
-        ':gpk': INSTALLS_GSI1PK,
-      },
-    }),
-  );
+  await requireDoc().send(new UpdateCommand(buildInstallUpsert(input, new Date())));
+}
+
+/**
+ * Pure builder for the installation upsert. Extracted so a test can assert the write ALWAYS
+ * carries the GSI1 keys — a write path that forgets them makes the installation invisible to
+ * `listInstallations` (the M2 → M4 regression behind ADR-029).
+ */
+export function buildInstallUpsert(
+  input: {
+    installationId: number;
+    accountLogin: string;
+    accountId: number;
+    suspended?: boolean;
+    deleted?: boolean;
+  },
+  now: Date,
+): {
+  TableName: string | undefined;
+  Key: Record<string, unknown>;
+  UpdateExpression: string;
+  ExpressionAttributeValues: Record<string, unknown>;
+} {
+  const iso = now.toISOString();
+  const gsi = installGsi1Keys(input.accountLogin);
+  return {
+    TableName: TABLE,
+    Key: { pk: installPk(input.installationId), sk: INSTALL_SK },
+    UpdateExpression:
+      'SET entity = :e, installationId = :iid, accountLogin = :login, accountId = :aid, ' +
+      'suspended = :susp, deleted = :del, updatedAt = :now, createdAt = if_not_exists(createdAt, :now), ' +
+      'gsi1pk = :gpk, gsi1sk = :gsk',
+    ExpressionAttributeValues: {
+      ':e': 'INSTALL',
+      ':iid': input.installationId,
+      ':login': input.accountLogin,
+      ':aid': input.accountId,
+      ':susp': input.suspended ?? false,
+      ':del': input.deleted ?? false,
+      ':now': iso,
+      ':gpk': gsi.gsi1pk,
+      ':gsk': gsi.gsi1sk,
+    },
+  };
+}
+
+/**
+ * Stamp GSI1 keys onto an installation row that lacks them (ADR-029 reconcile-on-read /
+ * backfill). Conditional on the row existing so a stale id is a no-op, and on `gsi1pk` being
+ * absent so a concurrent repair (or the backfill script) is a no-op rather than a clobber.
+ * Returns true when this call actually repaired the row.
+ */
+export async function repairInstallationIndex(input: {
+  installationId: number;
+  accountLogin: string;
+}): Promise<boolean> {
+  const keys = installGsi1Keys(input.accountLogin);
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(input.installationId), sk: INSTALL_SK },
+        UpdateExpression: 'SET gsi1pk = :gpk, gsi1sk = :gsk',
+        ConditionExpression: 'attribute_exists(pk) AND attribute_not_exists(gsi1pk)',
+        ExpressionAttributeValues: { ':gpk': keys.gsi1pk, ':gsk': keys.gsi1sk },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
 }
 
 /** Flip an installation's suspended / deleted flags (suspend/unsuspend/uninstall). */
@@ -180,10 +249,24 @@ export async function getRepo(
 // ---- M4 management reads / config writes -----------------------------------
 
 /**
- * Enumerate every installation (management UI). Uses the GSI1 `INSTALLS` partition, so no
- * table scan. Includes soft-deleted/suspended rows — the UI shows their state.
+ * Enumerate installations for the management UI (ADR-029).
+ *
+ * Primary path is the GSI1 `INSTALLS` partition — no table scan. But rows written before
+ * M4 (commit 63069ff) carry no `gsi1pk`, so they are invisible to that query: the console
+ * rendered "you have no installations" for an installation the platform was actively
+ * serving. GitHub never re-sends `installation.created`, so it does not self-heal.
+ *
+ * Fix without a scan: the caller passes the installation ids the session is *already*
+ * authorized for (resolved from GitHub at login, ADR-022). Any granted id missing from the
+ * index result is fetched by PRIMARY KEY (bounded: one GetItem per grant, and the caller
+ * only ever sees rows it is authorized for anyway) and, if found unindexed, repaired in
+ * place so the next read hits the index.
+ *
+ * Includes soft-deleted/suspended rows — the UI shows their state.
  */
-export async function listInstallations(): Promise<InstallationRecord[]> {
+export async function listInstallations(
+  reconcileIds: readonly number[] = [],
+): Promise<InstallationRecord[]> {
   const res = await requireDoc().send(
     new QueryCommand({
       TableName: TABLE,
@@ -192,7 +275,82 @@ export async function listInstallations(): Promise<InstallationRecord[]> {
       ExpressionAttributeValues: { ':gpk': INSTALLS_GSI1PK },
     }),
   );
-  return (res.Items ?? []) as unknown as InstallationRecord[];
+  const indexed = (res.Items ?? []) as unknown as InstallationRecord[];
+  return reconcileInstallations(indexed, reconcileIds, {
+    get: getInstallation,
+    repair: repairInstallationIndex,
+  });
+}
+
+/** Injected IO for {@link reconcileInstallations} — the seam the unit test replaces. */
+export interface ReconcileDeps {
+  get: (installationId: number) => Promise<InstallationRecord | undefined>;
+  repair: (input: { installationId: number; accountLogin: string }) => Promise<boolean>;
+}
+
+/**
+ * Append any authorized-but-unindexed installation to the index result, repairing its index
+ * keys as a side effect (ADR-029). Dependency-injected so the fix is unit-testable without
+ * DynamoDB — this is the code path that decides whether the console can render an
+ * installation the platform is already serving.
+ */
+export async function reconcileInstallations(
+  indexed: InstallationRecord[],
+  candidateIds: readonly number[],
+  deps: ReconcileDeps,
+): Promise<InstallationRecord[]> {
+  const missing = missingInstallationIds(indexed, candidateIds);
+  if (missing.length === 0) return indexed;
+
+  const recovered: InstallationRecord[] = [];
+  for (const id of missing) {
+    const row = await deps.get(id);
+    if (!row) continue; // a grant for an installation we never stored — nothing to show
+    recovered.push(row);
+    // Self-heal so this path costs one GetItem once, not on every poll.
+    try {
+      const repaired = await deps.repair({
+        installationId: id,
+        accountLogin: row.accountLogin,
+      });
+      if (repaired) {
+        console.log(
+          JSON.stringify({
+            msg: 'reconciled unindexed installation row',
+            installationId: id,
+            accountLogin: row.accountLogin,
+          }),
+        );
+      }
+    } catch (err) {
+      // A failed repair must NOT fail the read — the row is already in the response.
+      console.warn(
+        JSON.stringify({
+          msg: 'installation index repair failed',
+          installationId: id,
+          error: (err as Error).message,
+        }),
+      );
+    }
+  }
+  return [...indexed, ...recovered];
+}
+
+/**
+ * Which authorized installation ids the index did not return — pure, so the reconcile
+ * trigger is unit-testable without DynamoDB. De-duplicated, order preserved.
+ */
+export function missingInstallationIds(
+  indexed: readonly { installationId: number }[],
+  candidateIds: readonly number[],
+): number[] {
+  const present = new Set(indexed.map((i) => i.installationId));
+  const out: number[] = [];
+  for (const id of candidateIds) {
+    if (present.has(id) || out.includes(id)) continue;
+    out.push(id);
+  }
+  return out;
 }
 
 /** List the repos granted to one installation (Repos screen). */

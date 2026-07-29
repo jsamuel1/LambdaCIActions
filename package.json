@@ -19,7 +19,8 @@
     "cdk": "cdk",
     "build:images": "node scripts/build-images.mjs",
     "app:create": "node scripts/create-github-app.mjs",
-    "app:manifest": "node scripts/create-github-app.mjs --dry-run"
+    "app:manifest": "node scripts/create-github-app.mjs --dry-run",
+    "backfill:installs": "node scripts/backfill-installs.mjs"
   },
   "engines": {
     "node": ">=18"
