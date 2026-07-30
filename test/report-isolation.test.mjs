@@ -12,6 +12,7 @@ import {
   MAX_TOTAL_ROWS,
   PAGE_SIZE,
   fetchReportRuns,
+  resolveVisibleRepos,
 } from '../dist/src/mgmt/report-store.js';
 import { applyFilters, computeReport, validateReportSpec } from '../dist/src/mgmt/reports.js';
 
@@ -103,21 +104,30 @@ test('the computed total contains no contribution from another tenant', async ()
 
 test('a spec naming a foreign repo NARROWS to nothing rather than widening scope', async () => {
   const idx = fakeIndex({ 1: [[job(1)]], 2: [[job(2)]] });
-  // resolveVisibleRepos applies the intersection; here we exercise the real one through a
-  // stub listRepos that returns the session's repos, then let the spec filter narrow it.
-  const { resolveVisibleRepos } = await import('../dist/src/mgmt/report-store.js');
-  assert.equal(typeof resolveVisibleRepos, 'function');
-
+  // Exercises the REAL resolveVisibleRepos: the installation lister is stubbed (that is the
+  // DynamoDB boundary), but the intersection with spec.filters.repoIds is the shipped code.
   const res = await fetchReportRuns(MINE, spec({ filters: { repoIds: [2] } }), {
-    listRepos: async (_session, s) => {
-      const visible = [{ repoId: 1, repoFullName: 'mine/service' }];
-      const want = s?.filters.repoIds;
-      return want?.length ? visible.filter((r) => want.includes(r.repoId)) : visible;
-    },
+    listRepos: (session, s) =>
+      resolveVisibleRepos(session, s, {
+        listRepos: async (installationId) =>
+          installationId === 11 ? [{ repoId: 1, repoFullName: 'mine/service' }] : [],
+      }),
     listRunsByRepo: idx.listRunsByRepo,
   });
   assert.deepEqual(idx.queried, [], 'a foreign repo id in the spec caused a query');
   assert.equal(res.runs.length, 0);
+});
+
+test('resolveVisibleRepos intersects rather than unions a spec repo filter', async () => {
+  // Directly pins the narrowing property of the real function: one visible repo is kept, the
+  // foreign id in the spec is dropped instead of being added to the read set.
+  const visible = await resolveVisibleRepos(MINE, spec({ filters: { repoIds: [1, 2] } }), {
+    listRepos: async () => [
+      { repoId: 1, repoFullName: 'mine/service' },
+      { repoId: 3, repoFullName: 'mine/other' },
+    ],
+  });
+  assert.deepEqual(visible.map((r) => r.repoId), [1], 'scope was widened by a spec filter');
 });
 
 test('a zero-grant session reads nothing at all', async () => {
@@ -132,29 +142,24 @@ test('a zero-grant session reads nothing at all', async () => {
 });
 
 test('a repo granted via two installations is not double-counted', async () => {
-  // The real resolveVisibleRepos de-dupes; double-reading a shared repo would DOUBLE its spend.
-  const { resolveVisibleRepos } = await import('../dist/src/mgmt/report-store.js');
+  // Double-reading a shared repo would DOUBLE its spend, so the de-dupe is a correctness
+  // property, not a tidiness one. This drives the REAL resolveVisibleRepos with a lister that
+  // returns the same repo under both installations the operator administers.
   const both = session([
     { installationId: 11, accountLogin: 'a' },
     { installationId: 22, accountLogin: 'b' },
   ]);
-  // Exercise the de-dupe through the exported helper's own logic by stubbing the store call
-  // it depends on via the module's dependency-free path: feed the same repo from both installs.
   const idx = fakeIndex({ 1: [[job(1)]] });
   const res = await fetchReportRuns(both, spec({ dimension: 'none' }), {
-    listRepos: async () => {
-      const dupes = [
-        { repoId: 1, repoFullName: 'shared/repo' },
-        { repoId: 1, repoFullName: 'shared/repo' },
-      ];
-      const seen = new Set();
-      return dupes.filter((r) => (seen.has(r.repoId) ? false : (seen.add(r.repoId), true)));
-    },
+    listRepos: (s, sp) =>
+      resolveVisibleRepos(s, sp, {
+        listRepos: async () => [{ repoId: 1, repoFullName: 'shared/repo' }],
+      }),
     listRunsByRepo: idx.listRunsByRepo,
   });
-  assert.deepEqual(idx.queried, [1]);
+  assert.deepEqual(idx.queried, [1], 'a shared repo was queried once per installation');
   assert.equal(res.runs.length, 1);
-  assert.equal(typeof resolveVisibleRepos, 'function');
+  assert.deepEqual(res.repoIds, [1]);
 });
 
 test('paging stops as soon as a page predates the window', async () => {

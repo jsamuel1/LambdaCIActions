@@ -111,6 +111,22 @@ function buildOption(report: Report): echarts.EChartsCoreOption {
   };
 }
 
+/**
+ * Render one report as a chart.
+ *
+ * **The caller must not render this with an empty series.** The ECharts instance is bound to
+ * the host `<div>`, so the host has to exist for the whole lifetime of the instance. An
+ * internal "no points" early return would remove the host while the mount effect (keyed `[]`)
+ * kept its reference: going empty would leave `chart` pointing at a detached node, and going
+ * from empty to non-empty would never initialise at all, because the mount effect does not
+ * re-run. Either way `setOption` writes into nothing and the operator gets a silently blank
+ * panel. `useApi` holds the previous `data` across a refetch, so the component really does
+ * stay mounted while the metric/dimension changes — this is reachable, not theoretical.
+ *
+ * So the empty case is the caller's decision (`ReportView` in `Reports.tsx`), which mounts and
+ * unmounts this component instead. React then runs the cleanup and `dispose()` on the way out
+ * and a fresh `init()` on the way back in.
+ */
 export function ReportChart({ report }: { report: Report }): JSX.Element {
   const host = useRef<HTMLDivElement | null>(null);
   const chart = useRef<echarts.ECharts | undefined>(undefined);
@@ -133,9 +149,6 @@ export function ReportChart({ report }: { report: Report }): JSX.Element {
     chart.current?.setOption(buildOption(report), { notMerge: true });
   }, [report]);
 
-  if (!report.points.length) {
-    return <p className="muted">No jobs in this window.</p>;
-  }
   return <div className="chart" ref={host} />;
 }
 

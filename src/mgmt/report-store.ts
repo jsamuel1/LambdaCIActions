@@ -59,9 +59,11 @@ export interface FetchResult {
 export async function resolveVisibleRepos(
   session: SessionPayload,
   spec?: ReportSpec,
+  deps: { listRepos?: typeof listRepos } = {},
 ): Promise<{ repoId: number; repoFullName: string }[]> {
+  const fetchRepos = deps.listRepos ?? listRepos;
   const perInstall = await Promise.all(
-    session.installations.map((i) => listRepos(i.installationId)),
+    session.installations.map((i) => fetchRepos(i.installationId)),
   );
   let repos = perInstall.flat().map((r) => ({ repoId: r.repoId, repoFullName: r.repoFullName }));
   const requested = spec?.filters.repoIds;

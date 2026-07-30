@@ -553,7 +553,7 @@ async function listRunsRoute(
       q.cursor,
     );
     // `complete` reports whether rows were DROPPED from this response, not whether the index
-    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-031).
+    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-029).
     // `collectVisible` never slices, so an unfiltered repo page loses nothing: every visible
     // row the query returned is here, and a run's remaining jobs are reachable through
     // `nextCursor`. Reporting `nextCursor === undefined` here instead would make a
@@ -598,7 +598,7 @@ async function listRunsRoute(
   // carries the whole verdict here. It is decided HERE because only this code sees the raw
   // per-status pages: truncation must be judged before the visibility filter, since a page
   // filled with another tenant's rows looks short while this operator's sibling jobs sit
-  // unread past the boundary (ADR-031).
+  // unread past the boundary (ADR-029).
   return json(200, {
     runs: merged.map(toRunView),
     nextCursor: null,
@@ -617,7 +617,8 @@ async function listRunsRoute(
  * run LIST is installation-filtered. `stuck` is filtered to the session's grants so no run
  * identity leaks across tenants — the aggregate numbers are deliberately platform-level and
  * documented as such in spec 04.
- */async function healthRoute(session: SessionPayload): Promise<Reply> {
+ */
+async function healthRoute(session: SessionPayload): Promise<Reply> {
   // The counts below are deliberately platform-wide (unfilterable by design), so this is
   // the one route a ZERO-grant session (minted at callback time so Setup is reachable)
   // must not see — any GitHub user can complete the OAuth dance; only operators with at

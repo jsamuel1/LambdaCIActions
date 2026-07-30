@@ -360,6 +360,11 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
       <div className="card">
         {CHART_RENDERING[report.spec.chart] === 'table' ? (
           <ReportTable report={report} />
+        ) : !report.points.length ? (
+          // The chart is mounted ONLY with a non-empty series: it owns an ECharts instance bound
+          // to its host div, so an internal empty-state return would strand that instance (see
+          // ReportChart). Mount/unmount instead, and let React dispose it.
+          <p className="muted">No jobs in this window.</p>
         ) : (
           <>
             <ReportChart report={report} />

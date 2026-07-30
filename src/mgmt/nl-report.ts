@@ -39,7 +39,7 @@ import { flavorNames } from './views.js';
 
 /**
  * Model id. Sonnet (ADR-032): the task is small but genuinely structured — it maps loose
- * operator phrasing onto a 5-metric × 6-dimension × 5-chart menu plus a time window, and a
+ * operator phrasing onto a 5-metric × 6-dimension × 4-chart menu plus a time window, and a
  * wrong-but-valid spec is worse than a refusal because it silently answers a different
  * question. Overridable per-env without a code change.
  */

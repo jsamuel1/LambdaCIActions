@@ -403,3 +403,38 @@ test('every chart type and dimension in the vocabulary is a plain string enum', 
     assert.equal(typeof v, 'string');
   }
 });
+
+test('the chart host is unconditional and the empty series is gated by the caller', () => {
+  // Regression guard. The ECharts instance is bound to ReportChart's host div and the mount
+  // effect is keyed `[]`, so the host must exist for the instance's whole lifetime. An
+  // empty-series early return inside ReportChart used to remove that host: going empty left a
+  // detached instance, and empty -> non-empty never initialised (the mount effect does not
+  // re-run), so setOption wrote into nothing and the panel rendered silently blank. `useApi`
+  // keeps the previous `data` across a refetch, so the component stays mounted while the
+  // operator changes metric/dimension — the transition is reachable.
+  //
+  // Source-level assertion because this repo has no DOM harness for the SPA; it pins the two
+  // halves of the contract rather than the rendered output.
+  const chart = fs.readFileSync(
+    new URL('../web/src/screens/ReportChart.tsx', import.meta.url),
+    'utf8',
+  );
+  // Bounded to ReportChart itself: ReportTable follows it and legitimately has its own
+  // empty-row branch, which is fine — it owns no ECharts instance.
+  const start = chart.indexOf('export function ReportChart');
+  const body = chart.slice(start, chart.indexOf('export function ReportTable', start));
+  assert.ok(start >= 0 && body.length > 0, 'could not isolate the ReportChart body');
+  assert.ok(
+    !/report\.points\.length/.test(body),
+    'ReportChart returns early on an empty series again — that strands its ECharts instance',
+  );
+
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.ok(
+    /!report\.points\.length/.test(screen),
+    'Reports.tsx must gate the ReportChart mount on a non-empty series',
+  );
+});

@@ -1392,7 +1392,7 @@ stack default equals the handler default (a drift there is a runtime 403). The N
 **enabled by default** and can be switched off per-env with `REPORTS_NL_ENABLED=false`, which
 also drops the Bedrock grant from the template entirely.
 **Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto a
-5-metric × 6-dimension × 5-chart menu plus a time window is a small *structured* problem where
+5-metric × 6-dimension × 4-chart menu plus a time window is a small *structured* problem where
 a wrong-but-valid answer is worse than a refusal: an invalid spec is rejected and the operator
 sees the picker, but a plausible-but-wrong spec renders a chart that silently answers a
 different question. Sonnet's stronger instruction-following buys accuracy on exactly that
@@ -1420,7 +1420,7 @@ that the frontend evaluates, or SQL that the backend runs. Report data here is
 from GitHub. Any of it reaching a prompt is untrusted input, and anything the model emits that
 gets executed or rendered is an injection sink with a straight path to another tenant's data.
 **Decision**: the model **selects from a closed vocabulary and nothing else**. It emits a JSON
-report spec — one of 5 metrics, one of 6 dimensions, one of 5 chart types, a preset window, and
+report spec — one of 5 metrics, one of 6 dimensions, one of 4 chart types, a preset window, and
 optional flavor/status filters — which is parsed as data and passed through
 `validateReportSpec`, the *same* validator the manual picker's query params go through. The
 backend executes the deterministic report; the frontend renders it with pre-built components.
