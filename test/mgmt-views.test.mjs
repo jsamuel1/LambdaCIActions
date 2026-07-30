@@ -67,10 +67,12 @@ test('cost estimate scales with duration; unknown flavor has no estimate', () =>
 });
 
 test('run view exposes only run fields (no jit config, no secrets)', () => {
-  const view = toRunView(run({ ttl: 123, someInternal: 'x' }));
+  const view = toRunView(run({ ttl: 123, someInternal: 'x', hookTokenHash: 'a'.repeat(64) }));
   assert.deepEqual(
     Object.keys(view).sort(),
     [
+      'billableSeconds',
+      'costBasis',
       'costUsd',
       'createdAt',
       'durationSeconds',
@@ -87,6 +89,39 @@ test('run view exposes only run fields (no jit config, no secrets)', () => {
       'updatedAt',
     ],
   );
+  // ADR-021: the hook capability token hash is a bearer-secret verifier and must never leave
+  // the control plane, even though it now rides the same row the Reports fan-out reads.
+  assert.ok(!('hookTokenHash' in view));
+});
+
+// ADR-030: Run detail and Reports must never disagree about what one run cost, so both derive
+// from `billableSeconds`. These pin the shared basis and the fallback's direction of error.
+test('cost is priced from the runningAt watermark when the row has one', () => {
+  const view = toRunView(
+    run({
+      createdAt: '2026-07-01T00:00:00.000Z',
+      runningAt: '2026-07-01T00:05:00.000Z',
+      updatedAt: '2026-07-01T00:06:00.000Z',
+    }),
+  );
+  assert.equal(view.costBasis, 'measured');
+  assert.equal(view.billableSeconds, 60, 'queue time was billed');
+  assert.equal(view.durationSeconds, 360, 'duration is still total wall clock');
+});
+
+test('a pre-watermark row falls back to wall clock and is labelled as such', () => {
+  const view = toRunView(
+    run({ createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:06:00.000Z' }),
+  );
+  assert.equal(view.costBasis, 'wallClock');
+  assert.equal(view.billableSeconds, 360);
+});
+
+test('the watermark can only reduce the estimate, never inflate it', () => {
+  const base = { createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:06:00.000Z' };
+  const measured = toRunView(run({ ...base, runningAt: '2026-07-01T00:05:00.000Z' }));
+  const fallback = toRunView(run(base));
+  assert.ok(measured.costUsd < fallback.costUsd);
 });
 
 test('health folds counts, error rate, and stuck runs', () => {

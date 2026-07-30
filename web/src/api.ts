@@ -16,11 +16,18 @@ export class UnauthorizedError extends Error {
 export class ApiError extends Error {
   readonly status: number;
   readonly details?: unknown;
-  constructor(status: number, message: string, details?: unknown) {
+  /**
+   * The full parsed error body. Report refusals carry a machine-readable `reason` alongside
+   * `error`, and the Reports screen branches on it to decide between "ask differently" and
+   * "the assistant is down" — both of which fall back to the manual picker.
+   */
+  readonly body?: Record<string, unknown>;
+  constructor(status: number, message: string, details?: unknown, body?: Record<string, unknown>) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.details = details;
+    this.body = body;
   }
 }
 
@@ -44,7 +51,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     }
   }
   if (!res.ok) {
-    throw new ApiError(res.status, String(body.error ?? `HTTP ${res.status}`), body.details);
+    throw new ApiError(res.status, String(body.error ?? `HTTP ${res.status}`), body.details, body);
   }
   return body as T;
 }
@@ -117,6 +124,9 @@ export interface Run {
   updatedAt: string;
   durationSeconds: number;
   costUsd?: number;
+  /** `measured` = priced from the runningAt watermark; `wallClock` = pre-watermark, overstates. */
+  costBasis?: 'measured' | 'wallClock';
+  billableSeconds?: number;
 }
 
 export interface Health {
@@ -156,6 +166,100 @@ export interface LogPage {
   nextToken: string | null;
 }
 
+// ---- reports (mirror src/mgmt/reports.ts) ----------------------------------
+
+export type ReportMetric = 'spend' | 'runCount' | 'duration' | 'failureRate' | 'queueLatency';
+export type ReportDimension = 'repo' | 'flavor' | 'workflow' | 'status' | 'time' | 'none';
+export type ChartType = 'bar' | 'stackedBar' | 'line' | 'table';
+export type RangePreset = '24h' | '7d' | '30d' | '90d';
+
+export interface MetricDoc {
+  metric: ReportMetric;
+  label: string;
+  unit: string;
+  definition: string;
+  estimate: boolean;
+}
+
+export interface ReportCatalog {
+  metrics: MetricDoc[];
+  dimensions: ReportDimension[];
+  charts: ChartType[];
+  presets: RangePreset[];
+  maxRangeDays: number;
+  repos: { repoId: number; repoFullName: string }[];
+  nl: { enabled: boolean; modelId: string | null };
+}
+
+export interface ReportSpec {
+  metric: ReportMetric;
+  dimension: ReportDimension;
+  chart: ChartType;
+  filters: { repoIds?: number[]; flavors?: string[]; statuses?: RunStatus[] };
+  from: string;
+  to: string;
+  preset?: RangePreset;
+}
+
+export interface SeriesPoint {
+  key: string;
+  label: string;
+  value: number;
+  secondary?: number;
+  sampleSize: number;
+}
+
+export interface Report {
+  spec: ReportSpec;
+  metric: MetricDoc;
+  points: SeriesPoint[];
+  total?: number;
+  rowCount: number;
+  /** False when the fan-out spent its page budget — the numbers are a floor. */
+  complete: boolean;
+  coverage: number;
+  caveat?: string;
+  generatedAt: string;
+  /** What the server actually resolved + read (ADR-033 transparency). */
+  resolved: { query: string; repoCount: number; scope: string };
+  /** Present when the spec came from the model rather than the picker. */
+  source?: { kind: 'model'; modelId: string };
+}
+
+/** A refused NL question — the UI degrades to the manual picker on any of these. */
+export interface AskRefusal {
+  error: string;
+  reason: 'disabled' | 'unsupported' | 'invalid-spec' | 'unavailable' | 'bad-question';
+  details?: unknown;
+}
+
+/** Query-param bag for a report; mirrors `specToQuery` on the server. */
+export interface ReportQuery {
+  metric: ReportMetric;
+  dimension: ReportDimension;
+  chart: ChartType;
+  preset?: RangePreset;
+  from?: string;
+  to?: string;
+  repos?: number[];
+  flavors?: string[];
+  statuses?: RunStatus[];
+}
+
+export function reportQueryString(q: ReportQuery): string {
+  const p = new URLSearchParams();
+  p.set('metric', q.metric);
+  p.set('dimension', q.dimension);
+  p.set('chart', q.chart);
+  if (q.preset) p.set('preset', q.preset);
+  if (q.from) p.set('from', q.from);
+  if (q.to) p.set('to', q.to);
+  if (q.repos?.length) p.set('repos', q.repos.join(','));
+  if (q.flavors?.length) p.set('flavors', q.flavors.join(','));
+  if (q.statuses?.length) p.set('statuses', q.statuses.join(','));
+  return p.toString();
+}
+
 // ---- endpoints -------------------------------------------------------------
 
 export const api = {
@@ -192,7 +296,7 @@ export const api = {
      * `complete` is the server's answer to "were any job rows dropped from this response?" —
      * NOT "is the index exhausted" (that is `nextCursor`). The client cannot derive the
      * dropped-rows half, because truncation happens on the raw index pages before the
-     * installation-visibility filter (ADR-029). Absent (older API) is treated as `false` by
+     * installation-visibility filter (ADR-031). Absent (older API) is treated as `false` by
      * the caller: partial is the safe default.
      */
     return request<{ runs: Run[]; nextCursor: string | null; complete?: boolean }>(
@@ -221,5 +325,17 @@ export const api = {
   flavors: () => request<{ flavors: Flavor[] }>('/api/flavors'),
   health: () => request<Health>('/api/health'),
   settings: () => request<Settings>('/api/settings'),
+  reportCatalog: () => request<ReportCatalog>('/api/reports/catalog'),
+  report: (q: ReportQuery) => request<Report>(`/api/reports/run?${reportQueryString(q)}`),
+  /** Export URL (a plain link, so the browser downloads instead of buffering in JS). */
+  reportExportUrl: (q: ReportQuery, format: 'csv' | 'json' = 'csv') =>
+    `/api/reports/export?${reportQueryString(q)}&format=${format}`,
+  /**
+   * Ask for a report in natural language. A refusal is an `ApiError` with `details` carrying
+   * the machine-readable reason, so the caller can fall back to the picker rather than
+   * surfacing a stack of validation noise.
+   */
+  askReport: (question: string) =>
+    request<Report>('/api/reports/ask', { method: 'POST', body: JSON.stringify({ question }) }),
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 };

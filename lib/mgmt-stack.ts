@@ -35,7 +35,22 @@ export interface MgmtStackProps extends StackProps {
    * redirect target would be worse).
    */
   publicOrigin?: string;
+  /**
+   * Bedrock model backing the Reports assistant (ADR-032). Defaults to Claude 3.5 Sonnet.
+   * The IAM grant is scoped to exactly this model id — changing it here changes the policy,
+   * so the Mgmt λ can never invoke a model the stack didn't authorize.
+   */
+  reportsModelId?: string;
+  /** Set false to ship the Reports screen with the deterministic picker only. */
+  reportsNlEnabled?: boolean;
 }
+
+/**
+ * Default Reports assistant model. Mirrors `DEFAULT_MODEL_ID` in src/mgmt/nl-report.ts; the
+ * constant is duplicated rather than imported because CDK synth must not pull the Lambda's
+ * AWS-SDK imports into the app bundle. `test/mgmt-stack.test.mjs` asserts they agree.
+ */
+export const DEFAULT_REPORTS_MODEL_ID = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
 
 /**
  * MgmtStack — the management plane (spec 04, M4).
@@ -51,6 +66,8 @@ export interface MgmtStackProps extends StackProps {
  *     is checked for presence via `DescribeParameters` (a metadata action that returns no
  *     values) — so no code path can leak a SecureString (spec 04 hard rule).
  *   - CloudWatch Logs: read-only on the per-env run log group.
+ *   - Bedrock: `InvokeModel` on exactly ONE model id (the Reports assistant, ADR-032) — no
+ *     wildcard, no streaming, no other Bedrock action.
  *   - NO `lambda:RunMicrovm` / `TerminateMicrovm`, NO GitHub App PEM. It cannot launch
  *     compute or mint installation tokens; the only GitHub calls it makes are OAuth
  *     (its own client creds) and `/user/*` with the operator's token.
@@ -99,6 +116,11 @@ export class MgmtStack extends Stack {
         TABLE_NAME: table.tableName,
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
         PUBLIC_ORIGIN: props.publicOrigin ?? '',
+        // Reports assistant (ADR-032). Enabled by default; `REPORTS_NL_ENABLED=false` turns
+        // the NL path off without redeploying IAM, and the console degrades to the manual
+        // report picker rather than erroring.
+        REPORTS_NL_ENABLED: String(props.reportsNlEnabled ?? true),
+        REPORTS_MODEL_ID: props.reportsModelId ?? DEFAULT_REPORTS_MODEL_ID,
       },
     });
 
@@ -154,6 +176,25 @@ export class MgmtStack extends Stack {
     if (props.discoveryQueueArn) {
       const queue = sqs.Queue.fromQueueArn(this, 'DiscoveryQueueRef', props.discoveryQueueArn);
       queue.grantSendMessages(fn);
+    }
+
+    // Reports assistant (ADR-032): InvokeModel on EXACTLY the configured model, in this
+    // region only. `InvokeModelWithResponseStream` is deliberately NOT granted — the NL path
+    // wants one small JSON spec, not a stream. Foundation-model ARNs are account-less.
+    const reportsModel = props.reportsModelId ?? DEFAULT_REPORTS_MODEL_ID;
+    if (props.reportsNlEnabled ?? true) {
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeReportsModel',
+          actions: ['bedrock:InvokeModel'],
+          resources: [
+            `arn:${this.partition}:bedrock:${this.region}::foundation-model/${reportsModel}`,
+            // Cross-region inference profiles resolve to a regional profile ARN in the
+            // caller's account; needed if the model id is switched to an `xx.` profile.
+            `arn:${this.partition}:bedrock:${this.region}:${this.account}:inference-profile/${reportsModel}`,
+          ],
+        }),
+      );
     }
 
     this.httpApi = new apigw.HttpApi(this, 'MgmtApi', {

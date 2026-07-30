@@ -1095,7 +1095,6 @@ account login so a recovered row occupies the same position it will hold once th
 serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
 that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
 the reverse, and the mismatch would be the same row-jump wearing a disguise.
-||||||| 94360ca
 > **ADR numbering note.** This block was originally authored as 030..033 and has been renumbered
 > to **038..041** to vacate a collision: the concurrent branch `kermes/task-tidal-hawk` claims
 > 030..033 for entirely different subjects (adopt-mode label claiming, the auto-rewrite PR, EMF
@@ -1307,4 +1306,170 @@ so it consumes quota, costs money, and needs a repo to register against; it is t
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
 the static gates; the smoke run itself is verified against a live environment. Deferred to a
 follow-up card together with ADR-040.
-||||||| 94360ca
+
+> **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
+> to **042..046** to vacate a collision, following the same convention as the 038..041 block
+> above. At the time of renumbering 030..033 were claimed by `kermes/task-tidal-hawk` (PR #23),
+> 034/035 by `kermes/task-nervous-mountain`, and 036..041 had landed, so 042 was the lowest free
+> number. The mapping is 030→042 (phase watermarks), 031→043 (authorization-first aggregation),
+> 032→044 (Bedrock model + scoped grant), 033→045 (validated spec emission), 034→046 (ECharts).
+> Renumbering unconditionally means neither branch has to renumber at merge time; a gap is
+> cheaper than a duplicate number.
+
+
+## ADR-030 — Phase watermarks on the run row (`provisioningAt` / `runningAt`) (M5)
+**Status**: Accepted (v1) · resolves spec 04 OQ-5 · precondition for [ADR-031](#adr-031)
+**Context**: M4 priced a run as `wall-clock(createdAt → updatedAt) × flavor rate`. The microVM
+service only bills while the VM *runs*, so that figure includes queue time and provisioning
+time and is an unbounded overstatement — a job that sat queued for ten minutes and ran for one
+was priced at eleven. It also made queue-to-start latency, the single most useful number for
+judging whether the platform is keeping up, uncomputable: nothing recorded when a job started.
+**Decision**: stamp two ISO timestamps on the run row, inside the SAME guarded `UpdateItem`
+that performs the status transition, using `if_not_exists` so each is **write-once**:
+`provisioningAt` on first entry to `provisioning`, `runningAt` on first entry to `running`.
+`createdAt` already marks `queued` and `updatedAt` the terminal transition, so no third
+attribute is needed. Billable time is `runningAt → updatedAt`; queue latency is
+`createdAt → runningAt`.
+**Why write-once, and why in the transition write**: a `workflow_job` webhook can be delivered
+more than once, and `transitionRun` treats a same-status re-write as an idempotent success. A
+plain `SET` would let a duplicate `running` delivery push `runningAt` forward — *shrinking*
+billable time and *inflating* queue latency, both in the flattering direction, silently.
+Riding the existing forward-only condition also means a watermark can never exist for a phase
+the run did not actually enter. Rejected: a separate phase-history item per run (doubles write
+volume on the hot path for data only reporting reads), and deriving phases from CloudWatch
+(the log group is per-env and the correlation is by microVM id, which is stamped later).
+**Consequences**: rows created before M5 have no watermarks. Reports must treat that as
+**absent, never zero** — `queueLatency` excludes such rows and reports coverage, and `spend`
+falls back to wall-clock and labels the row `costBasis: wallClock`. So the cost estimate
+improves monotonically as history turns over rather than changing retroactively.
+`test/run-store.test.mjs` pins the write-once expression and that terminal/queued transitions
+stamp nothing.
+
+## ADR-031 — Reporting aggregates via authorization-first repo fan-out (M5)
+**Status**: Accepted (v1) · builds on [ADR-023](#adr-023), [ADR-030](#adr-030)
+**Context**: the Reports screen needs spend / counts / duration / failure rate / queue latency
+over a time window. The table has no aggregate index: rows are per-job, keyed by
+`(repoId, runId, jobId)` and indexed by status/time (GSI1) and repo/time (GSI2). Three designs
+were considered: (a) rollup rows written on every run transition, (b) a new time-bucketed GSI,
+(c) a bounded query fan-out over GSI2.
+**Decision**: **(c) a bounded fan-out, ordered authorization-first.** The Reports code resolves
+the operator's visible repos *before* reading anything — from the installation partitions their
+session grants — and only queries those GSI2 partitions. `spec.filters.repoIds` can only
+*narrow* that set (set intersection); it can never widen it.
+**Why**: the deciding factor is authorization, not cost. Every other management read queries a
+status/repo index and filters by installation *afterwards* (`collectVisible`, spec 04
+§ Authorization). For a list, a missed filter leaks a row. For an **aggregate** it converts a
+per-tenant total into a platform-wide one — and unlike a leaked row, a leaked *number* looks
+entirely plausible and no one notices. Inverting the order removes the filter that could be
+forgotten: a foreign row is never fetched. Rollup rows (a) were rejected because they put a
+write on the control-plane hot path for a management-plane read, need a backfill for existing
+history, and would themselves have to be keyed per-installation to be safe. A time-bucketed
+index (b) was rejected because the bucket partition is shared across tenants, which reproduces
+exactly the post-filter hazard this ADR exists to eliminate.
+**Consequences**: reads scale with (visible repos × pages), bounded by `MAX_PAGES_PER_REPO`
+(20), `PAGE_SIZE` (200) and `MAX_TOTAL_ROWS` (20 000), with concurrency 8. GSI2 is
+newest-first, so paging stops at the first row older than the window — a 24 h report costs one
+page per repo. Spending a budget sets `complete: false`, which the API returns and the UI
+renders as "treat these numbers as a floor"; it never silently truncates. Report windows are
+capped at 90 days because terminal rows carry a 90-day TTL, so a wider window cannot return
+more data. An operator with hundreds of active repos and a 90-day window is the case this
+design serves worst; if that becomes real, rollups keyed *per installation* are the next step.
+`test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the
+platform-wide total is strictly larger than the tenant total (so the test is actually
+isolating), and that a repo granted via two installations is not double-counted.
+
+## ADR-032 — Reports assistant on Bedrock: Claude Sonnet, one pinned model, one scoped grant (M5)
+**Status**: Accepted (v1) · security boundary in [ADR-033](#adr-033)
+**Context**: the Reports screen accepts a natural-language question ("spend by repo last 30
+days") and must turn it into a report. The repo had no Bedrock dependency, no model choice, and
+no IAM for one.
+**Decision**: `@aws-sdk/client-bedrock-runtime` (pinned exact, per repo convention), invoked
+from the existing Mgmt λ — not a new function — with `bedrock:InvokeModel` granted on **exactly
+one model id** in the deploy region. Default model: `anthropic.claude-3-5-sonnet-20241022-v2:0`.
+The id is a stack prop that flows to the λ as `REPORTS_MODEL_ID` *and* into the IAM resource
+ARN, so the policy and the runtime can never disagree; `test/mgmt-stack.test.mjs` asserts the
+stack default equals the handler default (a drift there is a runtime 403). The NL path is
+**enabled by default** and can be switched off per-env with `REPORTS_NL_ENABLED=false`, which
+also drops the Bedrock grant from the template entirely.
+**Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto a
+5-metric × 6-dimension × 5-chart menu plus a time window is a small *structured* problem where
+a wrong-but-valid answer is worse than a refusal: an invalid spec is rejected and the operator
+sees the picker, but a plausible-but-wrong spec renders a chart that silently answers a
+different question. Sonnet's stronger instruction-following buys accuracy on exactly that
+failure mode, and the cost is bounded by a ~400-token prompt, `max_tokens: 400`,
+`temperature: 0` and the caps below. `InvokeModelWithResponseStream` is deliberately NOT
+granted — one small JSON object needs no stream.
+**Why the existing λ**: a separate Reports λ would need its own DynamoDB read grant, its own
+session-secret read, and a second copy of the authorization logic that ADR-031 exists to keep
+in one place. The Mgmt λ's posture widens by exactly one action on one resource.
+**Cost / abuse controls**: `POST` (never a prefetchable `GET`); question capped at 400 chars and
+validated before any spend; per-actor sliding window of 10 invocations/minute keyed on the
+server-derived session login; a per-container ceiling of 500 invocations as a crude spend cap.
+Every invocation is logged with the actor, the model id, the outcome and the question *length* —
+never its content, which is operator-authored text. A durable cross-container budget belongs in
+the run table and is deferred rather than faked.
+**Consequences**: the console now has a per-request marginal cost on one interaction it did not
+have before, and a Bedrock regional dependency. Throttling, an unconfigured model, or a
+malformed response degrade to the manual picker (ADR-033), never to an error page.
+
+## ADR-033 — Generative UI = validated spec emission, never model-authored code (M5)
+**Status**: Accepted (v1) · this is the security boundary of the Reports feature
+**Context**: "dynamic generative UI" is commonly implemented by having a model emit JSX/HTML/JS
+that the frontend evaluates, or SQL that the backend runs. Report data here is
+**tenant-controlled**: repo names, workflow names, job names and branch names all originate
+from GitHub. Any of it reaching a prompt is untrusted input, and anything the model emits that
+gets executed or rendered is an injection sink with a straight path to another tenant's data.
+**Decision**: the model **selects from a closed vocabulary and nothing else**. It emits a JSON
+report spec — one of 5 metrics, one of 6 dimensions, one of 5 chart types, a preset window, and
+optional flavor/status filters — which is parsed as data and passed through
+`validateReportSpec`, the *same* validator the manual picker's query params go through. The
+backend executes the deterministic report; the frontend renders it with pre-built components.
+Specifically:
+- **No `eval`, no `new Function`, no `dangerouslySetInnerHTML`, no model-authored JS/JSX/HTML**,
+  and no model-authored DynamoDB expression. Unknown fields are rejected, not ignored, so a
+  spec carrying `html`, `component`, `query` or `KeyConditionExpression` fails closed.
+- **Authorization is not a spec field.** Scope comes from the session's installations
+  (ADR-031). A spec naming a foreign repo id contributes zero rows.
+- **No tenant data in the prompt.** Repo/workflow/job names are never sent, so a repo named
+  `ignore previous instructions…` cannot influence the model. The prompt is our catalog text
+  plus the operator's own question.
+- **Ambiguity fails closed.** An array of candidate specs is refused rather than silently
+  taking the first — rendering one of several proposals is rendering a report nobody chose.
+- **Transparency + fallback.** Every generated view states the report and filters it resolved
+  to, and the resolved spec is written into the URL, so a report is a plain shareable link that
+  re-runs deterministically and never re-invokes the model. Disabled, throttled, unsupported,
+  and invalid-spec outcomes all fall back to the manual picker with the reason shown.
+**Why**: this makes the blast radius of a fully-compromised model output equal to *picking the
+wrong report from a menu the operator could already pick from*. No prompt injection — from
+tenant data or from the question — can widen scope, execute code, or read another tenant's rows,
+because none of those are expressible in the spec grammar.
+**Consequences**: the assistant can only answer questions the deterministic catalog already
+covers; anything else is an explicit `unsupported` refusal rather than a bespoke answer. That is
+the intended trade. Adding a report means adding a catalog entry (which the prompt is generated
+from), not prompting differently. `test/nl-report.test.mjs` pins the refusals for hostile
+payloads: model-authored queries, render payloads, scope-widening fields, hallucinated metrics,
+truncated JSON, and candidate arrays.
+
+## ADR-034 — Charts: ECharts (Apache-2.0), not Highcharts (M5)
+**Status**: Accepted (v1)
+**Context**: the Reports screen needs bar / stacked-bar / line charts. Highcharts was the
+initial request. Highcharts is **commercially licensed** for non-personal use — unlike
+Chart.js, ECharts or Recharts it is not MIT/BSD — and no Amazon-acceptable entitlement covering
+this repo could be confirmed. The SPA also had zero chart dependencies and a deliberately lean
+runtime dep set (react + react-dom only), and is served as a static S3/CloudFront bundle.
+**Decision**: **Apache ECharts, pinned exact (`echarts@5.5.1`)**, imported per chart type
+(`echarts/core` + `BarChart`/`LineChart` + only the components used) rather than via the barrel,
+and rendered with the **SVG** renderer. Highcharts is rejected on licensing; the decision is
+recorded here rather than quietly vendoring a licensed library.
+**Why SVG over canvas**: the console's CSP is `default-src 'none'` with `style-src 'self'`
+(ADR-022) and the SVG path touches far less inline styling, and SVG text stays legible when an
+operator screenshots a report into a ticket. Chart height lives in `styles.css`, not a React
+inline style — the CSP drops `style="…"` attributes, so an inline-sized chart would work in dev
+and collapse to zero height in production. (ECharts' own runtime styling is CSSOM property
+assignment and SVG presentation attributes, neither of which `style-src` restricts;
+`test/web-stack.test.mjs` still fails the build if a React inline style appears in `web/src`.)
+**Consequences**: the SPA bundle grows to ~679 KB raw / ~224 KB gzipped — the first meaningful
+runtime dependency beyond React. Acceptable for an authenticated internal console behind
+CloudFront, and bounded by the per-chart-type import list: adding a chart type means editing
+that list, which is deliberate friction. If the bundle becomes a problem the next step is
+lazy-loading the Reports route, not swapping libraries.

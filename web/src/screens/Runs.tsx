@@ -35,8 +35,9 @@ function lowerBound(seconds: number, partial: boolean): string {
  * API's opaque cursor (ADR-021) and appends — deeper paging requires a repo or status filter,
  * because the unfiltered merged view has no coherent cursor.
  *
- * Cost is deliberately absent: a per-run cost total belongs on a Reports screen with a time
- * window and grouping, not on a history list (`formatCost` / `flavorRatePerMinute` stay).
+ * Cost is deliberately absent: a per-run cost total belongs on the Reports screen with a time
+ * window and grouping (ADR-029). `formatCost` still serves Run detail; the aggregate cost model
+ * lives in `src/mgmt/reports.ts`.
  */
 export function Runs({
   repoFilter,

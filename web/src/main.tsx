@@ -7,6 +7,7 @@ import { Repos } from './screens/Repos.js';
 import { RepoDetail } from './screens/RepoDetail.js';
 import { Runs } from './screens/Runs.js';
 import { RunDetail } from './screens/RunDetail.js';
+import { Reports } from './screens/Reports.js';
 import { Flavors, Settings } from './screens/Platform.js';
 import { Setup } from './screens/Setup.js';
 import './styles.css';
@@ -15,6 +16,7 @@ const NAV: { path: string; label: string }[] = [
   { path: '/', label: 'Dashboard' },
   { path: '/repos', label: 'Repos' },
   { path: '/runs', label: 'Runs' },
+  { path: '/reports', label: 'Reports' },
   { path: '/flavors', label: 'Flavors' },
   { path: '/settings', label: 'Settings' },
   { path: '/setup', label: 'Setup' },
@@ -124,6 +126,8 @@ function titleFor(segments: string[]): string {
       return segments[1] ? 'Repo detail' : 'Repos';
     case 'runs':
       return segments[1] ? 'Run detail' : 'Runs';
+    case 'reports':
+      return 'Reports';
     case 'flavors':
       return 'Flavors';
     case 'settings':
@@ -166,6 +170,8 @@ function renderRoute(
       );
     case 'flavors':
       return <Flavors />;
+    case 'reports':
+      return <Reports />;
     case 'settings':
       return <Settings />;
     case 'setup':

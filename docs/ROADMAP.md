@@ -51,8 +51,11 @@ True zero-edit adoption + hardening.
 - **Custom flavors** — per-installation bring-your-own image, merged over the built-in catalog (ADR-040), not routable until a smoke run proves it works (ADR-041).
 - Compat guidance surfaced with actionable fixes.
 - Metrics/alarms/X-Ray; cost estimates in Run detail.
-- **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
-  (cost left Runs per ADR-029; see spec 04 OQ-6).
+- **Reports screen** (spec 04 § Reports): spend / job counts / duration p50-p90 / failure rate /
+  queue-to-start latency over a window, charted + CSV/JSON export, plus a natural-language
+  report assistant. Cost left Runs per ADR-029 and lands here. Aggregates are
+  authorization-first (ADR-031); phase watermarks make the cost basis honest (ADR-030); the
+  assistant emits a **validated spec**, never code (ADR-033).
 - Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
 - `dev`/`prod` account separation; runbook + quotas doc.
 - 🎯 A brand-new repo runs unchanged in `adopt` mode; dashboard shows health + cost.

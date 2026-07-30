@@ -34,7 +34,11 @@ export type RouteId =
   | 'getRunLogs'
   | 'listFlavors'
   | 'health'
-  | 'settings';
+  | 'settings'
+  | 'reportCatalog'
+  | 'runReport'
+  | 'exportReport'
+  | 'askReport';
 
 export const ROUTES: readonly RouteDef[] = [
   // --- auth (unauthenticated by definition) ---
@@ -59,6 +63,12 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'listFlavors', method: 'GET', template: '/api/flavors', authRequired: true },
   { id: 'health', method: 'GET', template: '/api/health', authRequired: true },
   { id: 'settings', method: 'GET', template: '/api/settings', authRequired: true },
+  // --- reports (spec 04 § Reports) ---
+  { id: 'reportCatalog', method: 'GET', template: '/api/reports/catalog', authRequired: true },
+  { id: 'runReport', method: 'GET', template: '/api/reports/run', authRequired: true },
+  { id: 'exportReport', method: 'GET', template: '/api/reports/export', authRequired: true },
+  // POST because it spends money (a model invocation) — not a cacheable, prefetchable GET.
+  { id: 'askReport', method: 'POST', template: '/api/reports/ask', authRequired: true },
 ];
 
 export interface RouteMatch {

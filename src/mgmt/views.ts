@@ -26,6 +26,14 @@ export interface RunView {
   durationSeconds: number;
   /** Estimated microVM cost in USD; undefined when the flavor is unknown (never launched). */
   costUsd?: number;
+  /**
+   * Which clock the cost came from: `measured` (the `runningAt` watermark, ADR-030) or
+   * `wallClock` (a pre-watermark row, which overstates). Exposed so the UI states the bias
+   * instead of presenting both kinds of estimate as equally tight.
+   */
+  costBasis: CostBasis;
+  /** Seconds counted as billable for the cost figure. */
+  billableSeconds: number;
 }
 
 /**
@@ -70,20 +78,48 @@ export function durationSeconds(run: Pick<RunRecord, 'createdAt' | 'updatedAt'>)
   return Math.round((end - start) / 1000);
 }
 
+/** Which clock a cost estimate was derived from — surfaced so the UI can state the bias. */
+export type CostBasis = 'measured' | 'wallClock';
+
 /**
- * Estimated cost of a run: billable minutes × flavor rate. Only the `running` phase is
- * billed by the microVM service, but we don't persist a `startedAt` per phase in v1, so
- * this uses total wall-clock as an upper bound and is labelled an estimate in the UI.
+ * Billable seconds for a job, and which clock produced them.
+ *
+ * The microVM service bills only while the VM RUNS, so queue + provisioning time is not
+ * chargeable. Prefers the `runningAt` watermark (ADR-030); falls back to total wall clock for
+ * rows written before it existed, which OVERSTATES cost. The basis is returned rather than
+ * hidden so both Run detail and Reports can label the estimate the same way — this is the one
+ * definition of billable time in the codebase, so the two screens cannot disagree about what
+ * the same run cost.
  */
-export function estimateCostUsd(run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'flavor'>): number | undefined {
+export function billableSeconds(
+  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'runningAt'>,
+): { seconds: number; basis: CostBasis } {
+  const end = Date.parse(run.updatedAt);
+  const started = run.runningAt ? Date.parse(run.runningAt) : Number.NaN;
+  if (Number.isFinite(started) && Number.isFinite(end) && end >= started) {
+    return { seconds: Math.round((end - started) / 1000), basis: 'measured' };
+  }
+  return { seconds: durationSeconds(run), basis: 'wallClock' };
+}
+
+/**
+ * Estimated cost of a run: billable minutes × flavor rate. An ESTIMATE in two ways — the rate
+ * is derived from the flavor's vCPU/GB footprint rather than a bill (spec 04 OQ-3), and rows
+ * with no `runningAt` watermark are priced on wall clock, which overstates. `undefined` when
+ * the flavor is unknown, i.e. the job never launched and therefore cost nothing.
+ */
+export function estimateCostUsd(
+  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'runningAt' | 'flavor'>,
+): number | undefined {
   const rate = flavorRatePerMinute(run.flavor);
   if (rate === undefined) return undefined;
-  const minutes = durationSeconds(run) / 60;
+  const minutes = billableSeconds(run).seconds / 60;
   return Math.round(rate * minutes * 1e6) / 1e6;
 }
 
 /** Project a stored run row onto the API shape (adds derived duration + cost). */
 export function toRunView(run: RunRecord): RunView {
+  const billable = billableSeconds(run);
   return {
     repoId: run.repoId,
     repoFullName: run.repoFullName,
@@ -99,6 +135,8 @@ export function toRunView(run: RunRecord): RunView {
     updatedAt: run.updatedAt,
     durationSeconds: durationSeconds(run),
     costUsd: estimateCostUsd(run),
+    costBasis: billable.basis,
+    billableSeconds: billable.seconds,
   };
 }
 

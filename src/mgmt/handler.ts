@@ -36,6 +36,28 @@ import {
 import { parseLimit, parseEpochMs, validateFlavorMap, validateRepoPatch } from './validate.js';
 import { collectVisible } from './paging.js';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
+import {
+  METRIC_CATALOG,
+  CHART_TYPES,
+  DIMENSIONS,
+  RANGE_PRESETS,
+  MAX_RANGE_DAYS,
+  applyFilters,
+  computeReport,
+  specFromQuery,
+  specToQuery,
+  toCsv,
+  toExportRows,
+  type ReportSpec,
+} from './reports.js';
+import { fetchReportRuns, resolveVisibleRepos } from './report-store.js';
+import {
+  checkQuestion,
+  modelId,
+  nlEnabled,
+  proposeSpec,
+  rateLimit,
+} from './nl-report.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -465,6 +487,32 @@ async function route_(
     case 'settings':
       return settingsRoute();
 
+    case 'reportCatalog':
+      return json(200, {
+        metrics: METRIC_CATALOG,
+        dimensions: DIMENSIONS,
+        charts: CHART_TYPES,
+        presets: RANGE_PRESETS,
+        maxRangeDays: MAX_RANGE_DAYS,
+        // The UI needs the operator's repo list to offer a repo filter; it is the SAME
+        // authorization-resolved set the executor reads from, so the picker cannot offer a
+        // repo the report would refuse.
+        repos: (await resolveReportRepos(session)).map((r) => ({
+          repoId: r.repoId,
+          repoFullName: r.repoFullName,
+        })),
+        nl: { enabled: nlEnabled(), modelId: nlEnabled() ? modelId() : null },
+      });
+
+    case 'runReport':
+      return runReportRoute(session, q);
+
+    case 'exportReport':
+      return exportReportRoute(session, q);
+
+    case 'askReport':
+      return askReportRoute(session, event);
+
     default:
       return problem(404, 'not found');
   }
@@ -505,7 +553,7 @@ async function listRunsRoute(
       q.cursor,
     );
     // `complete` reports whether rows were DROPPED from this response, not whether the index
-    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-029).
+    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-031).
     // `collectVisible` never slices, so an unfiltered repo page loses nothing: every visible
     // row the query returned is here, and a run's remaining jobs are reachable through
     // `nextCursor`. Reporting `nextCursor === undefined` here instead would make a
@@ -550,7 +598,7 @@ async function listRunsRoute(
   // carries the whole verdict here. It is decided HERE because only this code sees the raw
   // per-status pages: truncation must be judged before the visibility filter, since a page
   // filled with another tenant's rows looks short while this operator's sibling jobs sit
-  // unread past the boundary (ADR-029).
+  // unread past the boundary (ADR-031).
   return json(200, {
     runs: merged.map(toRunView),
     nextCursor: null,
@@ -569,8 +617,7 @@ async function listRunsRoute(
  * run LIST is installation-filtered. `stuck` is filtered to the session's grants so no run
  * identity leaks across tenants — the aggregate numbers are deliberately platform-level and
  * documented as such in spec 04.
- */
-async function healthRoute(session: SessionPayload): Promise<Reply> {
+ */async function healthRoute(session: SessionPayload): Promise<Reply> {
   // The counts below are deliberately platform-wide (unfilterable by design), so this is
   // the one route a ZERO-grant session (minted at callback time so Setup is reachable)
   // must not see — any GitHub user can complete the OAuth dance; only operators with at
@@ -592,6 +639,155 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
     .flatMap((p) => p.runs)
     .filter((r) => canAdminInstallation(session, r.installationId));
   return json(200, { ...buildHealth(counts, active), countsExact: exact });
+}
+
+// ---- reports (spec 04 § Reports) -------------------------------------------
+
+/**
+ * Repos this session may report on. Delegates to the report store so the catalog route and
+ * the executor cannot disagree about the authorization scope.
+ */
+async function resolveReportRepos(
+  session: SessionPayload,
+): Promise<{ repoId: number; repoFullName: string }[]> {
+  return resolveVisibleRepos(session);
+}
+
+/**
+ * Resolve a spec from query params and execute it.
+ *
+ * A ZERO-grant session is refused outright: it administers nothing, so every aggregate it
+ * could ask for is either empty or (if a filter were ever forgotten) platform-wide. Same
+ * reasoning as `/api/health`.
+ */
+async function runReportRoute(
+  session: SessionPayload,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  if (session.installations.length === 0) return problem(403, 'no installations');
+  const parsed = specFromQuery(q);
+  if (!parsed.ok) return problem(400, 'invalid report spec', parsed.errors);
+  return json(200, await executeReport(session, parsed.value));
+}
+
+/**
+ * Execute a validated spec. The ONLY place a report is computed — the manual picker, a
+ * shared URL and the model-proposed path all land here, so the authorization scope and the
+ * completeness reporting are identical for all three.
+ */
+async function executeReport(
+  session: SessionPayload,
+  spec: ReportSpec,
+): Promise<Record<string, unknown>> {
+  const fetched = await fetchReportRuns(session, spec);
+  const rows = applyFilters(fetched.runs, spec);
+  const result = computeReport(rows, spec, { complete: fetched.complete });
+  return {
+    ...result,
+    // Transparency block (ADR-033): what was actually resolved and read, so a generated view
+    // can show its provenance and be pinned as a plain URL without re-invoking the model.
+    resolved: {
+      query: specToQuery(spec),
+      repoCount: fetched.repoIds.length,
+      /** Restates that scope came from the session, never from the request or a model. */
+      scope: 'operator installations',
+    },
+  };
+}
+
+/** CSV/JSON export of the underlying job rows for a spec (not the aggregate). */
+async function exportReportRoute(
+  session: SessionPayload,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  if (session.installations.length === 0) return problem(403, 'no installations');
+  const parsed = specFromQuery(q);
+  if (!parsed.ok) return problem(400, 'invalid report spec', parsed.errors);
+  const spec = parsed.value;
+  const fetched = await fetchReportRuns(session, spec);
+  const rows = toExportRows(applyFilters(fetched.runs, spec));
+  const stamp = new Date().toISOString().slice(0, 10);
+  const filename = `lca-${spec.metric}-${stamp}`;
+  if ((q.format ?? 'csv') === 'json') {
+    return json(200, { rows, complete: fetched.complete }, {
+      headers: { 'Content-Disposition': `attachment; filename="${filename}.json"` },
+    });
+  }
+  return {
+    statusCode: 200,
+    raw: toCsv(rows),
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}.csv"`,
+      // Tenant-controlled strings ride in this body; never let a browser sniff it as HTML.
+      'X-Content-Type-Options': 'nosniff',
+    },
+  };
+}
+
+/**
+ * Natural-language report (Part C). The pipeline is deliberately one-directional:
+ *
+ *   operator question → model → JSON spec → validateReportSpec → executeReport
+ *
+ * The model's output is data. It is parsed, validated against the closed catalog, and either
+ * executed by the SAME deterministic code path as the manual picker or refused. Nothing it
+ * returns is evaluated or rendered, and it cannot influence which repos are read.
+ */
+async function askReportRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+): Promise<Reply> {
+  if (session.installations.length === 0) return problem(403, 'no installations');
+  if (!nlEnabled()) return problem(503, 'natural-language reports are not enabled');
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const body = (raw ?? {}) as { question?: unknown };
+  const question = checkQuestion(body.question);
+  if (!question.ok) return problem(400, question.message);
+
+  const decision = rateLimit(session.login);
+  if (!decision.allowed) {
+    return json(
+      429,
+      {
+        error:
+          decision.reason === 'container-budget'
+            ? 'report assistant budget exhausted — use the manual report picker'
+            : 'too many report questions — slow down',
+        reason: decision.reason,
+      },
+      decision.retryAfterSeconds
+        ? { headers: { 'Retry-After': String(decision.retryAfterSeconds) } }
+        : {},
+    );
+  }
+
+  const proposal = await proposeSpec(question.question);
+  // Audit every invocation with the actor (ADR-032). The question is operator-authored text,
+  // so only its length is logged — not its content.
+  console.log(
+    JSON.stringify({
+      msg: 'report question',
+      actor: session.login,
+      modelId: modelId(),
+      questionChars: question.question.length,
+      outcome: proposal.ok ? 'spec' : proposal.reason,
+      ...(proposal.ok ? { metric: proposal.spec.metric, dimension: proposal.spec.dimension } : {}),
+    }),
+  );
+  if (!proposal.ok) {
+    // 422, not 500: the request was fine, the assistant could not serve it. The UI shows the
+    // manual picker rather than an error page.
+    return json(proposal.reason === 'unavailable' ? 503 : 422, {
+      error: proposal.message,
+      reason: proposal.reason,
+      ...(proposal.errors ? { details: proposal.errors } : {}),
+      fallback: 'manual',
+    });
+  }
+  const report = await executeReport(session, proposal.spec);
+  return json(200, { ...report, source: { kind: 'model', modelId: proposal.modelId } });
 }
 
 /**
