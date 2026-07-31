@@ -51,6 +51,8 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
   flavor routing with signal upgrade, runner registers with the job's own labels.
 - Opt-in auto-rewrite PR (ADR-031): line-level `runs-on` edit, dry-run label preview in the
   console, three independent gates, branch+PR only. `contents:write` stays **off by default**.
+- **Flavor catalog expansion** — standard language flavors (`python`, `java`, `go`, `rust`) with a prebaked runner tool cache so `setup-*` actions short-circuit (ADR-039); flavor images request their catalog memory (ADR-038).
+- **Custom flavors** — per-installation bring-your-own image, merged over the built-in catalog (ADR-040), not routable until a smoke run proves it works (ADR-041).
 - Compat findings carry an actionable `fix`; adopt candidacy surfaced separately from compat
   level so it doesn't mask real problems.
 - Metrics as EMF + per-env alarms + X-Ray (ADR-032); cost estimate in Run detail **and** a
@@ -59,6 +61,7 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
   (cost left Runs per ADR-029; see spec 04 OQ-6). **Still open**: the Dashboard estimate is a
   fixed bounded sample of recent finished runs, deliberately not the windowed, groupable
   report ADR-029 defers to this screen.
+- Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
 - `dev`/`prod` config separation (ADR-033); runbook + quotas docs.
 - 🎯 **Exit criterion not yet verified**: a brand-new repo running unchanged in `adopt` mode
   needs a live-repo run. It is also what closes spec 03 OQ-4 (does `generate-jitconfig`
@@ -72,7 +75,8 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
 - Shared caching layer (EFS/S3) for package managers + Docker layers.
 - WebSocket live updates (vs polling).
 - Secrets Manager + rotation (vs SSM).
-- Custom per-repo images (`custom-*` flavors) self-serve.
+- Language-runtime signal inference (route a `pytest` job to `python` with no label — needs parser support for `setup-*` steps + a multi-runtime policy, ADR-039).
+- A `dotnet` flavor (deliberately excluded from the M5 standard set — largest snapshot, no verified consumer yet).
 - Multi-region / DR for the webhook endpoint.
 
 ## Cross-cutting risks

@@ -138,7 +138,13 @@ function cpDir(from, to) {
 }
 
 function buildFlavor(flavor, ctx) {
-  console.log(`\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.vcpu}vCPU/${flavor.memoryMb}MB) ===`);
+  // The operator-facing shape line. `vcpu` is DESCRIPTIVE only (ADR-038) — the API takes no
+  // vCPU request — so label it, or this log reads as "provisioned 4 vCPU" and re-creates the
+  // exact misattribution ADR-038 corrects in docs/VERIFY-M3.md.
+  console.log(
+    `\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.memoryMb}MB requested; ` +
+      `${flavor.vcpu} vCPU descriptive-only) ===`,
+  );
   if (flavor.arch !== 'arm64') {
     // AGENTS.md hard rule — microVMs are Graviton only.
     throw new Error(`flavor ${flavor.name} arch=${flavor.arch}; microVMs are arm64 only`);
@@ -193,6 +199,17 @@ function buildFlavor(flavor, ctx) {
     '--logging',
     JSON.stringify({ cloudWatch: { logGroup: `/aws/lambda/microvms/lca-${ENV}-${flavor.name}` } }),
   ];
+
+  // Resource + CPU shape (ADR-038). The GA API accepts memory ONLY:
+  // `--resources minimumMemoryInMiB` (single-element list) and `--cpu-configurations
+  // architecture=ARM_64` (whose only permitted value is ARM_64 — there is no vCPU knob, and
+  // `run-microvm` has no sizing parameter at all, so a VM's shape is fixed by its image).
+  // Before this was sent, every flavor was built at the service default and the catalog's
+  // memoryMb was inert — including for the 8 GB flavors.
+  if (flavor.memoryMb) {
+    commonArgs.push('--resources', `minimumMemoryInMiB=${flavor.memoryMb}`);
+  }
+  commonArgs.push('--cpu-configurations', 'architecture=ARM_64');
 
   // Extra OS capabilities for the guest (ADR-020). Default microVMs boot with an empty
   // capability set, a read-only /sys and no writable cgroup hierarchy, so a rootful Docker

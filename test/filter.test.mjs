@@ -1,7 +1,12 @@
 // Unit tests for the workflow_job claim filter + provision projection (src/ingest/filter.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { shouldClaim, toProvisionRequest, dedupeKey } from '../dist/src/ingest/filter.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const CLAIMED = ['lambda-ci', 'lambda-ci-docker'];
 
@@ -25,6 +30,45 @@ test('does not claim non-queued actions', () => {
 test('does not claim jobs without our label', () => {
   assert.equal(shouldClaim(job('queued', ['ubuntu-latest']), CLAIMED), false);
   assert.equal(shouldClaim(job('queued', []), CLAIMED), false);
+});
+
+// The claim gate is an ALLOWLIST consulted BEFORE flavor resolution, and its value comes from
+// `/lca/<env>/config/runner-labels` — seeded by hand from DEPLOY-M1, never published by the
+// build script. So a flavor can be perfectly implemented, imaged, and resolvable and still be
+// unreachable end-to-end: `shouldClaim` drops the webhook with 202 `claimed:false`, no runner
+// is provisioned, and the job sits queued on GitHub with no error in any log. That is exactly
+// what shipping the expanded standard set (ADR-039) without touching the seed would have done.
+test('a flavor label absent from the claim list is silently never claimed', () => {
+  // The failure mode, stated as a fact rather than a warning: this is why the seed matters.
+  assert.equal(shouldClaim(job('queued', ['self-hosted', 'lambda-ci-python']), CLAIMED), false);
+});
+
+test('the documented runner-labels seed claims EVERY catalog flavor label', () => {
+  // DEPLOY-M1 phase 0 is the only place an operator learns what to put in this parameter, so
+  // the command it prints must stay a superset of the catalog. Adding a flavor without
+  // extending that seed fails here instead of in a queued-forever job.
+  const catalog = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, 'microvm', 'flavors.json'), 'utf8'),
+  );
+  const deploy = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOY-M1.md'), 'utf8');
+  const seeded = [...deploy.matchAll(/--value '([^']*lambda-ci[^']*)'/g)]
+    .flatMap((m) => m[1].split(','))
+    .map((l) => l.trim())
+    .filter(Boolean);
+  assert.ok(seeded.length > 0, 'DEPLOY-M1 no longer shows a runner-labels seed command');
+  for (const flavor of catalog.flavors) {
+    assert.ok(
+      seeded.includes(flavor.label),
+      `DEPLOY-M1's runner-labels seed omits '${flavor.label}' (flavor ${flavor.name}) — jobs ` +
+        'with that label would be dropped by shouldClaim before resolution ever runs',
+    );
+    // ...and the seed must be a value the gate actually accepts.
+    assert.equal(
+      shouldClaim(job('queued', ['self-hosted', flavor.label]), seeded),
+      true,
+      `${flavor.label} should be claimed with the documented seed`,
+    );
+  }
 });
 
 test('projects a webhook event into a provision request', () => {
