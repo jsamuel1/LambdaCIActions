@@ -2,7 +2,7 @@ import type { RunRecord, RunStatus } from '../shared/types.js';
 import { ALL_STATUSES, billableSeconds, flavorRatePerMinute, flavorNames } from './views.js';
 
 /**
- * Reporting read model (spec 04 § Reports, ADR-043/032/033).
+ * Reporting read model (spec 04 § Reports, ADR-043/044/045).
  *
  * Everything here is **pure**: the closed report vocabulary, the spec validator, the folds
  * that turn run rows into series, the percentile maths and the CSV serializer. The DynamoDB

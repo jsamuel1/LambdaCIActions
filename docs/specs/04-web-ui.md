@@ -166,7 +166,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/reports/catalog` | Metric catalog + vocabulary + the operator's reportable repos + assistant availability | ✅ |
 | `GET /api/reports/run` | Execute a report spec from query params | ✅ |
 | `GET /api/reports/export` | CSV/JSON download of the underlying job rows (`format=csv\|json`) | ✅ |
-| `POST /api/reports/ask` | NL question → validated spec → rendered report (ADR-044/033) | ✅ |
+| `POST /api/reports/ask` | NL question → validated spec → rendered report (ADR-044/045) | ✅ |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)) | M5 |
 
 Run paths carry `repoId` because the run row's key is the `(repoId, runId, jobId)`
