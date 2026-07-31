@@ -114,8 +114,17 @@ function GithubAppCard({ data, reload }: { data: SettingsData; reload: () => voi
           <h4>Installations</h4>
           {!data.installations.length ? (
             <p className="muted">
-              The App is not installed anywhere yet. Install it on an org or user account to
-              onboard repositories.
+              {data.installationsHidden ? (
+                <>
+                  {data.installationsHidden} installation(s) are not shown — they belong to
+                  accounts you do not administer. Ask a platform administrator for the full list.
+                </>
+              ) : (
+                <>
+                  The App is not installed anywhere yet. Install it on an org or user account to
+                  onboard repositories.
+                </>
+              )}
             </p>
           ) : (
             <table>
@@ -148,6 +157,12 @@ function GithubAppCard({ data, reload }: { data: SettingsData; reload: () => voi
                 ))}
               </tbody>
             </table>
+          )}
+          {data.installations.length > 0 && (data.installationsHidden ?? 0) > 0 && (
+            <p className="muted">
+              {data.installationsHidden} further installation(s) are not shown — they belong to
+              accounts you do not administer.
+            </p>
           )}
         </>
       )}
@@ -517,7 +532,19 @@ function ImpactView({ impact }: { impact: LabelImpact }): JSX.Element {
         {impact.removed.length ? `removing ${impact.removed.join(', ')}; ` : ''}
         {impact.losing.length} job(s) would stop being claimed, {impact.gaining.length} would
         start.
-        {impact.truncated && ' (analysis covered the first 50 repos)'}
+        {/*
+          The two partial causes are reported separately: a repo-cap truncation hides repos past
+          the bound, while an unverified App linkage can hide whole INSTALLATIONS. Printing the
+          repo-cap wording for the second case would understate the blind spot on the operator's
+          only warning before a change that affects every tenant.
+        */}
+        {impact.partial?.repoCap && ' Analysis covered the first 50 repositories only.'}
+        {impact.partial?.unverifiedInstallations &&
+          ' The GitHub App linkage could not be verified, so this scan may be missing whole' +
+            ' installations — jobs in them are not listed.'}
+        {impact.truncated &&
+          !impact.partial &&
+          ' Analysis is partial — some affected jobs may not be listed.'}
       </p>
       {[
         ['No longer claimed', impact.losing],

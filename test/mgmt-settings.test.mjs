@@ -211,6 +211,37 @@ test('the impact scan drops the same repos Ingest refuses (mode off, not just di
   assert.equal(isRepoOptedOut(undefined), false, 'a missing row fails open');
 });
 
+test('the impact preview names WHICH bound made it partial, not just that it is partial', () => {
+  // The two causes are a different size of blind spot, and this preview is the operator's only
+  // warning before a change that takes effect for every tenant on the next webhook. A repo-cap
+  // truncation hides repos past the bound; an unverified linkage can hide whole INSTALLATIONS.
+  // Reporting one flag forces the UI to print a caveat that may understate the risk.
+  const repos = [
+    {
+      repoId: 1,
+      repoFullName: 'org/a',
+      analyses: [{ path: '.github/workflows/ci.yml', parsed: { jobs: [{ id: 'build', runs_on: ['lca-base'] }] } }],
+    },
+  ];
+  const capped = buildLabelImpact(['lca-base'], ['lca-docker'], repos, {
+    repoCap: true,
+    unverifiedInstallations: false,
+  });
+  assert.equal(capped.truncated, true);
+  assert.deepEqual(capped.partial, { repoCap: true, unverifiedInstallations: false });
+
+  const blind = buildLabelImpact(['lca-base'], ['lca-docker'], repos, {
+    repoCap: false,
+    unverifiedInstallations: true,
+  });
+  assert.equal(blind.truncated, true, 'an unverifiable linkage is still "do not read as complete"');
+  assert.deepEqual(blind.partial, { repoCap: false, unverifiedInstallations: true });
+
+  const complete = buildLabelImpact(['lca-base'], ['lca-docker'], repos);
+  assert.equal(complete.truncated, false);
+  assert.deepEqual(complete.partial, { repoCap: false, unverifiedInstallations: false });
+});
+
 test('hostedLabelsIn flags claimed GitHub-hosted names', () => {
   assert.deepEqual(hostedLabelsIn(['lca-base', 'Ubuntu-Latest'], HOSTED_LABELS), ['Ubuntu-Latest']);
 });
@@ -598,6 +629,7 @@ const SETTINGS_FIXTURE = {
     { installationId: 11, accountLogin: 'acme', suspended: false, known: true },
     { installationId: 22, accountLogin: 'rival-corp', suspended: false, known: true },
   ],
+  installationsHidden: 0,
   runnerLabels: { labels: ['lca-base'], unset: false, hostedLabels: [] },
   webhook: buildWebhookHealth({}),
   flavors: [],
@@ -626,6 +658,40 @@ test('a zero-grant session sees no installations and no audit trail', () => {
   });
   assert.deepEqual(scoped.installations, []);
   assert.deepEqual(scoped.recentChanges, [], 'the operator audit trail is admin-only');
+});
+
+test('scoping reports how many installations it withheld', () => {
+  // Without the count the screen cannot tell "installed nowhere" from "installed, but not on an
+  // account you administer" — and a zero-grant session (minted on purpose so Setup is reachable)
+  // would be shown the first claim while the second is true. The count names no account and no
+  // id, so it leaks nothing the scoping exists to hide.
+  const partial = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: false,
+    canSeeInstallation: (id) => id === 11,
+  });
+  assert.equal(partial.installationsHidden, 1);
+
+  const none = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: false,
+    canSeeInstallation: () => false,
+  });
+  assert.equal(none.installationsHidden, 2, 'an empty list must still say the list was scoped');
+
+  const admin = scopeSettingsView(SETTINGS_FIXTURE, {
+    isPlatformAdmin: true,
+    canSeeInstallation: () => false,
+  });
+  assert.equal(admin.installationsHidden, 0, 'an admin sees everything, so nothing is withheld');
+
+  const genuinelyEmpty = scopeSettingsView(
+    { ...SETTINGS_FIXTURE, installations: [] },
+    { isPlatformAdmin: false, canSeeInstallation: () => false },
+  );
+  assert.equal(
+    genuinelyEmpty.installationsHidden,
+    0,
+    'an App installed nowhere must NOT read as scoped — that claim is then true',
+  );
 });
 
 test('environment-level facts stay visible to every session', () => {

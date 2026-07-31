@@ -551,6 +551,15 @@ export interface SettingsView {
   /** App id recorded in config, so a mismatch with `app.appId` is visible. */
   configuredAppId?: string;
   installations: AppInstallationView[];
+  /**
+   * How many installations were withheld from `installations` because this session does not
+   * administer them (ADR-035 scoping).
+   *
+   * Without it the client cannot tell "the App is installed nowhere" from "the App is installed,
+   * but not on an account you administer" — and a zero-grant session (minted on purpose so Setup
+   * is reachable) would be shown the first claim while the second is true.
+   */
+  installationsHidden: number;
   runnerLabels: RunnerLabelsView;
   webhook: WebhookHealthView;
   flavors: FlavorView[];
@@ -677,6 +686,20 @@ export interface LabelImpactView {
   gaining: LabelImpactJob[];
   /** True when the analysis is based on fewer workflows than exist (bounded scan). */
   truncated: boolean;
+  /**
+   * WHY the analysis is partial — the two causes are not interchangeable and the operator has to
+   * be told them apart, because this preview is their only warning before a change that takes
+   * effect for every tenant on the next webhook:
+   *
+   *  - `repoCap`: the scan stopped at the repo bound, so jobs in the repos past it are unlisted.
+   *  - `unverifiedInstallations`: the App linkage could not be verified, so the installation
+   *    enumeration fell back to the index plus this session's grants. Whole INSTALLATIONS may be
+   *    missing, not merely repos past a cap — a materially larger blind spot.
+   *
+   * `truncated` stays as the single "do not read this as complete" flag; this says which caveat
+   * to show.
+   */
+  partial: { repoCap: boolean; unverifiedInstallations: boolean };
 }
 
 export interface LabelImpactJob {
@@ -699,7 +722,10 @@ export function buildLabelImpact(
   current: string[],
   proposed: string[],
   analyses: { repoId: number; repoFullName: string; analyses: WorkflowAnalysisRecord[] }[],
-  truncated = false,
+  partial: { repoCap: boolean; unverifiedInstallations: boolean } = {
+    repoCap: false,
+    unverifiedInstallations: false,
+  },
 ): LabelImpactView {
   const cur = new Set(current.map((l) => l.toLowerCase()));
   const next = new Set(proposed.map((l) => l.toLowerCase()));
@@ -740,7 +766,8 @@ export function buildLabelImpact(
     removed: lower(current).filter((l) => !next.has(l)),
     losing,
     gaining,
-    truncated,
+    truncated: partial.repoCap || partial.unverifiedInstallations,
+    partial,
   };
 }
 
@@ -772,10 +799,15 @@ export function scopeSettingsView<T extends SettingsView>(
   view: T,
   opts: { isPlatformAdmin: boolean; canSeeInstallation: (installationId: number) => boolean },
 ): T {
-  if (opts.isPlatformAdmin) return view;
+  if (opts.isPlatformAdmin) return { ...view, installationsHidden: 0 };
+  const visible = view.installations.filter((i) => opts.canSeeInstallation(i.installationId));
   return {
     ...view,
-    installations: view.installations.filter((i) => opts.canSeeInstallation(i.installationId)),
+    installations: visible,
+    // The COUNT is not itself cross-tenant data (it names no account and no id), and withholding
+    // it is what makes the screen lie: an operator whose grants cover none of this environment's
+    // installations would otherwise be told the App is installed nowhere.
+    installationsHidden: view.installations.length - visible.length,
     recentChanges: [],
   };
 }

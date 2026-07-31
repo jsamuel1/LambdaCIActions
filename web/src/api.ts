@@ -268,6 +268,13 @@ export interface LabelImpact {
   losing: LabelImpactJob[];
   gaining: LabelImpactJob[];
   truncated: boolean;
+  /**
+   * Which bound made the analysis partial. The two are a different size of blind spot —
+   * `repoCap` means "repos past the cap are unlisted", while `unverifiedInstallations` means
+   * whole installations may be missing — so the UI must not print one caveat for both.
+   * Optional for forward/backward compatibility with an API that predates the split.
+   */
+  partial?: { repoCap: boolean; unverifiedInstallations: boolean };
 }
 
 /**
@@ -282,6 +289,11 @@ export interface Settings {
   appVerifyError?: string;
   configuredAppId?: string;
   installations: AppInstallation[];
+  /**
+   * Installations withheld because this session does not administer them. Non-zero means the
+   * visible list is a subset — the UI must not report "installed nowhere" from an empty list.
+   */
+  installationsHidden?: number;
   runnerLabels: RunnerLabels;
   webhook: WebhookHealth;
   flavors: Flavor[];

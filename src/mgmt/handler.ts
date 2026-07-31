@@ -869,6 +869,8 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     ...(linkage?.verifyError ? { appVerifyError: linkage.verifyError } : {}),
     ...(linkage?.configuredAppId ? { configuredAppId: linkage.configuredAppId } : {}),
     installations,
+    // Pre-scoping value; `scopeSettingsView` recomputes it from what it actually withheld.
+    installationsHidden: 0,
     runnerLabels: {
       labels,
       unset: labels.length === 0,
@@ -1074,7 +1076,10 @@ async function putRunnerLabelsRoute(
     detail: scrubForOperator(
       `from [${current.join(', ')}] to [${parsed.value.labels.join(', ')}]; ` +
         `${impact.losing.length} job(s) no longer claimed, ${impact.gaining.length} newly claimed` +
-        (impact.truncated ? ' (impact scan truncated)' : ''),
+        (impact.partial.repoCap ? ' (impact scan hit the repo cap)' : '') +
+        (impact.partial.unverifiedInstallations
+          ? ' (App linkage unverified — installations may be missing from the scan)'
+          : ''),
     ),
   }).catch((err) =>
     console.error(JSON.stringify({ msg: 'label audit write failed', error: errMsg(err) })),
@@ -1144,9 +1149,10 @@ async function labelImpact(
   const installs = await listInstallations(candidates).catch(() => []);
   const repos = await collectImpactRepos(installs, (id) => listRepos(id));
   // Two independent reasons the scan can be partial: the repo-count bound, and an unverifiable
-  // App linkage that left the installation enumeration incomplete. Either one means "there may
-  // be affected jobs not listed here", which is the single thing `truncated` tells the client.
-  const truncated = repos.length > MAX_IMPACT_REPOS || !verified;
+  // App linkage that left the installation enumeration incomplete. Both mean "there may be
+  // affected jobs not listed here", but they are NOT the same size of blind spot, so they are
+  // reported separately (`impact.partial`) rather than folded into one flag the UI must guess at.
+  const truncatedByCap = repos.length > MAX_IMPACT_REPOS;
   const scanned = repos.slice(0, MAX_IMPACT_REPOS);
   const withAnalyses = await Promise.all(
     scanned.map(async (r) => ({
@@ -1154,7 +1160,10 @@ async function labelImpact(
       analyses: (await listWorkflowAnalyses(r.repoId).catch(() => [])) as WorkflowAnalysisRecord[],
     })),
   );
-  return buildLabelImpact(current, proposed, withAnalyses, truncated);
+  return buildLabelImpact(current, proposed, withAnalyses, {
+    repoCap: truncatedByCap,
+    unverifiedInstallations: !verified,
+  });
 }
 
 /**

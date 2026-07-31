@@ -213,6 +213,12 @@ cross-referenced against our install store so a **missed `installation` webhook*
 App the key authenticates as is called out explicitly — that is the signature of a
 half-finished rotation.
 
+The installation list is scoped to the session's own grants (ADR-035), so the payload also
+carries `installationsHidden` — how many were withheld. Without it an empty list is ambiguous,
+and the screen would tell a zero-grant operator "the App is not installed anywhere" while it is
+in fact installed on accounts they do not administer. The count names no account and no id, so
+it discloses nothing the scoping exists to hide.
+
 ### 2. Runner labels
 
 The **effective** claim list (the value Ingest reads per delivery), not the parameter path.
@@ -245,6 +251,14 @@ counted, because Ingest fails open there. The scan is bounded to 50 repos and re
 `truncated`; the *enumeration* stops as soon as it holds more repos than it will scan, so a
 many-installation environment does not pay one `listRepos` query per installation inside the
 console's 29 s API Gateway integration cap.
+
+`truncated` is accompanied by `partial: { repoCap, unverifiedInstallations }`, because the two
+causes are a different size of blind spot and the UI must not print one caveat for both: the
+repo cap hides repositories past the bound, while an unverifiable App linkage forces the
+installation enumeration back onto the index plus this session's grants and can therefore hide
+**whole installations**. This preview is the operator's only warning before a change that takes
+effect for every tenant on the next webhook, so the wording has to say which one happened
+(pinned in `test/mgmt-settings.test.mjs`).
 
 "Very next delivery" is enforced, not assumed: Ingest reads the label parameter with a 30 s cache
 TTL (`RUNNER_LABELS_TTL_MS`) rather than `getParam`'s 5-minute default, which would otherwise
