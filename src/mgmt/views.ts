@@ -35,6 +35,10 @@ export interface RunView {
  *
  * Reference point (README): 2 vCPU / 4 GB ≈ $0.0044/min. Splitting that across the two
  * dimensions with AWS's usual ~2:1 vCPU:GB weighting gives the per-unit rates below.
+ *
+ * CAVEAT (ADR-038): only `memoryMb` is actually requested from the API; `vcpu` is
+ * descriptive. This therefore remains an **estimate** — every surface that shows it must
+ * label it as one, as `estimateCostUsd` does.
  */
 export const VCPU_USD_PER_MINUTE = 0.0011;
 export const GB_USD_PER_MINUTE = 0.00055;
@@ -43,6 +47,7 @@ interface FlavorDef {
   name: string;
   label: string;
   arch: string;
+  /** DESCRIPTIVE only — the API exposes no vCPU request (ADR-038). */
   vcpu: number;
   memoryMb: number;
   capabilities: string[];

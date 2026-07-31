@@ -5,11 +5,17 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
  *
  * Resolution order (first match wins), per this slice (M3-S1):
  *   1. Repo FlavorMap override (DynamoDB)   — explicit `label → flavor`.
- *   2. Explicit LCA label                   — `lambda-ci`, `lambda-ci-node`, `lambda-ci-docker`
- *                                             (most-specific label wins).
+ *   2. Explicit LCA label                   — `lambda-ci`, `lambda-ci-node`, `lambda-ci-docker`,
+ *                                             `lambda-ci-python`, `lambda-ci-java`,
+ *                                             `lambda-ci-go`, `lambda-ci-rust`
+ *                                             (most-specific label wins; equally specific
+ *                                             labels break the tie by flavor name — see
+ *                                             `explicitLabelMatch`).
  *   3. Signal-based upgrade                 — if the job needs a capability the resolved flavor
  *                                             lacks (e.g. Docker), upgrade to the smallest flavor
- *                                             that provides it.
+ *                                             that provides it. This REPLACES the flavor, so a
+ *                                             language toolchain is lost — the reason names it and
+ *                                             `compat` warns (`toolchain-dropped`).
  *   4. Fallback                             — the repo's operator-chosen `defaultFlavor`
  *                                             (console, spec 04) if set, else `base`; record a
  *                                             warning reason.
@@ -26,7 +32,13 @@ export interface FlavorDef {
   name: string;
   label: string;
   arch: string;
+  /**
+   * DESCRIPTIVE only — the GA `lambda-microvms` API exposes no vCPU request (ADR-038).
+   * Indicates the shape a flavor is intended for, and acts as the primary sort key when
+   * picking the smallest flavor with a capability. Never present this as provisioned capacity.
+   */
   vcpu: number;
+  /** Requested at image-build time as `--resources minimumMemoryInMiB` (ADR-038). */
   memoryMb: number;
   capabilities: string[];
   /**
@@ -40,6 +52,32 @@ export interface FlavorDef {
 
 const FLAVORS: FlavorDef[] = (flavorsCatalog as { flavors: FlavorDef[] }).flavors;
 const DEFAULT_FLAVOR = 'base';
+
+/**
+ * The closed capability vocabulary (ADR-041 static gate). Capabilities are not free-form
+ * strings: they drive `smallestWithCapability` upgrades here and the `docker-missing` compat
+ * message in `src/ingest/compat.ts`, so an unrecognized capability would be silently inert.
+ * Registering a custom flavor validates against this list; adding a capability means teaching
+ * the resolver and/or the compat gate what it means.
+ */
+export const KNOWN_CAPABILITIES: readonly string[] = [
+  'docker',
+  'node',
+  'python',
+  'java',
+  'go',
+  'rust',
+];
+
+/** True when every capability in `caps` is drawn from the known vocabulary. */
+export function areCapabilitiesKnown(caps: readonly string[]): boolean {
+  return caps.every((c) => KNOWN_CAPABILITIES.includes(c));
+}
+
+/** Every flavor in the catalog (read-only view; the JSON is compiled in at build time). */
+export function allFlavors(): readonly FlavorDef[] {
+  return FLAVORS;
+}
 
 /** Signals extracted from a job (spec 03 § parsing model → step_signals). */
 export interface JobSignals {
@@ -68,10 +106,58 @@ export interface FlavorResolution {
   flavor: string;
   /** Human-readable reason describing which rule matched. */
   reason: string;
+  /**
+   * The flavor selected BEFORE a signal upgrade replaced it, when one did (step 3). Absent
+   * when no upgrade happened.
+   *
+   * Load-bearing for `compat`: the upgrade is a REPLACEMENT (flavors carry one toolchain
+   * each, ADR-039), and `compat` can only re-derive what was requested from `runs_on` labels.
+   * That misses every selection made WITHOUT a catalog label — a FlavorMap entry
+   * (`ubuntu-latest → python`) or the repo's `defaultFlavor` — so a `services:` job on either
+   * of those paths silently lost its toolchain with no `toolchain-dropped` warning. Carrying
+   * the pre-upgrade name makes the loss visible regardless of which rule selected it.
+   */
+  replaced?: string;
 }
 
 function byName(name: string): FlavorDef | undefined {
   return FLAVORS.find((f) => f.name === name);
+}
+
+/**
+ * Resolve the winning catalog flavor for a job's (lower-cased) `runs-on` labels.
+ *
+ * "Most specific wins" was a length comparison while the catalog held exactly one
+ * `lambda-ci-<name>` label per length. With the expanded standard set (ADR-039) that is no
+ * longer true: `lambda-ci-python` and `lambda-ci-docker` are both 16 characters, and
+ * `lambda-ci-node`/`-java`/`-rust` are all 14. A pure length sort leaves those ties to
+ * `Array#sort` stability, i.e. to the ORDER OF ENTRIES IN `flavors.json` — so
+ * `runs-on: [self-hosted, lambda-ci-python, lambda-ci-docker]` routed to `python` only
+ * because `python` happens to be listed before `docker`, and reordering the catalog (or
+ * inserting a flavor) would silently re-route live jobs.
+ *
+ * So the tie-break is explicit and catalog-order-independent: longest label first, then
+ * flavor NAME ascending. That also lands the safer side of the one collision that matters
+ * today — a job labelled both `lambda-ci-python` and `lambda-ci-docker` gets `docker`, where
+ * a missing daemon fails loudly at the first `docker` step, rather than `python`, where the
+ * job's docker steps die with a socket error the labels said should work.
+ *
+ * Returns the match plus every equally specific label that also matched, so the caller can
+ * record the ambiguity in the resolution reason instead of hiding it.
+ */
+function explicitLabelMatch(
+  lower: string[],
+): { def: FlavorDef; ambiguousWith: string[] } | undefined {
+  const matches = FLAVORS.filter((f) => lower.includes(f.label.toLowerCase())).sort(
+    (a, b) => b.label.length - a.label.length || a.name.localeCompare(b.name),
+  );
+  if (matches.length === 0) return undefined;
+  const [def] = matches;
+  const ambiguousWith = matches
+    .slice(1)
+    .filter((f) => f.label.length === def.label.length)
+    .map((f) => f.label);
+  return { def, ambiguousWith };
 }
 
 /** Smallest (by vcpu, then memory) flavor that advertises the given capability. */
@@ -91,9 +177,21 @@ function applySignalUpgrade(current: FlavorResolution, signals?: JobSignals): Fl
   if (def?.capabilities.includes('docker')) return current;
   const upgraded = smallestWithCapability('docker');
   if (!upgraded) return current;
+  // The upgrade is a REPLACEMENT, not an addition: flavors are one-toolchain-per-image
+  // (ADR-039), so upgrading `python` → `docker` for a `services:` block hands the job an
+  // image with a daemon and NO Python. Name the capabilities the swap drops, so the reason
+  // on the Repo detail screen and in the provision log says what happened instead of
+  // presenting the upgrade as pure gain. `compat` raises the matching warning.
+  const lost = (def?.capabilities ?? []).filter((c) => !upgraded.capabilities.includes(c));
+  const lostNote = lost.length
+    ? ` (drops ${lost.map((c) => `'${c}'`).join(', ')} — flavors carry one toolchain each)`
+    : '';
   return {
     flavor: upgraded.name,
-    reason: `${current.reason}; upgraded to '${upgraded.name}' for docker capability`,
+    reason: `${current.reason}; upgraded to '${upgraded.name}' for docker capability${lostNote}`,
+    // Record what was replaced so `compat` can warn even when no catalog LABEL named it
+    // (FlavorMap / defaultFlavor selections carry no `lambda-ci-<lang>` label to re-derive from).
+    replaced: current.flavor,
   };
 }
 
@@ -120,13 +218,20 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     }
   }
 
-  // 2. Explicit LCA label — prefer the most specific (longest) matching label.
-  const explicit = [...FLAVORS]
-    .sort((a, b) => b.label.length - a.label.length)
-    .find((f) => lower.includes(f.label.toLowerCase()));
+  // 2. Explicit LCA label — prefer the most specific (longest) matching label, breaking
+  //    equal-length ties by flavor name so the outcome never depends on catalog order.
+  const explicit = explicitLabelMatch(lower);
   if (explicit) {
+    const ambiguity = explicit.ambiguousWith.length
+      ? ` (equally specific label(s) ${explicit.ambiguousWith
+          .map((l) => `'${l}'`)
+          .join(', ')} also present; resolved by flavor name)`
+      : '';
     return applySignalUpgrade(
-      { flavor: explicit.name, reason: `explicit LCA label '${explicit.label}'` },
+      {
+        flavor: explicit.def.name,
+        reason: `explicit LCA label '${explicit.def.label}'${ambiguity}`,
+      },
       opts.signals,
     );
   }

@@ -99,7 +99,7 @@ only *referenced* by CDK.
 | `/lca/<env>/mgmt/session-secret` | SecureString | Console session cookie signing key (ADR-022) |
 | `/lca/<env>/github/app-id` | String | App ID |
 | `/lca/<env>/config/image-arn-<flavor>` | String | Published by build script |
-| `/lca/<env>/config/runner-labels` | String | Claimed labels |
+| `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Must list every flavor label in `microvm/flavors.json` (plus any mapped label); a missing one means those jobs are never claimed. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
 | `/lca/<env>/config/table-name` | String | Published by `DataStack` |
 
 `scripts/create-github-app.mjs` writes the GitHub App credentials (app id, PEM, webhook
@@ -195,10 +195,17 @@ Rough, per reference (validate in M1):
 
 | Item | Rate |
 |---|---|
-| microVM 2 vCPU / 4 GB | ≈ \$0.0044 / min (per-second billed) |
+| microVM ≈ 2 vCPU / 4 GB | ≈ \$0.0044 / min (per-second billed) |
 | Snapshot storage/IO | ≈ \$1.50 / month / flavor image |
 | Lambda + API GW + SQS + Dynamo | negligible at low volume |
 | CloudFront + S3 (UI) | negligible |
+
+> **Sizing caveat (ADR-038)**: the vCPU half of that reference shape is **not requestable** —
+> `create-microvm-image` accepts `--resources minimumMemoryInMiB` and
+> `--cpu-configurations architecture=ARM_64` only, and `run-microvm` takes no sizing parameter
+> at all. Memory is the one dimension the build script requests (and the one the microVM quota
+> is denominated in); the vCPU figure is a reference point for the rate, not a provisioned
+> shape. Treat every derived cost as an estimate.
 
 Compared to GitHub `linux_2_core_arm` ≈ \$0.005/min → roughly a wash, favoring many short
 jobs (per-second vs per-minute). Real win is **latency** + **VPC access**, not raw price.

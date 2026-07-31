@@ -47,6 +47,8 @@ Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md)
 ## M5 — Drop-in & polish
 True zero-edit adoption + hardening.
 - `adopt` mode (standard-label mapping); opt-in auto-rewrite PR.
+- **Flavor catalog expansion** — standard language flavors (`python`, `java`, `go`, `rust`) with a prebaked runner tool cache so `setup-*` actions short-circuit (ADR-039); flavor images request their catalog memory (ADR-038).
+- **Custom flavors** — per-installation bring-your-own image, merged over the built-in catalog (ADR-040), not routable until a smoke run proves it works (ADR-041).
 - Compat guidance surfaced with actionable fixes.
 - Metrics/alarms/X-Ray; cost estimates in Run detail.
 - **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
@@ -62,7 +64,8 @@ True zero-edit adoption + hardening.
 - Shared caching layer (EFS/S3) for package managers + Docker layers.
 - WebSocket live updates (vs polling).
 - Secrets Manager + rotation (vs SSM).
-- Custom per-repo images (`custom-*` flavors) self-serve.
+- Language-runtime signal inference (route a `pytest` job to `python` with no label — needs parser support for `setup-*` steps + a multi-runtime policy, ADR-039).
+- A `dotnet` flavor (deliberately excluded from the M5 standard set — largest snapshot, no verified consumer yet).
 - Multi-region / DR for the webhook endpoint.
 
 ## Cross-cutting risks
