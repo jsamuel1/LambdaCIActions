@@ -168,8 +168,9 @@ export interface MintFailureClassification {
  * Matching the BODY, not the bare status, is deliberate. A 403 is also how GitHub reports a
  * revoked installation or an App missing a permission, which is genuinely permanent — reading
  * every 403 as transient would retry those into the DLQ instead of telling the operator what
- * to fix. `githubJson` puts the first 300 bytes of the response body in the message, which is
- * where these phrases live.
+ * to fix. `githubJson` puts GitHub's own `message` field (redacted, first 200 chars) in the
+ * error message, which is where these phrases live — it deliberately does NOT echo the raw
+ * response body, since a 4xx body can quote a submitted credential back (ADR-034).
  */
 const RATE_LIMIT_BODY =
   /rate limit|secondary rate|abuse detection|too many requests|retry.?after/i;

@@ -50,16 +50,26 @@ const tokenCache = new Map<number, CachedToken>();
 /**
  * A non-2xx response from the GitHub REST API, carrying the status as DATA.
  *
- * The message is deliberately unchanged (`GitHub <path> failed HTTP <status>: <body>`) because
- * several callers still match on that text (`isNotFound`, `classifyMintFailure`, the
- * `ensureBranch` existence probe). The typed `status` exists so the auto-rewrite λ can tell a
- * benign "no commits between base and head" 422 apart from a 403 (missing
- * `pull_requests:write`), a 429 (rate limited) or a 5xx — those must fail loudly and retry
- * rather than be reported to the operator as "nothing to do" (ADR-031).
+ * The message shape is stable (`GitHub <path> failed HTTP <status>: <detail>`) because several
+ * callers still match on that text (`isNotFound`, `classifyMintFailure`, the `ensureBranch`
+ * existence probe). What `<detail>` CONTAINS narrowed in ADR-034: it is GitHub's own `message`
+ * field, literal-redacted and capped, plus the request id — never the raw response body, which
+ * a 4xx can quote a submitted credential back into. The phrases those callers match on live in
+ * `message`, so the narrowing is behaviour-preserving for them.
+ *
+ * The typed `status` exists so the auto-rewrite λ can tell a benign "no commits between base
+ * and head" 422 apart from a 403 (missing `pull_requests:write`), a 429 (rate limited) or a
+ * 5xx — those must fail loudly and retry rather than be reported to the operator as "nothing
+ * to do" (ADR-031).
  */
 export class GithubApiError extends Error {
   readonly status: number;
   readonly responseText: string;
+  /**
+   * Parsed response body. Left UNSET by `githubJson` (ADR-034): the body is the leak vector
+   * this class's redaction exists to close, so nothing populates it today. The field remains
+   * for callers that construct the error themselves with a body they know to be safe.
+   */
   readonly responseBody: unknown;
   constructor(path: string, status: number, responseText: string, responseBody?: unknown) {
     super(`GitHub ${path} failed HTTP ${status}: ${responseText}`);
