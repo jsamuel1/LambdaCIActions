@@ -366,7 +366,8 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   `runningAt → updatedAt` instead of total wall clock and makes queue-to-start latency a real
   metric. Pre-M5 rows have no watermark and are reported as coverage, never as zero.
 - **Chart library** → **ECharts (Apache-2.0), pinned exact**, ADR-034. Highcharts was requested
-  but is commercially licensed and no entitlement covering this repo could be confirmed.
+  but is commercially licensed; the project owner declined to license it, so it is rejected
+  outright rather than pending a check. Future charting extends the ECharts wrapper.
 - **Generative UI shape** → **constrained spec emission**, ADR-033. The model selects from a
   closed catalog; no model-authored JS/JSX/HTML/query is ever evaluated or rendered.
 - **Report model** → **Claude 3.5 Sonnet on Bedrock**, from the existing Mgmt λ, with

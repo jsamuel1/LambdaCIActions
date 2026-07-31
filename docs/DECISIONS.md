@@ -1451,16 +1451,21 @@ payloads: model-authored queries, render payloads, scope-widening fields, halluc
 truncated JSON, and candidate arrays.
 
 ## ADR-034 — Charts: ECharts (Apache-2.0), not Highcharts (M5)
-**Status**: Accepted (v1)
+**Status**: Accepted (v1) · **settled** — Highcharts is not being licensed for this project
 **Context**: the Reports screen needs bar / stacked-bar / line charts. Highcharts was the
 initial request. Highcharts is **commercially licensed** for non-personal use — unlike
-Chart.js, ECharts or Recharts it is not MIT/BSD — and no Amazon-acceptable entitlement covering
-this repo could be confirmed. The SPA also had zero chart dependencies and a deliberately lean
-runtime dep set (react + react-dom only), and is served as a static S3/CloudFront bundle.
+Chart.js, ECharts or Recharts it is not MIT/BSD. The call was put to the project owner
+explicitly and the answer was **no Highcharts license**, so the licensed option is off the
+table rather than merely unconfirmed. The SPA also had zero chart dependencies and a
+deliberately lean runtime dep set (react + react-dom only), and is served as a static
+S3/CloudFront bundle.
 **Decision**: **Apache ECharts, pinned exact (`echarts@5.5.1`)**, imported per chart type
 (`echarts/core` + `BarChart`/`LineChart` + only the components used) rather than via the barrel,
 and rendered with the **SVG** renderer. Highcharts is rejected on licensing; the decision is
-recorded here rather than quietly vendoring a licensed library.
+recorded here rather than quietly vendoring a licensed library. **This is not a
+revisit-if-convenient item**: adopting Highcharts later would require a license decision, not
+just a dependency swap, so any future charting work should extend the ECharts wrapper in
+`web/src/screens/ReportChart.tsx`.
 **Why SVG over canvas**: the console's CSP is `default-src 'none'` with `style-src 'self'`
 (ADR-022) and the SVG path touches far less inline styling, and SVG text stays legible when an
 operator screenshots a report into a ticket. Chart height lives in `styles.css`, not a React
