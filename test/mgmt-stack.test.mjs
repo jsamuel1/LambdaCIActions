@@ -9,6 +9,7 @@ import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { DataStack } from '../dist/lib/data-stack.js';
 import { MgmtStack } from '../dist/lib/mgmt-stack.js';
+import { envConfig } from '../dist/lib/env-config.js';
 
 function synth() {
   const app = new App();
@@ -22,6 +23,7 @@ function synth() {
     discoveryQueueUrl: 'https://sqs.us-west-2.amazonaws.com/123456789012/lca-test-discovery',
     discoveryQueueArn: 'arn:aws:sqs:us-west-2:123456789012:lca-test-discovery',
     publicOrigin: 'https://console.example.com',
+    config: envConfig('test'),
   });
   return Template.fromStack(mgmt);
 }

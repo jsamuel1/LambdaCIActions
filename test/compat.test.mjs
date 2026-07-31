@@ -275,6 +275,51 @@ test('no upgrade means no `replaced` field, and no warning from it', () => {
   assert.equal(c.messages.length, 0);
 });
 
+test('adopt mode never trips `toolchain-dropped`, on any standard label', () => {
+  // The ADR-030 × ADR-039 interaction, pinned because the two shipped on separate branches and
+  // nothing else asserts they compose. An adopt-mode job never named a toolchain, so it cannot
+  // have one dropped, and the gate must stay silent on BOTH of its sources:
+  //   - `ubuntu-latest` is not a catalog label → CAPABILITIES_BY_LABEL contributes nothing;
+  //   - a docker upgrade sets `replaced: 'base'`, and base advertises [] → the `replaced`
+  //     source contributes nothing either.
+  // If this test fails, `ADOPT_LABEL_FLAVORS` has been pointed at a flavor that advertises a
+  // capability, and every adopted repo with a `services:` block just went yellow for a
+  // toolchain its workflow never asked for — destroying the compat signal spec 03 relies on.
+  for (const label of ['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-20.04']) {
+    for (const needs_docker of [false, true]) {
+      const r = resolveFlavor([label], { mode: 'adopt', signals: { needs_docker } });
+      assert.equal(r.flavor, needs_docker ? 'docker' : 'base', `${label}: routes as expected`);
+      const c = analyzeCompat(job({ runs_on: [label], needs_docker }), r);
+      assert.equal(
+        c.messages.some((x) => x.code === 'toolchain-dropped'),
+        false,
+        `${label} (needs_docker=${needs_docker}) must not warn about a dropped toolchain`,
+      );
+      assert.equal(c.level, 'ok', `${label} (needs_docker=${needs_docker}) stays green`);
+    }
+  }
+});
+
+test('adopt mode still warns when an explicit label DID name a toolchain', () => {
+  // The counterpart: adopt mode is not a blanket suppression. A repo in adopt mode whose job
+  // carries an explicit `lambda-ci-python` label resolves by the explicit-label rule (chain
+  // step 2, above adopt's step 3), so a docker upgrade drops a toolchain that WAS requested
+  // and must warn exactly as it does in label mode.
+  const r = resolveFlavor(['ubuntu-latest', 'lambda-ci-python'], {
+    mode: 'adopt',
+    signals: { needs_docker: true },
+  });
+  assert.equal(r.flavor, 'docker');
+  assert.equal(r.replaced, 'python', 'explicit label won over the adopt map');
+  const c = analyzeCompat(
+    job({ runs_on: ['ubuntu-latest', 'lambda-ci-python'], needs_docker: true }),
+    r,
+  );
+  const m = c.messages.find((x) => x.code === 'toolchain-dropped');
+  assert.ok(m, 'an explicitly requested toolchain that is dropped must still warn in adopt mode');
+  assert.match(m.text, /'python'/);
+});
+
 // 9. multiple rules → worst level wins, all messages present.
 test('block + docker-missing folds to block with both messages', () => {
   const r = analyzeCompat(

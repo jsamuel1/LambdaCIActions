@@ -56,7 +56,7 @@ export function validateRepoPatch(input: unknown): ValidationResult<RepoConfigPa
   if (!isPlainObject(input)) return { ok: false, errors: ['body must be a JSON object'] };
   const errors: string[] = [];
   const patch: RepoConfigPatch = {};
-  const allowed = new Set(['enabled', 'mode', 'defaultFlavor', 'flavorMap']);
+  const allowed = new Set(['enabled', 'mode', 'defaultFlavor', 'flavorMap', 'rewriteEnabled']);
 
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) errors.push(`unknown field "${key}"`);
@@ -90,9 +90,18 @@ export function validateRepoPatch(input: unknown): ValidationResult<RepoConfigPa
     if (!fm.ok) errors.push(...fm.errors);
     else patch.flavorMap = fm.value;
   }
+  if (input.rewriteEnabled !== undefined) {
+    // Per-repo opt-in to the auto-rewrite PR (ADR-031). Accepting it here does NOT grant
+    // anything on its own: the rewrite λ also requires the deployment-wide flag, and GitHub
+    // still enforces whether the App holds `contents:write`.
+    if (typeof input.rewriteEnabled !== 'boolean') errors.push('rewriteEnabled must be a boolean');
+    else patch.rewriteEnabled = input.rewriteEnabled;
+  }
 
   if (!errors.length && Object.keys(patch).length === 0) {
-    errors.push('body must set at least one of: enabled, mode, defaultFlavor, flavorMap');
+    errors.push(
+      'body must set at least one of: enabled, mode, defaultFlavor, flavorMap, rewriteEnabled',
+    );
   }
   return errors.length ? { ok: false, errors } : { ok: true, value: patch };
 }

@@ -45,17 +45,28 @@ Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md)
 - 🎯 An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI.
 
 ## M5 — Drop-in & polish
-True zero-edit adoption + hardening.
-- `adopt` mode (standard-label mapping); opt-in auto-rewrite PR.
+True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033,
+[RUNBOOK](RUNBOOK.md), [QUOTAS](QUOTAS.md).
+- `adopt` mode (standard-label mapping, ADR-030): mode-aware claim gate, standard-label →
+  flavor routing with signal upgrade, runner registers with the job's own labels.
+- Opt-in auto-rewrite PR (ADR-031): line-level `runs-on` edit, dry-run label preview in the
+  console, three independent gates, branch+PR only. `contents:write` stays **off by default**.
 - **Flavor catalog expansion** — standard language flavors (`python`, `java`, `go`, `rust`) with a prebaked runner tool cache so `setup-*` actions short-circuit (ADR-039); flavor images request their catalog memory (ADR-038).
 - **Custom flavors** — per-installation bring-your-own image, merged over the built-in catalog (ADR-040), not routable until a smoke run proves it works (ADR-041).
-- Compat guidance surfaced with actionable fixes.
-- Metrics/alarms/X-Ray; cost estimates in Run detail.
+- Compat findings carry an actionable `fix`; adopt candidacy surfaced separately from compat
+  level so it doesn't mask real problems.
+- Metrics as EMF + per-env alarms + X-Ray (ADR-032); cost estimate in Run detail **and** a
+  rolling per-flavor estimate on the Dashboard.
 - **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
-  (cost left Runs per ADR-029; see spec 04 OQ-6).
+  (cost left Runs per ADR-029; see spec 04 OQ-6). **Still open**: the Dashboard estimate is a
+  fixed bounded sample of recent finished runs, deliberately not the windowed, groupable
+  report ADR-029 defers to this screen.
 - Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
-- `dev`/`prod` account separation; runbook + quotas doc.
-- 🎯 A brand-new repo runs unchanged in `adopt` mode; dashboard shows health + cost.
+- `dev`/`prod` config separation (ADR-033); runbook + quotas docs.
+- 🎯 **Exit criterion not yet verified**: a brand-new repo running unchanged in `adopt` mode
+  needs a live-repo run. It is also what closes spec 03 OQ-4 (does `generate-jitconfig`
+  accept `ubuntu-latest` as a runner label? — see ADR-030's open verification item). The
+  dashboard health + cost half is shipped and unit-tested.
 
 ## Phase 3 backlog (post-v1)
 - Warm pool / boot-latency optimization (revisit ADR-006).
