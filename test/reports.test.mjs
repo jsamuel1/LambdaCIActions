@@ -206,6 +206,33 @@ test('an unknown flavor costs nothing rather than throwing', () => {
   assert.equal(jobCostUsd(job({ flavor: undefined })), 0);
 });
 
+// ADR-042's "one definition of billable time" has to include one definition of what is
+// BILLABLE AT ALL, or the two screens disagree about the same job. Provision stamps the intended
+// `flavor` on a mint/launch FAILURE for support, so flavor alone is not evidence a VM ran — and
+// Reports reads the same rows Run detail does.
+test('Reports does not price a row that never launched a microVM', () => {
+  for (const status of ['failed', 'timed_out', 'queued', 'provisioning']) {
+    assert.equal(
+      jobCostUsd(job({ status, flavor: 'base', microvmId: undefined })),
+      0,
+      `${status} without a microvmId must not be priced`,
+    );
+  }
+  // Evidence of compute — either signal — is priced. `microvmId` is stamped best-effort
+  // (ADR-019), so a post-launch status has to count on its own.
+  assert.ok(jobCostUsd(job({ status: 'failed', microvmId: 'mv-1' })) > 0);
+  assert.ok(jobCostUsd(job({ status: 'running', microvmId: undefined })) > 0);
+});
+
+test('a spend report and its export agree with Run detail on the same row', () => {
+  const launchFailure = job({ jobId: 9, status: 'failed', flavor: 'base', microvmId: undefined });
+  const spec = SPEC({ metric: 'spend', dimension: 'none' });
+  const res = computeReport([launchFailure], spec, { now: NOW });
+  assert.equal(res.total, 0, 'the aggregate must not bill a VM that never existed');
+  const [row] = toExportRows([launchFailure], NOW);
+  assert.equal(row.estimatedCostUsd, 0, 'the export must not contradict the aggregate');
+});
+
 test('measured cost is strictly lower than the wall-clock fallback', () => {
   const measured = jobCostUsd(job());
   const fallback = jobCostUsd(job({ runningAt: undefined }));
