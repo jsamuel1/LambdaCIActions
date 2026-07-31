@@ -320,6 +320,30 @@ test('spend coverage reports the share priced from a measured window', () => {
   assert.match(res.caveat, /OVERSTATES/);
 });
 
+test('spend coverage ignores rows that were never priced at all', () => {
+  // Coverage on `spend` answers one question: of the jobs we PRICED, how many were priced from
+  // a measured window rather than overstating wall clock? A queued / launch-failure row is
+  // priced at 0 (`isCostEligible`), so folding it into the denominator dragged coverage down
+  // and the caveat then described that share as wall-clock-overstated — it was not priced at
+  // all. Both shares must ignore it.
+  const spec = SPEC({ metric: 'spend', dimension: 'none' });
+  const priced = job();
+  const neverLaunched = job({ jobId: 2, status: 'queued', microvmId: undefined });
+  const res = computeReport([priced, neverLaunched], spec, { now: NOW });
+  assert.equal(res.total, computeReport([priced], spec, { now: NOW }).total, 'an unpriced row must not add spend');
+  assert.equal(res.coverage, 1, 'an unpriced row must not understate coverage');
+  assert.equal(res.points[0].sampleSize, 2, 'sampleSize still reports every row in the group');
+
+  // …and a row that carries a watermark but never launched cannot inflate coverage either.
+  const watermarkedFailure = job({ jobId: 3, status: 'failed', microvmId: undefined });
+  const mixed = computeReport(
+    [job({ runningAt: undefined }), watermarkedFailure],
+    spec,
+    { now: NOW },
+  );
+  assert.equal(mixed.coverage, 0, 'an unpriced row was counted as a measured price');
+});
+
 test('grouping by workflow labels rows with no workflow name rather than dropping them', () => {
   const spec = SPEC({ dimension: 'workflow' });
   const res = computeReport([job({ workflowName: undefined })], spec, { now: NOW });
@@ -491,5 +515,35 @@ test('the assistant provenance line is dropped once the picker moves off its spe
   assert.ok(
     /resolved && !refusal && !stale/.test(body),
     'the provenance line must be gated on staleness, not just on having a resolved report',
+  );
+});
+
+test('a truncated CSV export declares its truncation, since the body cannot', () => {
+  // The JSON export carries `complete` in its payload; CSV has nowhere to put it, so a
+  // budget-truncated download would look like a full one and its row count would be read as a
+  // total. The header is the only channel, and the UI has to say so next to the link — a header
+  // no operator sees is not a disclosure. Source-level, matching the SPA assertions above:
+  // this repo drives pure helpers in tests and has no handler/DOM harness.
+  const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  const start = handler.indexOf('async function exportReportRoute');
+  const body = handler.slice(start, handler.indexOf('async function askReportRoute', start));
+  assert.ok(start >= 0 && body.length > 0, 'could not isolate exportReportRoute');
+  assert.ok(
+    /'X-Report-Complete': String\(fetched\.complete\)/.test(body),
+    'the CSV export must publish its completeness in a header',
+  );
+  assert.ok(
+    /complete: fetched\.complete/.test(body),
+    'the JSON export must keep carrying `complete` in its body',
+  );
+
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    screen,
+    /export is\s*\n?\s*truncated/,
+    'the partial-report notice must tell the operator the export is truncated too',
   );
 });

@@ -503,6 +503,13 @@ export function computeReport(
         let usd = 0;
         for (const r of g.runs) {
           usd += jobCostUsd(r, now);
+          // Coverage is over the rows that were actually PRICED, not every row in the group.
+          // A queued / launch-failure row contributes 0 to spend (`isCostEligible`), so
+          // counting it in the denominator understated coverage on exactly the metric whose
+          // caveat then claimed the uncovered share was priced on overstating wall clock —
+          // it was not priced at all. An unpriced row is silent in both, so the ratio means
+          // what the caveat says it means.
+          if (!isCostEligible(r)) continue;
           coverageDen += 1;
           if (billableSeconds(r, now).basis === 'measured') coverageNum += 1;
         }
@@ -581,7 +588,7 @@ export function computeReport(
 function caveatFor(metric: ReportMetric): string | undefined {
   switch (metric) {
     case 'spend':
-      return 'Estimate. Coverage is the share of jobs priced from a measured run window; the remainder use queue-to-finish wall clock, which OVERSTATES cost.';
+      return 'Estimate. Coverage is the share of PRICED jobs whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES cost. Jobs that never launched a microVM are priced at 0 and counted in neither share.';
     case 'duration':
       return 'Coverage is the share of jobs that reached a terminal status; in-flight jobs are excluded.';
     case 'failureRate':

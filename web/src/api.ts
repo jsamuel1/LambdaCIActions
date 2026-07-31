@@ -381,9 +381,9 @@ export const api = {
   reportExportUrl: (q: ReportQuery, format: 'csv' | 'json' = 'csv') =>
     `/api/reports/export?${reportQueryString(q)}&format=${format}`,
   /**
-   * Ask for a report in natural language. A refusal is an `ApiError` with `details` carrying
-   * the machine-readable reason, so the caller can fall back to the picker rather than
-   * surfacing a stack of validation noise.
+   * Ask for a report in natural language. A refusal is an `ApiError` whose `body` carries the
+   * machine-readable `reason`, so the caller can fall back to the picker rather than surfacing a
+   * stack of validation noise.
    */
   askReport: (question: string) =>
     request<Report>('/api/reports/ask', { method: 'POST', body: JSON.stringify({ question }) }),

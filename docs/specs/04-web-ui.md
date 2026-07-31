@@ -231,7 +231,10 @@ the flavor's vCPU/GB footprint (OQ-3), and billable time comes from the `running
 (ADR-042) so queue and provisioning time are not charged. Rows predating the watermark fall back
 to total wall clock, which **overstates** cost; each export row carries `costBasis`
 (`measured` \| `wallClock`) and every report reports `coverage` — the share of contributing rows
-measured rather than inferred. Reconciliation against a real microVM bill is still outstanding
+measured rather than inferred. For `spend` that share is over the **priced** rows only: a job that
+never launched a microVM is priced at 0 and counted in neither side of the ratio, so coverage is
+not dragged down by rows the wall-clock caveat does not describe. Reconciliation against a real
+microVM bill is still outstanding
 (OQ-7): the direction of the error is known and stated, the magnitude is not.
 
 **Every report reports its own completeness.** `complete: false` means the read budget was spent

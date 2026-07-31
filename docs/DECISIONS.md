@@ -1982,8 +1982,8 @@ inline style — the CSP drops `style="…"` attributes, so an inline-sized char
 and collapse to zero height in production. (ECharts' own runtime styling is CSSOM property
 assignment and SVG presentation attributes, neither of which `style-src` restricts;
 `test/web-stack.test.mjs` still fails the build if a React inline style appears in `web/src`.)
-**Consequences**: the SPA bundle grows to ~679 KB raw / ~224 KB gzipped — the first meaningful
-runtime dependency beyond React. Acceptable for an authenticated internal console behind
-CloudFront, and bounded by the per-chart-type import list: adding a chart type means editing
-that list, which is deliberate friction. If the bundle becomes a problem the next step is
-lazy-loading the Reports route, not swapping libraries.
+**Consequences**: the SPA bundle grows to ~692 KB raw / ~228 KB gzipped (measured from
+`npm run build:web`) — the first meaningful runtime dependency beyond React. Acceptable for an
+authenticated internal console behind CloudFront, and bounded by the per-chart-type import list:
+adding a chart type means editing that list, which is deliberate friction. If the bundle becomes
+a problem the next step is lazy-loading the Reports route, not swapping libraries.
