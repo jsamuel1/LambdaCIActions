@@ -10,6 +10,7 @@ import { Template } from 'aws-cdk-lib/assertions';
 import { DataStack } from '../dist/lib/data-stack.js';
 import { MgmtStack } from '../dist/lib/mgmt-stack.js';
 import { ControlStack } from '../dist/lib/control-stack.js';
+import { envConfig } from '../dist/lib/env-config.js';
 
 function synth() {
   const app = new App();
@@ -26,6 +27,7 @@ function synth() {
     appcfgBrokerArn: 'arn:aws:lambda:us-west-2:123456789012:function:lca-test-appcfg',
     webhookUrl: 'https://api.example.com/webhook',
     publicOrigin: 'https://console.example.com',
+    config: envConfig('test'),
   });
   return Template.fromStack(mgmt);
 }
@@ -41,6 +43,7 @@ function synthControl() {
     ssmPrefix: '/lca/test',
     tagPrefix: 'lca',
     table: data.table,
+    config: envConfig('test'),
   });
   return Template.fromStack(control);
 }

@@ -14,9 +14,12 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cwactions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as ddb from 'aws-cdk-lib/aws-dynamodb';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { RemovalPolicy } from 'aws-cdk-lib';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ALARM_PERIOD, type EnvConfig } from './env-config.js';
+import { METRIC_NAMESPACE } from '../src/shared/metrics.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Stack runs from dist/lib/ at synth time; NodejsFunction needs the real .ts SOURCE tree
@@ -28,6 +31,8 @@ export interface ControlStackProps extends StackProps {
   ssmPrefix: string; // /lca/<env>
   tagPrefix: string; // lca
   table: ddb.ITable; // shared DynamoDB table (DataStack)
+  /** Per-env sizing / retention / alarm config (ADR-033). */
+  config: EnvConfig;
 }
 
 /**
@@ -56,11 +61,24 @@ export class ControlStack extends Stack {
   public readonly appcfgBrokerArn: string;
   /** The deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
   public readonly webhookUrl: string;
+  /** Rewrite queue coordinates, consumed by MgmtStack's rewrite-PR endpoint (M5). */
+  public readonly rewriteQueueUrl: string;
+  public readonly rewriteQueueArn: string;
+  /** SNS topic every alarm publishes to (subscribed via `-c alarmEmail=…`). */
+  public readonly alarmTopicArn: string;
 
   constructor(scope: Construct, id: string, props: ControlStackProps) {
     super(scope, id, props);
 
-    const { envName, ssmPrefix, table } = props;
+    const { envName, ssmPrefix, table, config } = props;
+    // Shared log-group settings so every function follows the env's retention policy
+    // (ADR-033) instead of a hardcoded two weeks.
+    const logDefaults = {
+      retention: config.lambdaLogRetention,
+      removalPolicy: config.logRemovalPolicy,
+    };
+    // X-Ray across API GW → Lambda → SQS on the hot path (spec 05 § Observability).
+    const tracing = config.tracing ? lambda.Tracing.ACTIVE : lambda.Tracing.DISABLED;
     // NOTE: props.tagPrefix is retained for future taggable resources (e.g. image tags via
     // lambda-microvms TagResource) but is NOT used for microVM launch/terminate isolation —
     // the GA API can't tag VMs (ADR-015). void it to satisfy noUnusedLocals.
@@ -112,8 +130,7 @@ export class ControlStack extends Stack {
     };
     const ingestLogGroup = new logs.LogGroup(this, 'IngestLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-ingest`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      ...logDefaults,
     });
     const ingest = new NodejsFunction(this, 'IngestFn', {
       functionName: `lca-${envName}-ingest`,
@@ -124,6 +141,7 @@ export class ControlStack extends Stack {
       timeout: Duration.seconds(10),
       memorySize: 256,
       logGroup: ingestLogGroup,
+      tracing,
       bundling,
       environment: {
         WEBHOOK_SECRET_PARAM: `${ssmPrefix}/github/webhook-secret`,
@@ -131,6 +149,9 @@ export class ControlStack extends Stack {
         QUEUE_URL: queue.queueUrl,
         DISCOVERY_QUEUE_URL: discoveryQueue.queueUrl,
         TABLE_NAME: table.tableName,
+        // Terminal-run TTL, per env (ADR-033). Every writer of run rows must agree, or the
+        // row's retention would depend on which λ happened to write it last.
+        RUN_RETENTION_DAYS: String(config.runRetentionDays),
       },
     });
     queue.grantSendMessages(ingest);
@@ -183,8 +204,7 @@ export class ControlStack extends Stack {
     // partition and never learns any microvmId (not even its own).
     const hookBrokerLogGroup = new logs.LogGroup(this, 'HookBrokerLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-hook-broker`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      ...logDefaults,
     });
     const hookBroker = new NodejsFunction(this, 'HookBrokerFn', {
       functionName: `lca-${envName}-hook-broker`,
@@ -197,8 +217,9 @@ export class ControlStack extends Stack {
       // Its only callers are microVMs running untrusted code, one call each at boot and at
       // job end. Cap the concurrency so a pathological/malicious VM fleet can't drain the
       // account's unreserved pool out from under the control plane.
-      reservedConcurrentExecutions: 20,
+      reservedConcurrentExecutions: config.hookBrokerConcurrency,
       logGroup: hookBrokerLogGroup,
+      tracing,
       bundling,
       environment: {
         TABLE_NAME: table.tableName,
@@ -240,8 +261,7 @@ export class ControlStack extends Stack {
 
     const provisionLogGroup = new logs.LogGroup(this, 'ProvisionLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-provision`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      ...logDefaults,
     });
     const provision = new NodejsFunction(this, 'ProvisionFn', {
       functionName: `lca-${envName}-provision`,
@@ -252,8 +272,9 @@ export class ControlStack extends Stack {
       timeout: Duration.seconds(60),
       memorySize: 512,
       // Bound launch rate → protects the microVM quota (spec 05).
-      reservedConcurrentExecutions: 10,
+      reservedConcurrentExecutions: config.provisionConcurrency,
       logGroup: provisionLogGroup,
+      tracing,
       bundling,
       environment: {
         APP_ID_PARAM: `${ssmPrefix}/github/app-id`,
@@ -262,6 +283,8 @@ export class ControlStack extends Stack {
         TABLE_NAME: table.tableName,
         RUNNER_ROLE_ARN: microvmExecRole.roleArn,
         HOOK_BROKER_NAME: hookBroker.functionName,
+        LCA_ENV: envName,
+        RUN_RETENTION_DAYS: String(config.runRetentionDays),
       },
     });
     // Provision must write the JIT config item (side-store) + stamp run rows.
@@ -333,8 +356,7 @@ export class ControlStack extends Stack {
     // analyzes compat, persists WorkflowAnalysisRecords for Ingest/Provision/UI.
     const discoveryLogGroup = new logs.LogGroup(this, 'DiscoveryLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-discovery`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      ...logDefaults,
     });
     const discovery = new NodejsFunction(this, 'DiscoveryFn', {
       functionName: `lca-${envName}-discovery`,
@@ -348,6 +370,7 @@ export class ControlStack extends Stack {
       // GitHub API rate-limit friendliness: one scan at a time is plenty.
       reservedConcurrentExecutions: 2,
       logGroup: discoveryLogGroup,
+      tracing,
       bundling,
       environment: {
         APP_ID_PARAM: `${ssmPrefix}/github/app-id`,
@@ -375,8 +398,7 @@ export class ControlStack extends Stack {
     // ---- Reaper λ + EventBridge schedule (spec 02 reaping, M2) ----
     const reaperLogGroup = new logs.LogGroup(this, 'ReaperLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-reaper`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      ...logDefaults,
     });
     const reaper = new NodejsFunction(this, 'ReaperFn', {
       functionName: `lca-${envName}-reaper`,
@@ -388,9 +410,11 @@ export class ControlStack extends Stack {
       memorySize: 256,
       reservedConcurrentExecutions: 1, // one sweep at a time
       logGroup: reaperLogGroup,
+      tracing,
       bundling,
       environment: {
         TABLE_NAME: table.tableName,
+        RUN_RETENTION_DAYS: String(config.runRetentionDays),
       },
     });
     // Reaper reads/updates run rows (incl. the status GSI) and lists/terminates VMs.
@@ -423,25 +447,223 @@ export class ControlStack extends Stack {
       targets: [new targets.LambdaFunction(reaper)],
     });
 
-    // ---- DLQ alarming (spec 05 observability) ----
-    // Any message landing in the DLQ means a job repeatedly failed to provision — page.
+    // ---- Per-run microVM log group (ADR-016 runtime logs, retention per ADR-033) ----
+    // Provision passes this group name at launch and the VM's exec role may CreateLogGroup, so
+    // without setting a policy here the group is auto-created with NEVER_EXPIRE retention — job
+    // logs would accumulate forever and the documented per-env retention would be fiction.
+    //
+    // `LogRetention` (a custom resource that PUTs the retention policy), NOT `logs.LogGroup`:
+    // every environment deployed before M5 ALREADY has this group, created by the launch path
+    // itself. A `logs.LogGroup` would try to CREATE it and fail with
+    // `ResourceAlreadyExistsException`, rolling the whole ControlStack update back — i.e. M5
+    // would be undeployable to dev without a manual out-of-band delete of live job logs.
+    // LogRetention creates the group when absent and adopts it when present, which is exactly
+    // the semantics we need. `logGroupName` matches what Provision passes and what the
+    // management API reads.
+    new logs.LogRetention(this, 'RunLogRetention', {
+      logGroupName: `/aws/lambda/microvms/runs/lca-${envName}`,
+      retention: config.runLogRetention,
+      // Never DESTROY: this group is not ours to delete — it holds customers' job logs and is
+      // written by the launch path, not by this stack.
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    // ---- Rewrite λ + queue (opt-in auto-rewrite PR; spec 03 § Auto-rewrite, ADR-031, M5) ----
+    // The ONLY function that writes to a customer repository. It is deployed in every env but
+    // refuses every request unless `config.rewriteEnabled` (CDK `-c rewrite=true`) is set AND
+    // the repo opted in — `contents:write` stays off by default (AGENTS.md hard rule).
+    const rewriteDlq = new sqs.Queue(this, 'RewriteDLQ', {
+      queueName: `lca-${envName}-rewrite-dlq`,
+      retentionPeriod: Duration.days(14),
+    });
+    const rewriteQueue = new sqs.Queue(this, 'RewriteQueue', {
+      queueName: `lca-${envName}-rewrite`,
+      visibilityTimeout: Duration.seconds(360),
+      deadLetterQueue: { queue: rewriteDlq, maxReceiveCount: 3 },
+    });
+    this.rewriteQueueUrl = rewriteQueue.queueUrl;
+    this.rewriteQueueArn = rewriteQueue.queueArn;
+
+    const rewriteLogGroup = new logs.LogGroup(this, 'RewriteLogGroup', {
+      logGroupName: `/aws/lambda/lca-${envName}-rewrite`,
+      ...logDefaults,
+    });
+    const rewrite = new NodejsFunction(this, 'RewriteFn', {
+      functionName: `lca-${envName}-rewrite`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(SRC, 'rewrite', 'handler.ts'),
+      handler: 'handler',
+      // Re-plans every workflow against live file contents, then commits + opens a PR.
+      timeout: Duration.seconds(300),
+      memorySize: 256,
+      // One repo at a time: these are operator-initiated, rare, and GitHub-rate-limited.
+      reservedConcurrentExecutions: 1,
+      logGroup: rewriteLogGroup,
+      tracing,
+      bundling,
+      environment: {
+        APP_ID_PARAM: `${ssmPrefix}/github/app-id`,
+        APP_PEM_PARAM: `${ssmPrefix}/github/app-pem`,
+        TABLE_NAME: table.tableName,
+        LCA_ENV: envName,
+        REWRITE_ENABLED: config.rewriteEnabled ? 'true' : 'false',
+      },
+    });
+    rewrite.addEventSource(
+      new SqsEventSource(rewriteQueue, { batchSize: 1, reportBatchItemFailures: true }),
+    );
+    // Reads the repo row (opt-in flag) + stored analyses. Read-only on the table: the rewrite
+    // flow changes nothing in our data model, only in the customer's repo.
+    table.grantReadData(rewrite);
+    rewrite.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadRewriteConfig',
+        actions: ['ssm:GetParameter'],
+        resources: [
+          paramArn(`${ssmPrefix}/github/app-id`),
+          paramArn(`${ssmPrefix}/github/app-pem`),
+        ],
+      }),
+    );
+
+    // ---- Alarming (spec 05 § Observability, ADR-032) ----
     const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
       topicName: `lca-${envName}-alarms`,
       displayName: `LambdaCIActions ${envName} alarms`,
     });
-    const dlqDepthAlarm = new cloudwatch.Alarm(this, 'DLQDepthAlarm', {
-      alarmName: `lca-${envName}-provision-dlq-depth`,
-      alarmDescription: 'Provisioning DLQ has messages — jobs failed to provision after retries',
+    // Subscription is opt-in via `-c alarmEmail=…`: an alarm topic with no subscriber is a
+    // silent alarm, but a hardcoded address would be wrong for every other deployment.
+    if (config.alarmEmail) {
+      alarmTopic.addSubscription(new subs.EmailSubscription(config.alarmEmail));
+    }
+    this.alarmTopicArn = alarmTopic.topicArn;
+
+    const alarm = (
+      id: string,
+      props: {
+        name: string;
+        description: string;
+        metric: cloudwatch.IMetric;
+        threshold: number;
+        evaluationPeriods?: number;
+        comparison?: cloudwatch.ComparisonOperator;
+      },
+    ): cloudwatch.Alarm => {
+      const a = new cloudwatch.Alarm(this, id, {
+        alarmName: props.name,
+        alarmDescription: props.description,
+        metric: props.metric,
+        threshold: props.threshold,
+        comparisonOperator:
+          props.comparison ?? cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: props.evaluationPeriods ?? 1,
+        // Absence of data means "no jobs ran", not "broken" — an idle platform must not page.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      a.addAlarmAction(new cwactions.SnsAction(alarmTopic));
+      return a;
+    };
+
+    /**
+     * A custom EMF metric emitted by the Lambdas (src/shared/metrics.ts).
+     *
+     * Bound to the `env`-only dimension set, which the emitter publishes alongside the
+     * per-flavor set precisely so alarms have an aggregate to read (CloudWatch does not sum
+     * across dimensions on its own).
+     */
+    const customMetric = (metricName: string, statistic = 'Sum'): cloudwatch.Metric =>
+      new cloudwatch.Metric({
+        namespace: METRIC_NAMESPACE,
+        metricName,
+        dimensionsMap: { env: envName },
+        statistic,
+        period: ALARM_PERIOD,
+      });
+
+    // Any message landing in a DLQ means repeated failure — page.
+    alarm('DLQDepthAlarm', {
+      name: `lca-${envName}-provision-dlq-depth`,
+      description: 'Provisioning DLQ has messages — jobs failed to provision after retries',
       metric: dlq.metricApproximateNumberOfMessagesVisible({
         period: Duration.minutes(1),
         statistic: 'Maximum',
       }),
       threshold: 0,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-      evaluationPeriods: 1,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
-    dlqDepthAlarm.addAlarmAction(new cwactions.SnsAction(alarmTopic));
+    alarm('DiscoveryDLQDepthAlarm', {
+      name: `lca-${envName}-discovery-dlq-depth`,
+      description: 'Discovery DLQ has messages — workflow scans are failing (stale routing/compat)',
+      metric: discoveryDlq.metricApproximateNumberOfMessagesVisible({
+        period: Duration.minutes(1),
+        statistic: 'Maximum',
+      }),
+      threshold: 0,
+    });
+    // A rewrite request that DLQs means an operator clicked "Open rewrite PR" and nothing
+    // appeared in their repo. Without this alarm that failure is invisible: the λ writes to
+    // GitHub, not to our data model, so no run row or queue age reflects it.
+    alarm('RewriteDLQDepthAlarm', {
+      name: `lca-${envName}-rewrite-dlq-depth`,
+      description: 'Rewrite DLQ has messages — a requested auto-rewrite PR never opened',
+      metric: rewriteDlq.metricApproximateNumberOfMessagesVisible({
+        period: Duration.minutes(1),
+        statistic: 'Maximum',
+      }),
+      threshold: 0,
+    });
+
+    // Quota throttles: spec 05 names the microVM quota the primary concurrency ceiling, and a
+    // throttled launch is an invisible failure to the developer waiting on their PR.
+    alarm('QuotaThrottleAlarm', {
+      name: `lca-${envName}-quota-throttles`,
+      description:
+        'microVM launches were throttled — request a service-quota increase (docs/QUOTAS.md)',
+      metric: customMetric('QuotaThrottles'),
+      threshold: 0,
+    });
+
+    // Provision failures beyond the env's tolerance.
+    alarm('ProvisionFailureAlarm', {
+      name: `lca-${envName}-provision-failures`,
+      description: 'Provision λ is failing to launch runners (see the run rows for reasons)',
+      metric: customMetric('ProvisionFailures'),
+      threshold: config.provisionFailureThreshold,
+    });
+
+    // Lambda-level errors on the hot path: a handler crash never reaches our own metrics.
+    //
+    // The alarm name is built from the LITERAL suffix, not `fn.functionName`: that attribute
+    // is a CloudFormation token (`Ref`), so interpolating it produced
+    // `lca-<env>-lca-<env>-ingest-errors` at deploy time — a name that matches nothing the
+    // runbook documents and that a `describe-alarms --alarm-names` lookup can't find.
+    for (const [id, fn, suffix] of [
+      ['IngestErrorAlarm', ingest, 'ingest'],
+      ['ProvisionErrorAlarm', provision, 'provision'],
+      ['HookBrokerErrorAlarm', hookBroker, 'hook-broker'],
+      ['ReaperErrorAlarm', reaper, 'reaper'],
+    ] as const) {
+      alarm(id, {
+        name: `lca-${envName}-${suffix}-errors`,
+        description: `lca-${envName}-${suffix} is throwing — control-plane fault`,
+        metric: fn.metricErrors({ period: ALARM_PERIOD, statistic: 'Sum' }),
+        threshold: config.isProd ? 0 : 2,
+      });
+    }
+
+    // Stuck provisioning: the oldest un-consumed provisioning message. If Provision stops
+    // consuming, no error metric fires anywhere — the queue just grows silently.
+    alarm('ProvisionBacklogAlarm', {
+      name: `lca-${envName}-provision-backlog-age`,
+      description:
+        'Provisioning messages are sitting unconsumed — jobs are queued but no runner is starting',
+      metric: queue.metricApproximateAgeOfOldestMessage({
+        period: ALARM_PERIOD,
+        statistic: 'Maximum',
+      }),
+      threshold: config.stuckRunMinutes * 60,
+      evaluationPeriods: 2,
+    });
 
     // ---- API Gateway: POST /webhook ----
     const httpApi = new apigw.HttpApi(this, 'WebhookApi', {
@@ -463,8 +685,15 @@ export class ControlStack extends Stack {
     // the Mgmt λ and nothing else, so secret-read + secret-write stay in the control plane.
     const appcfgLogGroup = new logs.LogGroup(this, 'AppConfigLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-appcfg`,
-      retention: logs.RetentionDays.THREE_MONTHS, // credential changes are audit-relevant
-      removalPolicy: RemovalPolicy.DESTROY,
+      // Deliberately NOT `logDefaults.retention`: this group is the audit trail for credential
+      // changes, so it outlives the env's ordinary Lambda retention (dev's two weeks would
+      // discard a relink history the operator may need to reconstruct). It floors at three
+      // months and follows the env when the env keeps logs longer.
+      retention: logs.RetentionDays.THREE_MONTHS,
+      // Removal DOES follow the env (ADR-033). Hardcoding DESTROY here would delete the
+      // credential-change history in `prod` on stack removal — exactly what the long
+      // retention above exists to prevent.
+      removalPolicy: config.logRemovalPolicy,
     });
     const appcfg = new NodejsFunction(this, 'AppConfigFn', {
       functionName: `lca-${envName}-appcfg`,
@@ -485,6 +714,7 @@ export class ControlStack extends Stack {
       // instead caches its GitHub answers per container (STATUS_CACHE_MS) so polling cannot
       // drain the App's shared 5,000/h JWT budget that Provision needs for job tokens.
       logGroup: appcfgLogGroup,
+      tracing,
       bundling,
       environment: {
         LCA_ENV: envName,
@@ -559,6 +789,11 @@ export class ControlStack extends Stack {
     new CfnOutput(this, 'ProvisionQueueUrl', { value: queue.queueUrl });
     new CfnOutput(this, 'ProvisionDLQUrl', { value: dlq.queueUrl });
     new CfnOutput(this, 'DiscoveryQueueUrl', { value: discoveryQueue.queueUrl });
+    new CfnOutput(this, 'RewriteQueueUrl', { value: rewriteQueue.queueUrl });
+    new CfnOutput(this, 'RewriteEnabled', {
+      value: String(config.rewriteEnabled),
+      description: 'Auto-rewrite PR capability (contents:write). Enable with -c rewrite=true.',
+    });
     new CfnOutput(this, 'ReaperFunctionName', { value: reaper.functionName });
     new CfnOutput(this, 'HookBrokerFunctionName', { value: hookBroker.functionName });
     new CfnOutput(this, 'AppConfigBrokerName', { value: appcfg.functionName });

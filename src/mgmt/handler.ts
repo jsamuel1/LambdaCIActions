@@ -55,6 +55,7 @@ import {
   validateRunnerLabels,
   validateWebhookTestBody,
 } from './validate.js';
+import { planPreviewFromAnalyses } from './rewrite.js';
 import { collectVisible } from './paging.js';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import { fetchRunLogs } from './logs.js';
@@ -87,7 +88,13 @@ import {
   getOauthUser,
   listUserInstallations,
 } from '../shared/github-app.js';
-import type { RepoRecord, RunRecord, RunStatus, WorkflowAnalysisRecord } from '../shared/types.js';
+import type {
+  RepoRecord,
+  RewriteRequest,
+  RunRecord,
+  RunStatus,
+  WorkflowAnalysisRecord,
+} from '../shared/types.js';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 
@@ -124,6 +131,19 @@ const PLATFORM_ADMINS_PARAM =
 const APPCFG_BROKER_NAME = process.env.APPCFG_BROKER_NAME ?? '';
 /** The webhook receiver this deployment exposes, for configured-vs-deployed comparison. */
 const WEBHOOK_URL = process.env.WEBHOOK_URL ?? '';
+/**
+ * Rows per terminal status folded into the Dashboard's rolling cost estimate. The Dashboard
+ * polls `/api/health` every 5 s, so this is a deliberate ceiling on read amplification, not
+ * an attempt at a complete billing window.
+ */
+const COST_SAMPLE_PER_STATUS = 50;
+const REWRITE_QUEUE_URL = process.env.REWRITE_QUEUE_URL ?? '';
+/**
+ * Deployment-wide auto-rewrite flag (ADR-031). Off unless the string is exactly `true`, so a
+ * missing/typo'd env var can never accidentally enable a capability that writes to customer
+ * repos.
+ */
+const REWRITE_ENABLED = process.env.REWRITE_ENABLED === 'true';
 /** Public origin of the console (CloudFront). Used to build the OAuth redirect URI. */
 const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN ?? '').replace(/\/+$/, '');
 
@@ -404,6 +424,24 @@ async function route_(
           patch: parsed.value,
         }),
       );
+      // A `mode` change invalidates every stored routing preview for this repo: Discovery
+      // resolves flavors WITH the repo's mode (M5, ADR-030), so switching label↔adopt changes
+      // both the flavor and its `reason` for every hosted-label job — and those stored routes
+      // are what the console renders and what the rewrite planner reads. Without a re-scan the
+      // operator flips to adopt and still sees `fallback to base (no matching label)` until
+      // someone happens to push a workflow change. Best-effort: the config write already
+      // succeeded, so a failed enqueue must not turn it into a 5xx.
+      if (parsed.value.mode !== undefined && parsed.value.mode !== repo.record.mode) {
+        await enqueueRescan(updated).catch((err) =>
+          console.error(
+            JSON.stringify({
+              msg: 'mode-change rescan enqueue failed (routes stay stale until the next push)',
+              repoId: updated.repoId,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          ),
+        );
+      }
       return json(200, { repo: toRepoView(updated) });
     }
 
@@ -422,20 +460,7 @@ async function route_(
       const repo = await authorizeRepo(session, match, q);
       if ('reply' in repo) return repo.reply;
       if (!DISCOVERY_QUEUE_URL) return problem(503, 'discovery queue not configured');
-      const [owner, name] = repo.record.repoFullName.split('/');
-      await sqs.send(
-        new SendMessageCommand({
-          QueueUrl: DISCOVERY_QUEUE_URL,
-          MessageBody: JSON.stringify({
-            installationId: repo.record.installationId,
-            repoId: repo.record.repoId,
-            repoFullName: repo.record.repoFullName,
-            owner,
-            repo: name,
-            reason: 'manual',
-          }),
-        }),
-      );
+      await enqueueRescan(repo.record);
       console.log(
         JSON.stringify({ msg: 'rescan requested', actor: session.login, repoId: repo.record.repoId }),
       );
@@ -472,6 +497,54 @@ async function route_(
         }),
       );
       return json(200, { flavorMap: updated.flavorMap ?? {} });
+    }
+
+    case 'rewritePreview': {
+      const repo = await authorizeRepo(session, match, q);
+      if ('reply' in repo) return repo.reply;
+      return rewritePreviewRoute(repo.record);
+    }
+
+    case 'rewritePr': {
+      const repo = await authorizeRepo(session, match, q);
+      if ('reply' in repo) return repo.reply;
+      // Both gates are re-checked HERE so the API refuses with a specific 409 instead of
+      // enqueuing work the rewrite λ will silently drop. The λ re-checks them anyway (it is
+      // the enforcement point; this is the good error message).
+      if (!REWRITE_ENABLED) {
+        return problem(409, 'auto-rewrite is disabled for this deployment', {
+          fix: 'Redeploy with `-c rewrite=true` after granting the GitHub App `contents:write` (off by default).',
+        });
+      }
+      // Strict `=== true`, matching `repoOptedIn` below and the λ's own gate. The row is
+      // writable out of band (RUNBOOK's break-glass `update-item`), so a stray `"false"` must
+      // not enqueue a request the λ will refuse anyway — the operator would get a 202 and no PR.
+      if (repo.record.rewriteEnabled !== true) {
+        return problem(409, 'repo has not opted into the auto-rewrite PR', {
+          fix: 'PATCH /api/repos/{repoId} with {"rewriteEnabled": true} (Repos screen toggle) first.',
+        });
+      }
+      if (!REWRITE_QUEUE_URL) return problem(503, 'rewrite queue not configured');
+      const [owner, name] = repo.record.repoFullName.split('/');
+      const msg: RewriteRequest = {
+        installationId: repo.record.installationId,
+        repoId: repo.record.repoId,
+        repoFullName: repo.record.repoFullName,
+        owner,
+        repo: name,
+        actor: session.login,
+      };
+      await sqs.send(
+        new SendMessageCommand({ QueueUrl: REWRITE_QUEUE_URL, MessageBody: JSON.stringify(msg) }),
+      );
+      console.log(
+        JSON.stringify({
+          msg: 'rewrite PR requested',
+          actor: session.login,
+          repoId: repo.record.repoId,
+        }),
+      );
+      return json(202, { queued: true });
     }
 
     case 'listRuns':
@@ -547,6 +620,9 @@ async function listRunsRoute(
   q: Record<string, string | undefined>,
 ): Promise<Reply> {
   const limit = parseLimit(q.limit);
+  // One `now` for the whole response so every row's live-cost estimate is measured against the
+  // same instant (and so `.map(toRunView)` can't accidentally pass the array INDEX as `now`).
+  const now = new Date();
   const visible = (runs: RunRecord[]): RunRecord[] =>
     runs.filter((r) => canAdminInstallation(session, r.installationId));
 
@@ -575,7 +651,7 @@ async function listRunsRoute(
     // history remains, and the client ANDs every page's flag, so walking to the end could
     // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
     return json(200, {
-      runs: page.runs.map(toRunView),
+      runs: page.runs.map((r) => toRunView(r, now)),
       nextCursor: page.nextCursor ?? null,
       complete: repoResponseComplete(status !== undefined),
     });
@@ -594,7 +670,7 @@ async function listRunsRoute(
     // A status-filtered page holds only the jobs IN that status, so a run folded from it is
     // partial by construction however far the cursor got.
     return json(200, {
-      runs: page.runs.map(toRunView),
+      runs: page.runs.map((r) => toRunView(r, now)),
       nextCursor: page.nextCursor ?? null,
       complete: false,
     });
@@ -614,13 +690,53 @@ async function listRunsRoute(
   // filled with another tenant's rows looks short while this operator's sibling jobs sit
   // unread past the boundary (ADR-029).
   return json(200, {
-    runs: merged.map(toRunView),
+    runs: merged.map((r) => toRunView(r, now)),
     nextCursor: null,
     complete: mergedResponseComplete({
       anyIndexTruncated: pages.some((p) => p.nextCursor !== undefined),
       visibleRows: visibleRuns.length,
       returnedRows: merged.length,
     }),
+  });
+}
+
+/**
+ * Enqueue a Discovery re-scan for one repo. Shared by the explicit "Re-scan" action and the
+ * automatic re-scan a `mode` change requires (stored routes are mode-dependent since M5).
+ */
+async function enqueueRescan(repo: RepoRecord): Promise<void> {
+  if (!DISCOVERY_QUEUE_URL) throw new Error('discovery queue not configured');
+  const [owner, name] = repo.repoFullName.split('/');
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: DISCOVERY_QUEUE_URL,
+      MessageBody: JSON.stringify({
+        installationId: repo.installationId,
+        repoId: repo.repoId,
+        repoFullName: repo.repoFullName,
+        owner,
+        repo: name,
+        reason: 'manual',
+      }),
+    }),
+  );
+}
+
+/**
+ * Auto-rewrite dry run (ADR-031). Read-only and always available — an operator must be able
+ * to see what the PR WOULD change before deciding whether to enable the capability, so this
+ * is deliberately not gated on `REWRITE_ENABLED` / `rewriteEnabled`. It reports both gates so
+ * the UI can explain why the Apply button is disabled.
+ */
+async function rewritePreviewRoute(repo: RepoRecord): Promise<Reply> {
+  const analyses = await listWorkflowAnalyses(repo.repoId);
+  const preview = planPreviewFromAnalyses(analyses);
+  return json(200, {
+    repo: toRepoView(repo),
+    deploymentEnabled: REWRITE_ENABLED,
+    repoOptedIn: repo.rewriteEnabled === true,
+    canApply: REWRITE_ENABLED && repo.rewriteEnabled === true,
+    ...preview,
   });
 }
 
@@ -653,7 +769,21 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
   const active: RunRecord[] = activePages
     .flatMap((p) => p.runs)
     .filter((r) => canAdminInstallation(session, r.installationId));
-  return json(200, { ...buildHealth(counts, active), countsExact: exact });
+  // Cost sample (M5). This costs three ADDITIONAL bounded index queries beyond the ones
+  // above, and the Dashboard polls this route every 5 s, so keep the window small: 50 rows
+  // per terminal status is enough for a rolling estimate and keeps a polling console from
+  // reading 300 rows every 5 seconds. Installation-filtered like every other run list, so
+  // the per-flavor figures only ever include the caller's own runs (unlike `counts`, which
+  // is deliberately platform-wide).
+  const terminalPages = await Promise.all(
+    (['completed', 'failed', 'timed_out'] as RunStatus[]).map((s) =>
+      listRunsByStatusPaged(s, { limit: COST_SAMPLE_PER_STATUS }),
+    ),
+  );
+  const costRuns: RunRecord[] = terminalPages
+    .flatMap((p) => p.runs)
+    .filter((r) => canAdminInstallation(session, r.installationId));
+  return json(200, { ...buildHealth(counts, active, new Date(), costRuns), countsExact: exact });
 }
 
 /**

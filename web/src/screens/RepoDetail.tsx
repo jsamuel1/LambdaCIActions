@@ -24,6 +24,13 @@ export function RepoDetail({
     [installationId, repoId],
   );
   const flavors = useApi(() => api.flavors(), []);
+  const rewrite = useApi(
+    () =>
+      installationId
+        ? api.rewritePreview(installationId, repoId)
+        : Promise.reject(new Error('no installation selected')),
+    [installationId, repoId],
+  );
   const [msg, setMsg] = useState<string | undefined>(undefined);
   const [err, setErr] = useState<string | undefined>(undefined);
   const [draft, setDraft] = useState<Record<string, string> | undefined>(undefined);
@@ -34,6 +41,7 @@ export function RepoDetail({
 
   const repo = wf.data.repo;
   const map = draft ?? repo.flavorMap;
+  const adoptCandidates = wf.data.workflows.reduce((n, w) => n + (w.adoptCandidates ?? 0), 0);
 
   async function saveMap(next: Record<string, string>): Promise<void> {
     setErr(undefined);
@@ -57,6 +65,46 @@ export function RepoDetail({
     }
   }
 
+  /** Switch onboarding mode (M5). `adopt` starts claiming this repo's `ubuntu-*` jobs. */
+  async function setMode(mode: 'label' | 'adopt' | 'off'): Promise<void> {
+    setErr(undefined);
+    try {
+      await api.patchRepo(repo.installationId, repo.repoId, { mode });
+      setMsg(
+        mode === 'adopt'
+          ? 'Adopt mode on — new jobs with standard GitHub-hosted labels will run on microVMs (arm64).'
+          : `Mode set to ${mode}.`,
+      );
+      wf.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Toggle the per-repo auto-rewrite opt-in (ADR-031). */
+  async function setRewriteOptIn(on: boolean): Promise<void> {
+    setErr(undefined);
+    try {
+      await api.patchRepo(repo.installationId, repo.repoId, { rewriteEnabled: on });
+      setMsg(on ? 'Auto-rewrite opt-in enabled for this repo.' : 'Auto-rewrite opt-in disabled.');
+      wf.reload();
+      rewrite.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Enqueue the rewrite PR. Refused (409) unless both gates are on. */
+  async function openRewritePr(): Promise<void> {
+    setErr(undefined);
+    try {
+      await api.rewritePr(repo.installationId, repo.repoId);
+      setMsg('Rewrite PR queued — it appears in the repo shortly. Nothing is merged for you.');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   return (
     <div className="stack">
       <div className="card">
@@ -70,6 +118,23 @@ export function RepoDetail({
         <p className="muted">
           mode: {repo.mode} · enabled: {String(repo.enabled)} · default flavor:{' '}
           {repo.defaultFlavor ?? '(catalog default)'}
+        </p>
+        <div className="row">
+          <label htmlFor="repo-mode">Onboarding mode</label>
+          <select
+            id="repo-mode"
+            value={repo.mode}
+            onChange={(e) => void setMode(e.target.value as 'label' | 'adopt' | 'off')}
+          >
+            <option value="label">label — only jobs carrying an LCA label</option>
+            <option value="adopt">adopt — also claim ubuntu-* jobs (no YAML edits)</option>
+            <option value="off">off — never claim this repo</option>
+          </select>
+        </div>
+        <p className="muted">
+          {repo.mode === 'adopt'
+            ? `Adopt mode is on: ${adoptCandidates} job(s) targeting standard GitHub-hosted labels run on arm64 microVMs. Jobs that need x86 will fail — check the compat findings below.`
+            : `${adoptCandidates} job(s) target standard GitHub-hosted labels and still run on GitHub-hosted runners. Switch to adopt mode to run them unchanged (arm64 only).`}
         </p>
         {msg && <p className="muted">{msg}</p>}
         {err && <p className="error">{err}</p>}
@@ -112,11 +177,19 @@ export function RepoDetail({
                         <CompatBadge level={j.compat.level} />
                       </td>
                       <td className="muted">
+                        {j.adoptCandidate && (
+                          <div>
+                            <strong>adopt candidate</strong>: runs on GitHub-hosted runners unless
+                            this repo is in adopt mode.
+                          </div>
+                        )}
                         {j.compat.messages.map((m) => (
                           <div key={m.code}>
                             {m.code}: {m.text}
+                            {m.fix && <div className="fix">Fix: {m.fix}</div>}
                           </div>
                         ))}
+                        {!j.adoptCandidate && !j.compat.messages.length && '—'}
                       </td>
                     </tr>
                   ))}
@@ -125,6 +198,85 @@ export function RepoDetail({
             )}
           </div>
         ))}
+      </div>
+
+      <div className="card">
+        <h3>Auto-rewrite PR</h3>
+        <p className="muted">
+          Opens a pull request that adds LCA labels to <code>runs-on</code>, so jobs route here
+          explicitly instead of relying on adopt mode. Only <code>runs-on</code> lines change —
+          comments and formatting are preserved. Always a reviewable PR: never a direct push,
+          never a force-push, and nothing is merged for you.
+        </p>
+        {rewrite.error && <p className="error">{rewrite.error}</p>}
+        {!rewrite.data && !rewrite.error && <Loading what="rewrite preview" />}
+        {rewrite.data && (
+          <>
+            <p className="muted">
+              Deployment capability:{' '}
+              <strong>{rewrite.data.deploymentEnabled ? 'enabled' : 'disabled'}</strong> · repo
+              opt-in: <strong>{rewrite.data.repoOptedIn ? 'on' : 'off'}</strong>
+            </p>
+            {!rewrite.data.deploymentEnabled && (
+              <p className="muted">
+                This deployment has auto-rewrite turned off. It needs the GitHub App to hold
+                <code> contents:write</code> (off by default) and a redeploy with{' '}
+                <code>-c rewrite=true</code>. The dry run below still works.
+              </p>
+            )}
+            <div className="row">
+              <label htmlFor="rewrite-optin">
+                <input
+                  id="rewrite-optin"
+                  type="checkbox"
+                  checked={rewrite.data.repoOptedIn}
+                  onChange={(e) => void setRewriteOptIn(e.target.checked)}
+                />{' '}
+                Allow LambdaCIActions to open a rewrite PR on this repo
+              </label>
+              <span className="spacer" />
+              <button
+                className="primary"
+                disabled={!rewrite.data.canApply || rewrite.data.changes === 0}
+                onClick={() => void openRewritePr()}
+              >
+                Open rewrite PR
+              </button>
+            </div>
+            <p className="muted">
+              {rewrite.data.changes} job(s) would change
+              {rewrite.data.skipped > 0 && `, ${rewrite.data.skipped} need a hand edit`}.
+            </p>
+            {rewrite.data.jobs.length > 0 && (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Workflow</th>
+                    <th>Job</th>
+                    <th>Change</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rewrite.data.jobs.map((j) => (
+                    <tr key={`${j.path}:${j.jobId}`}>
+                      <td className="muted">{j.path}</td>
+                      <td>{j.jobId}</td>
+                      <td>
+                        {j.after ? (
+                          <pre className="diff">
+                            {`- runs-on: ${j.before}\n+ runs-on: ${j.after}`}
+                          </pre>
+                        ) : (
+                          <span className="muted">skipped: {j.skipped}</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        )}
       </div>
 
       <div className="card">

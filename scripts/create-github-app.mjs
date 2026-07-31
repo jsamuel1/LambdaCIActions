@@ -80,7 +80,10 @@ async function guardDeployTarget() {
     process.exit(1);
   }
   try {
-    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION });
+    // `env: ENV` binds the selected environment to the pin (ADR-033): this script writes App
+    // credentials to `/lca/<env>/github/*`, so an unbound selector could stash prod secrets in
+    // the dev account's parameter store.
+    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION, env: ENV });
     REGION = target.region; // pin wins — SSM writes always carry --region <pin>
   } catch (e) {
     console.error(`ERROR: ${e.message}`);

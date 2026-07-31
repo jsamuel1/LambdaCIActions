@@ -29,6 +29,8 @@ export type RouteId =
   | 'rescanRepo'
   | 'getFlavorMap'
   | 'putFlavorMap'
+  | 'rewritePreview'
+  | 'rewritePr'
   | 'listRuns'
   | 'getRun'
   | 'getRunLogs'
@@ -55,6 +57,10 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'rescanRepo', method: 'POST', template: '/api/repos/{repoId}/rescan', authRequired: true },
   { id: 'getFlavorMap', method: 'GET', template: '/api/repos/{repoId}/flavor-map', authRequired: true },
   { id: 'putFlavorMap', method: 'PUT', template: '/api/repos/{repoId}/flavor-map', authRequired: true },
+  // Auto-rewrite (M5, ADR-031). GET is a pure dry-run diff — always available, writes nothing.
+  // POST enqueues the PR and is refused unless the deployment flag AND the repo opt-in are on.
+  { id: 'rewritePreview', method: 'GET', template: '/api/repos/{repoId}/rewrite-pr', authRequired: true },
+  { id: 'rewritePr', method: 'POST', template: '/api/repos/{repoId}/rewrite-pr', authRequired: true },
   // --- runs ---
   { id: 'listRuns', method: 'GET', template: '/api/runs', authRequired: true },
   { id: 'getRun', method: 'GET', template: '/api/runs/{repoId}/{runId}/{jobId}', authRequired: true },

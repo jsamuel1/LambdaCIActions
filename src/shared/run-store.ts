@@ -30,8 +30,26 @@ const doc = client ? DynamoDBDocumentClient.from(client) : undefined;
 
 const TABLE = process.env.TABLE_NAME;
 
-/** Terminal run age-out (DynamoDB TTL): 90 days. */
-const TERMINAL_TTL_SECONDS = 90 * 24 * 60 * 60;
+/**
+ * Terminal run age-out (DynamoDB TTL), in seconds.
+ *
+ * Per-environment (ADR-033): the writers are given `RUN_RETENTION_DAYS` by CDK from
+ * `envConfig` (dev 30 / prod 90). Falls back to 90 days when unset so a pre-M5 deployment,
+ * or a caller that doesn't set the var, keeps today's behaviour rather than silently
+ * shortening retention on existing run history.
+ *
+ * Read per call rather than captured at module load: the Lambda runtime sets env vars before
+ * the handler runs either way, but this keeps the value testable and makes a misconfigured
+ * value (`0`, `abc`) fall back instead of poisoning every write in the container's lifetime.
+ */
+export const DEFAULT_RUN_RETENTION_DAYS = 90;
+
+export function terminalTtlSeconds(): number {
+  const raw = process.env.RUN_RETENTION_DAYS;
+  const days = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  const effective = Number.isSafeInteger(days) && days > 0 ? days : DEFAULT_RUN_RETENTION_DAYS;
+  return effective * 24 * 60 * 60;
+}
 
 // ---- pure helpers (no AWS) -------------------------------------------------
 
@@ -202,7 +220,7 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
   if (TERMINAL.has(input.to)) {
     setParts.push('#ttl = :ttl');
     names['#ttl'] = 'ttl';
-    values[':ttl'] = Math.floor(now.getTime() / 1000) + TERMINAL_TTL_SECONDS;
+    values[':ttl'] = Math.floor(now.getTime() / 1000) + terminalTtlSeconds();
   }
 
   // Build the allowed-status IN (...) list for the condition.

@@ -26,6 +26,7 @@ import { MgmtStack } from '../lib/mgmt-stack.js';
 import { WebStack } from '../lib/web-stack.js';
 import { CertStack } from '../lib/cert-stack.js';
 import { loadEnvLocal, validateTarget } from '../lib/deploy-env.js';
+import { envConfig } from '../lib/env-config.js';
 import { resolveConsoleDomain } from '../lib/console-domain.js';
 
 const app = new App();
@@ -44,7 +45,7 @@ const ambientAccount = process.env.CDK_DEFAULT_ACCOUNT;
 let account: string | undefined;
 let region: string;
 if (ambientAccount || envLocal) {
-  const target = validateTarget(envLocal, { region: requestedRegion });
+  const target = validateTarget(envLocal, { region: requestedRegion, env: envName });
   if (ambientAccount && ambientAccount !== target.account) {
     throw new Error(
       `Deploy-target mismatch: credentials resolve to account ${ambientAccount}, but .env.local ` +
@@ -63,6 +64,20 @@ if (ambientAccount || envLocal) {
 const env = { account, region };
 const ssmPrefix = `/lca/${envName}`;
 const tagPrefix = 'lca';
+
+// Per-environment config (ADR-033): retention, concurrency, alarm thresholds, tracing.
+// `dev` and `prod` are separate ACCOUNTS (spec 05) — this only varies the knobs.
+//   -c alarmEmail=oncall@example.com   subscribe the alarm topic (unsubscribed by default)
+//   -c rewrite=true                    enable the auto-rewrite PR capability (OFF by default;
+//                                      requires the App to hold contents:write — ADR-031)
+const alarmEmail = app.node.tryGetContext('alarmEmail') as string | undefined;
+const rewriteCtx = app.node.tryGetContext('rewrite') as string | boolean | undefined;
+const config = envConfig(envName, {
+  alarmEmail,
+  // Only the exact string `true` (or boolean true) enables it: `-c rewrite=1` or a typo must
+  // NOT switch on a capability that writes to customer repositories.
+  ...(rewriteCtx === undefined ? {} : { rewriteEnabled: rewriteCtx === true || rewriteCtx === 'true' }),
+});
 
 // Phase 1: compute-plane image infra (deploy first; images built out-of-band by
 // scripts/build-images.mjs, which publishes image ARNs to SSM).
@@ -90,6 +105,7 @@ const controlStack = new ControlStack(app, `LCA-Control-${envName}`, {
   ssmPrefix,
   tagPrefix,
   table: dataStack.table,
+  config,
 });
 controlStack.addDependency(imageStack);
 controlStack.addDependency(dataStack);
@@ -129,7 +145,10 @@ const mgmtStack = new MgmtStack(app, `LCA-Mgmt-${envName}`, {
   appcfgBrokerName: controlStack.appcfgBrokerName,
   appcfgBrokerArn: controlStack.appcfgBrokerArn,
   webhookUrl: controlStack.webhookUrl,
+  rewriteQueueUrl: controlStack.rewriteQueueUrl,
+  rewriteQueueArn: controlStack.rewriteQueueArn,
   publicOrigin,
+  config,
 });
 mgmtStack.addDependency(dataStack);
 mgmtStack.addDependency(controlStack);

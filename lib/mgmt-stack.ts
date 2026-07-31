@@ -8,9 +8,9 @@ import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as ddb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
-import { RemovalPolicy } from 'aws-cdk-lib';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { EnvConfig } from './env-config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(__dirname, '..', '..', 'src');
@@ -44,6 +44,15 @@ export interface MgmtStackProps extends StackProps {
   appcfgBrokerArn?: string;
   /** Deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
   webhookUrl?: string;
+  /**
+   * Rewrite queue coordinates (ControlStack, M5). The console enqueues an auto-rewrite
+   * request here; the rewrite λ (which holds the App credential the management plane
+   * deliberately lacks — ADR-025) does the writing.
+   */
+  rewriteQueueUrl?: string;
+  rewriteQueueArn?: string;
+  /** Per-env sizing / retention config (ADR-033). */
+  config: EnvConfig;
 }
 
 /**
@@ -74,14 +83,14 @@ export class MgmtStack extends Stack {
   constructor(scope: Construct, id: string, props: MgmtStackProps) {
     super(scope, id, props);
 
-    const { envName, ssmPrefix, table } = props;
+    const { envName, ssmPrefix, table, config } = props;
     const paramArn = (name: string) =>
       `arn:${this.partition}:ssm:${this.region}:${this.account}:parameter${name}`;
 
     const logGroup = new logs.LogGroup(this, 'MgmtLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-mgmt`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      retention: config.lambdaLogRetention,
+      removalPolicy: config.logRemovalPolicy,
     });
 
     const runLogGroupName = `/aws/lambda/microvms/runs/lca-${envName}`;
@@ -95,6 +104,7 @@ export class MgmtStack extends Stack {
       timeout: Duration.seconds(29), // HTTP API integration cap
       memorySize: 512,
       logGroup,
+      tracing: config.tracing ? lambda.Tracing.ACTIVE : lambda.Tracing.DISABLED,
       bundling: {
         minify: true,
         sourceMap: false,
@@ -110,6 +120,8 @@ export class MgmtStack extends Stack {
         RUN_LOG_GROUP: runLogGroupName,
         TABLE_NAME: table.tableName,
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
+        REWRITE_QUEUE_URL: props.rewriteQueueUrl ?? '',
+        REWRITE_ENABLED: config.rewriteEnabled ? 'true' : 'false',
         PUBLIC_ORIGIN: props.publicOrigin ?? '',
         RUNNER_LABELS_PARAM: `${ssmPrefix}/config/runner-labels`,
         PLATFORM_ADMINS_PARAM: `${ssmPrefix}/config/platform-admins`,
@@ -175,6 +187,12 @@ export class MgmtStack extends Stack {
     // Manual re-scan: enqueue a discovery request (send only, no receive/delete).
     if (props.discoveryQueueArn) {
       const queue = sqs.Queue.fromQueueArn(this, 'DiscoveryQueueRef', props.discoveryQueueArn);
+      queue.grantSendMessages(fn);
+    }
+    // Auto-rewrite request: enqueue only. The management plane never gets `contents:write`
+    // or the App PEM — SendMessage is the entire extent of its involvement (ADR-031).
+    if (props.rewriteQueueArn) {
+      const queue = sqs.Queue.fromQueueArn(this, 'RewriteQueueRef', props.rewriteQueueArn);
       queue.grantSendMessages(fn);
     }
 
