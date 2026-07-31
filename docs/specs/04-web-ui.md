@@ -3,10 +3,10 @@
 Status: **Implemented (M4)** · Plane: Management
 
 > Implemented by `src/mgmt/**` (API), `web/**` (console), `lib/mgmt-stack.ts` +
-> `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-020) (auth),
-> [ADR-023](../DECISIONS.md#adr-021) (run-history index), [ADR-024](../DECISIONS.md#adr-022)
-> (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-023) (mgmt IAM boundary),
-> [ADR-026](../DECISIONS.md#adr-024) (polling), [ADR-027](../DECISIONS.md#adr-025) (where
+> `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-022) (auth),
+> [ADR-023](../DECISIONS.md#adr-023) (run-history index), [ADR-024](../DECISIONS.md#adr-024)
+> (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-025) (mgmt IAM boundary),
+> [ADR-026](../DECISIONS.md#adr-026) (polling), [ADR-027](../DECISIONS.md#adr-027) (where
 > console config is enforced), [ADR-029](../DECISIONS.md#adr-029) (run-primary Runs screen).
 > Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
 
@@ -240,6 +240,12 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   makes the fallback unnecessary. The app shell is served with a `self`-only CSP
   (`frame-ancestors 'none'`), HSTS, `nosniff`, and `Referrer-Policy: same-origin`
   (`test/web-stack.test.mjs`).
+- **Console origin**: a **vanity domain** when configured (ADR-036) — `lambdaciactions.<zone>`
+  for prod, `<env>.lambdaciactions.<zone>` otherwise — with a us-east-1 ACM cert
+  (`LCA-Cert-<env>`, CloudFront's only accepted cert region) and A+AAAA Route53 aliases.
+  Because the origin is then known at synth time, `PUBLIC_ORIGIN` is plain config and the
+  ADR-024 two-pass deploy disappears. With no domain configured the raw `*.cloudfront.net`
+  origin and the two-pass bootstrap still apply.
 - **API**: API Gateway (HTTP API) + one Lambda (TypeScript, arm64, Node 22), same toolchain
   as the orchestrator.
 - **State**: DynamoDB (shared single table) + GSI2 for per-repo run history (ADR-023).
@@ -255,13 +261,17 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - **Least privilege**: read-mostly. `dynamodb:UpdateItem` is the only write (no
   Put/Delete), `sqs:SendMessage` only on the discovery queue, log read-only on one group,
   and **no** microVM launch/terminate or `iam:PassRole`. Asserted against the synthesized
-  template in `test/mgmt-stack.test.mjs`.
+  template in `test/mgmt-stack.test.mjs`. Two code paths use that write: repo config
+  patches, and the ADR-037 installation index repair (`gsi1pk`/`gsi1sk` on an installation
+  the session already holds a grant for).
 - **Input allow-listing**: config bodies are validated field-by-field; unknown fields are a
   400, so a run's status/microVM id can't be patched through the config endpoint.
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo
   row and emit a structured log line with the actor and the patch.
 - **Config takes effect in the control plane** (ADR-027): the management λ only writes repo
-  config. `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
+  config (and the ADR-037 installation index repair, which writes only index attributes —
+  no field the console or control plane reads for behaviour).
+  `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
   `defaultFlavor` by `resolveFlavor`'s fallback. Both fail open, so a config read fault
   cannot stop a labeled job.
 - **CSP and inline styles**: the console CSP has `style-src 'self'` with no
@@ -286,7 +296,9 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 
 ## Open questions
 
-- **OQ-4**: custom domain + ACM cert for the console (currently the CloudFront domain) — M5.
+- **OQ-4**: ~~custom domain + ACM cert for the console~~ — **resolved** by
+  [ADR-036](../DECISIONS.md#adr-036) (M5): config-derived vanity origin + a us-east-1 cert
+  stack, with the raw-CloudFront path kept for accounts owning no domain.
 - **OQ-5**: per-phase run timestamps (`provisioningAt`/`runningAt`) would make the cost
   estimate exact and enable boot-latency charts. Worth a run-row schema addition in M5?
 - **OQ-6**: **Reports screen** — cost/utilisation over a time window, grouped by repo, flavor

@@ -11,6 +11,7 @@ import {
   OAUTH_STATE_COOKIE,
   SESSION_TTL_SECONDS,
   canAdminInstallation,
+  grantedInstallationIds,
   decodeSession,
   encodeSession,
   parseCookies,
@@ -300,7 +301,10 @@ async function route_(
       });
 
     case 'listInstallations': {
-      const all = await listInstallations();
+      // Pass the session's grants so a legacy row missing the GSI1 stamp is still found
+      // (by primary key) and repaired — ADR-037. The filter below is unchanged: reconcile
+      // can only surface installations this session was already authorized for.
+      const all = await listInstallations(grantedInstallationIds(session));
       const visible = all.filter((i) => canAdminInstallation(session, i.installationId));
       return json(200, {
         installations: visible.map((i) => ({

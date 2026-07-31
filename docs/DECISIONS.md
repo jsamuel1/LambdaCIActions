@@ -291,6 +291,10 @@ by every deploy-touching entry point:
 - **`scripts/build-images.mjs` / `scripts/create-github-app.mjs`**: refuse to start
   without a valid pin AND an STS caller-identity match; `--dry-run` is exempt (no AWS
   calls). Any explicit `--region`/`-c region` must equal the pinned region.
+- **`scripts/backfill-installs.mjs`** (ADR-037): same pin + STS match, but with **no dry-run
+  exemption** — its dry run still reads the live table, so an unpinned one would report
+  another account's rows as the target's. The exemption above is for commands whose dry run
+  makes no AWS call at all; it is not a blanket rule.
 **Why**: comparing the pin against the *actual* resolved identity (not just exporting a
 profile) catches every mis-targeting mode: wrong profile, stale credentials, env-var
 overrides. Keeping the guard dependency-free preserves the scripts' zero-npm-dep
@@ -650,7 +654,9 @@ the API behind CloudFront's TLS + edge termination for free.
 public origin, so the first deploy is **two-pass**: deploy `LCA-Web-<env>`, then re-deploy
 `LCA-Mgmt-<env>` with `-c publicOrigin=https://<domain>` (docs/DEPLOY-M4.md). We
 deliberately do NOT default `publicOrigin` to a guess — a wrong value is an open-redirect
-target, so login fails loudly (500) until it is set. Custom domains + ACM are M5.
+target, so login fails loudly (500) until it is set. Custom domains + ACM shipped in M5 —
+[ADR-036](#adr-036) makes the origin config-derived and removes the two-pass deploy for any
+env with a vanity domain configured; the two-pass path above still applies with none.
 
 ## ADR-025 — Management-plane IAM: read-mostly, config-write-only, no compute (M4)
 **Status**: Accepted (v1)
@@ -678,6 +684,12 @@ fails the build rather than silently widening the plane.
 which needs a GitHub token) requires a deliberate ADR + IAM change, not a one-line grant.
 The `DescribeParameters` statement is `Resource: '*'` because the API has no resource-level
 scoping — acceptable since it returns metadata only.
+
+**Amended by [ADR-037](#adr-037)**: the `UpdateItem` grant now backs a second code path —
+the installation GSI1 index repair. It needed **no IAM change** (same action, same table) and
+writes only index attributes (`gsi1pk`/`gsi1sk`) on an installation row the session already
+holds a grant for — no attribute the console or the control plane reads for behaviour.
+"UpdateItem is the only write" still holds; "its only purpose is repo config" no longer does.
 
 ## ADR-026 — Polling for live run updates in v1 (no WebSocket/SSE) (M4)
 **Status**: Accepted (v1) · resolves [spec 04](specs/04-web-ui.md) OQ-1
@@ -949,6 +961,141 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
+
+## ADR-036 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
+**Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
+[ADR-024](#adr-024)
+**Context**: The dev console shipped on CloudFront's generated name
+(`https://<id>.cloudfront.net`). That name is not cosmetic — it is load-bearing in three
+coupled places, all of which break if the distribution is ever replaced:
+1. `PUBLIC_ORIGIN` on the Mgmt λ (OAuth redirect URI + post-login redirect),
+2. the GitHub App's OAuth **callback URL**, and
+3. the first-party session cookie's origin (ADR-024).
+(2) is the expensive one: GitHub exposes **no REST endpoint for App settings** (verified
+2026-07-28 — `PATCH /app` does not exist), so a domain change is a browser-only edit and
+login stays broken until a human performs it. The generated name is also only knowable
+*after* WebStack's first deploy, which is the sole reason ADR-024 required a second
+`-c publicOrigin=...` deploy pass.
+**Decision**: give the console a **stable vanity hostname** and make the origin a
+**config input resolved at synth time**.
+- **Scheme** (`lib/console-domain.ts`): prod owns the bare project label, other envs are
+  prefixed — `lambdaciactions.<zone>` for prod, `<env>.lambdaciactions.<zone>` otherwise.
+  Prod therefore gets its permanent name on its **first** deploy, so a raw-CloudFront
+  callback URL is never registered for prod at all. `LCA_CONSOLE_DOMAIN` overrides the
+  scheme when a hostname must be exact.
+- **Config location**: `.env.local` (the same machine-local, gitignored file as the ADR-018
+  deploy pin), keys `LCA_CONSOLE_HOSTED_ZONE_ID` + `LCA_CONSOLE_ZONE_NAME`, each overridable
+  by `-c consoleHostedZoneId=` / `-c consoleZoneName=` / `-c consoleDomain=`. Not checked in:
+  a hosted zone is an account-specific resource.
+- **Certificate**: its own stack, `LCA-Cert-<env>`, with `env.region` **hard-pinned to
+  us-east-1** and a constructor assertion that refuses any other region. CloudFront accepts
+  viewer certs only from us-east-1 regardless of where the distribution's stack lives.
+  WebStack consumes the ARN via `crossRegionReferences: true` on both stacks. Validation is
+  DNS against the same public zone that holds the alias, so issuance is hands-off.
+- **Alias**: `domainNames` + `certificate` on the distribution, plus **A *and* AAAA** alias
+  records. Both zone references use `fromHostedZoneAttributes` (id + name), never
+  `fromLookup`, so credential-less `cdk synth` keeps working (ADR-018's CI exemption).
+- **Fallback**: with no `LCA_CONSOLE_*` config, `resolveConsoleDomain` returns `null` and
+  every custom-domain resource is skipped — a fresh account owning no domain still deploys
+  on the raw CloudFront name, and the ADR-024 two-pass bootstrap still applies there.
+**Why**: the origin becomes knowable before any resource exists, which (a) removes the
+two-pass deploy for domained envs — `PUBLIC_ORIGIN` is just config now — and (b) decouples
+all three coupling points from CloudFront's generated name, so a future distribution
+replacement no longer requires a browser edit to restore login. The us-east-1 pin is
+enforced in code because the wrong region is the classic trap here: it synths cleanly and
+fails at `cdk deploy` on the distribution update, *after* the cert has been issued.
+**Consequences**:
+- Config is **all-or-nothing**: a half-configured domain (zone id without zone name, or a
+  hostname outside the zone) **throws** rather than falling back. A silent fallback is the
+  dangerous case — the distribution would come up with no alias while `PUBLIC_ORIGIN`
+  pointed at the vanity name, and login would fail with a misleading `invalid OAuth state`
+  that reads like a cookie bug.
+- The cert stack is the repo's **first** stack outside `LCA_DEPLOY_REGION`, so a domained env
+  needs the CDK bootstrap stack in **us-east-1** too. Missing it fails the deploy instantly
+  (bootstrap-version SSM parameter not found) before ACM does anything; docs/DEPLOY-M4.md
+  Phase 2 carries the one-time `cdk bootstrap aws://<account>/us-east-1`. The no-domain path
+  keeps every stack in one region and needs no extra bootstrap.
+- First deploy of a new hostname is **slower**: ACM writes a `_<hash>` CNAME and polls, and
+  CloudFormation blocks the cert until `ISSUED`, so the distribution can never come up with
+  an alias whose cert is pending. A cert stuck in `PENDING_VALIDATION` means the CNAME never
+  resolved publicly (wrong zone, or a zone that is not authoritative).
+- Migration off an existing raw-CloudFront origin requires **both** callbacks registered on
+  the App simultaneously — add the vanity one, flip `PUBLIC_ORIGIN`, verify, then remove the
+  old one. This is possible because a GitHub App accepts up to **10** callback URLs (matched
+  exactly; OAuth Apps allow only one, with prefix matching). `-c publicOrigin=` still wins
+  over config precisely so an operator can pin a transitional origin mid-flip. Removing the
+  old entry first breaks login instantly.
+- During that flip the console is reachable on **two** hosts but only **one** can complete
+  OAuth: the `state` cookie is host-only (no `Domain` attribute) and `redirect_uri` is built
+  from the single `PUBLIC_ORIGIN`, so a login started on the other host returns to a callback
+  that never received the cookie → `invalid OAuth state`. Operators must stay on whichever
+  host `PUBLIC_ORIGIN` names until the flip completes; docs/DEPLOY-M4.md orders the steps
+  accordingly. Widening the cookie to the parent domain would fix the window at the cost of
+  scoping the session above the console — rejected.
+- Existing sessions do not survive the origin flip: the session cookie is scoped to the old
+  host, so operators re-authenticate once. That is the same revocation lever as rotating the
+  session secret (ADR-022), not a new failure mode.
+- **Apex override caveat**: `LCA_CONSOLE_DOMAIN` may name the zone apex (`example.com`), and
+  the alias records are then created at the apex (`recordName: undefined`). Two consequences
+  the derived scheme does not have: (a) the console's HSTS header carries
+  `includeSubdomains` with a one-year max-age, so serving the console at the apex pins
+  **every** host in that zone to HTTPS in any browser that has loaded it — including
+  unrelated subdomains; (b) an apex zone typically already carries other records. The derived
+  scheme puts the console under its own `lambdaciactions` label precisely so the HSTS scope
+  and the record namespace stay inside the console's own subtree. Use an apex override only
+  for a zone dedicated to this console.
+- `test/console-domain.test.mjs` pins the scheme + the refuse-on-partial-config behavior;
+  `test/console-domain-infra.test.mjs` pins the us-east-1 assertion, the A+AAAA pair, the
+  apex-override record shape, and the no-domain fallback (no alias, no cert, no records).
+## ADR-037 — Installation enumeration reconciles unindexed rows on read (M4 fix)
+**Status**: Accepted (v1) · follows [ADR-009](#adr-009), [ADR-022](#adr-022)
+**Context**: `listInstallations()` enumerates installations from the GSI1 `INSTALLS`
+partition so the console never table-scans. The `gsi1pk=INSTALLS` / `gsi1sk=<accountLogin>`
+write only arrived with M4 (commit 63069ff, 2026-07-28), so an INSTALL row written by M2-era
+code carries no index keys and is **invisible** to that query. Observed on dev: installation
+`146431062` (`jsamuel1`) served 30 granted repos and claimed jobs normally — the ingest hot
+path reads by primary key (`getRepo`) — while `GET /api/installations` returned `[]` and the
+Setup screen rendered "You have no LambdaCIActions App installations". GitHub does not
+re-send `installation.created` for an existing install, so nothing re-writes the row: the
+only workaround was uninstall/reinstall. DEPLOY-M4's claim that this "self-heals with
+activity" was wrong — job activity never touches the installation row.
+**Decision**: two parts.
+1. **Reconcile-on-read, bounded by the caller's grants.** `listInstallations(reconcileIds)`
+   keeps the GSI1 query as the primary path, then — for any id in `reconcileIds` the index
+   did not return — does a single `GetItem` by primary key and, when the row exists without
+   `gsi1pk`, repairs it in place (`SET gsi1pk, gsi1sk` conditional on
+   `attribute_not_exists(gsi1pk)`). The Mgmt handler passes `session.installations`, i.e.
+   exactly the installations the operator is *already* authorized to see (ADR-022 freezes
+   these at login from GitHub, independent of our table).
+2. **A one-shot backfill** — `npm run backfill:installs` (`scripts/backfill-installs.mjs`,
+   dry-run by default) stamps every unindexed installation row, so an existing environment is
+   fully repaired in one command rather than lazily per operator login. Both paths select on
+   the same signal — the key shape (`INSTALL#<id>` / `INSTALL`) plus a missing `gsi1pk`, not
+   the optional `entity` attribute — so neither can repair a row the other cannot.
+**Why not a fallback scan**: the obvious alternative — "if the GSI query comes back empty,
+scan with a filter" — is triggered by the wrong signal. Empty-index is not the failure mode;
+*partially* indexed is (one M4-era install indexed, one M2-era install not), and a scan that
+only fires on total emptiness still hides the legacy row. Firing the scan unconditionally
+puts a table scan on a polled console endpoint (ADR-026 polls), and its cost grows with run
+history, which dwarfs installation count. The grant list gives an exact, already-authorized
+candidate set: worst case one `GetItem` per installation the operator administers (a handful),
+paid once because the read self-heals. Reconcile also needs no new IAM — the Mgmt λ already
+holds `dynamodb:UpdateItem` for repo config (ADR-025), and this write touches only index
+attributes on a row keyed by an id the session is authorized for.
+**Consequences**: the invariant "an installation the platform is demonstrably serving is
+never absent from the console" holds for any operator with a grant for it, even on an
+un-backfilled environment. A legacy installation nobody holds a grant for stays invisible
+until the backfill runs — acceptable, since nobody can view it anyway. A repair failure is
+logged and swallowed: the row is already in the response, so the read must not fail. The
+repair is idempotent and concurrency-safe (conditional write; a losing racer is a no-op).
+`upsertInstallation` now stamps the keys via the shared `installGsi1Keys()` helper, and
+`test/install-store-gsi1.test.mjs` pins that every write path carries them — the regression
+class here is "a new write path forgets the index stamp". The reconciled list is re-sorted by
+account login so a recovered row occupies the same position it will hold once the index alone
+serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
+that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
+the reverse, and the mismatch would be the same row-jump wearing a disguise.
+||||||| 94360ca
 > **ADR numbering note.** This block was originally authored as 030..033 and has been renumbered
 > to **038..041** to vacate a collision: the concurrent branch `kermes/task-tidal-hawk` claims
 > 030..033 for entirely different subjects (adopt-mode label claiming, the auto-rewrite PR, EMF
@@ -1160,3 +1307,4 @@ so it consumes quota, costs money, and needs a repo to register against; it is t
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
 the static gates; the smoke run itself is verified against a live environment. Deferred to a
 follow-up card together with ADR-040.
+||||||| 94360ca

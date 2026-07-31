@@ -110,6 +110,11 @@ node scripts/create-github-app.mjs \
   --env dev --region us-west-2
 ```
 
+`--console-url` is only the App's homepage link, not the OAuth callback (that is registered
+in [DEPLOY-M4](DEPLOY-M4.md) Phase 4). If you already know the console's vanity hostname
+([ADR-036](DECISIONS.md#adr-036) — it is config, so it is knowable before any console
+resource exists), pass it here so the App never advertises a placeholder.
+
 Install the App on the test repo (the script prints the exact URL).
 
 ## Verify (M1 exit criterion)

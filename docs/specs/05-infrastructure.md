@@ -74,11 +74,16 @@ CDK v2 (TypeScript). Split so the compute plane can be built before the control 
 | `ControlStack` | API GW `/webhook`, Ingest λ, SQS + DLQ, Provision λ, Discovery λ, Hook broker λ, Reaper λ + schedule | Depends on image ARNs in config |
 | `DataStack` | DynamoDB table + GSI1 (status/time) + GSI2 (repo/time, ADR-023) | Shared by all planes |
 | `MgmtStack` | HTTP API `/api/*` + `/auth/*`, Mgmt API λ | Management plane (M4). IAM boundary per ADR-025 |
-| `WebStack` | S3 (OAC, private) + CloudFront; API attached as `/api/*` + `/auth/*` behaviors | Hosts the SPA; single origin per ADR-024 |
+| `WebStack` | S3 (OAC, private) + CloudFront; API attached as `/api/*` + `/auth/*` behaviors; vanity alias + A/AAAA records when a console domain is configured | Hosts the SPA; single origin per ADR-024, vanity domain per ADR-036 |
+| `CertStack` | ACM certificate for the console's vanity hostname, DNS-validated | **us-east-1 only** — CloudFront accepts viewer certs from no other region. Created ONLY when `LCA_CONSOLE_*` is configured (ADR-036); needs a us-east-1 CDK bootstrap |
 | ~~`AuthStack`~~ | — | **Dropped**: auth is GitHub OAuth + a signed session cookie, no Cognito user pool (ADR-022). The only resource it would own is the session secret — an out-of-band SecureString. |
 
 Cross-stack refs kept minimal; config values (image ARNs, table names) flow via SSM
-parameters rather than hard CFN exports where possible, to decouple deploy ordering.
+parameters rather than hard CFN exports where possible, to decouple deploy ordering. The one
+unavoidable hard ref is `CertStack` → `WebStack`: a CloudFront viewer certificate must be
+passed as an ARN, so both stacks set `crossRegionReferences: true` (CDK wires an SSM-backed
+custom-resource pair across the region boundary). That ref only exists on the vanity-domain
+path — with no console domain configured, every stack stays in `LCA_DEPLOY_REGION`.
 
 ## Secrets (SSM SecureString)
 
@@ -118,13 +123,16 @@ Same three-step shape as the reference, generalized:
                            upload, build, snapshot, poll, prune, write image ARN → SSM)
 
 3. deploy orchestrator  →  cdk deploy ControlStack MgmtStack WebStack
-                          (now image ARNs exist in SSM; Ingest/Provision/Discovery/Reaper λ,
+                          (+ CertStack in us-east-1 when a vanity domain is configured;
+                           now image ARNs exist in SSM — Ingest/Provision/Discovery/Reaper λ,
                            API GWs, and the console all come up)
 
 4. console origin pass  →  npm run build:web
                           cdk deploy MgmtStack -c publicOrigin=https://<cloudfront-domain>
-                          (the management API can't know its own public origin until the
-                           distribution exists — two-pass by design, ADR-024)
+                          (ONLY when no vanity domain is configured: the management API
+                           can't know CloudFront's generated origin until the distribution
+                           exists — two-pass by design, ADR-024. With LCA_CONSOLE_* set the
+                           origin comes from config and this step disappears, ADR-036)
 ```
 
 Re-running step 2 rebuilds images (e.g. patch day); steps 3–4 are idempotent. Full console

@@ -10,6 +10,12 @@
 // credentials that don't match the pin. Credential-less `cdk synth` (CI gate) is exempt.
 // Secrets are NEVER defined here — they are created out-of-band (ADR-008) and referenced
 // by ARN/path inside the stacks.
+//
+// The console's vanity domain (ADR-036) is also configured in `.env.local`
+// (LCA_CONSOLE_HOSTED_ZONE_ID + LCA_CONSOLE_ZONE_NAME): the hosted zone is an
+// account-specific resource, and an account owning no domain must still be able to deploy —
+// so with those unset every custom-domain resource is skipped and the console serves on the
+// raw CloudFront name.
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { App } from 'aws-cdk-lib';
@@ -18,7 +24,9 @@ import { ControlStack } from '../lib/control-stack.js';
 import { DataStack } from '../lib/data-stack.js';
 import { MgmtStack } from '../lib/mgmt-stack.js';
 import { WebStack } from '../lib/web-stack.js';
+import { CertStack } from '../lib/cert-stack.js';
 import { loadEnvLocal, validateTarget } from '../lib/deploy-env.js';
+import { resolveConsoleDomain } from '../lib/console-domain.js';
 
 const app = new App();
 
@@ -89,12 +97,28 @@ controlStack.addDependency(dataStack);
 // Phase 4 (M4): management plane. The console API reads the shared table + run logs and
 // enqueues manual re-scans onto the control plane's discovery queue.
 //
-// `publicOrigin` is the console's CloudFront domain, which does not exist until WebStack's
-// first deploy — hence the two-pass bootstrap documented in docs/DEPLOY-M4.md:
-//   1. deploy MgmtStack + WebStack (login disabled: no origin),
-//   2. re-deploy MgmtStack with `-c publicOrigin=https://<domain>`.
-// We refuse to guess an origin because a wrong value is an open-redirect target.
-const publicOrigin = (app.node.tryGetContext('publicOrigin') as string | undefined) ?? undefined;
+// `publicOrigin` (PUBLIC_ORIGIN on the mgmt λ) is the console's browser origin. It is used
+// to build the OAuth redirect URI and post-login redirects, so it must match the GitHub
+// App's registered callback URL exactly.
+//
+// With a vanity domain configured (ADR-036) the origin is KNOWN AT SYNTH TIME from config —
+// no discovery, no second pass. Without one, the origin is CloudFront's generated domain,
+// which does not exist until WebStack's first deploy, so the legacy two-pass bootstrap in
+// docs/DEPLOY-M4.md still applies: deploy, then re-deploy MgmtStack with
+// `-c publicOrigin=https://<domain>`. We never guess an origin — a wrong value is an
+// open-redirect target, so login fails loudly instead.
+const consoleDomain = resolveConsoleDomain({
+  envName,
+  envLocal,
+  contextDomain: app.node.tryGetContext('consoleDomain') as string | undefined,
+  contextHostedZoneId: app.node.tryGetContext('consoleHostedZoneId') as string | undefined,
+  contextZoneName: app.node.tryGetContext('consoleZoneName') as string | undefined,
+});
+
+// An explicit `-c publicOrigin=` still wins, so an operator can point the API at a
+// transitional origin mid-migration (both callbacks registered) without editing config.
+const publicOriginOverride = (app.node.tryGetContext('publicOrigin') as string | undefined) ?? undefined;
+const publicOrigin = publicOriginOverride ?? consoleDomain?.origin;
 const mgmtStack = new MgmtStack(app, `LCA-Mgmt-${envName}`, {
   env,
   envName,
@@ -107,13 +131,40 @@ const mgmtStack = new MgmtStack(app, `LCA-Mgmt-${envName}`, {
 mgmtStack.addDependency(dataStack);
 mgmtStack.addDependency(controlStack);
 
+// Phase 4 (M4): the console's ACM certificate. CloudFront only accepts viewer certs from
+// us-east-1, so this stack is region-pinned regardless of LCA_DEPLOY_REGION (ADR-036).
+// Only created when a vanity domain is configured.
+//
+// Cross-region references (WebStack consuming this cert ARN) require a CONCRETE account:
+// CDK cannot wire the SSM-reader custom resource for an environment-agnostic stack. That
+// only bites if someone forces a domain via `-c` with no pin and no credentials, so fail
+// with the actual reason instead of CDK's generic message.
+if (consoleDomain && !account) {
+  throw new Error(
+    `A console domain (${consoleDomain.hostname}) is configured, but no deploy account is ` +
+      'resolved. The us-east-1 certificate is a cross-region reference and needs a concrete ' +
+      'account.\nFix: pin LCA_DEPLOY_ACCOUNT in .env.local (ADR-018), or drop the console-domain ' +
+      'context flags for a credential-less synth.',
+  );
+}
+const certStack = consoleDomain
+  ? new CertStack(app, `LCA-Cert-${envName}`, {
+      env: { account, region: 'us-east-1' },
+      envName,
+      domain: consoleDomain,
+    })
+  : undefined;
+
 // Phase 4 (M4): console hosting. Fronts BOTH the SPA bundle and the management API on one
 // CloudFront distribution so the session cookie stays first-party (ADR-024).
 const webStack = new WebStack(app, `LCA-Web-${envName}`, {
   env,
   envName,
   apiHost: mgmtStack.apiEndpointHost,
+  domain: consoleDomain ?? undefined,
+  certificate: certStack?.certificate,
 });
 webStack.addDependency(mgmtStack);
+if (certStack) webStack.addDependency(certStack);
 
 app.synth();
