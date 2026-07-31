@@ -27,10 +27,12 @@ export interface MgmtStackProps extends StackProps {
   discoveryQueueUrl?: string;
   discoveryQueueArn?: string;
   /**
-   * Public origin of the console (the CloudFront domain), used to build the OAuth
-   * redirect URI and post-login redirects. Set after WebStack's first deploy — see
-   * docs/DEPLOY-M4.md; until then login returns 500 by design rather than guessing an
-   * origin (an attacker-controlled redirect target would be worse).
+   * Public origin of the console, used to build the OAuth redirect URI and post-login
+   * redirects. With a vanity domain configured (ADR-036) this is known at synth time from
+   * config. Without one it is CloudFront's generated domain, which only exists after
+   * WebStack's first deploy — see the two-pass path in docs/DEPLOY-M4.md. Until it is set,
+   * login returns 500 by design rather than guessing an origin (an attacker-controlled
+   * redirect target would be worse).
    */
   publicOrigin?: string;
 }

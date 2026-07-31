@@ -70,10 +70,13 @@ test('viewers are redirected to HTTPS on every behavior', () => {
   for (const b of cfg.CacheBehaviors) {
     assert.equal(b.ViewerProtocolPolicy, 'redirect-to-https');
   }
-  // Note: with no custom domain/ACM cert (M5), CloudFormation emits no `ViewerCertificate`
-  // at all — the distribution uses the default *.cloudfront.net cert and CloudFront pins the
-  // TLS floor itself, so the stack's `minimumProtocolVersion` is inert until an alias is
-  // attached. Asserted here so nobody reads it as an enforced control.
+  // Note: this stack is synthesized with NO console domain configured, which is still a
+  // supported path (ADR-036: an account owning no Route53 zone deploys on the raw
+  // *.cloudfront.net name). CloudFormation then emits no `ViewerCertificate` at all — the
+  // distribution uses the default *.cloudfront.net cert and CloudFront pins the TLS floor
+  // itself, so the stack's `minimumProtocolVersion` is inert until an alias is attached.
+  // Asserted here so nobody reads it as an enforced control. The domained path (where the
+  // floor IS enforced) is covered by test/console-domain-infra.test.mjs.
   assert.equal(cfg.ViewerCertificate, undefined);
 });
 
