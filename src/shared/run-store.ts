@@ -48,7 +48,7 @@ const STATUS_RANK: Record<RunStatus, number> = {
 const TERMINAL: ReadonlySet<RunStatus> = new Set(['completed', 'failed', 'timed_out']);
 
 /**
- * Run-row attribute that records first entry into a phase (ADR-030). Only the two phases
+ * Run-row attribute that records first entry into a phase (ADR-042). Only the two phases
  * reporting needs are stamped: `provisioningAt` (claim → launch) and `runningAt` (the
  * queue-to-start boundary AND the start of billable microVM time). `createdAt` already
  * marks `queued` and `updatedAt` the terminal transition, so no third attribute is needed.
@@ -193,7 +193,7 @@ export interface TransitionInput {
 }
 
 /**
- * Build the guarded transition write (pure, so the forward-only condition and the ADR-030
+ * Build the guarded transition write (pure, so the forward-only condition and the ADR-042
  * watermark semantics are unit-testable without AWS).
  */
 export function buildTransitionUpdate(
@@ -220,7 +220,7 @@ export function buildTransitionUpdate(
     ':gpk': `RUNSTATUS#${input.to}`,
   };
 
-  // Phase watermarks (ADR-030): stamped on the FIRST entry to a phase and never moved.
+  // Phase watermarks (ADR-042): stamped on the FIRST entry to a phase and never moved.
   // `if_not_exists` rather than a plain SET because a status can be re-written idempotently
   // (duplicate webhook delivery), and a moving watermark would corrupt both the
   // queue-to-start latency report and the billable-minutes cost basis. Written inside the

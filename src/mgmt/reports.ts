@@ -2,7 +2,7 @@ import type { RunRecord, RunStatus } from '../shared/types.js';
 import { ALL_STATUSES, billableSeconds, flavorRatePerMinute, flavorNames } from './views.js';
 
 /**
- * Reporting read model (spec 04 § Reports, ADR-031/032/033).
+ * Reporting read model (spec 04 § Reports, ADR-043/032/033).
  *
  * Everything here is **pure**: the closed report vocabulary, the spec validator, the folds
  * that turn run rows into series, the percentile maths and the CSV serializer. The DynamoDB
@@ -15,7 +15,7 @@ import { ALL_STATUSES, billableSeconds, flavorRatePerMinute, flavorNames } from 
  *     way a spec is constructed — from query params (manual picker) or from a model
  *     response (Part C). It rejects anything outside the enumerated metrics / dimensions /
  *     chart types / filter fields, so a model can never widen the query surface, author a
- *     DynamoDB expression, or smuggle a renderable payload (ADR-033).
+ *     DynamoDB expression, or smuggle a renderable payload (ADR-045).
  *  2. **Authorization is never a spec field.** A spec carries `repoIds` as a *narrowing*
  *     filter only; the set of repos actually read is computed server-side from the session's
  *     installations (see `report-store.ts`) and then intersected. A spec asking for a repo
@@ -202,7 +202,7 @@ export function presetWindow(preset: RangePreset, now: Date = new Date()): { fro
  * Total and closed: unknown top-level fields, unknown filter fields, unknown enum values and
  * out-of-range windows are all rejected with operator-readable errors rather than coerced.
  * This is the single validator for BOTH the manual picker's query params and a model
- * response (ADR-033) — so the security boundary cannot be bypassed by the newer caller.
+ * response (ADR-045) — so the security boundary cannot be bypassed by the newer caller.
  */
 export function validateReportSpec(input: unknown, now: Date = new Date()): SpecResult {
   if (!isPlainObject(input)) return { ok: false, errors: ['spec must be a JSON object'] };
@@ -360,7 +360,7 @@ export function specFromQuery(
 /**
  * Billable seconds + basis. Re-exported from `views.ts` rather than reimplemented: Run detail
  * and Reports must never disagree about what a single run cost, so there is exactly one
- * definition of billable time (ADR-030).
+ * definition of billable time (ADR-042).
  */
 export { billableSeconds } from './views.js';
 
@@ -670,7 +670,7 @@ export function toCsv(rows: ExportRow[], columns: readonly string[] = EXPORT_COL
   return [head, ...body].join('\r\n');
 }
 
-/** Stable, shareable query string for a spec — the URL a report is pinned by (ADR-033). */
+/** Stable, shareable query string for a spec — the URL a report is pinned by (ADR-045). */
 export function specToQuery(spec: ReportSpec): string {
   const p = new URLSearchParams();
   p.set('metric', spec.metric);

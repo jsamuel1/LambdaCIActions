@@ -193,7 +193,7 @@ export interface RunRecord {
   reason?: string;
   createdAt: string; // ISO8601
   /**
-   * Phase watermarks, stamped once on first entry to each phase (ADR-030 / spec 04 OQ-5).
+   * Phase watermarks, stamped once on first entry to each phase (ADR-042 / spec 04 OQ-5).
    * Write-once (`if_not_exists`) so a duplicate/late webhook can't move them, and ABSENT on
    * rows created before M5 — every report that consumes them reports coverage rather than
    * silently treating a missing watermark as zero.

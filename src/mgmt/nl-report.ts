@@ -14,7 +14,7 @@ import {
 import { flavorNames } from './views.js';
 
 /**
- * Natural-language → report spec (spec 04 § Reports, ADR-032 model choice, ADR-033 security
+ * Natural-language → report spec (spec 04 § Reports, ADR-044 model choice, ADR-045 security
  * boundary).
  *
  * The security shape of this module, which is the whole point of it:
@@ -38,7 +38,7 @@ import { flavorNames } from './views.js';
  */
 
 /**
- * Model id. Sonnet (ADR-032): the task is small but genuinely structured — it maps loose
+ * Model id. Sonnet (ADR-044): the task is small but genuinely structured — it maps loose
  * operator phrasing onto a 5-metric × 6-dimension × 4-chart menu plus a time window, and a
  * wrong-but-valid spec is worse than a refusal because it silently answers a different
  * question. Overridable per-env without a code change.
@@ -59,7 +59,7 @@ export const RATE_WINDOW_MS = 60_000;
  * Platform-wide invocation ceiling per Lambda container lifetime. A crude but real spend cap:
  * the Mgmt λ is not a fleet, so a single container absorbing a scripted abuse loop is the
  * realistic failure mode. A persistent cross-container budget belongs in the run table and is
- * deliberately deferred (ADR-032) rather than faked here.
+ * deliberately deferred (ADR-044) rather than faked here.
  */
 export const MAX_INVOCATIONS_PER_CONTAINER = 500;
 
@@ -262,7 +262,7 @@ export function checkQuestion(raw: unknown): { ok: true; question: string } | { 
 
 /**
  * Ask the model for a spec. Never throws: a Bedrock fault becomes `reason: 'unavailable'` so
- * the caller degrades to the manual picker (ADR-033 fallback requirement).
+ * the caller degrades to the manual picker (ADR-045 fallback requirement).
  */
 export async function proposeSpec(
   question: string,

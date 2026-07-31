@@ -5,10 +5,10 @@ import type { SessionPayload } from './session.js';
 import type { ReportSpec } from './reports.js';
 
 /**
- * Report row sourcing (spec 04 § Reports, ADR-031).
+ * Report row sourcing (spec 04 § Reports, ADR-043).
  *
  * The run table has no aggregate index: rows are per-job, indexed by status/time (GSI1) and
- * repo/time (GSI2). Three options were on the table (see ADR-031): rollup rows written on
+ * repo/time (GSI2). Three options were on the table (see ADR-043): rollup rows written on
  * every run transition, a new time-bucketed index, or a bounded fan-out over GSI2. This is
  * the fan-out, and the deciding reason is **authorization**, not cost:
  *

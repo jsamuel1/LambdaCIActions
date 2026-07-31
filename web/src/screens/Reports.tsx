@@ -26,7 +26,7 @@ import { CHART_RENDERING, ReportChart, ReportTable, formatValue } from './Report
  *  - the **assistant**, which sends a question to `/api/reports/ask`, gets back a *validated
  *    spec plus its result*, and then writes that spec into the same URL. So a generated report
  *    is indistinguishable from a hand-picked one once it lands — reloading the link re-runs the
- *    deterministic report and never re-invokes the model (ADR-033).
+ *    deterministic report and never re-invokes the model (ADR-045).
  *
  * Every refusal from the assistant (disabled, unsupported question, invalid spec, model
  * unavailable, rate limited) leaves the picker fully usable and shows why.

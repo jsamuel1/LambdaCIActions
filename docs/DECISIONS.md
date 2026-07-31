@@ -1317,8 +1317,8 @@ follow-up card together with ADR-040.
 > cheaper than a duplicate number.
 
 
-## ADR-030 — Phase watermarks on the run row (`provisioningAt` / `runningAt`) (M5)
-**Status**: Accepted (v1) · resolves spec 04 OQ-5 · precondition for [ADR-031](#adr-031)
+## ADR-042 — Phase watermarks on the run row (`provisioningAt` / `runningAt`) (M5)
+**Status**: Accepted (v1) · resolves spec 04 OQ-5 · precondition for [ADR-043](#adr-043)
 **Context**: M4 priced a run as `wall-clock(createdAt → updatedAt) × flavor rate`. The microVM
 service only bills while the VM *runs*, so that figure includes queue time and provisioning
 time and is an unbounded overstatement — a job that sat queued for ten minutes and ran for one
@@ -1345,8 +1345,8 @@ improves monotonically as history turns over rather than changing retroactively.
 `test/run-store.test.mjs` pins the write-once expression and that terminal/queued transitions
 stamp nothing.
 
-## ADR-031 — Reporting aggregates via authorization-first repo fan-out (M5)
-**Status**: Accepted (v1) · builds on [ADR-023](#adr-023), [ADR-030](#adr-030)
+## ADR-043 — Reporting aggregates via authorization-first repo fan-out (M5)
+**Status**: Accepted (v1) · builds on [ADR-023](#adr-023), [ADR-042](#adr-042)
 **Context**: the Reports screen needs spend / counts / duration / failure rate / queue latency
 over a time window. The table has no aggregate index: rows are per-job, keyed by
 `(repoId, runId, jobId)` and indexed by status/time (GSI1) and repo/time (GSI2). Three designs
@@ -1378,8 +1378,8 @@ design serves worst; if that becomes real, rollups keyed *per installation* are 
 platform-wide total is strictly larger than the tenant total (so the test is actually
 isolating), and that a repo granted via two installations is not double-counted.
 
-## ADR-032 — Reports assistant on Bedrock: Claude Sonnet, one pinned model, one scoped grant (M5)
-**Status**: Accepted (v1) · security boundary in [ADR-033](#adr-033)
+## ADR-044 — Reports assistant on Bedrock: Claude Sonnet, one pinned model, one scoped grant (M5)
+**Status**: Accepted (v1) · security boundary in [ADR-045](#adr-045)
 **Context**: the Reports screen accepts a natural-language question ("spend by repo last 30
 days") and must turn it into a report. The repo had no Bedrock dependency, no model choice, and
 no IAM for one.
@@ -1400,7 +1400,7 @@ failure mode, and the cost is bounded by a ~400-token prompt, `max_tokens: 400`,
 `temperature: 0` and the caps below. `InvokeModelWithResponseStream` is deliberately NOT
 granted — one small JSON object needs no stream.
 **Why the existing λ**: a separate Reports λ would need its own DynamoDB read grant, its own
-session-secret read, and a second copy of the authorization logic that ADR-031 exists to keep
+session-secret read, and a second copy of the authorization logic that ADR-043 exists to keep
 in one place. The Mgmt λ's posture widens by exactly one action on one resource.
 **Cost / abuse controls**: `POST` (never a prefetchable `GET`); question capped at 400 chars and
 validated before any spend; per-actor sliding window of 10 invocations/minute keyed on the
@@ -1410,9 +1410,9 @@ never its content, which is operator-authored text. A durable cross-container bu
 the run table and is deferred rather than faked.
 **Consequences**: the console now has a per-request marginal cost on one interaction it did not
 have before, and a Bedrock regional dependency. Throttling, an unconfigured model, or a
-malformed response degrade to the manual picker (ADR-033), never to an error page.
+malformed response degrade to the manual picker (ADR-045), never to an error page.
 
-## ADR-033 — Generative UI = validated spec emission, never model-authored code (M5)
+## ADR-045 — Generative UI = validated spec emission, never model-authored code (M5)
 **Status**: Accepted (v1) · this is the security boundary of the Reports feature
 **Context**: "dynamic generative UI" is commonly implemented by having a model emit JSX/HTML/JS
 that the frontend evaluates, or SQL that the backend runs. Report data here is
@@ -1429,7 +1429,7 @@ Specifically:
   and no model-authored DynamoDB expression. Unknown fields are rejected, not ignored, so a
   spec carrying `html`, `component`, `query` or `KeyConditionExpression` fails closed.
 - **Authorization is not a spec field.** Scope comes from the session's installations
-  (ADR-031). A spec naming a foreign repo id contributes zero rows.
+  (ADR-043). A spec naming a foreign repo id contributes zero rows.
 - **No tenant data in the prompt.** Repo/workflow/job names are never sent, so a repo named
   `ignore previous instructions…` cannot influence the model. The prompt is our catalog text
   plus the operator's own question.
@@ -1450,7 +1450,7 @@ from), not prompting differently. `test/nl-report.test.mjs` pins the refusals fo
 payloads: model-authored queries, render payloads, scope-widening fields, hallucinated metrics,
 truncated JSON, and candidate arrays.
 
-## ADR-034 — Charts: ECharts (Apache-2.0), not Highcharts (M5)
+## ADR-046 — Charts: ECharts (Apache-2.0), not Highcharts (M5)
 **Status**: Accepted (v1) · **settled** — Highcharts is not being licensed for this project
 **Context**: the Reports screen needs bar / stacked-bar / line charts. Highcharts was the
 initial request. Highcharts is **commercially licensed** for non-personal use — unlike

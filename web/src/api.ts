@@ -220,7 +220,7 @@ export interface Report {
   coverage: number;
   caveat?: string;
   generatedAt: string;
-  /** What the server actually resolved + read (ADR-033 transparency). */
+  /** What the server actually resolved + read (ADR-045 transparency). */
   resolved: { query: string; repoCount: number; scope: string };
   /** Present when the spec came from the model rather than the picker. */
   source?: { kind: 'model'; modelId: string };

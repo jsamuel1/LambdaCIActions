@@ -18,6 +18,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 - [Personas & jobs-to-be-done](#personas--jobs-to-be-done)
 - [Screens](#screens)
 - [Management API](#management-api)
+- [Reports](#reports)
 - [Auth](#auth)
 - [Live run updates](#live-run-updates)
 - [Tech choices](#tech-choices)
@@ -71,7 +72,7 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   which answers "how long did the run take". The **sum of job durations** appears on expand as
   **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
   time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
-  basis (billable time is `runningAt → last transition` — ADR-030, § Reports). It exceeds wall
+  basis (billable time is `runningAt → last transition` — ADR-042, § Reports). It exceeds wall
   clock for parallel matrices, which is its point. On a
   partial window a duration renders as `≥ 4m 10s` (`durationLabel`); a run with no elapsed span
   yet keeps the plain em dash, since `≥ —` would read as "at least unknown".
@@ -165,7 +166,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/reports/catalog` | Metric catalog + vocabulary + the operator's reportable repos + assistant availability | ✅ |
 | `GET /api/reports/run` | Execute a report spec from query params | ✅ |
 | `GET /api/reports/export` | CSV/JSON download of the underlying job rows (`format=csv\|json`) | ✅ |
-| `POST /api/reports/ask` | NL question → validated spec → rendered report (ADR-032/033) | ✅ |
+| `POST /api/reports/ask` | NL question → validated spec → rendered report (ADR-044/033) | ✅ |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)) | M5 |
 
 Run paths carry `repoId` because the run row's key is the `(repoId, runId, jobId)`
@@ -225,7 +226,7 @@ p90 invents a value between two real jobs.
 
 **Cost honesty.** `spend` is an estimate and is labelled as one everywhere. The rate comes from
 the flavor's vCPU/GB footprint (OQ-3), and billable time comes from the `runningAt` watermark
-(ADR-030) so queue and provisioning time are not charged. Rows predating the watermark fall back
+(ADR-042) so queue and provisioning time are not charged. Rows predating the watermark fall back
 to total wall clock, which **overstates** cost; each export row carries `costBasis`
 (`measured` \| `wallClock`) and every report reports `coverage` — the share of contributing rows
 measured rather than inferred. Reconciliation against a real microVM bill is still outstanding
@@ -236,7 +237,7 @@ before the window was exhausted, and the UI renders the numbers as a floor with 
 the window — it never silently truncates. `coverage` and the metric's `caveat` are shown
 alongside every chart.
 
-**Tenant isolation (ADR-031).** Unlike run lists, reporting does **not** post-filter. It resolves
+**Tenant isolation (ADR-043).** Unlike run lists, reporting does **not** post-filter. It resolves
 the operator's visible repos first and queries only those GSI2 partitions, so a foreign row is
 never fetched. `filters.repoIds` can only narrow that set. A zero-grant session gets 403, as on
 `/api/health`. `test/report-isolation.test.mjs` asserts the platform-wide total is strictly
@@ -246,7 +247,7 @@ larger than the tenant total, so the test is provably isolating something.
 fields are RFC-4180 quoted **and** formula-defanged: repo/workflow/job names are
 tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Excel/Sheets.
 
-**Assistant (ADR-032 / ADR-033).** `POST /api/reports/ask` sends the operator's question to
+**Assistant (ADR-044 / ADR-045).** `POST /api/reports/ask` sends the operator's question to
 Bedrock, which replies with a JSON spec — never code, never a query, never markup. The spec goes
 through the *same* validator as the picker's query params; anything outside the vocabulary is
 rejected, not repaired. The resolved spec is written into the URL, so a generated report is a
@@ -358,20 +359,20 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   term is a proxy for the shape a flavor is intended for, not for provisioned capacity. The
   two-term formula stays (memory is real and drives quota), but every surface must label the
   figure an estimate; the Flavors screen footnotes the `vcpu` column for this reason.
-  **Amended by ADR-030**: the *duration* term is no longer wall clock. v1 had no per-phase
+  **Amended by ADR-042**: the *duration* term is no longer wall clock. v1 had no per-phase
   timestamps, so it billed queue + provisioning time too; the watermarks below narrow it to
   `runningAt → updatedAt`. The figure stays an estimate — the rate is still derived, not billed.
-- **OQ-5** (per-phase run timestamps) → **added**, ADR-030. `provisioningAt` + `runningAt` are
+- **OQ-5** (per-phase run timestamps) → **added**, ADR-042. `provisioningAt` + `runningAt` are
   stamped write-once inside the guarded status transition, which makes billable time
   `runningAt → updatedAt` instead of total wall clock and makes queue-to-start latency a real
   metric. Pre-M5 rows have no watermark and are reported as coverage, never as zero.
-- **Chart library** → **ECharts (Apache-2.0), pinned exact**, ADR-034. Highcharts was requested
+- **Chart library** → **ECharts (Apache-2.0), pinned exact**, ADR-046. Highcharts was requested
   but is commercially licensed; the project owner declined to license it, so it is rejected
   outright rather than pending a check. Future charting extends the ECharts wrapper.
-- **Generative UI shape** → **constrained spec emission**, ADR-033. The model selects from a
+- **Generative UI shape** → **constrained spec emission**, ADR-045. The model selects from a
   closed catalog; no model-authored JS/JSX/HTML/query is ever evaluated or rendered.
 - **Report model** → **Claude 3.5 Sonnet on Bedrock**, from the existing Mgmt λ, with
-  `bedrock:InvokeModel` scoped to that one model id, ADR-032.
+  `bedrock:InvokeModel` scoped to that one model id, ADR-044.
 
 ## Open questions
 
@@ -383,5 +384,5 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   labelled and its bias (overstates, for rows without a `runningAt` watermark) is known;
   the magnitude is not.
 - **OQ-7**: a durable, cross-container spend budget for the Reports assistant. The current cap
-  is per-λ-container (ADR-032) — adequate for a single-λ console, wrong the moment reporting
+  is per-λ-container (ADR-044) — adequate for a single-λ console, wrong the moment reporting
   moves to its own function or the console scales out.

@@ -398,7 +398,7 @@ test('every chart type in the vocabulary is one the frontend actually renders', 
 
 test('every chart type and dimension in the vocabulary is a plain string enum', () => {
   // Guards against a future "chart" that carries options — the model picks from this list, so
-  // anything structured here becomes model-controlled render input (ADR-033).
+  // anything structured here becomes model-controlled render input (ADR-045).
   for (const v of [...CHART_TYPES, ...DIMENSIONS, ...METRICS]) {
     assert.equal(typeof v, 'string');
   }

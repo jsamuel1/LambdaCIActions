@@ -27,7 +27,7 @@ export interface RunView {
   /** Estimated microVM cost in USD; undefined when the flavor is unknown (never launched). */
   costUsd?: number;
   /**
-   * Which clock the cost came from: `measured` (the `runningAt` watermark, ADR-030) or
+   * Which clock the cost came from: `measured` (the `runningAt` watermark, ADR-042) or
    * `wallClock` (a pre-watermark row, which overstates). Exposed so the UI states the bias
    * instead of presenting both kinds of estimate as equally tight.
    */
@@ -85,7 +85,7 @@ export type CostBasis = 'measured' | 'wallClock';
  * Billable seconds for a job, and which clock produced them.
  *
  * The microVM service bills only while the VM RUNS, so queue + provisioning time is not
- * chargeable. Prefers the `runningAt` watermark (ADR-030); falls back to total wall clock for
+ * chargeable. Prefers the `runningAt` watermark (ADR-042); falls back to total wall clock for
  * rows written before it existed, which OVERSTATES cost. The basis is returned rather than
  * hidden so both Run detail and Reports can label the estimate the same way — this is the one
  * definition of billable time in the codebase, so the two screens cannot disagree about what

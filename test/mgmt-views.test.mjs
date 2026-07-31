@@ -94,7 +94,7 @@ test('run view exposes only run fields (no jit config, no secrets)', () => {
   assert.ok(!('hookTokenHash' in view));
 });
 
-// ADR-030: Run detail and Reports must never disagree about what one run cost, so both derive
+// ADR-042: Run detail and Reports must never disagree about what one run cost, so both derive
 // from `billableSeconds`. These pin the shared basis and the fallback's direction of error.
 test('cost is priced from the runningAt watermark when the row has one', () => {
   const view = toRunView(

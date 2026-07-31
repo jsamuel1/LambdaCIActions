@@ -685,7 +685,7 @@ async function executeReport(
   const result = computeReport(rows, spec, { complete: fetched.complete });
   return {
     ...result,
-    // Transparency block (ADR-033): what was actually resolved and read, so a generated view
+    // Transparency block (ADR-045): what was actually resolved and read, so a generated view
     // can show its provenance and be pinned as a plain URL without re-invoking the model.
     resolved: {
       query: specToQuery(spec),
@@ -765,7 +765,7 @@ async function askReportRoute(
   }
 
   const proposal = await proposeSpec(question.question);
-  // Audit every invocation with the actor (ADR-032). The question is operator-authored text,
+  // Audit every invocation with the actor (ADR-044). The question is operator-authored text,
   // so only its length is logged — not its content.
   console.log(
     JSON.stringify({

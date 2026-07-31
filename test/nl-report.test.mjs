@@ -1,5 +1,5 @@
 // Generative-UI security boundary + availability behaviour for the NL report path
-// (src/mgmt/nl-report.ts, ADR-032 / ADR-033).
+// (src/mgmt/nl-report.ts, ADR-044 / ADR-045).
 //
 // The model is a *selector*, not an author. Everything it returns is parsed as data and run
 // through the same validator the manual picker uses; a hostile, malformed, or merely creative

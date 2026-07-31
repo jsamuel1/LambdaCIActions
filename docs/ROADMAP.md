@@ -54,8 +54,8 @@ True zero-edit adoption + hardening.
 - **Reports screen** (spec 04 § Reports): spend / job counts / duration p50-p90 / failure rate /
   queue-to-start latency over a window, charted + CSV/JSON export, plus a natural-language
   report assistant. Cost left Runs per ADR-029 and lands here. Aggregates are
-  authorization-first (ADR-031); phase watermarks make the cost basis honest (ADR-030); the
-  assistant emits a **validated spec**, never code (ADR-033).
+  authorization-first (ADR-043); phase watermarks make the cost basis honest (ADR-042); the
+  assistant emits a **validated spec**, never code (ADR-045).
 - Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
 - `dev`/`prod` account separation; runbook + quotas doc.
 - 🎯 A brand-new repo runs unchanged in `adopt` mode; dashboard shows health + cost.

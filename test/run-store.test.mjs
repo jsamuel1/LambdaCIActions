@@ -111,7 +111,7 @@ test('absent workflow/job names are OMITTED, not written as undefined', () => {
   assert.ok(!('jobName' in item));
 });
 
-// ADR-030: phase watermarks are the cost + latency basis. They must be write-once, and must
+// ADR-042: phase watermarks are the cost + latency basis. They must be write-once, and must
 // only ever be written by the same guarded transition that actually enters the phase.
 test('entering provisioning/running stamps a write-once phase watermark', () => {
   const now = new Date('2026-07-11T00:00:00.000Z');

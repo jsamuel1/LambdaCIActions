@@ -36,7 +36,7 @@ export interface MgmtStackProps extends StackProps {
    */
   publicOrigin?: string;
   /**
-   * Bedrock model backing the Reports assistant (ADR-032). Defaults to Claude 3.5 Sonnet.
+   * Bedrock model backing the Reports assistant (ADR-044). Defaults to Claude 3.5 Sonnet.
    * The IAM grant is scoped to exactly this model id — changing it here changes the policy,
    * so the Mgmt λ can never invoke a model the stack didn't authorize.
    */
@@ -66,7 +66,7 @@ export const DEFAULT_REPORTS_MODEL_ID = 'anthropic.claude-3-5-sonnet-20241022-v2
  *     is checked for presence via `DescribeParameters` (a metadata action that returns no
  *     values) — so no code path can leak a SecureString (spec 04 hard rule).
  *   - CloudWatch Logs: read-only on the per-env run log group.
- *   - Bedrock: `InvokeModel` on exactly ONE model id (the Reports assistant, ADR-032) — no
+ *   - Bedrock: `InvokeModel` on exactly ONE model id (the Reports assistant, ADR-044) — no
  *     wildcard, no streaming, no other Bedrock action.
  *   - NO `lambda:RunMicrovm` / `TerminateMicrovm`, NO GitHub App PEM. It cannot launch
  *     compute or mint installation tokens; the only GitHub calls it makes are OAuth
@@ -116,7 +116,7 @@ export class MgmtStack extends Stack {
         TABLE_NAME: table.tableName,
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
         PUBLIC_ORIGIN: props.publicOrigin ?? '',
-        // Reports assistant (ADR-032). Enabled by default; `REPORTS_NL_ENABLED=false` turns
+        // Reports assistant (ADR-044). Enabled by default; `REPORTS_NL_ENABLED=false` turns
         // the NL path off without redeploying IAM, and the console degrades to the manual
         // report picker rather than erroring.
         REPORTS_NL_ENABLED: String(props.reportsNlEnabled ?? true),
@@ -178,7 +178,7 @@ export class MgmtStack extends Stack {
       queue.grantSendMessages(fn);
     }
 
-    // Reports assistant (ADR-032): InvokeModel on EXACTLY the configured model, in this
+    // Reports assistant (ADR-044): InvokeModel on EXACTLY the configured model, in this
     // region only. `InvokeModelWithResponseStream` is deliberately NOT granted — the NL path
     // wants one small JSON spec, not a stream. Foundation-model ARNs are account-less.
     const reportsModel = props.reportsModelId ?? DEFAULT_REPORTS_MODEL_ID;

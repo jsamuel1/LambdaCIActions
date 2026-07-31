@@ -6,7 +6,7 @@ import { SVGRenderer } from 'echarts/renderers';
 import type { ChartType, Report, SeriesPoint } from '../api.js';
 
 /**
- * Report charts (spec 04 § Reports, ADR-034).
+ * Report charts (spec 04 § Reports, ADR-046).
  *
  * ECharts (Apache-2.0) via **per-chart-type imports** rather than the `echarts` barrel: the
  * console is a static S3/CloudFront bundle, and the full package is several times the size of
