@@ -330,12 +330,16 @@ minting an installation token per job, so a polling console (or an unprivileged 
 be able to starve run provisioning. Any mutation clears both levels, so a relink or label change
 is never read back stale; a DynamoDB fault on the cache path degrades to a live GitHub read.
 
-Rotating the webhook secret has one further consequence on the **inbound** side: `getParam`
-caches for 5 minutes, so a warm Ingest container would keep verifying against the previous secret
-while GitHub already signs with the new one — and GitHub does not retry a delivery that failed
-verification, so those `workflow_job` events would be lost silently. Ingest therefore re-reads
-the secret **uncached once** before rejecting a signed-but-unverified delivery, rate-bounded per
-container and skipped for an absent/malformed signature (`verifyWithRotation`).
+Rotating the webhook secret has one further consequence on the **inbound** side: a warm Ingest
+container would keep verifying against the previous secret while GitHub already signs with the new
+one — and GitHub does not retry a delivery that failed verification, so those `workflow_job` events
+would be lost silently. Ingest bounds this twice. It re-reads the secret **uncached once** before
+rejecting a signed-but-unverified delivery (`verifyWithRotation`), which recovers on the first
+failing delivery; and the secret read carries its own 30 s TTL (`WEBHOOK_SECRET_TTL_MS`) instead of
+`getParam`'s 5-minute default. The TTL is the actual guarantee, because the re-read is rate-bounded
+per container to keep the public `/webhook` path from driving an SSM call per request — an anonymous
+caller can spend that window on junk with a well-formed signature prefix, so recovery must not
+depend on it. The re-read is also skipped for an absent/malformed signature.
 
 ### 4. Diagnostics (collapsed)
 

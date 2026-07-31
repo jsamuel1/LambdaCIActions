@@ -1595,16 +1595,21 @@ Three further consequences of that design, each pinned by a test:
   genuinely the newer one. A DynamoDB fault on either cache path degrades to
   a live GitHub read rather than failing the screen. This is why the broker's `CONFIG#*`-scoped
   DynamoDB grant includes `GetItem` alongside `UpdateItem`.
-- **Rotating the webhook secret has an Ingest cache window.** `getParam` caches for 5 minutes,
-  so a warm Ingest container keeps verifying against the PREVIOUS webhook secret for up to that
-  long after a relink rotated it — while GitHub already signs with the new one. GitHub does **not**
-  retry a delivery that failed verification, so every `workflow_job` in that window would be lost
-  silently, and Settings would report `degraded` for a rotation that actually succeeded. Ingest
-  therefore re-reads the secret **uncached once** before rejecting a signed-but-unverified
-  delivery (`verifyWithRotation`). That re-read is the one SSM call reachable before
-  authentication, so it is rate-bounded per container (30 s), skipped entirely for an
-  absent/malformed `sha256=` signature, short-circuited when the stored value is unchanged, and
-  degrades to rejection (never a 5xx) if the read faults. Pinned by
+- **Rotating the webhook secret has an Ingest cache window.** A warm Ingest container keeps
+  verifying against the PREVIOUS webhook secret until its cached copy expires — while GitHub
+  already signs with the new one. GitHub does **not** retry a delivery that failed verification,
+  so every `workflow_job` in that window would be lost silently, and Settings would report
+  `degraded` for a rotation that actually succeeded. Two bounds, and the second is the guarantee:
+  Ingest re-reads the secret **uncached once** before rejecting a signed-but-unverified delivery
+  (`verifyWithRotation`), which recovers on the FIRST failing delivery; and the secret's own read
+  carries a 30 s TTL (`WEBHOOK_SECRET_TTL_MS`) rather than `getParam`'s 5-minute default. The
+  re-read alone is not sufficient, because it is the one SSM call reachable before authentication
+  and is therefore rate-bounded per container (30 s) — an anonymous caller posting junk with a
+  well-formed `sha256=` prefix once per window can keep that window spent, so GitHub's real
+  delivery would find it throttled and be rejected. The TTL removes that dependency: worst-case
+  staleness is 30 s whether or not the re-read gets to fire. The re-read is additionally skipped
+  entirely for an absent/malformed `sha256=` signature, short-circuited when the stored value is
+  unchanged, and degrades to rejection (never a 5xx) if the read faults. Both bounds are pinned by
   `test/ingest-secret-rotation.test.mjs`.
 - **Losing the config lock is retryable, not a rejection.** The broker returns `busy` and the
   management API answers **503 with `Retry-After`**, rather than the 422/502 a real credential or

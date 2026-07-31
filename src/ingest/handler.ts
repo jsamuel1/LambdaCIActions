@@ -60,12 +60,31 @@ const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM!;
  * point of previewing which jobs move. With the default TTL a warm container would keep claiming
  * against the PREVIOUS label set for up to 5 minutes: jobs the operator just stopped claiming
  * would still be provisioned here, and jobs they just adopted would still go to GitHub-hosted,
- * with nothing on the screen saying so. Unlike the webhook secret there is no recovery signal to
- * trigger a re-read from (an unclaimed job simply runs elsewhere), so the bound has to be the TTL
- * itself. Labels are a non-secret String, so the cost is one extra `GetParameter` per container
- * per 30 s on the webhook path.
+ * with nothing on the screen saying so. There is no recovery signal to trigger a re-read from (an
+ * unclaimed job simply runs elsewhere), so the bound has to be the TTL itself. Labels are a
+ * non-secret String, so the cost is one extra `GetParameter` per container per 30 s on the
+ * webhook path.
  */
 export const RUNNER_LABELS_TTL_MS = 30_000;
+
+/**
+ * Cache TTL for the webhook secret, likewise far below `getParam`'s 5-minute default (ADR-034).
+ *
+ * `verifyWithRotation` below recovers from a rotation faster than any TTL by re-reading when a
+ * signature fails to verify — but that trigger must NOT be the only bound, because the thing
+ * that trips it is a request on a PUBLIC endpoint. The re-read is rate-limited per container
+ * (`SECRET_RECHECK_MS`) so an anonymous flood cannot drive an SSM call per delivery, and that
+ * rate limit is exactly what an attacker can consume: posting junk with a well-formed
+ * `sha256=` prefix every 30 s keeps the window spent, so GitHub's real delivery arrives, fails
+ * against the stale cached secret, finds the re-read throttled, and is rejected 401. GitHub does
+ * not retry a delivery that failed verification, so those `workflow_job` events are lost, not
+ * delayed — for as long as the cache holds.
+ *
+ * Making the TTL itself the bound removes that dependency: worst-case staleness is 30 s whether
+ * or not the recovery signal ever fires. Same cost as the label read it sits beside — one
+ * `GetParameter` per container per 30 s — since both are read on the same path.
+ */
+export const WEBHOOK_SECRET_TTL_MS = 30_000;
 const QUEUE_URL = process.env.QUEUE_URL!;
 const DISCOVERY_QUEUE_URL = process.env.DISCOVERY_QUEUE_URL;
 
@@ -85,7 +104,7 @@ export async function handler(
   const signature = headers['x-hub-signature-256'] ?? headers['X-Hub-Signature-256'];
   const ghEvent = headers['x-github-event'] ?? headers['X-GitHub-Event'];
 
-  const secret = await getParam(WEBHOOK_SECRET_PARAM);
+  const secret = await getParam(WEBHOOK_SECRET_PARAM, WEBHOOK_SECRET_TTL_MS);
   const verified = await verifyWithRotation(rawBody, signature, secret, () =>
     getParam(WEBHOOK_SECRET_PARAM, 0),
   );
@@ -125,6 +144,9 @@ export async function handler(
  * At most one uncached secret re-read per container per window. `/webhook` is public and the
  * signature check is what rejects an anonymous caller, so an unthrottled re-read would let
  * anyone drive an SSM `GetParameter` per request.
+ *
+ * Because it is rate-limited, it is a FAST PATH and not the staleness bound: an anonymous
+ * caller can spend the window on junk (see `WEBHOOK_SECRET_TTL_MS`, which is the real bound).
  */
 const SECRET_RECHECK_MS = 30_000;
 let lastSecretRecheck = 0;
@@ -132,13 +154,17 @@ let lastSecretRecheck = 0;
 /**
  * Verify a delivery, tolerating an in-flight webhook-secret rotation (ADR-034).
  *
- * `getParam` caches for 5 minutes, so a WARM container keeps verifying against the PREVIOUS
- * secret for up to that long after a relink rotated it — while GitHub already signs with the new
- * one. GitHub does NOT retry a delivery that failed verification, so every `workflow_job` in that
- * window would be silently lost, and the Settings screen would read `degraded` for a rotation
- * that actually succeeded. One bounded uncached re-read closes the window; because it goes
- * through `getParam(name, 0)` it also refreshes the container's cache, so subsequent deliveries
- * verify on the first attempt.
+ * `getParam` caches the secret for `WEBHOOK_SECRET_TTL_MS`, so a WARM container can keep verifying
+ * against the PREVIOUS secret for up to that long after a relink rotated it — while GitHub already
+ * signs with the new one. GitHub does NOT retry a delivery that failed verification, so every
+ * `workflow_job` in that window would be silently lost. One bounded uncached re-read collapses the
+ * window to the FIRST failing delivery instead of waiting out the TTL; because it goes through
+ * `getParam(name, 0)` it also refreshes the container's cache, so subsequent deliveries verify on
+ * the first attempt.
+ *
+ * This is an optimization on top of the TTL, not the guarantee: the re-read is rate-bounded, and
+ * an anonymous caller posting junk with a well-formed `sha256=` prefix can hold that window spent.
+ * The TTL is what makes recovery unconditional.
  *
  * Guards, in order: an absent/malformed signature never triggers a re-read (nothing to rotate
  * toward), the re-read is rate-bounded per container, a read fault degrades to rejection rather

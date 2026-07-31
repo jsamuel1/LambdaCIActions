@@ -20,9 +20,12 @@ process.env.RUNNER_LABELS_PARAM = '/lca/test/config/runner-labels';
 process.env.QUEUE_URL = 'https://sqs.test/queue';
 process.env.TABLE_NAME = 'lca-test-table';
 
-const { verifyWithRotation, _resetSecretRecheck, RUNNER_LABELS_TTL_MS } = await import(
-  '../dist/src/ingest/handler.js'
-);
+const {
+  verifyWithRotation,
+  _resetSecretRecheck,
+  RUNNER_LABELS_TTL_MS,
+  WEBHOOK_SECRET_TTL_MS,
+} = await import('../dist/src/ingest/handler.js');
 
 const OLD_SECRET = 'old-webhook-secret-value';
 const NEW_SECRET = 'new-webhook-secret-value';
@@ -123,9 +126,8 @@ test('an unchanged stored value short-circuits instead of re-verifying', async (
 // `workflow_job` delivery — that is exactly what the mandatory impact preview describes. With
 // `getParam`'s 5-minute default TTL a warm container would keep claiming against the PREVIOUS
 // label set, so jobs the operator just stopped claiming would still be provisioned here and jobs
-// they just adopted would still go to GitHub-hosted. Unlike the webhook secret there is no
-// failure signal to trigger a re-read from (an unclaimed job simply runs elsewhere), so the TTL
-// itself is the bound.
+// they just adopted would still go to GitHub-hosted. There is no failure signal to trigger a
+// re-read from (an unclaimed job simply runs elsewhere), so the TTL itself is the bound.
 test('the claimed-label read is bounded well below the default SSM cache TTL', () => {
   assert.ok(
     RUNNER_LABELS_TTL_MS > 0 && RUNNER_LABELS_TTL_MS <= 60_000,
@@ -134,5 +136,34 @@ test('the claimed-label read is bounded well below the default SSM cache TTL', (
   assert.ok(
     RUNNER_LABELS_TTL_MS < 5 * 60 * 1000,
     'the getParam default (5 min) is far longer than the "next delivery" the UI promises',
+  );
+});
+
+// ---- the recovery signal is suppressible, so the TTL must be the real bound ----------------
+//
+// `verifyWithRotation` recovers from a rotation on the FIRST failing delivery, which is faster
+// than any TTL — but its trigger is a request on a PUBLIC endpoint, and the re-read behind it is
+// rate-limited per container so an anonymous flood cannot drive an SSM call per delivery. That
+// rate limit is precisely what an attacker can consume: junk with a well-formed `sha256=` prefix,
+// posted once per window, keeps it spent (asserted by the throttle test above). GitHub's real
+// delivery then fails against the stale cached secret, finds the re-read throttled, and is
+// rejected 401 — and GitHub does not retry a delivery that failed verification, so the
+// `workflow_job` is lost rather than delayed, for as long as the cache holds it.
+//
+// So the secret read carries its own short TTL: worst-case staleness is bounded whether or not
+// the recovery signal ever gets to fire.
+test('the webhook-secret read is bounded by its own TTL, not only by the re-read signal', () => {
+  assert.ok(
+    WEBHOOK_SECRET_TTL_MS > 0 && WEBHOOK_SECRET_TTL_MS <= 60_000,
+    `webhook-secret staleness must stay inside a minute, got ${WEBHOOK_SECRET_TTL_MS}ms`,
+  );
+  assert.ok(
+    WEBHOOK_SECRET_TTL_MS < 5 * 60 * 1000,
+    'the getParam default (5 min) leaves a suppressible window in which deliveries are lost',
+  );
+  // The re-read throttle is what an attacker spends; recovery must not be slower than it.
+  assert.ok(
+    WEBHOOK_SECRET_TTL_MS <= 30_000,
+    'the TTL must not exceed the re-read throttle window it exists to back up',
   );
 });
