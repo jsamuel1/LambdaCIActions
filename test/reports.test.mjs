@@ -465,3 +465,31 @@ test('the chart host is unconditional and the empty series is gated by the calle
     'Reports.tsx must gate the ReportChart mount on a non-empty series',
   );
 });
+
+test('the assistant provenance line is dropped once the picker moves off its spec', () => {
+  // The "Resolved to …" line is a provenance claim about the report on screen. `ask` adopts the
+  // model's spec as picker state, so it is true immediately after an ask — but the banner lives
+  // in the Assistant while the picker mutates the parent's query, so a later metric/window/repo
+  // change left the claim describing a report that is no longer rendered. Source-level assertion
+  // (no DOM harness for the SPA): pins that the render is guarded by a staleness comparison
+  // against the live query rather than by `resolved` alone.
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  const start = screen.indexOf('function Assistant');
+  const body = screen.slice(start, screen.indexOf('function specToQuery', start));
+  assert.ok(start >= 0 && body.length > 0, 'could not isolate the Assistant body');
+  assert.ok(
+    /query:\s*ReportQuery/.test(body),
+    'Assistant cannot detect staleness without seeing the live query',
+  );
+  assert.ok(
+    /stale/.test(body) && /reportQueryString\(query\)/.test(body),
+    'Assistant must compare its resolved spec against the live query',
+  );
+  assert.ok(
+    /resolved && !refusal && !stale/.test(body),
+    'the provenance line must be gated on staleness, not just on having a resolved report',
+  );
+});

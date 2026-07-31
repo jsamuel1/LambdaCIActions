@@ -237,7 +237,16 @@ measured rather than inferred. Reconciliation against a real microVM bill is sti
 **Every report reports its own completeness.** `complete: false` means the read budget was spent
 before the window was exhausted, and the UI renders the numbers as a floor with advice to narrow
 the window — it never silently truncates. `coverage` and the metric's `caveat` are shown
-alongside every chart.
+alongside every chart. The transparency block separates the two repo counts that a partial read
+makes different: `repoCount` is the operator's authorization scope, `repoCountRead` is the repos a
+query was actually issued for. They diverge only when the row budget stopped the fan-out, and the
+UI then reads *“M of N repos read”* rather than implying the numbers cover the whole scope.
+
+**Export.** `GET /api/reports/export` returns the underlying job rows, not the aggregate. CSV
+fields are RFC-4180 quoted **and** formula-defanged: repo/workflow/job names are
+tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Excel/Sheets. An
+export is truncated by the same budget as its report: the JSON form carries `complete`, and the
+CSV form — which has nowhere in the body to put it — carries `X-Report-Complete`.
 
 **Tenant isolation (ADR-043).** Unlike run lists, reporting does **not** post-filter. It resolves
 the operator's visible repos first and queries only those GSI2 partitions, so a foreign row is
@@ -245,15 +254,13 @@ never fetched. `filters.repoIds` can only narrow that set. A zero-grant session 
 `/api/health`. `test/report-isolation.test.mjs` asserts the platform-wide total is strictly
 larger than the tenant total, so the test is provably isolating something.
 
-**Export.** `GET /api/reports/export` returns the underlying job rows, not the aggregate. CSV
-fields are RFC-4180 quoted **and** formula-defanged: repo/workflow/job names are
-tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Excel/Sheets.
-
 **Assistant (ADR-044 / ADR-045).** `POST /api/reports/ask` sends the operator's question to
 Bedrock, which replies with a JSON spec — never code, never a query, never markup. The spec goes
 through the *same* validator as the picker's query params; anything outside the vocabulary is
 rejected, not repaired. The resolved spec is written into the URL, so a generated report is a
-plain shareable link that re-runs deterministically without the model. Refusals (disabled,
+plain shareable link that re-runs deterministically without the model. The assistant's
+*“resolved to …”* provenance line is dropped as soon as a picker change moves the screen off that
+spec, so it can never describe a report that is no longer rendered. Refusals (disabled,
 unsupported, invalid spec, unavailable, rate-limited) leave the manual picker fully usable and
 show why. No tenant data enters the prompt; authorization is never a spec field. Limits: 400-char
 question, 10 invocations/minute per actor, 500 per container.

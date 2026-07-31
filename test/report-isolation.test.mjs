@@ -190,3 +190,57 @@ test('budget constants are coherent', () => {
   assert.ok(PAGE_SIZE > 0 && MAX_PAGES_PER_REPO > 0);
   assert.ok(MAX_TOTAL_ROWS >= PAGE_SIZE * MAX_PAGES_PER_REPO / 4, 'row cap would fire before the page cap is useful');
 });
+
+test('a row-budget cut reports the repos READ, not the whole authorization scope', async () => {
+  // The row cap stops the workers, so repos still queued are never queried at all. Reporting the
+  // resolved scope as the read set would tell the operator a partial number covered every repo
+  // they administer — an overstatement of coverage precisely when the report is least complete.
+  const repoCount = 24;
+  const repos = Array.from({ length: repoCount }, (_, i) => ({
+    repoId: i + 1,
+    repoFullName: `mine/r${i + 1}`,
+  }));
+  // Each repo returns one page big enough that a handful of them exhausts MAX_TOTAL_ROWS.
+  const perRepo = Math.ceil(MAX_TOTAL_ROWS / 3);
+  const byRepo = {};
+  for (const r of repos) {
+    byRepo[r.repoId] = [
+      Array.from({ length: perRepo }, (_, n) => job(1, { repoId: r.repoId, jobId: n + 1 })),
+    ];
+  }
+  const idx = fakeIndex(byRepo);
+  const res = await fetchReportRuns(MINE, spec(), {
+    listRepos: async () => repos,
+    listRunsByRepo: idx.listRunsByRepo,
+  });
+
+  assert.equal(res.complete, false, 'the row budget did not actually trip');
+  assert.equal(res.repoIds.length, repoCount, 'the authorization scope should be the full set');
+  assert.ok(
+    res.repoIdsRead.length < res.repoIds.length,
+    'repoIdsRead must exclude repos the budget never reached',
+  );
+  assert.deepEqual(
+    res.repoIdsRead,
+    res.repoIdsRead.filter((id) => res.repoIds.includes(id)),
+    'a repo was reported read that is not even in scope',
+  );
+  // Every repo counted as read was genuinely queried.
+  const queried = new Set(idx.queried);
+  for (const id of res.repoIdsRead) {
+    assert.ok(queried.has(id), `repo ${id} counted as read but never queried`);
+  }
+});
+
+test('a complete read reports scope and read set as equal', async () => {
+  const idx = fakeIndex({ 1: [[job(1)]], 3: [[]] });
+  const res = await fetchReportRuns(MINE, spec(), {
+    listRepos: async () => [
+      { repoId: 1, repoFullName: 'mine/service' },
+      { repoId: 3, repoFullName: 'mine/other' },
+    ],
+    listRunsByRepo: idx.listRunsByRepo,
+  });
+  assert.equal(res.complete, true);
+  assert.deepEqual(res.repoIdsRead, res.repoIds, 'a complete read must not understate coverage');
+});

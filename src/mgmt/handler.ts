@@ -813,7 +813,14 @@ async function executeReport(
     // can show its provenance and be pinned as a plain URL without re-invoking the model.
     resolved: {
       query: specToQuery(spec),
+      /** Repos in the operator's authorization scope for this spec. */
       repoCount: fetched.repoIds.length,
+      /**
+       * Repos actually queried. Lower than `repoCount` only when the row budget cut the
+       * fan-out short, which is also when `complete` is false. Reported separately because
+       * presenting the scope as the read set overstates what the numbers cover.
+       */
+      repoCountRead: fetched.repoIdsRead.length,
       /** Restates that scope came from the session, never from the request or a model. */
       scope: 'operator installations',
     },
@@ -847,6 +854,11 @@ async function exportReportRoute(
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}.csv"`,
+      // A CSV body has nowhere to put the `complete` flag the JSON export carries, so a
+      // truncated fan-out would hand the operator a silently short file. State it in a header
+      // (and in the UI beside the download link) rather than letting the row count imply a
+      // total it is not.
+      'X-Report-Complete': String(fetched.complete),
       // Tenant-controlled strings ride in this body; never let a browser sniff it as HTML.
       'X-Content-Type-Options': 'nosniff',
     },

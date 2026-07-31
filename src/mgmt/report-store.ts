@@ -44,8 +44,18 @@ export interface FetchResult {
   runs: RunRecord[];
   /** False when a page/row budget was spent before the window was exhausted. */
   complete: boolean;
-  /** Repos actually read — the authorization scope, echoed for the API's transparency block. */
+  /**
+   * The authorization SCOPE: every repo the session may report on after the spec's narrowing
+   * filter. Echoed for the API's transparency block. This is NOT read coverage — when the row
+   * budget trips, workers stop and repos still queued are never queried at all.
+   */
   repoIds: number[];
+  /**
+   * Repos a query was actually issued for. Equals `repoIds` on a complete read; strictly
+   * smaller when `MAX_TOTAL_ROWS` cut the fan-out short. Kept separate so the UI can never
+   * present the authorization scope as the set the numbers were computed over.
+   */
+  repoIdsRead: number[];
 }
 
 /**
@@ -100,12 +110,14 @@ export async function fetchReportRuns(
   const runs: RunRecord[] = [];
   let complete = true;
   let budgetSpent = false;
+  const read = new Set<number>();
 
   const queue = [...repos];
   async function worker(): Promise<void> {
     for (;;) {
       const repo = queue.shift();
       if (!repo || budgetSpent) return;
+      read.add(repo.repoId);
       let cursor: string | undefined;
       for (let page = 0; page < MAX_PAGES_PER_REPO; page++) {
         const res = await fetchPage(repo.repoId, { limit: PAGE_SIZE, cursor });
@@ -137,5 +149,10 @@ export async function fetchReportRuns(
     Array.from({ length: Math.min(CONCURRENCY, Math.max(repos.length, 1)) }, () => worker()),
   );
 
-  return { runs, complete, repoIds: repos.map((r) => r.repoId) };
+  return {
+    runs,
+    complete,
+    repoIds: repos.map((r) => r.repoId),
+    repoIdsRead: repos.map((r) => r.repoId).filter((id) => read.has(id)),
+  };
 }

@@ -97,7 +97,7 @@ export function Reports(): JSX.Element {
 
   return (
     <div className="stack">
-      <Assistant catalog={catalog.data} onSpec={setQuery} />
+      <Assistant catalog={catalog.data} query={query} onSpec={setQuery} />
       <Picker catalog={catalog.data} query={query} onChange={setQuery} />
       {report.error ? (
         <ErrorBox message={report.error} />
@@ -114,15 +114,25 @@ export function Reports(): JSX.Element {
 
 function Assistant({
   catalog,
+  query,
   onSpec,
 }: {
   catalog: ReportCatalog;
+  query: ReportQuery;
   onSpec: (q: ReportQuery) => void;
 }): JSX.Element | null {
   const [question, setQuestion] = useState('');
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<{ message: string; reason?: string } | undefined>();
   const [resolved, setResolved] = useState<Report | undefined>();
+
+  // Drop the provenance line as soon as the report on screen is no longer the one the
+  // assistant resolved. `ask` adopts the model's spec as picker state, so the query matches
+  // right after a successful ask; any later picker change (metric, window, repo) makes the
+  // "Resolved to …" claim describe a report that is no longer rendered. Comparing the
+  // serialized query is the same identity the report fetch is keyed on.
+  const resolvedQuery = resolved ? reportQueryString(specToQuery(resolved)) : undefined;
+  const stale = resolvedQuery !== undefined && resolvedQuery !== reportQueryString(query);
 
   if (!catalog.nl.enabled) {
     return (
@@ -182,7 +192,7 @@ function Assistant({
             : 'Try rephrasing, or use the picker below.'}
         </p>
       )}
-      {resolved && !refusal && (
+      {resolved && !refusal && !stale && (
         <p className="gap-top muted tight">
           Resolved to <strong>{resolved.metric.label}</strong>{' '}
           {DIMENSION_LABELS[resolved.spec.dimension]}, {windowLabel(resolved)} — rendered from the{' '}
@@ -330,7 +340,11 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
           </div>
           <div className="spacer" />
           <span className="muted">
-            {report.rowCount} jobs · {report.resolved.repoCount} repos · {windowLabel(report)}
+            {report.rowCount} jobs ·{' '}
+            {report.resolved.repoCountRead < report.resolved.repoCount
+              ? `${report.resolved.repoCountRead} of ${report.resolved.repoCount} repos read`
+              : `${report.resolved.repoCount} repos`}{' '}
+            · {windowLabel(report)}
           </span>
           <a className="badge" href={api.reportExportUrl(query, 'csv')} download>
             CSV
@@ -352,7 +366,8 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
           <p className="gap-top tight">
             <span className="error">
               Partial: the read budget was spent before this window was exhausted — treat these
-              numbers as a floor, and narrow the window or the repo filter.
+              numbers as a floor, and narrow the window or the repo filter. The CSV/JSON export is
+              truncated the same way.
             </span>
           </p>
         )}
