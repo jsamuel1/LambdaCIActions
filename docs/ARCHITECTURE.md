@@ -51,8 +51,9 @@ Owns operator-facing state and UX. A web UI + management API backed by DynamoDB:
 installed orgs/repos, discovered workflows, flavor mappings, and a run history/log view.
 Read-mostly; writes are config (flavor overrides, repo enable/disable). Implemented in M4 —
 see [spec 04](specs/04-web-ui.md); the plane's IAM boundary (no compute, no secret values,
-no Put/Delete on the table) is pinned by [ADR-025](DECISIONS.md#adr-023), and the console +
-API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-022)).
+no Put/Delete on the table) is pinned by [ADR-025](DECISIONS.md#adr-025), and the console +
+API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-024)) — on a config-derived
+vanity hostname when one is configured ([ADR-036](DECISIONS.md#adr-036)).
 
 ```
 ┌── Control plane ─────────┐   ┌── Compute plane ──────────┐   ┌── Management plane ──────┐
@@ -78,7 +79,8 @@ API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-022)).
 | Image builder | Lambda + code bucket | Build/snapshot flavor images; publish image ARNs |
 | Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config only (ADR-025) |
 | Config + run store | DynamoDB | Installations, repos, workflows, flavor maps, run records |
-| Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024) |
+| Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024). Vanity alias + A/AAAA Route53 records when a console domain is configured (ADR-036) |
+| Console cert | ACM (**us-east-1**) | Viewer certificate for the vanity hostname — CloudFront accepts no other region. Only exists on the vanity-domain path (ADR-036) |
 | Auth | GitHub OAuth + signed session cookie | UI login scoped to installations the user can admin (ADR-022) |
 | Secrets | SSM Parameter Store (SecureString) | App private key, webhook secret, OAuth client secret |
 
