@@ -39,7 +39,7 @@ import {
   validateVersionSnapshot,
 } from '../dist/src/appcfg/broker-core.js';
 import { isRepoOptedOut, shouldClaim } from '../dist/src/ingest/filter.js';
-import { collectImpactRepos } from '../dist/src/mgmt/handler.js';
+import { collectImpactRepos, installationsEnumerated } from '../dist/src/mgmt/handler.js';
 
 // ---- runner labels ---------------------------------------------------------
 
@@ -240,6 +240,45 @@ test('the impact preview names WHICH bound made it partial, not just that it is 
   const complete = buildLabelImpact(['lca-base'], ['lca-docker'], repos);
   assert.equal(complete.truncated, false);
   assert.deepEqual(complete.partial, { repoCap: false, unverifiedInstallations: false });
+});
+
+test('a verified App installed nowhere is NOT reported as an unverified enumeration', () => {
+  // The two facts are different: "we could not enumerate installations" is a blind spot that can
+  // hide whole installations from the label-impact preview, while "the App is verified and simply
+  // not installed anywhere yet" is an authoritative empty list with no blind spot at all.
+  // Deriving the flag from list LENGTH conflated them, so a fresh environment previewing a label
+  // change was told "the GitHub App linkage could not be verified" — sending the operator after a
+  // credential fault that does not exist, in the audit row as well as the UI.
+  const app = { appId: 123, name: 'n', slug: 's', htmlUrl: '', ownerLogin: 'o', events: [], permissions: {} };
+  assert.equal(
+    installationsEnumerated({ app, installations: [], webhook: null }),
+    true,
+    'verified + zero installations is a complete enumeration',
+  );
+  assert.equal(
+    installationsEnumerated({
+      app,
+      installations: [],
+      webhook: null,
+      verifyError: 'GitHub /app/installations failed HTTP 403',
+    }),
+    false,
+    'identity verified but the installation fetch failed IS a blind spot',
+  );
+  assert.equal(
+    installationsEnumerated({ app: null, installations: [], webhook: null, verifyError: 'bad key' }),
+    false,
+    'an unverifiable linkage cannot enumerate',
+  );
+  assert.equal(installationsEnumerated(undefined), false, 'no broker answer cannot enumerate');
+  assert.equal(
+    installationsEnumerated({
+      app,
+      installations: [{ installationId: 11, accountLogin: 'acme', suspended: false }],
+      webhook: null,
+    }),
+    true,
+  );
 });
 
 test('hostedLabelsIn flags claimed GitHub-hosted names', () => {

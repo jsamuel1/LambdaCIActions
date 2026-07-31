@@ -260,6 +260,15 @@ installation enumeration back onto the index plus this session's grants and can 
 effect for every tenant on the next webhook, so the wording has to say which one happened
 (pinned in `test/mgmt-settings.test.mjs`).
 
+`unverifiedInstallations` is decided by whether the linkage **verified**
+(`installationsEnumerated`: an App identity and no `verifyError`), not by the list being
+non-empty. A verified App that is not installed anywhere yet enumerates authoritatively to zero,
+so claiming a blind spot there would send the operator after a credential fault that does not
+exist; an identity that verified while `/app/installations` failed sets `verifyError` and *is*
+reported as a blind spot. The same discriminator decides whether the Settings installation list
+comes from GitHub or falls back to the store, so an authoritative empty list cannot resurrect
+stale store rows.
+
 "Very next delivery" is enforced, not assumed: Ingest reads the label parameter with a 30 s cache
 TTL (`RUNNER_LABELS_TTL_MS`) rather than `getParam`'s 5-minute default, which would otherwise
 leave a warm container claiming against the previous set for minutes with no signal — an

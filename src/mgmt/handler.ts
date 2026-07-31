@@ -826,6 +826,10 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     ]);
 
   const labels = parseRunnerLabels(labelsRaw);
+  // Whether GitHub's own installation list is trustworthy — NOT whether it is non-empty (see
+  // `installationsEnumerated`). A verified App installed nowhere yet is an authoritative empty
+  // list, so the store fallback below must not resurrect stale rows for it.
+  const enumerated = installationsEnumerated(linkage);
   // The store read above reconciles the SESSION's grants (ADR-037), which is the right scope
   // for the fallback list below — it only ever shows this operator's installations. The
   // `known` flag, though, is a platform-wide claim about every installation GitHub reports.
@@ -834,7 +838,7 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
   // false` for an installation the platform is actively serving — the same index blindness
   // ADR-037 fixed, resurfacing as a false warning. Reconcile against those ids (GetItem only
   // for ones the index really missed, repairing as it goes) before deciding `known`.
-  const reconciled = linkage?.installations?.length
+  const reconciled = enumerated && linkage?.installations?.length
     ? await reconcileInstallations(
         storedInstalls,
         linkage.installations.map((i) => i.installationId),
@@ -845,8 +849,8 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
 
   // Installations come from GitHub when the linkage verified (ground truth even if an
   // `installation` webhook was missed); fall back to our store when it didn't.
-  const installations: AppInstallationView[] = linkage?.installations?.length
-    ? linkage.installations.map((i) => ({
+  const installations: AppInstallationView[] = enumerated
+    ? (linkage?.installations ?? []).map((i) => ({
         installationId: i.installationId,
         accountLogin: i.accountLogin,
         suspended: i.suspended,
@@ -906,6 +910,29 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     /** Whether THIS session may use the mutating actions (drives the UI's disabled state). */
     canAdminPlatform: isPlatformAdmin,
   });
+}
+
+/**
+ * Whether GitHub's installation enumeration for this environment can be trusted as COMPLETE.
+ *
+ * The discriminator is the App linkage verifying, **not** the list being non-empty. Those are
+ * different facts, and conflating them makes the screen state something false in both
+ * directions: a verified App that is simply not installed anywhere yet returns an authoritative
+ * empty list, which must not be reported as "we could not enumerate installations" (and must not
+ * make the settings view fall back to stale store rows GitHub says are gone). Conversely, an
+ * identity that verified while `/app/installations` FAILED sets `verifyError` with an empty
+ * list — that one genuinely is a blind spot.
+ *
+ * `verifyError` is the broker's single channel for both failures (`statusAction` sets it for an
+ * identity failure and for an installations failure alike), so "app present AND no verifyError"
+ * is exactly "the list is complete".
+ *
+ * Exported for tests: it is the discriminator two operator-facing claims depend on.
+ */
+export function installationsEnumerated(
+  linkage: (AppcfgResult['linkage'] & { brokerError?: string }) | undefined,
+): boolean {
+  return Boolean(linkage?.app) && !linkage?.verifyError;
 }
 
 /** Broker `status` call, folded into a shape the settings view can consume. */
@@ -1142,7 +1169,12 @@ async function labelImpact(
   session: SessionPayload,
 ): Promise<LabelImpactView> {
   const linkage = await appLinkage();
-  const verified = Boolean(linkage?.installations?.length);
+  // Trust GitHub's list when the linkage VERIFIED, not merely when the list is non-empty: an
+  // App verified and installed nowhere yet enumerates authoritatively to zero, and reporting
+  // that as `unverifiedInstallations` would print "the linkage could not be verified" on the
+  // operator's only pre-change warning — sending them after a credential fault that does not
+  // exist, for a scan that has no blind spot at all.
+  const verified = installationsEnumerated(linkage);
   const candidates = verified
     ? (linkage?.installations ?? []).map((i) => i.installationId)
     : grantedInstallationIds(session);
