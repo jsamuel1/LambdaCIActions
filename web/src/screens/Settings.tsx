@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, relinkFailureFrom, type LabelImpact, type RelinkResult, type Settings as SettingsData } from '../api.js';
+import { api, installationListState, relinkSubmitFailure, type LabelImpact, type RelinkResult, type Settings as SettingsData } from '../api.js';
 import { useApi } from '../hooks.js';
 import { Badge, ErrorBox, Loading, formatTime } from '../components.js';
 
@@ -112,51 +112,77 @@ function GithubAppCard({ data, reload }: { data: SettingsData; reload: () => voi
           </table>
 
           <h4>Installations</h4>
-          {!data.installations.length ? (
-            <p className="muted">
-              {data.installationsHidden ? (
-                <>
-                  {data.installationsHidden} installation(s) are not shown — they belong to
-                  accounts you do not administer. Ask a platform administrator for the full list.
-                </>
-              ) : (
-                <>
+          {(() => {
+            // Three different facts arrive as the same empty array (scoped / could-not-enumerate
+            // / authoritatively none). `installationListState` picks between them so the screen
+            // never asserts "not installed anywhere" from a list GitHub never answered.
+            const state = installationListState(data);
+            if (state === 'scoped') {
+              return (
+                <p className="muted">
+                  {data.installationsHidden} installation(s) are not shown — they belong to accounts
+                  you do not administer. Ask a platform administrator for the full list.
+                </p>
+              );
+            }
+            if (state === 'unenumerated') {
+              return (
+                <p className="error">
+                  GitHub&apos;s installation list could not be read
+                  {data.appVerifyError ? `: ${data.appVerifyError}` : ''}. The App itself
+                  authenticates, so this is not evidence that it is uninstalled — retry, or check
+                  the App&apos;s permissions at GitHub.
+                </p>
+              );
+            }
+            if (state === 'empty') {
+              return (
+                <p className="muted">
                   The App is not installed anywhere yet. Install it on an org or user account to
                   onboard repositories.
-                </>
-              )}
-            </p>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Account</th>
-                  <th>Installation ID</th>
-                  <th>State</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.installations.map((i) => (
-                  <tr key={i.installationId}>
-                    <td>{i.accountLogin || '—'}</td>
-                    <td className="muted">{i.installationId}</td>
-                    <td>
-                      {i.suspended ? (
-                        <Badge kind="warn">suspended</Badge>
-                      ) : (
-                        <Badge kind="ok">active</Badge>
-                      )}
-                      {!i.known && (
-                        <>
-                          {' '}
-                          <Badge kind="warn">not in run store</Badge>
-                        </>
-                      )}
-                    </td>
+                </p>
+              );
+            }
+            return (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Account</th>
+                    <th>Installation ID</th>
+                    <th>State</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {data.installations.map((i) => (
+                    <tr key={i.installationId}>
+                      <td>{i.accountLogin || '—'}</td>
+                      <td className="muted">{i.installationId}</td>
+                      <td>
+                        {i.suspended ? (
+                          <Badge kind="warn">suspended</Badge>
+                        ) : (
+                          <Badge kind="ok">active</Badge>
+                        )}
+                        {!i.known && (
+                          <>
+                            {' '}
+                            <Badge kind="warn">not in run store</Badge>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            );
+          })()}
+          {data.installations.length > 0 && data.installationsEnumerated === false && (
+            <p className="error">
+              GitHub&apos;s installation list could not be read
+              {data.appVerifyError ? `: ${data.appVerifyError}` : ''}. The rows above come from this
+              platform&apos;s own store, so an installation added or removed since the last webhook
+              may be missing or stale.
+            </p>
           )}
           {data.installations.length > 0 && (data.installationsHidden ?? 0) > 0 && (
             <p className="muted">
@@ -211,18 +237,21 @@ function RelinkForm({
   async function submit(allowHookDesync = false): Promise<void> {
     setBusy(true);
     setError(undefined);
-    setResult(undefined);
     if (!allowHookDesync) setDesyncRefusal(undefined);
     try {
       const res = await api.relinkGithubApp({ ...creds, ...(allowHookDesync ? { allowHookDesync } : {}) });
       applyRelinkOutcome(res);
     } catch (err) {
-      // A refusal arrives as a rejected 422 carrying a structured body (`relinkFailureFrom`).
-      // Without recovering it, the desync retry and the rollback handle would be unreachable and
-      // the operator would see only an error string.
-      const refusal = relinkFailureFrom(err);
-      if (refusal) applyRelinkOutcome(refusal);
-      else setError(err instanceof Error ? err.message : String(err));
+      // A refusal arrives as a rejected 422 carrying a structured body; an opaque failure (503
+      // lock contention, a proxy error page, a dropped connection) must NOT discard the previous
+      // outcome, because that outcome holds the rollback handle and the `rolledBack` flag the
+      // desync panel below reads. `relinkSubmitFailure` owns that decision (and is unit-tested).
+      const next = relinkSubmitFailure(err, result);
+      if ('outcome' in next) applyRelinkOutcome(next.outcome);
+      else {
+        setError(next.error);
+        setResult(next.result);
+      }
     } finally {
       setBusy(false);
     }

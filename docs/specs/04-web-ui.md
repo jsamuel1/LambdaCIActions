@@ -219,6 +219,27 @@ and the screen would tell a zero-grant operator "the App is not installed anywhe
 in fact installed on accounts they do not administer. The count names no account and no id, so
 it discloses nothing the scoping exists to hide.
 
+The payload also carries `installationsEnumerated` — whether the list is GitHub's COMPLETE
+answer. An empty array has three possible meanings and the operator's next action differs for
+each, so the client picks between them explicitly (`installationListState`, pinned in
+`test/web-api-error.test.mjs`):
+
+| `installationsEnumerated` | `installationsHidden` | What the screen says |
+| --- | --- | --- |
+| `true` | `0` | The App is not installed anywhere yet — install it on an org or user account. |
+| `true` | `> 0` | *n* installation(s) are withheld from this session (ADR-035). |
+| `false` | — | GitHub's installation list could not be read; the rows shown come from our store. |
+
+The third row cannot be inferred from the rest of the payload, which is why it is on the wire:
+an App whose identity verified while `/app/installations` FAILED still returns a populated `app`
+(the screen shows a green **verified** badge), and `appVerifyError` is only rendered where `app`
+is null. Without the flag that fallback list — empty on a fresh environment, or stale where an
+installation row is unindexed — reads as "not installed anywhere", a claim the platform has no
+evidence for, and sends the operator to install an App that may already be installed everywhere
+it needs to be. A non-empty fallback list is annotated for the same reason: its rows may be
+stale. Scoping outranks enumeration in that decision — a withheld list is a fact about the
+session that holds regardless of how the list was obtained.
+
 ### 2. Runner labels
 
 The **effective** claim list (the value Ingest reads per delivery), not the parameter path.
@@ -356,6 +377,14 @@ would otherwise leave a broken environment that looks fine:
   could *not* roll itself back. A client that discards non-2xx bodies leaves the operator with no
   supported way forward, so `ApiError` carries the parsed body and the relink form recovers it
   (`relinkFailureFrom`). Pinned by `test/web-api-error.test.mjs`.
+- **An opaque failure must not discard the previous outcome.** A retry can fail for reasons that
+  say nothing about the environment's credential state — 503 lock contention, an edge error page,
+  a dropped connection. Clearing the panel's outcome on those loses the rollback handle *and* the
+  `rolledBack` flag the desync warning is worded from, so a refusal that reported "the rollback
+  did not complete — parameters may still hold the submitted values" would silently become
+  "nothing was changed" with no rollback button, in the one situation the panel exists for. The
+  console therefore classifies the failure (`relinkSubmitFailure`): a structured refusal
+  supersedes the previous outcome, an opaque one carries it forward and reports itself alongside.
 
 An explicit rollback reads **every** historical value before it writes any of them. A
 read-then-write loop that faulted midway would leave a mixed credential set — some parameters

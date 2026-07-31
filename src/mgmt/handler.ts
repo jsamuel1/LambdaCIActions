@@ -847,23 +847,10 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     : storedInstalls;
   const knownIds = new Set(reconciled.map((i) => i.installationId));
 
-  // Installations come from GitHub when the linkage verified (ground truth even if an
-  // `installation` webhook was missed); fall back to our store when it didn't.
-  const installations: AppInstallationView[] = enumerated
-    ? (linkage?.installations ?? []).map((i) => ({
-        installationId: i.installationId,
-        accountLogin: i.accountLogin,
-        suspended: i.suspended,
-        known: knownIds.has(i.installationId),
-      }))
-    : storedInstalls
-        .filter((i) => !i.deleted)
-        .map((i) => ({
-          installationId: i.installationId,
-          accountLogin: i.accountLogin,
-          suspended: i.suspended,
-          known: true,
-        }));
+  // Installations and the `installationsEnumerated` flag are resolved TOGETHER: they are two
+  // halves of one fact (whose list this is), and a caller that could set one without the other
+  // would be able to publish a store fallback labelled as GitHub's authoritative answer.
+  const resolved = resolveInstallationList(linkage, storedInstalls, knownIds);
 
   const deliveries: WebhookDeliveryView[] = linkage?.webhook?.recentDeliveries ?? [];
   const view: SettingsView = {
@@ -872,9 +859,14 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     app: linkage?.app ?? null,
     ...(linkage?.verifyError ? { appVerifyError: linkage.verifyError } : {}),
     ...(linkage?.configuredAppId ? { configuredAppId: linkage.configuredAppId } : {}),
-    installations,
+    installations: resolved.installations,
     // Pre-scoping value; `scopeSettingsView` recomputes it from what it actually withheld.
     installationsHidden: 0,
+    // Whether the list above is GitHub's complete answer. A false makes the empty case mean
+    // "we could not ask", not "installed nowhere" — the client cannot infer this from the rest
+    // of the payload, because an identity that verified while `/app/installations` failed still
+    // renders a verified App.
+    installationsEnumerated: resolved.enumerated,
     runnerLabels: {
       labels,
       unset: labels.length === 0,
@@ -933,6 +925,50 @@ export function installationsEnumerated(
   linkage: (AppcfgResult['linkage'] & { brokerError?: string }) | undefined,
 ): boolean {
   return Boolean(linkage?.app) && !linkage?.verifyError;
+}
+
+/**
+ * Resolve the installation list AND whether it is GitHub's complete answer, as one value.
+ *
+ * These are deliberately not two independent expressions. They are two halves of one fact —
+ * *whose list is this* — and separating them lets a caller publish a store fallback while
+ * labelling it as GitHub's authoritative enumeration. That mislabelling is exactly what the
+ * client acts on: it decides between "the App is not installed anywhere yet" (an instruction to
+ * go install it) and "GitHub's list could not be read" (an instruction to retry / check
+ * permissions). Returning both from one place makes the pair unbreakable and unit-testable
+ * without AWS.
+ *
+ * When the linkage verified, GitHub's list wins even against our store — it is ground truth even
+ * if an `installation` webhook was missed, and `known` then flags the rows our store lacks.
+ * When it did not, the store is all we have, and `enumerated: false` says so.
+ */
+export function resolveInstallationList(
+  linkage: (AppcfgResult['linkage'] & { brokerError?: string }) | undefined,
+  stored: { installationId: number; accountLogin: string; suspended: boolean; deleted?: boolean }[],
+  knownIds: ReadonlySet<number>,
+): { installations: AppInstallationView[]; enumerated: boolean } {
+  if (installationsEnumerated(linkage)) {
+    return {
+      enumerated: true,
+      installations: (linkage?.installations ?? []).map((i) => ({
+        installationId: i.installationId,
+        accountLogin: i.accountLogin,
+        suspended: i.suspended,
+        known: knownIds.has(i.installationId),
+      })),
+    };
+  }
+  return {
+    enumerated: false,
+    installations: stored
+      .filter((i) => !i.deleted)
+      .map((i) => ({
+        installationId: i.installationId,
+        accountLogin: i.accountLogin,
+        suspended: i.suspended,
+        known: true,
+      })),
+  };
 }
 
 /** Broker `status` call, folded into a shape the settings view can consume. */

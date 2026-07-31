@@ -274,7 +274,17 @@ export interface AppLinkageView {
     events: string[];
     permissions: Record<string, string>;
   } | null;
-  /** Why verification failed (sanitized), when `app` is null. */
+  /**
+   * Why verification failed (sanitized).
+   *
+   * Set for THREE distinct failures, only two of which leave `app` null: unreadable credentials,
+   * an App identity that would not authenticate, and — with `app` POPULATED — a failed
+   * `/app/installations` call. That last case is deliberate and load-bearing: it is the only
+   * signal that `installations` is incomplete, and `installationsEnumerated` in the management
+   * handler reads exactly `app && !verifyError` to decide whether the list can be trusted as
+   * complete. Do not narrow this field to "only when `app` is null" — an identity that verified
+   * while installation enumeration failed would then read as an authoritative empty list.
+   */
   verifyError?: string;
   /** App id recorded in SSM — shown alongside `app.appId` so a mismatch is visible. */
   configuredAppId?: string;

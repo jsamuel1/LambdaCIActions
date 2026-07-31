@@ -560,6 +560,19 @@ export interface SettingsView {
    * is reachable) would be shown the first claim while the second is true.
    */
   installationsHidden: number;
+  /**
+   * Whether `installations` is GitHub's COMPLETE answer for this environment.
+   *
+   * False means the enumeration failed (`appVerifyError` says how) and the list below is a
+   * fallback from our own store, so its emptiness proves nothing. The client needs this as a
+   * separate fact because the failure is invisible in the rest of the payload: an App whose
+   * identity verified while `/app/installations` failed still renders `app` — a green "verified"
+   * badge — and `appVerifyError` is only shown where `app` is null. Without this flag an empty
+   * fallback list is reported as "the App is not installed anywhere yet", which is a claim the
+   * platform has no evidence for and sends the operator to install an App that may already be
+   * installed everywhere it needs to be.
+   */
+  installationsEnumerated: boolean;
   runnerLabels: RunnerLabelsView;
   webhook: WebhookHealthView;
   flavors: FlavorView[];

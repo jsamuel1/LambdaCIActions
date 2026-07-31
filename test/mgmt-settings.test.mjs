@@ -39,7 +39,7 @@ import {
   validateVersionSnapshot,
 } from '../dist/src/appcfg/broker-core.js';
 import { isRepoOptedOut, shouldClaim } from '../dist/src/ingest/filter.js';
-import { collectImpactRepos, installationsEnumerated } from '../dist/src/mgmt/handler.js';
+import { collectImpactRepos, installationsEnumerated, resolveInstallationList } from '../dist/src/mgmt/handler.js';
 
 // ---- runner labels ---------------------------------------------------------
 
@@ -279,6 +279,99 @@ test('a verified App installed nowhere is NOT reported as an unverified enumerat
     }),
     true,
   );
+});
+
+test('an unenumerated installation list is reported as such, not as an empty one', () => {
+  // The settings payload must carry the discriminator, not just USE it internally. An App whose
+  // identity verified while `/app/installations` failed still renders `app` — a green "verified"
+  // badge — and `appVerifyError` is only shown by the client where `app` is null. So without an
+  // explicit flag the fallback list (our own store, possibly empty on a fresh env or an
+  // unindexed row) is indistinguishable from GitHub authoritatively answering zero, and the
+  // screen tells the operator to install an App that may already be installed. Mutation-tested
+  // by hardcoding the field to `true`: the unenumerated case below then fails.
+  const app = { appId: 123, name: 'n', slug: 's', htmlUrl: '', ownerLogin: 'o', events: [], permissions: {} };
+  assert.equal(
+    installationsEnumerated({ app, installations: [], webhook: null }),
+    true,
+    'a verified App with zero installations enumerated completely',
+  );
+  assert.equal(
+    installationsEnumerated({
+      app,
+      installations: [],
+      webhook: null,
+      verifyError: 'GitHub /app/installations failed HTTP 502',
+    }),
+    false,
+    'identity verified + enumeration failed must NOT read as enumerated',
+  );
+
+  // The flag survives scoping: a non-admin whose grants hide everything must still be told the
+  // list was never enumerated, otherwise the two blind spots stack silently.
+  const scoped = scopeSettingsView(
+    { ...SETTINGS_FIXTURE, installations: [], installationsEnumerated: false },
+    { isPlatformAdmin: false, canSeeInstallation: () => false },
+  );
+  assert.equal(scoped.installationsEnumerated, false);
+  assert.equal(scoped.installationsHidden, 0, 'nothing was withheld — the list was never obtained');
+});
+
+test('the installation list and its enumerated flag are resolved as one fact', () => {
+  // They are two halves of "whose list is this", and resolving them separately would let the
+  // route publish a STORE FALLBACK labelled as GitHub's authoritative enumeration — the exact
+  // mislabelling the client acts on when it chooses between "not installed anywhere yet" (go
+  // install it) and "GitHub's list could not be read" (retry / check permissions).
+  const app = { appId: 123, name: 'n', slug: 's', htmlUrl: '', ownerLogin: 'o', events: [], permissions: {} };
+  const stored = [
+    { installationId: 11, accountLogin: 'acme', suspended: false },
+    { installationId: 22, accountLogin: 'gone', suspended: false, deleted: true },
+  ];
+
+  // Verified: GitHub's list wins even where our store disagrees, and `known` flags the gap.
+  const live = resolveInstallationList(
+    { app, installations: [{ installationId: 33, accountLogin: 'new-org', suspended: false }], webhook: null },
+    stored,
+    new Set([11]),
+  );
+  assert.equal(live.enumerated, true);
+  assert.deepEqual(live.installations, [
+    { installationId: 33, accountLogin: 'new-org', suspended: false, known: false },
+  ]);
+
+  // Verified + installed nowhere: an AUTHORITATIVE empty list. It must NOT resurrect store rows
+  // GitHub has just contradicted, and must still report itself as enumerated.
+  const nowhere = resolveInstallationList({ app, installations: [], webhook: null }, stored, new Set([11]));
+  assert.equal(nowhere.enumerated, true);
+  assert.deepEqual(nowhere.installations, []);
+
+  // Identity verified but `/app/installations` failed: the store is all we have, and the flag has
+  // to say so — otherwise an empty store reads as "installed nowhere" behind a verified badge.
+  const failed = resolveInstallationList(
+    { app, installations: [], webhook: null, verifyError: 'GitHub /app/installations failed HTTP 502' },
+    stored,
+    new Set([11]),
+  );
+  assert.equal(failed.enumerated, false);
+  assert.deepEqual(
+    failed.installations.map((i) => i.installationId),
+    [11],
+    'deleted store rows stay out of the fallback',
+  );
+  assert.equal(failed.installations[0].known, true, 'a store row is known by construction');
+
+  // No broker answer at all: fallback, flagged.
+  const noBroker = resolveInstallationList(undefined, stored, new Set());
+  assert.equal(noBroker.enumerated, false);
+  assert.equal(noBroker.installations.length, 1);
+
+  // An empty store under a failed enumeration is the load-bearing case: an empty LIST with
+  // `enumerated: false` is what stops the screen asserting the App is installed nowhere.
+  const blind = resolveInstallationList(
+    { app, installations: [], webhook: null, verifyError: 'boom' },
+    [],
+    new Set(),
+  );
+  assert.deepEqual(blind, { installations: [], enumerated: false });
 });
 
 test('hostedLabelsIn flags claimed GitHub-hosted names', () => {
@@ -669,6 +762,7 @@ const SETTINGS_FIXTURE = {
     { installationId: 22, accountLogin: 'rival-corp', suspended: false, known: true },
   ],
   installationsHidden: 0,
+  installationsEnumerated: true,
   runnerLabels: { labels: ['lca-base'], unset: false, hostedLabels: [] },
   webhook: buildWebhookHealth({}),
   flavors: [],

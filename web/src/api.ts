@@ -294,6 +294,13 @@ export interface Settings {
    * visible list is a subset — the UI must not report "installed nowhere" from an empty list.
    */
   installationsHidden?: number;
+  /**
+   * Whether `installations` is GitHub's complete answer. False means the enumeration failed and
+   * the list is a store fallback, so an empty list is not evidence of anything — the UI must say
+   * "we could not enumerate" rather than "not installed anywhere". Optional for compatibility
+   * with an API that predates the flag; absent is treated as enumerated (the old behaviour).
+   */
+  installationsEnumerated?: boolean;
   runnerLabels: RunnerLabels;
   webhook: WebhookHealth;
   flavors: Flavor[];
@@ -371,6 +378,63 @@ export function relinkFailureFrom(err: unknown): RelinkResult | undefined {
       : {}),
     ...(Array.isArray(created) ? { createdParams: created.filter((p) => typeof p === 'string') } : {}),
   };
+}
+
+/**
+ * Classify a thrown relink failure into the next panel state.
+ *
+ * Two outcomes, and the difference is load-bearing:
+ *
+ *  - A **structured refusal** (422 with `applied: false`) is an answer about the environment's
+ *    credential state — it supersedes whatever the panel showed before.
+ *  - An **opaque failure** (503 lock contention, a proxy error page, a dropped connection) says
+ *    nothing about that state, so the PREVIOUS outcome is still the best description of it and is
+ *    carried forward. That matters because the previous outcome holds the rollback handle
+ *    (`replacedVersions` / `createdParams`) and the `rolledBack` flag the desync panel reads to
+ *    decide whether to warn that parameters may still hold submitted values. Dropping it on a
+ *    failed `allowHookDesync` retry would hide the rollback button and silently downgrade a
+ *    `rolledBack: false` warning to "nothing was changed".
+ *
+ * Pure, so the retention is testable without a DOM.
+ */
+export function relinkSubmitFailure(
+  err: unknown,
+  prevResult: RelinkResult | undefined,
+): { outcome: RelinkResult } | { error: string; result: RelinkResult | undefined } {
+  const refusal = relinkFailureFrom(err);
+  if (refusal) return { outcome: refusal };
+  return {
+    error: err instanceof Error ? err.message : String(err),
+    result: prevResult,
+  };
+}
+
+/**
+ * What an EMPTY installation list on the Settings screen actually means.
+ *
+ * Three different facts arrive as the same empty array, and printing the wrong one sends the
+ * operator somewhere useless:
+ *
+ *  - `scoped`: the session does not administer this environment's installations (ADR-035). The
+ *    App may be installed on many accounts; this operator may see none of them.
+ *  - `unenumerated`: GitHub's `/app/installations` call failed, so the list is a fallback from
+ *    our own store and its emptiness is not evidence. Note that the App identity can have
+ *    verified in the same response — the screen shows a green "verified" badge — so the failure
+ *    is invisible unless this case is named.
+ *  - `empty`: GitHub authoritatively enumerated zero installations. Only here is "install it
+ *    somewhere" the right instruction.
+ *
+ * `scoped` outranks `unenumerated` because a withheld list is a fact about THIS session that no
+ * enumeration outcome changes. Pure, so the choice is testable without a DOM.
+ */
+export function installationListState(
+  s: Pick<Settings, 'installations' | 'installationsHidden' | 'installationsEnumerated'>,
+): 'listed' | 'scoped' | 'unenumerated' | 'empty' {
+  if (s.installations.length > 0) return 'listed';
+  if (s.installationsHidden) return 'scoped';
+  // Absent means an API predating the flag, which only ever sent enumerated lists.
+  if (s.installationsEnumerated === false) return 'unenumerated';
+  return 'empty';
 }
 
 export interface LogPage {
