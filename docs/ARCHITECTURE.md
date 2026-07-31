@@ -77,7 +77,7 @@ vanity hostname when one is configured ([ADR-036](DECISIONS.md#adr-036)).
 | Hook broker λ | Lambda | Only AWS surface a runner microVM can call: hands back that run's JIT config and terminates that run's VM, capability-token gated (ADR-020) |
 | Reaper λ | Lambda (EventBridge schedule) | Kill microVMs exceeding max lifetime; reconcile orphans |
 | Image builder | Lambda + code bucket | Build/snapshot flavor images; publish image ARNs |
-| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config only (ADR-025) |
+| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config + installation index repair only (ADR-025, ADR-037) |
 | Config + run store | DynamoDB | Installations, repos, workflows, flavor maps, run records |
 | Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024). Vanity alias + A/AAAA Route53 records when a console domain is configured (ADR-036) |
 | Console cert | ACM (**us-east-1**) | Viewer certificate for the vanity hostname — CloudFront accepts no other region. Only exists on the vanity-domain path (ADR-036) |

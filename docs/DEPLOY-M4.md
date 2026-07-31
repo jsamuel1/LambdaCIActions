@@ -253,11 +253,45 @@ Two index keys are new in M4 and are only written going forward:
 
 - **Run rows** get `gsi2pk`/`gsi2sk` (ADR-023) at creation, so runs that existed before this
   deploy do not appear in the per-repo history view (`?repo=<id>`). They are still visible
-  via the status filter and by direct URL.
-- **Installation rows** get `gsi1pk=INSTALLS` on upsert, so `GET /api/installations`
-  (and the Setup screen) lists an installation only after its next lifecycle webhook.
+  via the status filter and by direct URL. This one is cosmetic and fills in with new runs.
+- **Installation rows** get `gsi1pk=INSTALLS` on upsert (`listInstallations` enumerates that
+  partition to avoid a table scan). An INSTALL row written by M2-era code has no `gsi1pk`,
+  so `GET /api/installations` omits it and the Setup screen shows the "no installations"
+  empty state — **even while the platform is claiming and running that installation's jobs**
+  (ingest reads repos by primary key, so the hot path is unaffected).
 
-Both are cosmetic and self-heal with activity. To force it: re-run the App installation's
-"suspend/unsuspend" (or add/remove a repository) to fire an installation webhook. There is
-deliberately no migration script — backfilling would mean a full table scan for a view that
-fills in on its own.
+**The installation case does NOT self-heal.** GitHub never re-sends `installation.created`
+for an existing installation, and job activity never touches the installation row. Run the
+backfill on any environment first deployed before M4:
+
+```bash
+npm run build                             # the ADR-018 pin guard is loaded from dist/
+npm run backfill:installs                 # dry run — lists the rows it would stamp
+npm run backfill:installs -- --apply      # write
+```
+
+The script (`scripts/backfill-installs.mjs`, ADR-037) scans for installation rows (keyed
+`INSTALL#<id>` / `INSTALL`) missing `gsi1pk` and stamps `gsi1pk=INSTALLS`,
+`gsi1sk=<accountLogin>`. It is idempotent (conditional
+on `attribute_not_exists(gsi1pk)`) — a second run reports nothing to do. It requires the
+same `.env.local` deploy-target pin as every other account-touching command (ADR-018), for
+the **dry run too**, since the dry run reads the live table and an unpinned run would report
+the wrong account's rows. Defaults: `--env dev`; pass `--table <name>` to skip the SSM
+table-name lookup.
+
+Verify:
+
+```bash
+aws dynamodb query --table-name lca-dev --index-name gsi1 \
+  --key-condition-expression 'gsi1pk = :p' \
+  --expression-attribute-values '{":p":{"S":"INSTALLS"}}' \
+  --query 'Items[].{id:installationId.N,login:accountLogin.S}'
+```
+
+Every installation should be listed. Then reload the console — Setup lists the account as
+`active`.
+
+If you cannot run the backfill immediately, the console still self-heals **per operator**:
+`GET /api/installations` reconciles any installation the session holds a grant for but the
+index did not return, fetching it by primary key and repairing the row (ADR-037). The
+backfill is still the right move — it repairs rows nobody has logged in for yet.

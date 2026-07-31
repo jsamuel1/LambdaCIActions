@@ -44,8 +44,9 @@ export interface MgmtStackProps extends StackProps {
  *
  * Plane boundary (docs/ARCHITECTURE.md, ADR-025): this stack deliberately grants the Mgmt λ
  * a **narrow, mostly-read** posture:
- *   - DynamoDB: table-wide read; writes limited to `UpdateItem` (config patches). No
- *     `PutItem`/`DeleteItem`, so it cannot forge run rows or delete history.
+ *   - DynamoDB: table-wide read; writes limited to `UpdateItem` (config patches, plus the
+ *     ADR-037 installation index repair — both `SET`s of specific attributes on an existing
+ *     row). No `PutItem`/`DeleteItem`, so it cannot forge run rows or delete history.
  *   - SSM: reads ONLY its own OAuth client id/secret + session key. Every other parameter
  *     is checked for presence via `DescribeParameters` (a metadata action that returns no
  *     values) — so no code path can leak a SecureString (spec 04 hard rule).
@@ -104,8 +105,9 @@ export class MgmtStack extends Stack {
     // Reads across all entities (runs, installs, repos, workflow analyses).
     table.grantReadData(fn);
     // Config writes ONLY: UpdateItem on the table. No Put/Delete → cannot forge or destroy
-    // run history, only patch existing config rows (which its handler further restricts to
-    // enabled/mode/defaultFlavor/flavorMap).
+    // run history, only patch existing rows. The handler restricts what it patches: repo
+    // config (enabled/mode/defaultFlavor/flavorMap) and the ADR-037 installation GSI1 index
+    // repair (gsi1pk/gsi1sk on an installation the session is already authorized for).
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'PatchRepoConfig',

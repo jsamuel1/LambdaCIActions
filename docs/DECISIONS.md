@@ -291,6 +291,10 @@ by every deploy-touching entry point:
 - **`scripts/build-images.mjs` / `scripts/create-github-app.mjs`**: refuse to start
   without a valid pin AND an STS caller-identity match; `--dry-run` is exempt (no AWS
   calls). Any explicit `--region`/`-c region` must equal the pinned region.
+- **`scripts/backfill-installs.mjs`** (ADR-037): same pin + STS match, but with **no dry-run
+  exemption** — its dry run still reads the live table, so an unpinned one would report
+  another account's rows as the target's. The exemption above is for commands whose dry run
+  makes no AWS call at all; it is not a blanket rule.
 **Why**: comparing the pin against the *actual* resolved identity (not just exporting a
 profile) catches every mis-targeting mode: wrong profile, stale credentials, env-var
 overrides. Keeping the guard dependency-free preserves the scripts' zero-npm-dep
@@ -681,6 +685,12 @@ which needs a GitHub token) requires a deliberate ADR + IAM change, not a one-li
 The `DescribeParameters` statement is `Resource: '*'` because the API has no resource-level
 scoping — acceptable since it returns metadata only.
 
+**Amended by [ADR-037](#adr-037)**: the `UpdateItem` grant now backs a second code path —
+the installation GSI1 index repair. It needed **no IAM change** (same action, same table) and
+writes only index attributes (`gsi1pk`/`gsi1sk`) on an installation row the session already
+holds a grant for — no attribute the console or the control plane reads for behaviour.
+"UpdateItem is the only write" still holds; "its only purpose is repo config" no longer does.
+
 ## ADR-026 — Polling for live run updates in v1 (no WebSocket/SSE) (M4)
 **Status**: Accepted (v1) · resolves [spec 04](specs/04-web-ui.md) OQ-1
 **Context**: Run detail and the dashboard should update while a job executes. Spec 04 listed
@@ -1037,3 +1047,52 @@ fails at `cdk deploy` on the distribution update, *after* the cert has been issu
 - `test/console-domain.test.mjs` pins the scheme + the refuse-on-partial-config behavior;
   `test/console-domain-infra.test.mjs` pins the us-east-1 assertion, the A+AAAA pair, the
   apex-override record shape, and the no-domain fallback (no alias, no cert, no records).
+## ADR-037 — Installation enumeration reconciles unindexed rows on read (M4 fix)
+**Status**: Accepted (v1) · follows [ADR-009](#adr-009), [ADR-022](#adr-022)
+**Context**: `listInstallations()` enumerates installations from the GSI1 `INSTALLS`
+partition so the console never table-scans. The `gsi1pk=INSTALLS` / `gsi1sk=<accountLogin>`
+write only arrived with M4 (commit 63069ff, 2026-07-28), so an INSTALL row written by M2-era
+code carries no index keys and is **invisible** to that query. Observed on dev: installation
+`146431062` (`jsamuel1`) served 30 granted repos and claimed jobs normally — the ingest hot
+path reads by primary key (`getRepo`) — while `GET /api/installations` returned `[]` and the
+Setup screen rendered "You have no LambdaCIActions App installations". GitHub does not
+re-send `installation.created` for an existing install, so nothing re-writes the row: the
+only workaround was uninstall/reinstall. DEPLOY-M4's claim that this "self-heals with
+activity" was wrong — job activity never touches the installation row.
+**Decision**: two parts.
+1. **Reconcile-on-read, bounded by the caller's grants.** `listInstallations(reconcileIds)`
+   keeps the GSI1 query as the primary path, then — for any id in `reconcileIds` the index
+   did not return — does a single `GetItem` by primary key and, when the row exists without
+   `gsi1pk`, repairs it in place (`SET gsi1pk, gsi1sk` conditional on
+   `attribute_not_exists(gsi1pk)`). The Mgmt handler passes `session.installations`, i.e.
+   exactly the installations the operator is *already* authorized to see (ADR-022 freezes
+   these at login from GitHub, independent of our table).
+2. **A one-shot backfill** — `npm run backfill:installs` (`scripts/backfill-installs.mjs`,
+   dry-run by default) stamps every unindexed installation row, so an existing environment is
+   fully repaired in one command rather than lazily per operator login. Both paths select on
+   the same signal — the key shape (`INSTALL#<id>` / `INSTALL`) plus a missing `gsi1pk`, not
+   the optional `entity` attribute — so neither can repair a row the other cannot.
+**Why not a fallback scan**: the obvious alternative — "if the GSI query comes back empty,
+scan with a filter" — is triggered by the wrong signal. Empty-index is not the failure mode;
+*partially* indexed is (one M4-era install indexed, one M2-era install not), and a scan that
+only fires on total emptiness still hides the legacy row. Firing the scan unconditionally
+puts a table scan on a polled console endpoint (ADR-026 polls), and its cost grows with run
+history, which dwarfs installation count. The grant list gives an exact, already-authorized
+candidate set: worst case one `GetItem` per installation the operator administers (a handful),
+paid once because the read self-heals. Reconcile also needs no new IAM — the Mgmt λ already
+holds `dynamodb:UpdateItem` for repo config (ADR-025), and this write touches only index
+attributes on a row keyed by an id the session is authorized for.
+**Consequences**: the invariant "an installation the platform is demonstrably serving is
+never absent from the console" holds for any operator with a grant for it, even on an
+un-backfilled environment. A legacy installation nobody holds a grant for stays invisible
+until the backfill runs — acceptable, since nobody can view it anyway. A repair failure is
+logged and swallowed: the row is already in the response, so the read must not fail. The
+repair is idempotent and concurrency-safe (conditional write; a losing racer is a no-op).
+`upsertInstallation` now stamps the keys via the shared `installGsi1Keys()` helper, and
+`test/install-store-gsi1.test.mjs` pins that every write path carries them — the regression
+class here is "a new write path forgets the index stamp". The reconciled list is re-sorted by
+account login so a recovered row occupies the same position it will hold once the index alone
+serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
+that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
+the reverse, and the mismatch would be the same row-jump wearing a disguise.
+||||||| 94360ca
