@@ -10,6 +10,7 @@ import { Template } from 'aws-cdk-lib/assertions';
 import { DataStack } from '../dist/lib/data-stack.js';
 import { MgmtStack, DEFAULT_REPORTS_MODEL_ID } from '../dist/lib/mgmt-stack.js';
 import { DEFAULT_MODEL_ID } from '../dist/src/mgmt/nl-report.js';
+import { envConfig } from '../dist/lib/env-config.js';
 
 function synth(over = {}) {
   const app = new App();
@@ -23,6 +24,7 @@ function synth(over = {}) {
     discoveryQueueUrl: 'https://sqs.us-west-2.amazonaws.com/123456789012/lca-test-discovery',
     discoveryQueueArn: 'arn:aws:sqs:us-west-2:123456789012:lca-test-discovery',
     publicOrigin: 'https://console.example.com',
+    config: envConfig('test'),
     ...over,
   });
   return Template.fromStack(mgmt);

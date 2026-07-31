@@ -303,6 +303,21 @@ convention, and one TS module shared via `dist/` avoids two divergent implementa
 .env.local` + editing two values (deliberate one-time friction). Dev/prod account
 separation (M5) becomes trivial: each checkout/env pins its own account.
 
+**M5 review fix — the pin also binds the ENVIRONMENT, not just the account.** The paragraph
+above was optimistic: `-c env=prod` / `--env prod` selected resource names, retention,
+concurrency and alarm thresholds, while the account came from an independent pin, and *nothing
+tied the two together*. A pin for the dev account plus `env=prod` therefore deployed
+`lca-prod-*` resources into the **dev** account, published prod-namespaced image ARNs to
+`/lca/prod/image-arn/*` there, and let `app:create --env prod` write GitHub App SecureStrings to
+`/lca/prod/github/*` in the wrong account — the reciprocal was equally possible. Since dev and
+prod are separate **accounts** by design (spec 05), the pin is the only authority on which
+environment a checkout may build. `.env.local` now also carries **`LCA_DEPLOY_ENV`** (`dev` |
+`prod`), and `validateTarget` refuses a command whose selected env contradicts it — before any
+STS call, in the CDK app and in both scripts. The key is **optional** so existing
+single-account checkouts keep working: with no `LCA_DEPLOY_ENV` there is no env claim to
+contradict, and only the account+region pin applies. Pinned by `test/deploy-env.test.mjs`,
+which also asserts each entrypoint actually passes its selector through.
+
 ## ADR-019 — Self-terminate via run-row readback (no in-guest microVM id source) (M3)
 **Status**: Accepted (v1) · amends [ADR-016](#adr-016) (teardown path)
 **Context**: The `/run` hook is supposed to call `terminate-microvm` on ITSELF at job end
@@ -901,8 +916,12 @@ every run row built from it is partial by construction.
   because it answers "how long did this run take". The **sum of job durations** is shown on
   expand as **job time** — deliberately not "compute": each job's `durationSeconds` is itself
   queue → last transition, so queued time is included and the sum is an upper bound on billed
-  microVM runtime, not a cost basis (v1 stores no per-phase timestamps — spec 04 OQ-5). It
+  microVM runtime, not a cost basis (v1 stored no per-phase timestamps — spec 04 OQ-5). It
   exceeds wall clock whenever jobs run in parallel, which is the question it answers.
+  **Amended by [ADR-042](#adr-042)**: the watermarks resolve OQ-5, so billable time is now
+  `runningAt → updatedAt` where a watermark exists. This figure is unchanged — it is still
+  queue-inclusive job time, deliberately not a cost basis; the cost basis lives in
+  `views.billableSeconds`.
 - **Completeness** is split into two halves, so neither side can lie on its own. The **server**
   returns `complete` on `GET /api/runs`, answering only *were any job rows dropped from this
   response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
@@ -961,6 +980,495 @@ a cost figure belongs on a Reports screen with a window and grouping, so `format
 `flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
 If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
 ADR is the place to record the reversal.
+
+## ADR-030 — Adopt mode: standard-label claiming, with the runner advertising the job's own labels (M5)
+**Status**: Accepted (v1) · supersedes the deferral note in [ADR-005](#adr-005) · one
+**open verification item** (below)
+**Context**: `label` mode (ADR-005) needs a one-line YAML edit per job. The M5 exit criterion
+is stronger: *a brand-new repo runs unchanged in adopt mode*. Two facts constrain the design:
+- GitHub matches a job to a runner by **label set containment** — the runner must advertise
+  *every* label in the job's `runs-on` ("Using self-hosted runners in a workflow": labels
+  "operate cumulatively"). So a job that says `runs-on: ubuntu-latest` can only ever be served
+  by a runner carrying `ubuntu-latest`.
+- Registration accepts caller-supplied labels as given, including GitHub's own default label
+  names (`config.sh --labels gpu,x64,linux` — "GitHub Actions accepts them as given and does
+  not validate that the runner is actually using that operating system or architecture").
+**Decision**:
+- **Claim gate** (`src/ingest/adopt.ts` `decideClaim`) becomes mode-aware. `windows-*` /
+  `macos-*` are refused **first, in every mode** — above the explicit-label rule, because
+  `runs-on: [windows-latest, lambda-ci]` is a workflow mistake rather than consent, and
+  claiming it strands the job on a runner that can never execute it. The compat gate cannot be
+  the only guard: it fails open by design. Then an explicit LCA label wins and is recorded as
+  `via: 'label'`. Only in `adopt` mode do standard hosted
+  labels (`ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`, `ubuntu-20.04`) claim a job, as
+  `via: 'adopt'`.
+- **Routing**: every standard label maps to `base`, and the existing signal-based upgrade
+  (spec 03 step 4) moves the job to `docker` when its parsed steps need it. This
+  settles spec 03 OQ-3 in favour of *signal-driven*: the label `ubuntu-latest` carries no
+  information about what the job needs, so guessing `node` from it would be superstition.
+- **JIT labels** (`src/provision/labels.ts`): the minted runner advertises the **job's own**
+  label set (de-duplicated, matrix expressions dropped, capped), because of containment
+  above. In adopt mode that includes `ubuntu-latest`.
+- **Mode is per repo and defaults to `label`.** Adopt is all-or-nothing per repo (GitHub gives
+  us no way to take *some* `ubuntu-latest` jobs), and it silently moves work to arm64 — so it
+  is the operator's explicit choice, made from the console where compat findings are visible.
+- The repo row is now read **before** the claim decision (previously after the label filter),
+  since `mode` is an input to it. A row-read failure degrades to `label` mode: a DynamoDB
+  fault must never *start* intercepting a repo's hosted-label jobs.
+**Why not rewrite-only**: rewriting YAML (ADR-031) is the honest alternative, but it needs
+`contents:write` and a merged PR, i.e. it is not "unchanged". Adopt mode is the zero-edit path;
+the rewrite PR is the make-it-explicit path. We ship both and let the operator pick.
+**Consequences**: one repo-row read per queued job in every mode (was: only for label-matched
+jobs). Adopt-mode jobs land on Graviton, so a job with an undeclared x86 dependency will fail
+where it used to pass — compat analysis flags what is statically visible and the console states
+the tradeoff at the toggle, but `arch_hints` are heuristics, not proof.
+**⚠️ Open verification item**: GitHub reserves its hosted-runner label names on some
+registration paths, and `generate-jitconfig` may reject `ubuntu-latest` with **HTTP 422**. The
+current docs for label assignment do not state such a prohibition, and we have not yet observed
+the call against a live repo. Mitigation shipped now: `classifyMintFailure` treats a 4xx mint
+failure as **permanent** (no SQS retry storm, no burnt DLQ budget) and, for a 422 carrying a
+hosted label, writes an actionable reason onto the run row naming the fix (switch to `label`
+mode, or use the rewrite PR). A **transient** mint failure (429/5xx/network, and a rate-limit
+403 — see the sixth-review fix below) deliberately does
+NOT write a terminal status: `failed` is terminal, so the redelivered message's
+`queued→provisioning` idempotency guard would refuse to advance the row and skip the launch —
+the retry would never reach the mint again. The row stays `provisioning` and the Reaper
+backstops a run that never recovers. **Adopt mode must not be advertised as GA until a real
+adopt-mode job has been observed green end to end**; the M5 exit criterion is what closes this.
+`test/adopt.test.mjs` and `test/jit-labels.test.mjs` pin the behaviour either way.
+**Seventh-review fixes (two ways a claimed job could never run, or ran on the wrong machine)**:
+- **An x86 architecture label is refused, in every mode.** `decideClaim` refused only
+  `windows*`/`macos*`, so `runs-on: [self-hosted, linux, x64, lambda-ci]` was claimed and `x64`
+  was passed straight through to `generate-jitconfig`. GitHub matches a runner to a job on
+  **advertised labels alone**, so this registers a Graviton runner that CLAIMS to be x86 — and
+  the job is then assigned and **executes on the wrong architecture**, rather than staying
+  queued for a runner that could serve it. That is strictly worse than the stranded-job outcome
+  the non-Linux refusal prevents, and compat analysis does not contain it (x86 hints are `risk`,
+  and the analysis lookup fails open by design). The refusal is now a shared predicate,
+  `incompatibleRunnerLabel`, applied by `decideClaim`, by `rewriteTargets` /
+  `rewriteRunsOnValue` (rewriting such a job would produce a selector we refuse AND that
+  GitHub-hosted can no longer serve), by the console's `adoptCandidate` flag, and **again**
+  pre-mint in Provision (`IncompatibleRunnerLabelError`, classified permanent) so a message
+  queued before the gate existed cannot mint the false label. Exact tokens only
+  (`x64`, `x86`, `x86_64`, `x86-64`, `amd64`, `i386`, `i686`) — a substring test would catch
+  custom labels like `x64-cache-warmer`, and `arm64`/`aarch64` are true of us.
+- **A job naming a non-default runner group is not claimed.** `runs-on: { group: X, labels:
+  [...] }` requires a runner that is in group X **and** carries the labels. We register into the
+  repo-level default group only (`runner_group_id: 1`, spec 01 OQ-1), and the `workflow_job`
+  webhook carries only the labels — so adopt mode claimed a
+  `{ group: special, labels: [ubuntu-latest] }` job on the strength of `ubuntu-latest`, minted a
+  runner in the default group, and the job waited forever. This is newly reachable in M5
+  precisely because adopt mode claims the hosted label with no LCA label present anywhere. The
+  parser now records `runner_group` on the parsed job (kept separate from `runs_on`: a group is
+  not a label), and Ingest refuses the claim when the matched analysis names a group other than
+  `default`. Consistent with the compat gate, the refusal is **evidence-based**: with no stored
+  analysis the group is invisible and the pre-existing fail-open posture stands — the residual
+  gap, closed only by resolving group ids at mint time, which v1 does not do. The refusal is a
+  shared predicate (`unreachableRunnerGroup`) applied by the Ingest gate, by the console's
+  `adoptCandidate` flag and by `rewriteTargets`: a predicate that *predicts* a claim must agree
+  with the gate, or RepoDetail advertises jobs adopt mode always refuses and the rewrite PR edits
+  a customer workflow for a job that still cannot run.
+  `test/adopt.test.mjs`, `test/adopt-routing-consistency.test.mjs` and
+  `test/jit-labels.test.mjs` pin all of it.
+
+**Sixth-review fix**: a **rate-limit 403 is transient**, not permanent. `generate-jitconfig`
+is a POST, so GitHub's **secondary** rate limits meter it and GitHub refuses with **403**, not
+429 — for both the primary limit and the secondary/abuse limit. The blanket "non-429 4xx is permanent" rule therefore
+stamped a merely throttled job terminal `failed` with "rejected by GitHub", and because
+`failed` is terminal the redelivered message's `queued→provisioning` guard refuses to advance
+the row — so the SQS retry that would have succeeded never reached the mint, and a developer's
+job needed a manual re-run. Adopt mode is exactly what makes the burst reachable: claiming by
+standard label mints a whole workflow's jobs at once, and Provision's reserved concurrency
+(10 dev / 25 prod) can outrun GitHub's per-minute ceiling. Two published secondary limits apply
+(GitHub docs, "Rate limits for the REST API"): **900 points/minute** per endpoint with a POST
+costing **5 points** (≈180 mints/min), and a separate **content-creation** cap of **80/minute
+and 500/hour**. The hourly one is the one concurrency cannot buy its way out of — it binds at
+500 minting jobs in an hour whatever the rate, which RUNBOOK now says explicitly so the
+"lower `provisionConcurrency`" remedy is not applied to a volume limit it cannot fix. GitHub
+states the secondary limits change without notice and that some endpoints carry undisclosed
+costs, so the numbers are indicative and the classification matches the refusal, not a budget
+calculation. The classification now matches on the response
+**body**, not the bare status, because 403 is also how GitHub reports a revoked installation or
+a missing permission — which is genuinely permanent and must keep naming the fix rather than
+retrying into the DLQ. `test/jit-labels.test.mjs` pins both halves.
+
+**Fifth-review fix**: the label cap is a **refusal**, not a truncation. `jitRunnerLabels`
+used to stop at `MAX_JIT_LABELS` (20), which is the same silent-failure class as the empty-set
+case above and quieter. `decideClaim` claims on the FULL webhook label set, so a job like
+`[l1 … l20, lambda-ci]` is claimed and the truncated mint then registers a runner that never
+advertises `lambda-ci`. GitHub matches cumulatively, so the runner can never be assigned the
+job it was launched for: the VM boots, burns the single-use JIT config, matches nothing and
+idles until the Reaper — while the run row already reads `running`, so the console shows a
+healthy run that will never move. Normalization now returns the whole set and Provision refuses
+an over-cap job pre-mint with `TooManyRunnerLabelsError` (classified **permanent**, stating the
+observed count, the cap and the fix). Pinned by `test/jit-labels.test.mjs` and
+`test/provision-config-guard.test.mjs`.
+
+**Fourth-review fix**: `adoptCandidate` (the console's per-job flag and its `adoptCandidates`
+count) now applies the SAME non-Linux refusal as `decideClaim`. It previously asked only "has a
+standard hosted label AND no LCA label", so a mixed selector like `[ubuntu-latest,
+windows-latest]` — which the claim gate refuses in every mode, and which `rewriteTargets`
+already excluded — was counted and advertised. RepoDetail states that count as fact ("N job(s)
+… run on arm64 microVMs"), so the divergence made the console overstate what adopt mode would
+claim on exactly the repos where the mistake matters. `test/mgmt-views.test.mjs` now cross-checks
+the flag against `decideClaim` and `rewriteTargets` rather than restating the rule.
+
+**Third-review fixes (both were silent-failure paths, not cosmetics)**:
+- **An all-expression `runs-on` is refused BEFORE the mint.** `jitRunnerLabels` drops unresolved
+  `${{ … }}` entries because they are not labels, so `runs-on: ${{ matrix.os }}` normalizes to an
+  EMPTY set. GitHub accepts `labels: []` and returns a JIT config for a runner carrying only its
+  automatic defaults (`self-hosted`, `linux`, `ARM64`) — which cannot satisfy the job's real
+  selector. The VM would boot, consume the single-use JIT config, match nothing, and idle until
+  the Reaper: paid compute that could never take the job, reported as a timeout rather than a
+  configuration error. `NoRunnerLabelsError` now fails the run pre-mint with the fix in the
+  reason (add a literal LCA label alongside the expression), and `classifyMintFailure` special-
+  cases it as **permanent** — it carries no `HTTP <status>`, so the status-based rule would
+  otherwise read it as transient and retry forever.
+- **Discovery resolves flavors WITH the repo's mode.** The stored `routes[jobId]` is not just a
+  console decoration: it is what the auto-rewrite planner reads to choose the label it writes
+  into a customer's PR (ADR-031). Resolving without `mode` sent every hosted-label job through
+  the FALLBACK, so an adopt-mode repo's routes read `fallback to base (no matching label)` —
+  wrong explanation always, and the wrong *flavor* whenever the repo also set `defaultFlavor`
+  (the fallback honours it; the adopt map does not). A `mode` change now also enqueues a
+  re-scan, because otherwise the operator flips to adopt and the console keeps showing the
+  stale fallback routes until someone happens to push a workflow change.
+
+## ADR-031 — Auto-rewrite PR: line-level edit, three gates, never a push (M5)
+
+**Status**: Accepted (v1) · implements spec 03 § Auto-rewrite · keeps the AGENTS.md
+`contents:write` hard rule intact
+**Context**: some teams want the routing decision visible **in the repo** rather than implied
+by console config. Spec 03 promises an opt-in PR that adds LCA labels. `contents:write` is an
+elevated GitHub App permission and is **off by default** by project rule, so the capability
+cannot simply exist.
+**Decision**:
+- **Line-level text edit, not a YAML round-trip.** `src/mgmt/rewrite.ts` rewrites only the
+  `runs-on:` lines it is confident about and leaves every other byte alone. Re-serializing
+  with js-yaml would drop comments and normalize quoting/key order across the whole file,
+  producing a diff no reviewer can sanely approve. Shapes we cannot edit safely (block
+  sequences, `${{ matrix.os }}`, the runner-group object form) are reported as `skipped` with
+  a reason for the operator to hand-edit — we never guess and corrupt a workflow.
+- **The hosted label is removed**, not kept beside ours: by ADR-030's containment rule,
+  leaving `ubuntu-latest` in would demand a runner advertising it and defeat the rewrite.
+- **Three independent gates**, all required: (1) deployment flag `-c rewrite=true` →
+  `REWRITE_ENABLED`; (2) per-repo `rewriteEnabled`, set from the console; (3) GitHub's own
+  answer if the App lacks `contents:write` (403, surfaced as the failure reason). Any one off
+  ⇒ no write. The dry-run diff stays available regardless, so an operator can see exactly what
+  the PR *would* do before enabling anything.
+- **A separate control-plane λ does the writing** (`src/rewrite/handler.ts`), fed by an SQS
+  queue. The management API only enqueues. This preserves ADR-025: the read-mostly management
+  plane holds no App PEM and cannot mint installation tokens, so the one capability that
+  writes to a customer repo does not live behind the console's IAM role.
+- **Branch + PR only.** An existing branch is never reset (that would be a force-push — spec
+  03 forbids it); an existing open PR is reused rather than duplicated; nothing is auto-merged.
+  Commits carry the blob `sha` we planned against, so a concurrent edit makes GitHub reject
+  the write instead of us clobbering it.
+- The λ **re-plans against live file contents** rather than trusting the operator's dry run,
+  which may be stale. Critically it plans against **the ref it is about to write**: the default
+  branch when creating the branch, the rewrite branch when that branch already exists. Reading
+  the default branch on a re-run would yield a stale blob sha, so the `sha`-guarded write would
+  409 on every attempt, retry, and DLQ — and a partially applied multi-file rewrite could never
+  be completed. `rewriteTargets` skips jobs that already carry an LCA label, so a re-run is
+  naturally a no-op for files already rewritten. The target list still comes from the stored
+  analysis, so `rewriteRunsOnValue` re-checks the **live** value for a standard hosted label and
+  refuses anything else: if a job's `runs-on` changed to `windows-latest`, or to another fleet's
+  `[self-hosted, gpu]`, since the scan, it is skipped with a reason rather than rewritten into
+  something unroutable.
+  CRLF files are handled without reformatting: line terminators are preserved per line, so a
+  Windows-checked-in workflow is not silently reported as unrewritable (nor converted to LF).
+- **The `runs-on:` scanner is anchored to the job-body indent column**, not "first match at any
+  deeper indent" (second review fix). YAML siblings share a column, so a job's own keys all sit
+  at one indent; anything deeper is something else. Two shapes made the looser scan actively
+  dangerous rather than merely imprecise:
+  `strategy.matrix.runs-on:` (a matrix *dimension*) and a `runs-on:`-looking line inside a
+  `run: |` block scalar. Both are indented deeper than the job body and both precede the real
+  selector, so a first-match scanner rewrote the WRONG line — committing a corrupted matrix into
+  the customer's repo while leaving the actual selector unrouted. Anchoring makes the matrix case
+  resolve to the job's real `runs-on: ${{ matrix.runs-on }}`, which `rewriteRunsOnValue` then
+  refuses as an expression: the correct outcome is a `skipped` reason, never a blind edit.
+- **A re-run that finds nothing to change returns the open PR's URL.** That is the normal second
+  click — the first run already rewrote every job, so `rewriteTargets` skips them all. Reporting
+  a bare "nothing to do" for a request whose entire outcome is a waiting pull request would send
+  the operator hunting for it. The lookup is best-effort: failing to decorate a successful no-op
+  must not turn it into an SQS retry. **A no-op with no open PR is reported differently when the
+  branch already existed** (fourth review fix): we plan against that branch and never reset it,
+  so if its PR was closed — or merged and the branch left behind — every further click is a
+  permanent no-op while the default branch may still be unrouted. The reason names the branch and
+  the unblocking action (delete it, so the next request re-plans from the default branch) instead
+  of claiming there is nothing to do.
+- **…but where a PR can still be opened, the no-edit path OPENS it** (eighth review fix). The
+  "delete the branch" advice above is only correct when the branch's rewrite has already been
+  merged. It is actively harmful in the state the λ actually lands in when the commits succeeded
+  and only `ensurePullRequest` failed — a 5xx, or an App granted `contents:write` but not
+  `pull_requests:write`. The redelivery re-plans against the rewrite branch, whose jobs now all
+  carry LCA labels, so every job is skipped and the request degrades to a permanent no-op;
+  telling the operator to delete that branch discards the committed rewrite AND cannot produce a
+  PR, because a fresh branch cut from the default branch reaches the same state again. So when
+  the branch exists, has no open PR, and there are no new edits, the λ calls `ensurePullRequest`
+  and reports `opened`. The attempt is best-effort (a failure degrades to the honest no-op
+  reason above, never a DLQ for a delivery that committed nothing), and GitHub's 422 "no commits
+  between base and head" is exactly the already-merged case where deleting the branch IS the
+  right advice. The recovery PR is opened with no plan, so `rewritePrBody` describes the earlier
+  commits rather than claiming "0 job(s) across 0 workflow file(s)".
+**Why the console preview is not a file diff**: the management λ cannot read repo files (no
+credential, by design), so its dry run is derived from the stored parse (`runs_on` per job).
+It shows the exact label change per job — the thing being decided — without pretending to be
+a byte-level diff. The λ produces the real unified diff when it commits.
+**Seventh-review fix**: the `runs-on:` scanner must **forget the current job** on structure it
+cannot parse, not skip the line. Its job-key pattern accepted only plain scalars, so a YAML-quoted
+job id (`"build":` / `'release':` — legal YAML and a legal GitHub job id) was not recognized as a
+key. That did not merely lose the job: `currentJob` stayed pointing at the PREVIOUS job while the
+scan walked into the new job's body, so the next `runs-on:` was recorded under the wrong job id.
+The planner then rewrote job B's selector using job A's target — e.g. stamping `lambda-ci-docker`
+(4 vCPU / 8 GB) onto a job that asked for neither, while the job that did need docker stayed
+unrouted and was reported as having no `runs-on`. In the worst shape (`lint` with a block-sequence
+selector followed by a quoted `"release"`), planning the *refused* job edited the *other* job's
+line. Quoted ids are now recognized, and — because the class is open (ids needing escapes,
+complex `?` keys) — any unrecognized non-blank line at or shallower than the job-id column clears
+the current job, so the outcome is a `skipped` reason rather than an edit against the wrong job.
+A job whose body is an **inline flow mapping** (`build: {runs-on: ubuntu-latest}`) is refused for
+the same reason: there is no line to edit without re-flowing the mapping, and treating its
+interior lines as body keys would drop their separators. Pinned by `test/rewrite.test.mjs`.
+
+**Eighth-review fix**: the inline-sequence tokenizer is now **escape-aware**, because it was
+silently rewriting a label into a DIFFERENT label. Inside a double-quoted YAML scalar `\"` is an
+escaped quote, not the closing one, but the scanner treated any `"` as a terminator — so it
+dropped out of "inside a quote" state MID-LABEL. A following `,` then split one label in two and
+the halves were re-emitted joined by `, `: `[ubuntu-latest, "a\"x,y\"z"]` became
+`[self-hosted, "a\"x, y\"z", lambda-ci]`, i.e. the runner is asked for a label the workflow never
+named — committed to the customer's repo, and shown identically in the console dry run. The
+existing unterminated-quote refusal could not catch it: an even number of escaped quotes
+re-balances the state. The same early exit made a later ` #` inside the label read as a comment
+and truncate the value, which surfaced as a wrong "no longer targets a standard GitHub-hosted
+label" refusal. Two consequences fixed together: the scanner skips the character after a
+backslash inside a double-quoted token (and refuses a dangling trailing escape rather than
+guessing), and `unquoteLabel` now DECODES `\\`/`\"` and single-quoted `''` so every comparison
+predicate (`already carries an LCA label`, `isAdoptLabel`, `nonLinuxHostedLabel`) sees the label
+the parser would produce rather than its escaped spelling — otherwise a label written
+`"lambda-ci"` dodged the already-routed check. Single-quoted scalars have no backslash escapes,
+so the backslash rule is scoped to `"`. `test/rewrite.test.mjs` pins each case by semantic round
+trip through the production parser, not by output string.
+
+**Ninth-review fix**: the escape decode is now the **whole YAML double-quoted table**, not just
+`\\` and `\"`, because a partial decode was not the conservative direction the eighth-review fix
+assumed. That fix argued an undecoded escape can only make a comparison MISS, which keeps the
+label as-is — true for the predicates that DROP a label, false for the ones that REFUSE on one.
+The arm64 containment guard is a refusal: `[ubuntu-latest, "\x77indows-latest"]` parses as
+`windows-latest` (verified against js-yaml 5.2.1, the parser Discovery runs), so
+`nonLinuxHostedLabel` never saw it, the mixed-selector refusal was skipped, and the rewrite
+emitted `[self-hosted, "\x77indows-latest", lambda-ci]` into the customer's PR — a job
+`decideClaim` refuses (non-Linux label) that GitHub-hosted can no longer take either (we added
+`self-hosted`), i.e. one that queues forever. The same hole let an escaped `"lambda\x2dci"` dodge
+the already-routed check. `unquoteLabel` therefore decodes every single-character escape
+`js-yaml` implements plus `\xNN`/`\uNNNN`/`\UNNNNNNNN`, and — the important half — **returns
+undefined for any escape it cannot decode exactly**, which fails the whole tokenization so the
+caller refuses the file. Guessing is not available: a predicate that refuses needs the label's
+real value, and a token carrying an unknown escape is invalid YAML anyway (the file would not
+have parsed for Discovery), so refusing costs nothing and keeps this decoder from having to be a
+superset of the parser. Pinned by `test/rewrite.test.mjs` in both directions — escaped
+`windows`/`macos`/LCA spellings are refused, and an escaped `ubuntu-latest` is still recognized
+as the label we may replace.
+
+**Tenth-review fix**: a **comment-only `runs-on` value is refused**, not tokenized as labels.
+`RUNS_ON_RE` consumes the whitespace after `runs-on:`, so a line whose whole value is a comment
+(`runs-on: # options: self-hosted, ubuntu-latest`, with the real labels in the block sequence on
+the following lines) reaches `splitComment` as a string whose FIRST character is `#`. The comment
+scanner required a preceding whitespace character, so it found no comment and handed the comment
+TEXT to the label tokenizer. A comment that happens to name a hosted label therefore passed the
+hosted-label gate, and the emitted line was
+`runs-on: [self-hosted, # options: self-hosted, lambda-ci]` — which **does not parse at all**
+(`missed comma between flow collection entries`), leaves the block sequence below it dangling,
+and would have been committed to the customer's repository by a PR we opened. That is exactly the
+failure the line-level design exists to prevent, and neither the unterminated-quote refusal nor
+the escape-decode work above could see it: the value is well-formed, it simply is not a value.
+`splitComment` now treats a `#` at position 0 as a comment (matching YAML), which leaves the
+remaining value empty, and `rewriteRunsOnValue` refuses it with a reason naming the shape (the
+labels are on the following lines — hand-edit) rather than the generic block-sequence message.
+Pinned by `test/rewrite.test.mjs`, which asserts the original file parses, the plan produces NO
+edits and NO `content`, and the skip reason names the operator action.
+
+**Twelfth-review fixes (the recovery path was reporting failures as success)**:
+- **Only GitHub's "No commits between…" 422 is benign.** The eighth-review fix taught the
+  no-edit path to OPEN a PR for a branch that already carries a rewrite — the state the λ lands
+  in when the commits succeeded and only the PR call failed. Its catch, however, swallowed
+  *every* failure and returned `nothing-to-do`, whose reason tells the operator to **delete the
+  branch holding their un-PR'd rewrite**. A 403 (App holds `contents:write` but not
+  `pull_requests:write` — exactly the case the comment cites), a rate-limit 403/429, a 5xx and
+  any other 422 were all reported as "nothing to do" while the SQS message was acknowledged, so
+  the operator had a `202`, no PR, and destructive advice. `githubJson` now throws a typed
+  `GithubApiError` carrying the **status** (the message text is unchanged — `isNotFound` and
+  `classifyMintFailure` match on it), and the recovery rethrows everything except a 422 whose
+  body says "no commits between", so a real failure retries and ultimately DLQs visibly. The
+  open-PR **lookup** also stopped swallowing: concluding "no PR is open" from a *failed* call
+  would let the recovery open a SECOND pull request for a branch that already has one.
+- **Workflow paths are encoded per segment.** Both the contents read and the write used
+  `encodeURI`, which deliberately leaves `#` and `?` unescaped. A legitimately named
+  `.github/workflows/release#arm.yml` was therefore sent as a URL **fragment** (dropped from the
+  request entirely) and `release?arm.yml` started a query string — the read 404s and the λ
+  misreports the workflow as deleted, and the write targets the wrong resource. Both now encode
+  each segment with `encodeURIComponent` and rejoin on `/`, matching what `encodeRefPath`
+  already did for branch names. `test/rewrite-pr-lookup.test.mjs` pins the status
+  discrimination, the rethrow, and the request paths for `#`, `?`, `%`, spaces and Unicode.
+
+**Eleventh-review fix**: both opt-in gates admit only the **exact** enabling value, and the
+gate ordering is pinned by a test. `validateRepoPatch` accepts only a boolean for
+`rewriteEnabled`, but the repo row is also writable out of band — RUNBOOK documents a
+break-glass `dynamodb update-item` on exactly that item for `mode` — so the λ's truthiness test
+(`!repo?.rewriteEnabled`) would have treated a stray `"false"` or `1` as consent, while
+`toRepoView` and the management API's `repoOptedIn` both report `=== true`: the console would
+show the toggle OFF for a repo the writer was willing to open a PR on. Both the λ and the API
+now test `!== true` / `=== true`. Separately, the gates' *position* was unpinned: the CDK test
+only proved `REWRITE_ENABLED` reaches the function's environment, so nothing stopped a future
+edit from moving a gate below the `getParam(APP_PEM_PARAM)` read or a repo call.
+`test/rewrite-pr-lookup.test.mjs` now asserts the deployment gate precedes the per-repo gate,
+and both precede the App private-key read and every GitHub call (`getRepoDefaultBranch`,
+`getBranchSha`, `getFileContent`, `ensureBranch`, `putFileOnBranch`, `ensurePullRequest`,
+`findOpenPullRequest`) — a refused request must reach neither the credential nor the repo.
+
+**Consequences**: an extra queue + λ, both inert in a default deployment. The rewriter's
+coverage is deliberately partial; `skipped` entries are a first-class output surfaced in the
+UI and repeated in the PR body, alongside an explicit arm64 warning for the reviewer.
+`test/rewrite.test.mjs` pins comment/indentation preservation and every refusal.
+
+**Fifth-review fix**: a **deleted or renamed workflow is skipped, not fatal**. Discovery upserts
+one analysis row per workflow and never prunes rows for files that no longer exist, so a stored
+candidate can 404 on read. Letting that throw failed the whole request: SQS redelivered, 404ed
+again, and the message DLQed (alarming) while every OTHER workflow in the repo went unrewritten
+and the operator got no PR at all — from a repo simply having deleted a workflow since its last
+scan. Only 404 is swallowed (a 403 from a missing `contents:write`, or a 5xx, still retries), and
+when every candidate has vanished the no-op reason names the paths and tells the operator to
+re-scan rather than claiming no job needs a label. Pinned by `test/rewrite-pr-lookup.test.mjs`.
+
+**Sixth-review fixes** (both about touching the customer's repo, so both are in scope for the
+`contents:write` hard rule):
+- **The ref path keeps its slashes.** `GET /repos/{o}/{r}/git/ref/{ref}` matches the ref as
+  literal path segments and does not decode `%2F`, so `encodeURIComponent` over the whole branch
+  name made the existence probe 404 for a branch that exists. Our branch always contains a slash
+  (`lambda-ci-actions/adopt-labels-<env>`), so this was the normal case: the probe reported
+  "absent", the create then failed `422 Reference already exists`, the request errored, SQS
+  redelivered, and the message DLQed — every second "Open rewrite PR" click was unfixable, and
+  `planRef` would have read the wrong ref anyway. Encoding is now per segment.
+- **No branch is created for a request with nothing to rewrite.** The λ used to call
+  `ensureBranch` before planning (it needed to know whether the branch existed to pick
+  `planRef`). That pushed a stray `lambda-ci-actions/adopt-labels-<env>` branch into the
+  customer's repo on every no-op request — including a repo whose jobs are all already labelled,
+  where the operator's action produced a branch and no PR. The existence check is now a
+  non-mutating probe (`getBranchSha`), and the branch is created only once there is at least one
+  edit to commit. Both pinned by `test/rewrite-pr-lookup.test.mjs`.
+
+## ADR-032 — Custom metrics as EMF log lines, alarms bound to an env-only dimension set (M5)
+**Status**: Accepted (v1) · implements spec 05 § Observability
+**Context**: spec 05 names the platform metrics (`ProvisionLatency`, `ProvisionFailures`,
+`QuotaThrottles`, …) and the alarms over them. Two implementation traps: a `PutMetricData`
+call on the provisioning hot path adds latency and its own throttling failure mode; and a
+CloudWatch alarm reads **one exact dimension set** — it does not aggregate across dimensions.
+**Decision**:
+- Emit metrics as **CloudWatch Embedded Metric Format** log lines (`src/shared/metrics.ts`):
+  no extra API call, no `cloudwatch:PutMetricData` grant on any Lambda, and the datapoint
+  shares a log line with the context that explains it. `putMetrics` (real API) exists for
+  non-Lambda callers and is unused on the hot path.
+- **Publish two dimension sets** per datum: the full set (`env` + `flavor`/`via`/`kind`) for
+  console drill-down, and an **`env`-only rollup** that alarms bind to. Without the rollup an
+  alarm on `{env}` would sit at `INSUFFICIENT_DATA` forever while the per-flavor metric
+  ticked up — a silent alarm, which is worse than no alarm.
+- **Cardinality rule**: repo full name, run id, job id and microVM id are attached as EMF
+  **properties**, never dimensions. As dimensions they would bill one custom metric per run
+  and be useless for alarming; as properties they stay queryable in Logs Insights.
+- Alarms (ControlStack): both DLQ depths, `QuotaThrottles > 0`, `ProvisionFailures` over the
+  env threshold, per-λ `Errors`, and provisioning-queue **age of oldest message** (the only
+  signal that catches "Provision stopped consuming", which emits no error anywhere). All use
+  `treatMissingData: NOT_BREACHING` so an idle platform never pages.
+- The alarm topic gets a subscriber only via `-c alarmEmail=…`. An unsubscribed topic is a
+  silent alarm, but a hardcoded team address would be wrong for every other deployment (and
+  is a small information leak in a public repo), so this is an explicit deploy-time input.
+- X-Ray active tracing on the hot path, per-env (`config.tracing`).
+- **A quota throttle is retried, not failed** — Provision rethrows without writing a terminal
+  status, because `failed` is final and the redelivered message's queued→provisioning guard
+  would then return early, so the retry we asked SQS for could never re-attempt the launch. One
+  throttle would permanently fail a job that only needed to wait. The accepted cost: the
+  redelivery re-mints a JIT config and abandons the previous one. That is safe (single-use, and
+  the side-store item TTLs out in 30 min unclaimed — [ADR-016](#adr-016)) and bounded
+  (`maxReceiveCount` 3, so ≤3 mints per job), whereas carrying the old config across deliveries
+  would risk launching on one another delivery already consumed. It does spend GitHub API budget
+  during a throttle storm, which is part of why `QuotaThrottles` is alarmed rather than only
+  logged.
+- **The dashboard cost sample prices only runs that actually launched a microVM** (third review
+  fix). Provision stamps `flavor` on its mint- and launch-failure paths for support, so a run
+  that never got a VM still carries a priced flavor; `estimateCostUsd` then billed its full
+  wall-clock (including the queued wait) for compute that never existed. The estimate therefore
+  grew every time provisioning broke — exactly when an operator is reading the dashboard.
+  `microvmId` is the only evidence a VM existed, so it gates the sample.
+- **The dashboard total does not pre-empt the Reports screen** ([ADR-029](#adr-029) moved cost
+  off Runs on the grounds that a cost figure needs a window and grouping). This is deliberately
+  the weaker artefact ADR-029 does not defer: a fixed, bounded sample of the most recent
+  terminal runs, labelled as such, reachable with no new index and no new read pattern — it
+  answers "is spend roughly what I expect" for the M5 exit criterion ("dashboard shows health
+  + cost"). The windowed, groupable report now ships on the Reports screen
+  ([ADR-043](#adr-043), spec 04 § Reports), which serves it by authorization-first repo fan-out
+  over GSI2 under a read budget; this sample stays as the health-screen figure rather than a
+  second source of truth, and both now share one billable-time definition so they cannot
+  disagree about what a job cost.
+- **The cost sample's unit is a JOB, not a workflow run** (review fix). The run store is keyed
+  `(repoId, runId, jobId)` (ADR-009/ADR-029), so a 3-variant matrix workflow is three rows.
+  `CostSummary` originally called its counter `runs`, and the Dashboard rendered it as
+  "3 finished run(s)" for ONE workflow and divided the total by 3 for a "mean per run" — a
+  denominator off by the matrix width. The summed spend was always right; only the count and the
+  mean lied. The field is `jobs` (and `byFlavor[f].jobs`), and the Dashboard says so, because
+  grouping by `(repoId, runId)` here would misrepresent the sample in the other direction: the
+  sample is a bounded page of job rows, so a run whose jobs straddle the page boundary would be
+  priced as a complete run when it is not — the same partial-window problem ADR-029 solved on
+  Runs with an explicit flag. Per-workflow-run cost is **still not delivered by either surface**:
+  the Reports screen ([ADR-043](#adr-043)) ships the windowed, groupable report but its counting
+  unit is also the job — its dimensions are repo/flavor/workflow/status/time, with no `run` — so a
+  true per-workflow-run figure remains future work.
+**Consequences**: metric emission cannot fail a provision (`emitMetrics` swallows everything —
+telemetry is best-effort by construction). Alarm thresholds and λ error tolerances differ per
+environment (ADR-033). Anyone adding a metric must keep the emitter's dimension set and the
+alarm's `dimensionsMap` in sync; `test/metrics.test.mjs` and `test/observability.test.mjs`
+assert the pairing rather than leaving it to review.
+
+## ADR-033 — Per-environment config module; `prod` hardens retention and removal (M5)
+**Status**: Accepted (v1) · refines spec 05 § Environments · builds on [ADR-018](#adr-018)
+**Context**: M1–M4 hardcoded one deployment shape: 2-week log retention, `RemovalPolicy.DESTROY`
+on every log group, fixed Provision concurrency, no alarm subscription. That is correct for
+`dev` and wrong for `prod` — an incident review needs logs older than two weeks, and a stack
+rollback must not delete the evidence of the failure that caused it.
+**Decision**: a single `lib/env-config.ts` returns the knobs that legitimately differ by
+environment — log retention (Lambda + run logs), log removal policy, Provision/broker reserved
+concurrency, run-row retention, alarm thresholds, tracing, alarm email, and the auto-rewrite
+flag. `prod` retains log groups and keeps 3-month Lambda / 1-month run-log retention; `dev`
+stays cheap and disposable. **An unknown env name (a personal sandbox like `jsam-dev`) gets the
+dev shape** — never prod's, so a typo cannot create retained resources.
+Every value is a plain constant: no context lookups, so credential-less `cdk synth` (the CI
+gate, ADR-018) keeps working.
+**Why not one account with stage prefixes**: spec 05 already commits to `dev`/`prod` as separate
+AWS accounts, and ADR-018 pins the deploy target per checkout. This module deliberately does
+**not** try to make one account host both — it only varies the knobs, while account isolation
+stays the real boundary (separate GitHub App, separate secrets, separate quota). That boundary
+is an operational convention: ADR-018 checks a pin against the ambient credentials, it does not
+bind an env NAME to an account, so co-tenanting `dev` and `prod` is possible (names are
+`env`-suffixed so it would not collide) and simply forfeits the isolation.
+**Wiring note (both directions matter)**: a config knob that nothing reads is worse than no
+knob — the docs then describe behaviour the system does not have. Two were caught in review and
+wired: `runRetentionDays` reaches the run store as `RUN_RETENTION_DAYS` on **every** λ that
+writes run rows (Ingest, Provision, Reaper — if they disagreed, a row's retention would depend
+on which one wrote it last), falling back to 90 days when unset so pre-M5 deployments keep
+today's behaviour; and `runLogRetention` is applied to the per-run microVM log group in
+`ControlStack` — the microVM exec role holds `logs:CreateLogGroup`, so a group with no policy
+is auto-created with `NEVER_EXPIRE` and job logs accumulate forever.
+**That policy is set with `logs.LogRetention`, not `logs.LogGroup`** (second review fix). Every
+environment deployed before M5 already HAS `/aws/lambda/microvms/runs/lca-<env>`, created by the
+launch path itself. A `logs.LogGroup` would attempt a CREATE and fail the ControlStack update
+with `ResourceAlreadyExistsException`, rolling M5 back — M5 would have been undeployable to the
+existing dev account without deleting live job logs by hand. `LogRetention` is a custom resource
+that PUTs the retention policy, creating the group only when absent and adopting it when present.
+Its removal policy is pinned `RETAIN` regardless of env: the group holds customers' job logs and
+is written by the launch path, so it is not this stack's to delete.
+**Consequences**: stack constructors now take a required `config` prop (call sites and tests
+updated). `prod` log groups survive stack deletion and must be cleaned up deliberately —
+intentional, and the same trade DataStack already made for the table. Auto-rewrite is `false`
+in the base config for **every** environment including prod (ADR-031), so enabling it is always
+an explicit deploy-time act.
 
 ## ADR-036 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
 **Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
@@ -1095,6 +1603,7 @@ account login so a recovered row occupies the same position it will hold once th
 serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
 that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
 the reverse, and the mismatch would be the same row-jump wearing a disguise.
+
 > **ADR numbering note.** This block was originally authored as 030..033 and has been renumbered
 > to **038..041** to vacate a collision: the concurrent branch `kermes/task-tidal-hawk` claims
 > 030..033 for entirely different subjects (adopt-mode label claiming, the auto-rewrite PR, EMF

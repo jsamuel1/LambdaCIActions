@@ -1,5 +1,5 @@
 import type { RunRecord, RunStatus } from '../shared/types.js';
-import { ALL_STATUSES, billableSeconds, flavorRatePerMinute, flavorNames } from './views.js';
+import { ALL_STATUSES, billableSeconds, isCostEligible, flavorRatePerMinute, flavorNames } from './views.js';
 
 /**
  * Reporting read model (spec 04 § Reports, ADR-043/044/045).
@@ -364,13 +364,23 @@ export function specFromQuery(
  */
 export { billableSeconds } from './views.js';
 
-/** Estimated USD for one job. `undefined` flavor ⇒ never launched ⇒ no cost. */
+/**
+ * Estimated USD for one job. `0` when the row is not evidence a microVM ran — the same
+ * `isCostEligible` gate Run detail and the Dashboard use, so a mint/launch-failure row (which
+ * carries the intended `flavor` for support but never had a VM) is not priced here while being
+ * unpriced there. ADR-042's "one definition of billable time" has to mean one *eligibility*
+ * rule too, or the two screens disagree about the same job.
+ */
 export function jobCostUsd(
-  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'runningAt' | 'flavor'>,
+  run: Pick<
+    RunRecord,
+    'createdAt' | 'updatedAt' | 'runningAt' | 'flavor' | 'status' | 'microvmId'
+  >,
+  now: Date = new Date(),
 ): number {
-  const rate = flavorRatePerMinute(run.flavor);
-  if (rate === undefined) return 0;
-  return (billableSeconds(run).seconds / 60) * rate;
+  if (!isCostEligible(run)) return 0;
+  const rate = flavorRatePerMinute(run.flavor)!;
+  return (billableSeconds(run, now).seconds / 60) * rate;
 }
 
 // ---- folds -----------------------------------------------------------------
@@ -492,9 +502,9 @@ export function computeReport(
       case 'spend': {
         let usd = 0;
         for (const r of g.runs) {
-          usd += jobCostUsd(r);
+          usd += jobCostUsd(r, now);
           coverageDen += 1;
-          if (billableSeconds(r).basis === 'measured') coverageNum += 1;
+          if (billableSeconds(r, now).basis === 'measured') coverageNum += 1;
         }
         points.push({ key, label: g.label, value: round(usd, 6), sampleSize: g.runs.length });
         break;
@@ -627,9 +637,9 @@ export interface ExportRow {
   [k: string]: string | number;
 }
 
-export function toExportRows(runs: RunRecord[]): ExportRow[] {
+export function toExportRows(runs: RunRecord[], now: Date = new Date()): ExportRow[] {
   return runs.map((r) => {
-    const billable = billableSeconds(r);
+    const billable = billableSeconds(r, now);
     return {
       repoId: r.repoId,
       repoFullName: r.repoFullName,
@@ -645,7 +655,7 @@ export function toExportRows(runs: RunRecord[]): ExportRow[] {
       wallClockSeconds: wallClockSeconds(r),
       billableSeconds: billable.seconds,
       costBasis: billable.basis,
-      estimatedCostUsd: round(jobCostUsd(r), 6),
+      estimatedCostUsd: round(jobCostUsd(r, now), 6),
     };
   });
 }

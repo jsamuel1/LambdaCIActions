@@ -39,7 +39,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | Screen | Purpose | Key data | Route |
 |---|---|---|---|
 | **Setup / Install** | Installation list + platform readiness | install state, missing SSM params | `#/setup` |
-| **Dashboard** | Health at a glance | active/queued/running counts, error rate, stuck runs, recent runs | `#/` |
+| **Dashboard** | Health at a glance | active/queued/running counts, error rate, stuck runs, recent runs, **rolling cost estimate** (per **job**, sampled) | `#/` |
 | **Repos** | List installed repos; enable/disable; set mode + default flavor | full_name, mode, default flavor, compat rollup, last change + actor | `#/repos` |
 | **Repo detail** | Per-repo workflows + flavor map | workflows[], per-job routing, compat findings, override editor, re-scan | `#/repos/{repoId}` |
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
@@ -154,20 +154,22 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/me` | Session introspection (login, installations, expiry) | ✅ |
 | `GET /api/installations` | List installations the caller can admin | ✅ |
 | `GET /api/repos?installation=<id>` | List repos + compat rollup | ✅ |
-| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
+| `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap`, `rewriteEnabled` | ✅ |
+| `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`; `repo`+`status` compose); returns `complete` (were any job rows dropped from this response?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
-| `GET /api/health` | Dashboard aggregates + stuck-run detection | ✅ |
+| `GET /api/health` | Dashboard aggregates + stuck-run detection + cost sample (`cost.jobs` — run rows are per-job, so a matrix workflow contributes one each; the denominator and mean are per job, not per workflow run) | ✅ |
 | `GET /api/settings` | Env identity + SSM parameter **presence** | ✅ |
 | `GET /api/reports/catalog` | Metric catalog + vocabulary + the operator's reportable repos + assistant availability | ✅ |
 | `GET /api/reports/run` | Execute a report spec from query params | ✅ |
 | `GET /api/reports/export` | CSV/JSON download of the underlying job rows (`format=csv\|json`) | ✅ |
 | `POST /api/reports/ask` | NL question → validated spec → rendered report (ADR-044/045) | ✅ |
-| `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)) | M5 |
+| `GET /api/repos/{repoId}/rewrite-pr` | Auto-rewrite **dry run** — always available, writes nothing | ✅ M5 |
+| `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)); 409 unless the deployment flag **and** the repo opt-in are both on | ✅ M5 |
 
 Run paths carry `repoId` because the run row's key is the `(repoId, runId, jobId)`
 idempotency triple (ADR-009) — the API mirrors the storage key rather than adding a lookup.
@@ -230,7 +232,7 @@ the flavor's vCPU/GB footprint (OQ-3), and billable time comes from the `running
 to total wall clock, which **overstates** cost; each export row carries `costBasis`
 (`measured` \| `wallClock`) and every report reports `coverage` — the share of contributing rows
 measured rather than inferred. Reconciliation against a real microVM bill is still outstanding
-(OQ-6): the direction of the error is known and stated, the magnitude is not.
+(OQ-7): the direction of the error is known and stated, the magnitude is not.
 
 **Every report reports its own completeness.** `complete: false` means the read budget was spent
 before the window was exhausted, and the UI renders the numbers as a floor with advice to narrow
@@ -366,6 +368,12 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   stamped write-once inside the guarded status transition, which makes billable time
   `runningAt → updatedAt` instead of total wall clock and makes queue-to-start latency a real
   metric. Pre-M5 rows have no watermark and are reported as coverage, never as zero.
+- **OQ-6** (**Reports screen**: windowed cost/utilisation grouped by repo, flavor or workflow)
+  → **shipped**, see § Reports. The open part was how to aggregate without a scan; the answer is
+  authorization-first repo fan-out over GSI2 with a read budget (ADR-043), not a new index or an
+  aggregation job. The Dashboard's rolling total stays what it was — a fixed bounded sample of
+  recent terminal **job** rows with no window and no grouping (ADR-032) — and is deliberately
+  *not* this report; the two now share one billable-time definition so they cannot disagree.
 - **Chart library** → **ECharts (Apache-2.0), pinned exact**, ADR-046. Highcharts was requested
   but is commercially licensed; the project owner declined to license it, so it is rejected
   outright rather than pending a check. Future charting extends the ECharts wrapper.
@@ -374,15 +382,42 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - **Report model** → **Claude 3.5 Sonnet on Bedrock**, from the existing Mgmt λ, with
   `bedrock:InvokeModel` scoped to that one model id, ADR-044.
 
+  The Dashboard's rolling total (M5) folds the same per-run estimate over a bounded sample of
+  recent terminal runs, and counts **only runs that actually launched a microVM** (`microvmId`
+  present) — Provision stamps `flavor` on its mint/launch failure rows for support, so pricing
+  those would bill wall-clock for compute that never existed and inflate the estimate exactly
+  when provisioning is broken.
+
+  Two review fixes make the *per-run* figure agree with that:
+  - **The eligibility gate lives in the estimator, not the rollup.** It was applied only by
+    `summarizeCost`, so Run detail priced a job that never launched — the same page printing
+    “microVM: (not launched)” showed a non-zero estimated cost, and it disagreed with the
+    Dashboard total for the same job. Eligibility is now one predicate (`isCostEligible`) inside
+    `estimateCostUsd`, which both callers share, so the two cannot diverge again. The predicate
+    takes **two** signals, because `microvmId` alone is not sufficient in either direction:
+    `stampMicrovmId` is best-effort by design (ADR-019 — the VM is already up when it runs, and
+    a failed stamp must not abort the launch), so requiring it would silently drop real billable
+    runs; a **post-launch status** (`running` / `completed`) is therefore accepted as evidence
+    too. `failed` / `timed_out` are not: those are exactly the mint- and launch-failure rows
+    that carry a flavor but no VM.
+  - **A live run's estimate advances with `now`.** `updatedAt` is written only on a status
+    **transition**, so a job sitting in `running` kept reporting the seconds it took to *reach*
+    `running`: polling Run detail reprojected the same row and the figure was frozen, materially
+    understating active spend. A non-terminal row is now measured `createdAt → now` (terminal
+    rows stay pinned to `updatedAt`, since their billing window is closed), with `now` injected
+    so it is deterministic in tests and one instant per API response. It remains an upper bound
+    — the ADR-042 watermarks narrow it (`runningAt → now` once the job is running), but a live
+    row is still measured to the current instant rather than to a closed billing window.
+
 ## Open questions
 
 - **OQ-4**: ~~custom domain + ACM cert for the console~~ — **resolved** by
   [ADR-036](../DECISIONS.md#adr-036) (M5): config-derived vanity origin + a us-east-1 cert
   stack, with the raw-CloudFront path kept for accounts owning no domain.
-- **OQ-6**: reconcile the `spend` estimate against a real microVM bill for one month so the
+- **OQ-7**: reconcile the `spend` estimate against a real microVM bill for one month so the
   error bar is a measured number rather than a stated direction. The estimate is deliberately
   labelled and its bias (overstates, for rows without a `runningAt` watermark) is known;
   the magnitude is not.
-- **OQ-7**: a durable, cross-container spend budget for the Reports assistant. The current cap
+- **OQ-8**: a durable, cross-container spend budget for the Reports assistant. The current cap
   is per-λ-container (ADR-044) — adequate for a single-λ console, wrong the moment reporting
   moves to its own function or the console scales out.

@@ -85,9 +85,19 @@ export interface Repo {
   mode: 'label' | 'adopt' | 'off';
   defaultFlavor?: string;
   flavorMap: Record<string, string>;
+  /** Per-repo auto-rewrite opt-in (ADR-031). */
+  rewriteEnabled: boolean;
   updatedBy?: string;
   updatedAt: string;
   compat?: CompatRollup;
+}
+
+export interface CompatMessage {
+  level: string;
+  code: string;
+  text: string;
+  /** Actionable remedy (M5) — what the operator should change. */
+  fix?: string;
 }
 
 export interface WorkflowJob {
@@ -96,7 +106,9 @@ export interface WorkflowJob {
   runsOn: string[];
   flavor?: string;
   flavorReason?: string;
-  compat: { level: CompatLevel; messages: { level: string; code: string; text: string }[] };
+  /** Job runs on GitHub-hosted runners today; adopt mode would claim it (M5). */
+  adoptCandidate: boolean;
+  compat: { level: CompatLevel; messages: CompatMessage[] };
 }
 
 export interface Workflow {
@@ -106,7 +118,20 @@ export interface Workflow {
   parseError?: string;
   lastParsedSha?: string;
   updatedAt: string;
+  adoptCandidates: number;
   jobs: WorkflowJob[];
+}
+
+/** Dry-run of the auto-rewrite PR (ADR-031). */
+export interface RewritePreview {
+  repo: Repo;
+  /** Deployment-wide flag (`-c rewrite=true`). */
+  deploymentEnabled: boolean;
+  repoOptedIn: boolean;
+  canApply: boolean;
+  changes: number;
+  skipped: number;
+  jobs: { path: string; jobId: string; before: string; after?: string; skipped?: string }[];
 }
 
 export interface Run {
@@ -129,11 +154,21 @@ export interface Run {
   billableSeconds?: number;
 }
 
+export interface CostSummary {
+  /** Sampled **jobs** (run rows are per-job — a matrix workflow contributes one each). */
+  jobs: number;
+  totalUsd: number;
+  avgUsd: number;
+  byFlavor: Record<string, { jobs: number; usd: number }>;
+}
+
 export interface Health {
   counts: Record<RunStatus, number>;
   active: number;
   errorRate: number;
   stuck: Run[];
+  /** Rolling spend estimate over the sampled terminal runs (M5). */
+  cost: CostSummary;
   generatedAt: string;
   /** False when a status count hit the paging budget and is a floor, not a total. */
   countsExact?: boolean;
@@ -285,6 +320,14 @@ export const api = {
       `/api/repos/${repoId}/flavor-map?installation=${installationId}`,
       { method: 'PUT', body: JSON.stringify({ flavorMap }) },
     ),
+  /** Dry run — always available, writes nothing. */
+  rewritePreview: (installationId: number, repoId: number) =>
+    request<RewritePreview>(`/api/repos/${repoId}/rewrite-pr?installation=${installationId}`),
+  /** Open the PR. 409s unless the deployment flag AND the repo opt-in are both on. */
+  rewritePr: (installationId: number, repoId: number) =>
+    request<{ queued: boolean }>(`/api/repos/${repoId}/rewrite-pr?installation=${installationId}`, {
+      method: 'POST',
+    }),
   runs: (query: { repo?: number; status?: RunStatus; limit?: number; cursor?: string } = {}) => {
     const p = new URLSearchParams();
     if (query.repo !== undefined) p.set('repo', String(query.repo));
