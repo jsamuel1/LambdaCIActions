@@ -159,8 +159,10 @@ export const METRIC_CATALOG: readonly MetricDoc[] = [
     unit: 'seconds',
     definition:
       'Seconds from queued to first entry into `running`, over jobs that carry a ' +
-      '`runningAt` watermark. Jobs predating the watermark (pre-M5 rows) are EXCLUDED and ' +
-      'reported as coverage, never counted as zero.',
+      '`runningAt` watermark. Jobs without one are EXCLUDED and reported as coverage, never ' +
+      'counted as zero. A watermark is missing on a pre-M5 row AND on a job whose terminal ' +
+      'webhook beat the `running` transition, so the excluded rows skew FAST — read the ' +
+      'percentiles as covering the jobs that were observably queued.',
     estimate: false,
   },
 ];
@@ -594,7 +596,7 @@ function caveatFor(metric: ReportMetric): string | undefined {
     case 'failureRate':
       return 'Coverage is the share of jobs that reached a terminal status; in-flight jobs are excluded from numerator and denominator.';
     case 'queueLatency':
-      return 'Coverage is the share of jobs carrying a runningAt watermark; jobs predating it are excluded, not counted as zero.';
+      return 'Coverage is the share of jobs carrying a runningAt watermark; the rest are excluded, not counted as zero. A watermark is absent on pre-M5 rows and on jobs that finished before the running transition landed, so the excluded rows are biased towards FAST jobs and these percentiles read slightly high.';
     case 'runCount':
       return undefined;
   }

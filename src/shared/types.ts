@@ -219,6 +219,11 @@ export interface RunRecord {
    * Write-once (`if_not_exists`) so a duplicate/late webhook can't move them, and ABSENT on
    * rows created before M5 — every report that consumes them reports coverage rather than
    * silently treating a missing watermark as zero.
+   *
+   * Also absent on a job whose TERMINAL webhook beat the `running` transition: `provisioning
+   * → completed` is a legal forward move, after which `completed → running` is rejected, so
+   * that row never gains a `runningAt` at all. Such rows are the FAST ones, so consumers must
+   * not describe a missing watermark as merely "old data".
    */
   provisioningAt?: string; // ISO8601
   /** First entry into `running`: the queue-to-start boundary and the billing start. */

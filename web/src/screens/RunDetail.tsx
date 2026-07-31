@@ -149,7 +149,7 @@ export function RunDetail({
           Cost is an estimate: billable minutes × flavor rate (vCPU + GB), where the rate is
           derived from the flavor footprint rather than a bill.{' '}
           {r.costBasis === 'wallClock'
-            ? 'This run predates per-phase timestamps, so it is priced on total wall clock — an overstatement, since queue and provisioning time are not billed.'
+            ? 'This run carries no start watermark — it predates per-phase timestamps, or it finished before the running transition landed — so it is priced on total wall clock, an overstatement, since queue and provisioning time are not billed.'
             : 'Billable time is measured from when the microVM started running, so queue and provisioning time are excluded.'}{' '}
           See Reports for spend over a window.
         </p>

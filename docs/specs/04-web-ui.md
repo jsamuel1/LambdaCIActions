@@ -228,12 +228,16 @@ p90 invents a value between two real jobs.
 
 **Cost honesty.** `spend` is an estimate and is labelled as one everywhere. The rate comes from
 the flavor's vCPU/GB footprint (OQ-3), and billable time comes from the `runningAt` watermark
-(ADR-042) so queue and provisioning time are not charged. Rows predating the watermark fall back
+(ADR-042) so queue and provisioning time are not charged. Rows carrying no watermark fall back
 to total wall clock, which **overstates** cost; each export row carries `costBasis`
 (`measured` \| `wallClock`) and every report reports `coverage` — the share of contributing rows
 measured rather than inferred. For `spend` that share is over the **priced** rows only: a job that
 never launched a microVM is priced at 0 and counted in neither side of the ratio, so coverage is
-not dragged down by rows the wall-clock caveat does not describe. Reconciliation against a real
+not dragged down by rows the wall-clock caveat does not describe. A watermark is absent on pre-M5
+rows **and** on a job whose terminal webhook beat the `running` transition (the forward-only guard
+then rejects `running`, so the row never gains one) — both are priced on wall clock, and
+`queueLatency` excludes both, which biases its percentiles slightly high because the excluded jobs
+are the fast ones. Reconciliation against a real
 microVM bill is still outstanding
 (OQ-7): the direction of the error is known and stated, the magnitude is not.
 

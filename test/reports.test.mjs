@@ -18,6 +18,7 @@ import {
   billableSeconds,
   computeReport,
   jobCostUsd,
+  metricDoc,
   percentiles,
   presetWindow,
   specFromQuery,
@@ -311,6 +312,43 @@ test('queue latency excludes rows with no watermark instead of counting them as 
   assert.equal(res.points[0].sampleSize, 1);
   assert.equal(res.coverage, 0.5);
   assert.match(res.caveat, /watermark/);
+});
+
+test('a fast job that finished before the running transition is priced, and its caveat does not blame age', () => {
+  // `stampMicrovmId` runs BEFORE the `running` transition (src/provision/handler.ts), and
+  // `provisioning -> completed` is a legal forward move while `completed -> running` is
+  // rejected. So an ultra-fast job whose terminal webhook wins that race is permanently
+  // `completed` + `microvmId` + NO `runningAt` — a brand-new row, not a pre-M5 one.
+  //
+  // Two things must hold: it is still PRICED (it really did run a microVM), and nothing
+  // describes its missing watermark as merely old data — the excluded rows here are the
+  // FAST ones, so calling them stale would invert the bias an operator should read.
+  const fast = job({
+    jobId: 7,
+    status: 'completed',
+    microvmId: 'mv-fast',
+    runningAt: undefined,
+    createdAt: '2026-07-15T11:00:00.000Z',
+    updatedAt: '2026-07-15T11:00:20.000Z',
+  });
+
+  const spend = computeReport([fast], SPEC({ metric: 'spend', dimension: 'none' }), { now: NOW });
+  assert.ok(spend.total > 0, 'a job that ran a microVM must still be priced');
+  assert.equal(spend.coverage, 0, 'it was priced on wall clock, so it is uncovered — not absent');
+
+  const latency = computeReport([fast], SPEC({ metric: 'queueLatency', dimension: 'none' }), {
+    now: NOW,
+  });
+  assert.equal(latency.points.length, 0, 'no watermark must not become a 0s queue time');
+  assert.equal(latency.coverage, 0);
+  // The caveat and the catalog definition must name this cause, not just "pre-M5".
+  assert.doesNotMatch(
+    latency.caveat,
+    /predating it are excluded, not counted as zero\.$/,
+    'caveat still attributes a missing watermark solely to age',
+  );
+  assert.match(latency.caveat, /before the running transition landed/);
+  assert.match(metricDoc('queueLatency').definition, /terminal webhook beat the `running`/);
 });
 
 test('spend coverage reports the share priced from a measured window', () => {
