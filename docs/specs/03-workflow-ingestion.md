@@ -92,19 +92,50 @@ routing/compat needs):
 Resolution order (first match wins):
 
 1. **Repo FlavorMap override** (DynamoDB) — explicit `label → flavor`.
-2. **Explicit LCA label** — `lambda-ci`, `lambda-ci-docker`, `lambda-ci-node` → that flavor.
+2. **Explicit LCA label** — `lambda-ci`, `lambda-ci-docker`, `lambda-ci-node`,
+   `lambda-ci-python`, `lambda-ci-java`, `lambda-ci-go`, `lambda-ci-rust` → that flavor.
+   The **most specific** (longest) matching label wins, so `[self-hosted, lambda-ci,
+   lambda-ci-java]` routes to `java`, not `base`. Labels of **equal** specificity break the
+   tie by **flavor name ascending** — the expanded set has several same-length labels
+   (`lambda-ci-python`/`-docker` are both 16 chars; `-node`/`-java`/`-rust` all 14), and
+   without an explicit rule the winner would fall out of the order of entries in
+   `flavors.json`. That also lands the safer side of the one collision that matters:
+   `[lambda-ci-python, lambda-ci-docker]` → `docker`, where a job's docker steps work,
+   rather than `python`, where they would fail on a missing daemon. The resolution reason
+   records the ambiguity.
 3. **Adopt-mode standard-label map** (if adopt enabled for the repo):
    | GitHub label | Default flavor |
    |---|---|
    | `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | `base` (or `node`/`docker` per signals) |
    | any + docker signals | `docker` |
    | `self-hosted` + our labels | matched flavor |
-4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it.
+4. **Signal-based upgrade** — if resolved flavor lacks a needed capability (e.g. Docker), upgrade to the smallest flavor that has it. The upgrade is a **replacement, not an addition**: flavors carry one toolchain each (ADR-039), so a `lambda-ci-python` job with `services:` resolves to `docker` and no longer has Python. The resolution reason names what the swap drops and compat raises `toolchain-dropped` (below) — a job needing both a runtime and a daemon wants a custom flavor, or an in-job toolchain install.
 5. **Fallback** — the repo's operator-chosen `defaultFlavor` (set from the console, [04](04-web-ui.md))
    if present and valid, else `base`; record a warning if uncertain.
 
+**Language flavors are label-selected, not signal-inferred.** Step signals currently model
+only `needs_docker`, so a job that runs `pytest` does **not** auto-upgrade off `base` — it is
+routed to `python` by an explicit label, a `FlavorMap` entry (e.g. `ubuntu-latest → python`),
+or the repo's `defaultFlavor`. Inferring a runtime from `setup-*` steps needs parser support
+plus a policy for jobs that need two runtimes, and is deliberately out of scope (ADR-039).
+
+A custom flavor (ADR-040) participates in every step above **only once it is `valid`**
+(ADR-041): an unvalidated or `invalid` custom flavor resolves as if it did not exist, so a
+half-configured flavor degrades to a working job on the fallback chain rather than a failed
+one. The reason string records that it was skipped. **Not implemented yet** — the resolver is
+built-in-catalog-only today; this is the contract the follow-up card must meet (see spec 02
+§ Custom flavors).
+
 The Ingest λ ([01](01-github-app.md)) only *claims* a `workflow_job` if routing says
 `eligible` for that job's labels. Non-eligible jobs are ignored (GitHub-hosted still runs them).
+
+**The claim allowlist runs first.** `shouldClaim` compares the job's `runs-on` against
+`/lca/<env>/config/runner-labels` *before* any of the resolution above happens, so a flavor
+label missing from that parameter is a dead end no resolver rule can rescue: the webhook is
+acked `claimed:false` and the job stays queued on GitHub with nothing logged as an error. That
+parameter is seeded by hand ([DEPLOY-M1](../DEPLOY-M1.md)) and must list every catalog label
+plus any label a repo `FlavorMap` maps — `test/filter.test.mjs` pins the documented seed against
+the catalog.
 
 **Repo opt-out** (ADR-027): before enqueueing a claimed job, Ingest reads the repo row and
 drops the job when the console has set `enabled=false` or `mode='off'`. The management plane
@@ -124,6 +155,22 @@ Because runners are **arm64-only** and single-use, ingestion computes a `compat.
 
 Surfaced in the UI per workflow/job with actionable messages (e.g. "image `foo:amd64` is
 x86-only; publish an arm64 variant or exclude this job").
+
+The docker-capable set the `docker-missing` check uses is **derived from the flavor catalog**
+(`capabilities` includes `docker`), not hard-coded — so adding a language flavor cannot
+accidentally suppress the warning, and a job needing Docker on `python`/`java`/`go`/`rust`
+still warns. Capabilities are drawn from a closed vocabulary (`docker`, `node`, `python`,
+`java`, `go`, `rust`): an unrecognized capability string would be silently inert here and in
+the resolver's upgrade step, which is why custom-flavor registration validates against it
+(ADR-041).
+
+The mirror-image check is **`toolchain-dropped`**: the job's labels ask for a capability the
+flavor it actually resolved to does not provide. That happens whenever the docker signal
+upgrade replaces a language flavor (`[self-hosted, lambda-ci-python]` + `services:` → `docker`,
+which has a daemon and no Python) and whenever a `FlavorMap` points a language label at the
+wrong flavor. Without it the job fails at its first `python`/`go`/`cargo` step with a bare
+command-not-found, having asked for the runtime explicitly. Also derived from the catalog, so a
+new flavor is covered without teaching the gate about it.
 
 ## Onboarding modes
 

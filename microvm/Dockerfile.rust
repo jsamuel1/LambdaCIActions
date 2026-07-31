@@ -1,0 +1,120 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.rust — the `rust` flavor microVM image (docs/specs/02-microvm-runners.md,
+# capabilities: ["rust"]). Base runner + a pinned Rust toolchain (rustc/cargo/clippy/rustfmt)
+# for aarch64-unknown-linux-gnu.
+#
+# NOTE — no tool-cache entry, deliberately. Unlike node/python/java/go there is no first-party
+# `actions/setup-rust` that consults the runner tool cache; the ecosystem standard
+# (`dtolnay/rust-toolchain`, `actions-rs/toolchain`) drives **rustup**, which manages its own
+# toolchain store under CARGO_HOME/RUSTUP_HOME. So the win here comes from having rustup +
+# the pinned toolchain already resolved on PATH, not from ${RUNNER_TOOL_CACHE} (ADR-039).
+#
+# This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
+# staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
+# layers the extra toolchain on top. Keep the base layers in sync with Dockerfile.base.
+#
+# HARD RULE (AGENTS.md): arm64 ONLY. Lambda microVMs are Graviton-only — the base image,
+# the runner agent tarball, and every binary below must be arm64. Do NOT switch to an
+# x86_64 base or the snapshot build will produce an unbootable image.
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ARG RUNNER_VERSION=2.335.1
+ARG NODE_MAJOR=24
+# Pinned Rust stable. Bump deliberately (ADR-039) — tracking `stable` would make image
+# rebuilds non-reproducible.
+ARG RUST_VERSION=1.97.1
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_DIR=/opt/actions-runner \
+    RUN_HOOK_PORT=8080 \
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+    AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
+    # Shared rustup/cargo so the toolchain is baked into the snapshot rather than re-resolved
+    # per job into the runner's home. RUSTUP_HOME stays here at RUNTIME (and is chowned to the
+    # runner below — `rustup toolchain install` writes into it); CARGO_HOME does NOT — see the
+    # runtime override at the bottom of this file.
+    RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo
+
+# Common toolchain + the runner agent's runtime deps. Node is needed both for the
+# run-hook server and for the GitHub Actions runner's node-based actions.
+# `awscli` is apt's aws-cli **v1** — the CLI ADR-028 measures the cold boot cost against.
+# See Dockerfile.base for why v1 is correct here and what to re-check before changing it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git jq unzip tar gzip sudo \
+      libicu70 lsb-release awscli \
+      # rustc shells out to `cc` for linking — a Rust build fails without a C toolchain.
+      build-essential pkg-config libssl-dev \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- rust flavor extras -----------------------------------------------------------------
+# Install rustup non-interactively with the toolchain PINNED (not `stable`), plus the two
+# components CI almost always wants. `--profile minimal` keeps the snapshot down (no docs).
+# `--component` takes ONE value per occurrence — `--component clippy rustfmt` makes rustup-init
+# exit with "unexpected argument 'rustfmt' found" and fails the image build. Repeat the flag.
+RUN mkdir -p ${RUSTUP_HOME} ${CARGO_HOME} \
+    && curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y \
+         --no-modify-path \
+         --profile minimal \
+         --default-toolchain ${RUST_VERSION} \
+         --default-host aarch64-unknown-linux-gnu \
+         --component clippy \
+         --component rustfmt \
+    && rm /tmp/rustup-init.sh \
+    && chmod -R a+rX /opt/rust \
+    # Fail the BUILD (not a job) if the toolchain did not land.
+    && ${CARGO_HOME}/bin/rustc --version \
+    && ${CARGO_HOME}/bin/cargo --version
+# NOTE: PATH is set once, after the runner user exists — see the CARGO_HOME override below.
+# ----------------------------------------------------------------------------------------
+
+# GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
+RUN mkdir -p ${RUNNER_DIR} \
+    && curl -fsSL -o /tmp/runner.tar.gz \
+       https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz \
+    && tar -xzf /tmp/runner.tar.gz -C ${RUNNER_DIR} \
+    && rm /tmp/runner.tar.gz \
+    && ${RUNNER_DIR}/bin/installdependencies.sh
+
+# The lifecycle-hook server (ADR-012). It receives the JIT config via POST /run and
+# launches the runner agent for exactly one job, then self-terminates.
+COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
+
+# The runner must NOT run as root (agent refuses); create an unprivileged user that owns
+# the runner dir and can sudo for job steps that need it.
+#
+# RUSTUP_HOME must be WRITABLE by the runner. The ecosystem-standard action this flavor exists
+# to serve (`dtolnay/rust-toolchain`) runs `rustup toolchain install …` and `rustup default …`,
+# and both write into RUSTUP_HOME (`toolchains/`, `settings.toml`). Left root-owned, any
+# workflow that pins a toolchain — i.e. nearly every real Rust workflow — fails with a
+# permission error before it compiles anything. The microVM is single-use and runs exactly one
+# job, so there is no later job for a compromised one to poison; write access buys correctness
+# at no cross-job cost. The baked TOOLCHAIN BINARIES stay world-readable via `chmod a+rX`
+# above, so a job that does not install its own toolchain still gets the pinned one.
+#
+# ${RUNNER_TOOL_CACHE} must be CREATED before it is chowned: this flavor bakes no tool-cache
+# entry (rustup owns the toolchain), so nothing above has made the directory and `chown -R`
+# on a missing path fails the image build outright.
+RUN useradd -m -s /bin/bash runner \
+    && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && mkdir -p ${RUNNER_TOOL_CACHE} \
+    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE} ${RUSTUP_HOME}
+
+# CARGO_HOME must be WRITABLE at runtime. The build-time value above (/opt/rust/cargo) is
+# root-owned so a job cannot poison the shared toolchain — but cargo also writes the registry
+# index, crate cache and any `cargo install` binaries into CARGO_HOME, so leaving it there
+# makes every dependency fetch fail with "failed to download replaced source registry
+# `crates-io`: Permission denied (os error 13)". Point it at the runner's home and keep
+# /opt/rust/cargo/bin on PATH for the baked rustup shims.
+ENV CARGO_HOME=/home/runner/.cargo
+ENV PATH=/opt/rust/cargo/bin:/home/runner/.cargo/bin:$PATH
+
+USER runner
+WORKDIR ${RUNNER_DIR}
+
+EXPOSE 8080
+# Entrypoint is the run-hook server; it blocks until /run then supervises the single job.
+ENTRYPOINT ["node", "/opt/actions-runner/run-hook.mjs"]

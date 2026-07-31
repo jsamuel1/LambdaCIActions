@@ -27,9 +27,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Must match the node flavor's baked tool-cache pin (Dockerfile.node NODE_VERSION).
+      # setup-node resolves `node-version` against ${RUNNER_TOOL_CACHE}/node/<semver>/arm64,
+      # so asking for a major the image did not prebake is a silent cache MISS and a full
+      # download on every job — i.e. this repo's own dogfood CI would not exercise ADR-039's
+      # whole point. Pinned by test/image-content.test.mjs.
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install dependencies
         run: npm ci

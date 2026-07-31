@@ -194,3 +194,14 @@ export function parsePlatformAdmins(raw: string | undefined): string[] {
     .map((l) => l.trim())
     .filter(Boolean);
 }
+
+/**
+ * The installation ids this session holds a grant for (ADR-022). Named so the reconcile
+ * candidate set `listInstallations` takes has ONE canonical source: an inline
+ * `session.installations.map(...)` at the call site is indistinguishable from `[]` to a
+ * reader, and `listInstallations([])` restores the pre-ADR-037 index-only blindness with no
+ * type error. `test/install-store-gsi1.test.mjs` pins the route to this helper.
+ */
+export function grantedInstallationIds(session: SessionPayload): number[] {
+  return session.installations.map((i) => i.installationId);
+}

@@ -3,11 +3,12 @@
 Status: **Implemented (M4)** · Plane: Management
 
 > Implemented by `src/mgmt/**` (API), `web/**` (console), `lib/mgmt-stack.ts` +
-> `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-020) (auth),
-> [ADR-023](../DECISIONS.md#adr-021) (run-history index), [ADR-024](../DECISIONS.md#adr-022)
-> (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-023) (mgmt IAM boundary),
-> [ADR-026](../DECISIONS.md#adr-024) (polling), [ADR-027](../DECISIONS.md#adr-025) (where
-> console config is enforced). Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
+> `lib/web-stack.ts` (infra). Design decisions: [ADR-022](../DECISIONS.md#adr-022) (auth),
+> [ADR-023](../DECISIONS.md#adr-023) (run-history index), [ADR-024](../DECISIONS.md#adr-024)
+> (single CloudFront origin), [ADR-025](../DECISIONS.md#adr-025) (mgmt IAM boundary),
+> [ADR-026](../DECISIONS.md#adr-026) (polling), [ADR-027](../DECISIONS.md#adr-027) (where
+> console config is enforced), [ADR-029](../DECISIONS.md#adr-029) (run-primary Runs screen).
+> Deploy: [DEPLOY-M4](../DEPLOY-M4.md).
 
 The operator console: install/manage the GitHub App, see which repos + workflows are
 onboarded, inspect live and historical runs with logs, and tune flavor mappings. Backed by
@@ -22,6 +23,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 - [Live run updates](#live-run-updates)
 - [Tech choices](#tech-choices)
 - [Non-functional](#non-functional)
+- [Resolved questions](#resolved-questions)
 - [Open questions](#open-questions)
 
 ---
@@ -41,7 +43,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Repos** | List installed repos; enable/disable; set mode + default flavor | full_name, mode, default flavor, compat rollup, last change + actor | `#/repos` |
 | **Repo detail** | Per-repo workflows + flavor map | workflows[], per-job routing, compat findings, override editor, re-scan | `#/repos/{repoId}` |
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
-| **Runs** | Filterable run history | status, repo, run/job, flavor, duration, est. cost, started | `#/runs` (`?repo=<id>`) |
+| **Runs** | Filterable, run-primary history | run + folded status, flavor rollup, duration, job count, expandable jobs | `#/runs` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
 | **Settings** | GitHub App linkage, runner labels, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
@@ -49,6 +51,75 @@ a management API over the same DynamoDB the control/compute planes write to.
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has
 a handful of workflow files, and the operator's question ("which job goes where, and what's
 incompatible?") is answered by one table per file without a navigation hop.
+
+### Runs screen — run-primary rows and rollup rules
+
+The run store is per **job** (key = `(repoId, runId, jobId)`, ADR-009) but an operator thinks
+in workflow **runs**, so the screen's primary row is a run and its jobs are nested behind an
+expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to the SPA as
+`web/src/rollup.ts`, tested in `test/run-rollup.test.mjs`) — **ADR-029**:
+
+- **Status fold** — failure dominates: any `failed` → `failed`, then `timed_out`; otherwise
+  the most advanced active status wins (`running` > `provisioning` > `queued`); `completed`
+  only when every job completed. An empty job set folds to `queued`, never `completed`.
+- **Flavor rollup** — the single name when all jobs agree, else `<most common> +<n>` (e.g.
+  `node +2`) with the full breakdown shown on expand. Jobs with no flavor yet are ignored.
+  On a **partial** window the label is weakened rather than stated as fact (`node +?`,
+  `node +2?`): an unread job may use a flavor the loaded jobs never mention, so
+  "all jobs agree" is unprovable there.
+- **Duration** — the run row shows **wall clock** (earliest job queued → latest transition),
+  which answers "how long did the run take". The **sum of job durations** appears on expand as
+  **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
+  time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
+  basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point. On a
+  partial window a duration renders as `≥ 4m 10s` (`durationLabel`); a run with no elapsed span
+  yet keeps the plain em dash, since `≥ —` would read as "at least unknown".
+- **Started** — the earliest job queue time. On a **partial** window it is an *upper* bound and
+  renders as `≤ 01/07/2026, 09:14`: an unread job of the same run may have been queued earlier,
+  so the run started at or before the figure shown. It is the one run-row value bounded the
+  other way from the durations and job count.
+- **Partial rollups** — grouping is client-side over an index **page**, so a run's jobs can
+  straddle the page boundary. Completeness is therefore three signals. `GET /api/runs` returns
+  **`complete`**, the server's answer to *were any job rows dropped from this response?* — it
+  deliberately does **not** mean "the index is exhausted", which the client already knows from
+  the cursor. The server half has to be server-side because truncation is judged on the raw
+  index pages *before* the installation-visibility filter — a page filled with another tenant's
+  rows comes back short while this operator's sibling jobs sit unread past the boundary. The
+  third signal is the client's own head/older **seam**: the head page is re-polled every 5 s
+  while appended older pages stay in state, and GSI2 sorts on the immutable `createdAt`, so a
+  newly queued job pushes a row off the bottom of the head page into a gap the older pages
+  start below. The client remembers the key of the head row directly above the first older row
+  and marks the window partial once it is gone (`headSeamIntact`). The seam is armed by the
+  paging **hop** rather than by appended rows — an empty page with a live cursor still moved
+  the cursor off the head page — and the boundary is captured from the head snapshot the
+  cursor was read from. Whole runs are folded only
+  when `complete` held for every loaded page, the cursor is exhausted, and the seam is intact;
+  otherwise every run in the window is badged `partial` and its status, job count, flavor,
+  durations and start time render as bounds rather than facts. A repo-filtered page drops nothing, so paging it to the end
+  yields exact rollups — until new jobs arrive and shift the seam, when the badge returns. A
+  `status=` filter selects *jobs*, so it always reports `complete: false` (including alongside
+  `repo=`, where it applies as a post-query predicate) — the screen says so inline.
+- **Ids** — run/job ids are small dim text at the end of their column with a copy button
+  (`CopyId`): an accessible label, a polite live region for both the copied and the
+  could-not-copy outcome, and `stopPropagation` so copying does not trigger the row's
+  navigation. The button is rendered only when `navigator.clipboard` exists (it needs a secure
+  context — HTTPS-only in production per ADR-024, absent on a plain-HTTP dev origin), because a
+  control that does nothing when pressed is worse than none: the id is on screen and selectable
+  regardless.
+- **Expansion survives polling** — expansion is component state keyed `repoId-runId`, so the
+  5 s poll re-renders rows without collapsing an open run.
+- **A filter change abandons in-flight paging.** "Load older" is asynchronous while the repo /
+  status controls reset the appended pages, the cursor and the seam, so a response can land in a
+  window it does not belong to. Each request is stamped with its filter identity
+  (`pageQueryKey`) and dropped on arrival if the filter has moved on — otherwise the previous
+  repo's jobs would be appended under the newly selected repo and further paging would walk the
+  old index.
+- **No cost column.** Cost belongs on a Reports screen with a time window and grouping, not on
+  a history list; `formatCost` / `flavorRatePerMinute` remain for Run detail and Reports (M5).
+- **Repo filter** is an in-screen picker that fans out over the session's installations
+  client-side (`GET /api/repos` is installation-scoped; no aggregated repos read was added).
+  The selection lives in the URL (`#/runs?repo=<id>`), keeping the
+  Repo-detail deep link and shareable filtered views working.
 
 Wireframe (Repo detail):
 
@@ -84,7 +155,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap` | ✅ || `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
-| `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`) | ✅ |
+| `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`; `repo`+`status` compose); returns `complete` (were any job rows dropped from this response?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
 | `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
@@ -377,6 +448,12 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   makes the fallback unnecessary. The app shell is served with a `self`-only CSP
   (`frame-ancestors 'none'`), HSTS, `nosniff`, and `Referrer-Policy: same-origin`
   (`test/web-stack.test.mjs`).
+- **Console origin**: a **vanity domain** when configured (ADR-036) — `lambdaciactions.<zone>`
+  for prod, `<env>.lambdaciactions.<zone>` otherwise — with a us-east-1 ACM cert
+  (`LCA-Cert-<env>`, CloudFront's only accepted cert region) and A+AAAA Route53 aliases.
+  Because the origin is then known at synth time, `PUBLIC_ORIGIN` is plain config and the
+  ADR-024 two-pass deploy disappears. With no domain configured the raw `*.cloudfront.net`
+  origin and the two-pass bootstrap still apply.
 - **API**: API Gateway (HTTP API) + one Lambda (TypeScript, arm64, Node 22), same toolchain
   as the orchestrator.
 - **State**: DynamoDB (shared single table) + GSI2 for per-repo run history (ADR-023).
@@ -396,13 +473,17 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   launch/terminate or `iam:PassRole`. Asserted against the synthesized template in
   `test/mgmt-stack.test.mjs`, which also pins the broker's `ssm:PutParameter` blast radius to
   the exact credential + label paths (specifically *not* the console session key or the image
-  ARNs).
+  ARNs). Two code paths use the DynamoDB write: repo config patches, and the ADR-037
+  installation index repair (`gsi1pk`/`gsi1sk` on an installation the session already holds a
+  grant for).
 - **Input allow-listing**: config bodies are validated field-by-field; unknown fields are a
   400, so a run's status/microVM id can't be patched through the config endpoint.
 - **Auditability**: config writes stamp `updatedBy` (GitHub login) + `updatedAt` on the repo
   row and emit a structured log line with the actor and the patch.
 - **Config takes effect in the control plane** (ADR-027): the management λ only writes repo
-  config. `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
+  config (and the ADR-037 installation index repair, which writes only index attributes —
+  no field the console or control plane reads for behaviour).
+  `enabled=false` / `mode='off'` are enforced by Ingest's claim gate, and
   `defaultFlavor` by `resolveFlavor`'s fallback. Both fail open, so a config read fault
   cannot stop a labeled job.
 - **CSP and inline styles**: the console CSP has `style-src 'self'` with no
@@ -419,9 +500,21 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
   $0.0044/min reference) rather than a hand-maintained rate table, so a new flavor cannot
   ship without a price. Surfaced as an explicit *estimate*: it uses wall-clock duration,
   which is an upper bound on billed microVM runtime (v1 stores no per-phase timestamps).
+  **Amended by ADR-038**: the catalog's `vcpu` is *descriptive* — the microVM API accepts a
+  memory request (`--resources minimumMemoryInMiB`) and exposes no vCPU knob — so the vCPU
+  term is a proxy for the shape a flavor is intended for, not for provisioned capacity. The
+  two-term formula stays (memory is real and drives quota), but every surface must label the
+  figure an estimate; the Flavors screen footnotes the `vcpu` column for this reason.
 
 ## Open questions
 
-- **OQ-4**: custom domain + ACM cert for the console (currently the CloudFront domain) — M5.
+- **OQ-4**: ~~custom domain + ACM cert for the console~~ — **resolved** by
+  [ADR-036](../DECISIONS.md#adr-036) (M5): config-derived vanity origin + a us-east-1 cert
+  stack, with the raw-CloudFront path kept for accounts owning no domain.
 - **OQ-5**: per-phase run timestamps (`provisioningAt`/`runningAt`) would make the cost
   estimate exact and enable boot-latency charts. Worth a run-row schema addition in M5?
+- **OQ-6**: **Reports screen** — cost/utilisation over a time window, grouped by repo, flavor
+  or workflow, using `formatCost` / `flavorRatePerMinute` (removed from Runs per ADR-029).
+  Whether that needs a run-keyed index or an aggregation job is the open part — a per-run cost
+  total over an arbitrary window cannot be served by the current per-job indexes without a
+  scan. Tracked as its own M5 card, not part of the Runs work.

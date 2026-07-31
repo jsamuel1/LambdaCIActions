@@ -109,17 +109,75 @@ function selfTerminate(reason) {
 // flush and paying idle minutes.
 const BROKER_CALL_TIMEOUT_MS = 15000;
 
-// The BOOT fetch gets a tighter bound than that, because it runs inside a platform deadline:
-// the image declares `microvmHooks.run` with `runTimeoutInSeconds: 30` (scripts/build-images.mjs),
-// and this call is synchronous INSIDE the `/run` request — the ACK cannot be sent until it
-// returns. A budget larger than the hook timeout is self-defeating: the platform gives up on
-// `/run` while the hook is still retrying, so the extra attempts can never help and the VM is
-// stranded for the Reaper anyway. Worst case here is
-//   3 × 6 s invoke + 2 s + 4 s backoff = 24 s < 30 s,
-// leaving headroom for the request/JSON handling around it. Terminate keeps the larger budget:
-// it fires after the job, with no platform deadline behind it.
-const BOOT_CALL_TIMEOUT_MS = 6000;
-const BOOT_CALL_ATTEMPTS = 3;
+// The BOOT fetch runs inside a platform deadline: the image declares `microvmHooks.run` with
+// `runTimeoutInSeconds` (scripts/build-images.mjs), and this call is synchronous INSIDE the
+// `/run` request — the ACK cannot be sent until it returns. A retry budget larger than the hook
+// timeout is self-defeating: the platform gives up on `/run` while the hook is still retrying,
+// so the extra attempts can never help and the VM is stranded for the Reaper anyway.
+//
+// The first cut of this budget was 6 s × 3 attempts, sized off the BROKER's latency (~50 ms of
+// DynamoDB work). That was the wrong cost model: the call is dominated by the COLD `aws` CLI in
+// a freshly snapshot-resumed guest. Live dev verification (2026-07-28, run 30407823249) had
+// attempts 1 AND 2 fail `spawnSync aws ETIMEDOUT` on all three flavors — every boot survived on
+// its LAST attempt, burning ~22 s of a 30 s hook deadline for one success, i.e. zero margin.
+//
+// The CLI in question is apt's aws-cli **v1** (1.22.34 / botocore 1.23.34 — see
+// microvm/Dockerfile.base), NOT the deploy host's v2: the ≥2.35.17 floor in spec 05 is a
+// deployer requirement for the `lambda-microvms` model, while the guest only calls plain
+// `lambda invoke`. Reproduced in ubuntu:22.04: 6.36 s cold vs 2.50 s repeated — the cold figure
+// sits right on the old 6 s bound, which is exactly why attempts 1 and 2 expired.
+//
+// The hook timeout is NOT ours to pick freely: the API caps
+// `microvmHooks.runTimeoutInSeconds` at 60 s (`MicrovmHooksRunTimeoutInSecondsInteger`:
+// min 1, max 60, in the lambda-microvms 2025-09-09 model — note this is a much tighter cap
+// than the image hooks' `readyTimeoutInSeconds`, which allows 3600 s). So the image asks for
+// the maximum 60 s and the retry budget is derived DOWN from that ceiling; we cannot buy our
+// way out of a slow cold call with a bigger deadline.
+//
+// Two changes, because either alone is fragile:
+//   * the image now declares the 60 s API maximum (was 30 s) and the budget is sized to leave
+//     real margin inside it: a 15 s per-invoke bound × 2 attempts + 2 s backoff = 32 s worst
+//     case, so a further full-length attempt (4 s backoff + 15 s invoke = 51 s total) still
+//     fits. Attempts drop 3 → 2 deliberately: against a 60 s ceiling, per-invoke headroom for
+//     a cold call is worth more than a third attempt, because the failure this fixes is one
+//     SLOW call, not three flaky ones (each observed failure was the 6 s bound expiring, not
+//     the broker refusing). 3 × 15 s would consume 51 s of the 60 s ceiling and leave the same
+//     zero margin we are removing. test/run-hook.test.mjs pins the arithmetic, the margin AND
+//     the 60 s API cap, so a future edit can't quietly return to a no-retry-margin budget or
+//     declare a timeout the service will reject.
+//   * `prewarmAwsCli()` pays the CLI's cold cost during the image build (see /ready below), so
+//     a normal boot should resolve on attempt 1 and the raised bound is dead headroom rather
+//     than added boot latency.
+// Terminate keeps its own budget: it fires after the job, with no platform deadline behind it,
+// so it keeps the larger attempt count the post-launch stamp race needs.
+const BOOT_CALL_TIMEOUT_MS = 15000;
+const BOOT_CALL_ATTEMPTS = 2;
+
+// Cold-CLI pre-warm knobs (see prewarmAwsCli below). The warmup runs in the `ready` IMAGE hook,
+// i.e. during the image build, before the snapshot is captured — so its cost is paid once at
+// build time instead of on every VM's boot critical path. It needs no credentials and no
+// egress: the target is a CLOSED loopback port, so the CLI does its whole import/model-load/
+// endpoint-resolution work and then fails to connect, which is the expected outcome.
+const PREWARM_TIMEOUT_MS = 30000;
+const PREWARM_ENDPOINT = 'http://127.0.0.1:1'; // closed port — nothing leaves the guest
+// A region is REQUIRED even though nothing leaves the guest: without one the CLI aborts at
+// parameter validation (`NoRegion`) BEFORE it resolves an endpoint or builds its HTTP stack —
+// i.e. before the expensive half of the cold path this warmup exists to pay. The build guest
+// sets no AWS_REGION (see microvm/Dockerfile.*), so supply a default rather than inherit one.
+// The value is inert: `--endpoint-url` points at loopback, so it never selects a real endpoint.
+const PREWARM_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
+// The connect failure the warmup MUST end at, having done all the import/model-load/endpoint/
+// HTTP-client work. Reaching anything else (e.g. NoRegion) means it exited early and warmed
+// only the cheap half — that has to read as a FAILED warmup, not a successful one.
+//
+// BOTH botocore connect-phase errors count, because both are raised only after the endpoint is
+// resolved and the HTTP client is built: `EndpointConnectionError` ("Could not connect to the
+// endpoint URL") is the refused-port case this warmup normally hits, and `ConnectTimeoutError`
+// ("Connect timeout on endpoint URL") is what a guest that DROPS rather than refuses the
+// loopback SYN produces. Matching only the first would report warmed=false on a warmup that
+// did all the work — the exact false signal the `warmed` flag exists to prevent.
+const PREWARM_REACHED_RE = /(Could not connect to the endpoint URL|Connect timeout on endpoint URL)/i;
+let prewarmed = false;
 
 // Invoke the hook broker λ via the baked-in AWS CLI (no npm deps in the image). The VM's
 // execution role grants exactly one action — lambda:InvokeFunction on this function ARN.
@@ -167,12 +225,18 @@ function callBroker(action, attempts = 3, delayMs = 2000, callTimeoutMs = BROKER
       outFile,
     ];
     if (runCtx.region) args.push('--region', runCtx.region);
+    const startedAt = Date.now();
     const r = spawnSync('aws', args, {
       encoding: 'utf8',
       maxBuffer: 8 * 1024 * 1024,
       timeout: callTimeoutMs,
       killSignal: 'SIGKILL',
     });
+    // Measure every attempt. The boot budget above is only defensible against a MEASURED
+    // cold-call duration — the 6 s original was sized off an assumed one and ran a whole
+    // milestone with no retry margin before a live deploy exposed it. `ms` is the number a
+    // future verification reads back out of the run's log stream; it carries no payload bytes.
+    const ms = Date.now() - startedAt;
     if (r.status !== 0) {
       // The CLI echoes offending parameter values on validation errors; the payload now
       // travels by file, but redact anyway — a future arg or an echoed file body must not
@@ -181,6 +245,7 @@ function callBroker(action, attempts = 3, delayMs = 2000, callTimeoutMs = BROKER
       log('broker invoke failed', {
         action,
         attempt: i + 1,
+        ms,
         status: r.status,
         error: r.error ? safeErr(r.error) : undefined,
         stderr: redact(r.stderr || '').slice(0, 512),
@@ -213,11 +278,17 @@ function callBroker(action, attempts = 3, delayMs = 2000, callTimeoutMs = BROKER
       log(brokerRefusal ? 'broker denied request' : 'broker invoke errored', {
         action,
         attempt: i + 1,
+        ms,
         error: brokerRefusal ? body.error : safeErr(body),
       });
       if (brokerRefusal) return body; // an auth failure won't fix itself — don't burn retries
       continue;
     }
+    // The SUCCESS path is the one that matters for sizing the budget: a healthy boot must show
+    // attempt 1 completing well inside BOOT_CALL_TIMEOUT_MS, and that is also how a regressed
+    // pre-warm is detected (attempt 1 succeeds, but slowly). Only the action/attempt/duration
+    // are logged — never `body`, which carries the run's single-use registration credential.
+    log('broker invoke ok', { action, attempt: i + 1, ms });
     // For terminate, an ok:true with terminated:false means "id not stamped yet" — retry.
     if (action === 'terminate' && body.terminated === false && i + 1 < attempts) continue;
     return body;
@@ -288,6 +359,79 @@ function sleepSync(ms) {
   } catch {
     /* best-effort */
   }
+}
+
+/**
+ * Pay the `aws` CLI's cold-start cost ONCE, during the image build, so the snapshot carries
+ * warm state and the boot-path `jitconfig` call is not the first CLI invocation in the guest.
+ *
+ * Why here: the CLI's first run costs Python interpreter startup + botocore service-model load
+ * + endpoint resolution. In a snapshot-resumed guest that lands on the boot critical path,
+ * INSIDE the platform's `/run` deadline — which is exactly how the 2026-07-28 verification
+ * burned attempts 1 and 2 of the jitconfig fetch on every boot. The `ready` IMAGE hook runs
+ * during `create/update-microvm-image` BEFORE the snapshot is captured, so warming there is
+ * free at boot.
+ *
+ * The pre-warm deliberately needs no credentials and no network egress: the build guest holds
+ * neither the run's execution role nor the broker's name. `--no-sign-request` skips credential
+ * resolution, `--endpoint-url http://127.0.0.1:1` targets a closed loopback port, and IMDS is
+ * disabled for the child — so the CLI executes its whole import/model-load/endpoint path and
+ * then fails to connect. A NON-ZERO exit is the expected outcome; only the elapsed time
+ * matters, and it is logged so the build record MEASURES the cold cost instead of assuming it
+ * (the assumption is what produced the 6 s budget). Idempotent and best-effort: the `ready`
+ * hook must answer 200 regardless, or the image build fails with "Ready hook check failed".
+ *
+ * Residual cold cost, stated so the next reader does not over-trust this: `--no-sign-request`
+ * and the disabled IMDS mean the credential-provider chain and the SigV4 signing path are the
+ * one part of the cold path this warmup CANNOT pay — the build guest has no role to resolve.
+ * A real boot call signs, so attempt 1 still pays that fraction (the expensive terms — Python
+ * start, service-model load, endpoint resolution, HTTP-stack construction — are all warm). That
+ * is a second reason BOOT_CALL_TIMEOUT_MS stays sized for a cold-ish call rather than a warm one.
+ *
+ * The warmup is only worth anything if it reaches the CONNECT attempt: an early exit (most
+ * plausibly `NoRegion`, since the build guest sets no AWS_REGION) returns non-zero after doing
+ * only argument parsing, leaving endpoint resolution and the HTTP stack cold — exactly the
+ * work the boot path would then pay for. So a region is always passed, and `warmed` reports
+ * whether the expected connect failure was actually reached rather than merely that the CLI
+ * ran. A false `warmed` in the build log means the boot path is back on the cold-cost path and
+ * is relying on the raised BOOT_CALL_TIMEOUT_MS alone.
+ */
+export function prewarmAwsCli(spawn = spawnSync) {
+  if (prewarmed) return { skipped: true };
+  prewarmed = true;
+  const startedAt = Date.now();
+  const r = spawn(
+    'aws',
+    [
+      'lambda', 'invoke',
+      '--no-sign-request',
+      '--region', PREWARM_REGION,
+      '--endpoint-url', PREWARM_ENDPOINT,
+      '--cli-connect-timeout', '1',
+      '--cli-read-timeout', '1',
+      '--function-name', 'lca-prewarm',
+      '--payload', 'fileb:///dev/null',
+      '/dev/null',
+    ],
+    {
+      encoding: 'utf8',
+      timeout: PREWARM_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+      // No IMDS round-trips: there is no instance identity to find, and a hanging metadata
+      // probe would be the one way this best-effort warmup could eat the ready-hook budget.
+      env: { ...process.env, AWS_EC2_METADATA_DISABLED: 'true' },
+    },
+  );
+  const ms = Date.now() - startedAt;
+  // `ran` = the CLI process started at all (a missing binary or a timeout surfaces as r.error).
+  // `warmed` = it got as far as the connect attempt, which is the only outcome that proves the
+  // expensive cold path executed. `stderr` is a fixed CLI diagnostic against a loopback
+  // endpoint with no credentials — it carries no run data (there is no run yet at build time).
+  const ran = !r.error;
+  const stderr = String(r.stderr || '').trim().slice(0, 200);
+  const warmed = ran && PREWARM_REACHED_RE.test(stderr);
+  log('aws cli prewarm', { ms, ran, warmed, status: r.status ?? null, stderr: warmed ? undefined : stderr });
+  return { ms, ran, warmed, skipped: false };
 }
 
 // Fetch the stashed JIT config through the hook broker (ADR-016 by-reference payload,
@@ -380,7 +524,17 @@ const server = http.createServer(async (req, res) => {
     // The `ready` image hook: fires during image build once the app has finished
     // initializing, so the snapshot is captured in a ready state. Required whenever any
     // lifecycle hook is enabled. Match any method.
+    //
+    // Also where the AWS CLI is pre-warmed: this hook is the last thing to run before the
+    // snapshot is taken, so the cold-start cost is paid at BUILD time instead of on the boot
+    // critical path inside the `/run` deadline. Best-effort — a failed warmup must never
+    // fail the ready hook (a non-200 here fails the whole image build).
     if (path === '/ready') {
+      try {
+        prewarmAwsCli();
+      } catch (err) {
+        log('aws cli prewarm threw; boot will pay the cold cost', { error: safeErr(err) });
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ready":true}');
       return;

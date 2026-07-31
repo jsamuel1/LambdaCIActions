@@ -291,6 +291,10 @@ by every deploy-touching entry point:
 - **`scripts/build-images.mjs` / `scripts/create-github-app.mjs`**: refuse to start
   without a valid pin AND an STS caller-identity match; `--dry-run` is exempt (no AWS
   calls). Any explicit `--region`/`-c region` must equal the pinned region.
+- **`scripts/backfill-installs.mjs`** (ADR-037): same pin + STS match, but with **no dry-run
+  exemption** — its dry run still reads the live table, so an unpinned one would report
+  another account's rows as the target's. The exemption above is for commands whose dry run
+  makes no AWS call at all; it is not a blanket rule.
 **Why**: comparing the pin against the *actual* resolved identity (not just exporting a
 profile) catches every mis-targeting mode: wrong profile, stale credentials, env-var
 overrides. Keeping the guard dependency-free preserves the scripts' zero-npm-dep
@@ -405,7 +409,8 @@ root entrypoint scoped to docker-capable flavors, no `sudo`, bounded readiness w
 
 ## ADR-021 — microVMs hold no ambient AWS authority: brokered run-hook operations (M3)
 **Status**: Accepted (v1) · supersedes the IAM half of [ADR-019](#adr-019) · amends
-[ADR-016](#adr-016) (payload-by-reference access path)
+[ADR-016](#adr-016) (payload-by-reference access path) · boot budget amended by
+[ADR-028](#adr-028)
 **Context**: The microVM execution role (`lca-<env>-microvm-exec`) is stamped on VMs that
 execute **untrusted workflow code**, and carried two grants that couldn't be scoped where
 they were:
@@ -463,12 +468,15 @@ reason to be reachable off-account); leaving read table-wide and only fixing ter
 **Consequences**: One extra Lambda invoke on the boot path (~50 ms) — and it is *on* the
 critical path, because `/run` cannot ACK until the JIT config is resolved and Lambda gates
 traffic to the VM until that ACK. That makes the guest-side call bounded on purpose, and the
-boot call bounded *twice*: the image declares `microvmHooks.run` with
-`runTimeoutInSeconds: 30`, so the whole boot retry budget (invokes + backoff) has to fit
+boot call bounded *twice*: the image declares `microvmHooks.run` with a
+`runTimeoutInSeconds`, so the whole boot retry budget (invokes + backoff) has to fit
 inside that deadline — a bigger budget cannot help, because the platform abandons `/run`
 while the hook is still sleeping between attempts and the VM strands for the Reaper with the
-job unstarted. Boot therefore uses a 6 s per-invoke bound × 3 attempts + 2 s/4 s backoff
-(24 s worst case); terminate keeps a 15 s per-invoke bound and a larger attempt budget (no
+job unstarted. Boot therefore uses a per-invoke bound × a small attempt count with exponential
+backoff (originally 6 s × 3 + 2 s/4 s = 24 s — **resized in [ADR-028](#adr-028)** to 15 s × 2 +
+2 s after live measurement showed the cost is the cold `aws` CLI, not the broker, and that the
+hook deadline is itself capped at 60 s by the API); terminate keeps a 15 s per-invoke bound and
+a larger attempt budget (no
 platform deadline behind it). The bound exists at all because the AWS CLI otherwise blocks
 `spawnSync` forever if the guest's network is broken, which would strand the VM with no ACK
 and no retry; the backoff is exponential across attempts, since the reserved-concurrency cap
@@ -646,7 +654,9 @@ the API behind CloudFront's TLS + edge termination for free.
 public origin, so the first deploy is **two-pass**: deploy `LCA-Web-<env>`, then re-deploy
 `LCA-Mgmt-<env>` with `-c publicOrigin=https://<domain>` (docs/DEPLOY-M4.md). We
 deliberately do NOT default `publicOrigin` to a guess — a wrong value is an open-redirect
-target, so login fails loudly (500) until it is set. Custom domains + ACM are M5.
+target, so login fails loudly (500) until it is set. Custom domains + ACM shipped in M5 —
+[ADR-036](#adr-036) makes the origin config-derived and removes the two-pass deploy for any
+env with a vanity domain configured; the two-pass path above still applies with none.
 
 ## ADR-025 — Management-plane IAM: read-mostly, config-write-only, no compute (M4)
 **Status**: Accepted (v1)
@@ -674,6 +684,12 @@ fails the build rather than silently widening the plane.
 which needs a GitHub token) requires a deliberate ADR + IAM change, not a one-line grant.
 The `DescribeParameters` statement is `Resource: '*'` because the API has no resource-level
 scoping — acceptable since it returns metadata only.
+
+**Amended by [ADR-037](#adr-037)**: the `UpdateItem` grant now backs a second code path —
+the installation GSI1 index repair. It needed **no IAM change** (same action, same table) and
+writes only index attributes (`gsi1pk`/`gsi1sk`) on an installation row the session already
+holds a grant for — no attribute the console or the control plane reads for behaviour.
+"UpdateItem is the only write" still holds; "its only purpose is repo config" no longer does.
 
 ## ADR-026 — Polling for live run updates in v1 (no WebSocket/SSE) (M4)
 **Status**: Accepted (v1) · resolves [spec 04](specs/04-web-ui.md) OQ-1
@@ -726,6 +742,225 @@ spec 03 § routing. Consequently a *disabled* repo whose row read fails will sti
 job; that is the deliberate trade (availability over strictness) and matches the compat
 gate. `mode='adopt'` is not an opt-out — it is treated as `label` until the M5
 standard-label map ships. `test/filter.test.mjs` and `test/flavor.test.mjs` pin both.
+
+## ADR-028 — The boot broker budget is sized for a cold AWS CLI, and the CLI is warmed pre-snapshot (M4)
+**Status**: Accepted (v1) · amends the boot-budget half of [ADR-021](#adr-021)
+**Context**: ADR-021 put a bounded, retried `aws lambda invoke` on the boot critical path:
+`/run` cannot ACK until the JIT config is resolved, and the platform abandons the hook after
+the image's declared `microvmHooks.runTimeoutInSeconds`. That budget was sized off the
+**broker's** latency (~50 ms of DynamoDB work) — 6 s per invoke × 3 attempts + 2 s/4 s
+backoff = 24 s against a 30 s hook timeout.
+
+The cost model was wrong. The dominant term is the **cold `aws` CLI** in a freshly
+snapshot-resumed guest — Python interpreter start, botocore service-model load, endpoint
+resolution — not the broker. The 2026-07-28 dev verification (run `30407823249`) shows attempts 1 **and** 2 failing
+identically on **all three** flavors (recorded in `docs/VERIFY-DEPLOY-ADR021-M4.md`, which
+lands on its own branch — not an ancestor of this one, so the evidence is reproduced here
+rather than only cited):
+
+```json
+{"msg":"broker invoke failed","action":"jitconfig","attempt":1,"status":null,"error":"spawnSync aws ETIMEDOUT","stderr":""}
+```
+
+Every job still ran — attempt 3 succeeded each time — so this was latent, not breaking. But
+it means the boot path had **zero retry margin**: ~22 s of the 30 s deadline consumed to
+obtain one success. One further slow attempt exhausts the hook deadline, `/run` never ACKs,
+Lambda keeps traffic gated, and the VM is stranded until the Reaper: a failed job plus paid
+idle time. A cold-start blip or a throttled broker turns that into intermittent boot failures.
+
+**Decision**: fix the cost and the budget, and pin the margin.
+1. **Warm the CLI pre-snapshot.** `run-hook.mjs` exports `prewarmAwsCli()`, called from the
+   `ready` **image** hook — which runs during `create/update-microvm-image`, *before* the
+   snapshot is captured, so the snapshot carries the warm state and a booted VM's first
+   broker call is not the guest's first CLI invocation. The warmup is credential-free and
+   egress-free: `--no-sign-request` against a **closed loopback port**
+   (`http://127.0.0.1:1`) with IMDS disabled, which forces the whole import/model-load/
+   endpoint path and then fails to connect. A non-zero exit is the expected outcome; only the
+   elapsed time is interesting, and it is logged. It is best-effort and wrapped — a non-200
+   from `/ready` fails the entire image build ("Ready hook check failed").
+
+   **Which CLI this is about.** The guest is not running the deploy host's CLI. All three
+   Dockerfiles install Ubuntu 22.04's apt `awscli`, which is **aws-cli v1 (1.22.34 /
+   botocore 1.23.34)** — the `≥ 2.35.17` floor in `docs/specs/05-infrastructure.md` applies to
+   the *deployer*, which needs the `lambda-microvms` service model; the guest only calls
+   `lambda invoke` from the long-standing base service, which v1 has. This matters because v1
+   is the slower cold path of the two, so it is the binary any future tuning must measure.
+   Reproduced in an `ubuntu:22.04` container (x86 host, so treat the absolute numbers as
+   corroborating rather than authoritative — the guest is arm64 and snapshot-resumed):
+   **6.36 s cold** for the prewarm invocation vs **2.50 s** for an immediately repeated one.
+   The cold figure lands directly on top of the old 6 s bound, which is what made attempts 1
+   and 2 time out; the ~3.9 s the repeat saves is what the pre-warm moves to build time.
+
+   It must reach the **connect attempt** to be worth anything. A region is therefore passed
+   explicitly (`PREWARM_REGION`, defaulted — the guest images set no `AWS_REGION`): without
+   one the CLI aborts at parameter validation with `NoRegion`, *before* endpoint resolution
+   and HTTP-stack construction, i.e. before the expensive half of the cold path. Confirmed on
+   the guest's own v1 CLI: with a region it reaches `Could not connect to the endpoint URL`
+   (exit 255, the expected outcome); without one it exits at `You must specify a region`
+   having done none of the endpoint/HTTP work. The log line reports `warmed`
+   (the connect attempt was reached) separately from `ran` (the process started), so an early
+   exit reads as a failed warmup instead of a successful one — a `ran`-only signal would have
+   reported success for a warmup that did nothing. `warmed` accepts **either** botocore
+   connect-phase error — `EndpointConnectionError` (port refused, the normal case) or
+   `ConnectTimeoutError` (SYN dropped, e.g. a loopback firewall rule) — since both are raised
+   only after the expensive work is done (both format strings verified present in the guest's
+   botocore 1.23.34, not just in a current release); matching one wording would report a
+   failed warmup on
+   a fully warm CLI.
+
+   What it does **not** warm: `--no-sign-request` plus disabled IMDS means the
+   credential-provider chain and the SigV4 signing path stay cold, because the build guest has
+   no role to resolve. A real boot call signs, so attempt 1 still pays that fraction — a second
+   reason the per-invoke bound below is sized for a cold-ish call rather than a warm one.
+2. **Resize the budget for a cold call anyway**, because a pre-warm can regress silently (a
+   base-image change, a CLI upgrade, a rebuilt snapshot) and the guest must not depend on it.
+   The deadline is not a free variable: the API caps `microvmHooks.runTimeoutInSeconds` at
+   **60 s** (`MicrovmHooksRunTimeoutInSecondsInteger`: min 1, max 60, lambda-microvms
+   `2025-09-09` — the image hooks' `readyTimeoutInSeconds` is a separate shape allowing
+   3600 s, which is easy to confuse with it). So the image takes the whole ceiling, **30 s →
+   60 s**, and the budget is derived down from it: per-invoke bound **6 s → 15 s** and attempts
+   **3 → 2**, giving `2 × 15 s + 2 s = 32 s` worst case with a further full-length attempt
+   (`+ 4 s backoff + 15 s`) still fitting inside 60 s.
+
+   Dropping an attempt is deliberate. The observed failure is one **slow** call, not three
+   flaky ones — every logged failure was the 6 s bound expiring, never a broker refusal — so
+   per-invoke headroom buys more than a third try. Against a 60 s ceiling the two cannot both
+   be had: `3 × 15 s + 2 s + 4 s = 51 s` would re-create exactly the zero margin this ADR
+   exists to remove. Terminate is unaffected and keeps its larger attempt count (no platform
+   deadline behind it).
+3. **Measure, don't assume.** Every broker attempt logs its own `ms` — on success (`broker
+   invoke ok`, action/attempt/duration only, never the response body) as well as on failure, so
+   a healthy boot proves attempt 1 clears the bound and a regressed pre-warm shows up as a slow
+   success rather than silence. The next
+   verification reads the real cold-call duration out of the run's log stream instead of
+   re-deriving it from a timeout.
+4. **Pin it in tests.** `test/run-hook.test.mjs` keeps the original "budget < hook timeout"
+   invariant (which the 6 s budget satisfied while still having no margin) and adds: the API's
+   real **1–60 s** range for the declared hook timeout (a value above it fails the image build
+   with a `ValidationException`, so this is a build-breaking invariant, not a style one),
+   budget + one more full-length attempt ≤ hook timeout, a floor on the per-invoke bound above
+   the measured cold cost, a floor of one retry, the presence of per-attempt duration logging,
+   the pre-warm's credential-free/loopback/bounded properties, that its bound fits the `ready`
+   hook deadline, that it passes a region, and that `warmed` is false on an early exit but true
+   on a connect timeout. Both budget invariants read the backoff from the **jitconfig call
+   site**, not from `callBroker`'s parameter default — boot passes its own literal, so sizing
+   off the default would let a call-site change blow the deadline with the tests still green.
+
+**Why**: the two halves cover each other. The pre-warm removes the latency, so the raised
+bound is dead headroom on a healthy boot rather than added boot time; the raised bound means a
+*failed or regressed* pre-warm degrades to a slower boot instead of a stranded VM. Pinning the
+*margin* rather than just the budget is the part that would have caught this: the shipped 6 s
+budget passed the pre-existing invariant.
+
+Alternatives rejected: **raising only the timeout** — not available past 60 s anyway (API cap),
+and even at the cap it leaves ~20 s of cold-CLI latency on every boot with every boot one blip
+from the wall; **only pre-warming** (a silent regression puts us straight back to a no-margin
+budget); **keeping 3 attempts** (see decision 2 — it spends the 60 s ceiling on retries instead
+of on per-attempt headroom, for a failure mode that is slowness rather than flakiness);
+**replacing the CLI with a hand-rolled signed HTTPS call from Node** — it removes the startup
+cost entirely, but it means implementing SigV4 plus credential-provider-chain resolution in an
+image that deliberately carries **no npm deps**, and re-deriving the two security properties the
+current file-based handling already gives us (the capability token stays off `argv`, and the
+credential-bearing response stays out of shared `/tmp`). That is a large, security-sensitive
+surface for a latency win the pre-warm already delivers; revisit only if the CLI's cold cost
+becomes structural — the 60 s cap means there is no headroom left to buy a second time.
+
+**Consequences**: a wedged boot now occupies its VM for up to 60 s instead of 30 s before the
+platform gives up — bounded, and small against the Reaper's 2 h lifetime cap that actually
+bounds paid idle time. A boot that needs more than two broker attempts now fails where it
+previously had a third try; that is the accepted trade for per-attempt headroom, and the
+pre-warm plus the 15 s bound make a single attempt succeed in the measured case. Deploy-touching:
+the new hook timeout and the pre-warm both live in the **image**, so they need an image rebuild
+(`npm run build:images`) and the ADR-021 skew-window discipline in `docs/DEPLOY-M1.md`. The
+pre-warm adds one CLI invocation to each image build. Boot logs gain an `aws cli prewarm` line
+and an `ms` field per broker attempt; neither carries payload content (the capability token and
+the JIT config stay redacted per ADR-021).
+
+## ADR-029 — Runs is run-primary with client-side grouping and an explicit partial flag (M4)
+**Status**: Accepted (v1) · refines [ADR-023](#adr-023) · [spec 04](specs/04-web-ui.md) § Runs
+**Context**: the Runs screen listed one row per **job**, because that is what the store holds:
+a run row is keyed by the `(repoId, runId, jobId)` triple (ADR-009) and both indexes (GSI1
+status/time, GSI2 repo/time) page over job rows. An operator thinks in **workflow runs**, so a
+matrix of 8 jobs read as 8 unrelated lines. Making the run the primary row needs a fold — and
+the fold can lie: `GET /api/runs` returns an index **page**, so a run's jobs can straddle the
+page boundary and a rollup computed from a partial job set reports a wrong duration and a
+wrong status. A `status=` filter makes it worse: it returns only the jobs *in that status*, so
+every run row built from it is partial by construction.
+**Decision**: group **client-side**, and carry completeness explicitly rather than assuming it.
+- The fold lives in one pure module, `src/mgmt/run-rollup.ts`, re-exported to the SPA via
+  `web/src/rollup.ts` and unit-tested against `dist/` (`test/run-rollup.test.mjs`) — not
+  inline in the React component, where it could not be tested.
+- **Status fold**: failure dominates (any `failed` → `failed`, then `timed_out`); otherwise the
+  most advanced active status wins (`running` > `provisioning` > `queued`); `completed` only
+  when every job completed. An empty job set folds to `queued`, never `completed`.
+- **Flavor rollup**: the single name when all jobs agree, else `<most common> +<n>` with the
+  full breakdown on expand. Jobs with no flavor yet are ignored, not folded in. On a partial
+  window the label is weakened (`node +?` / `node +2?`) because an unread job may use an
+  unseen flavor — "all jobs agree" is exactly the claim a partial window cannot make.
+- **Duration**: **wall clock** (earliest job queued → latest transition) is the primary figure
+  because it answers "how long did this run take". The **sum of job durations** is shown on
+  expand as **job time** — deliberately not "compute": each job's `durationSeconds` is itself
+  queue → last transition, so queued time is included and the sum is an upper bound on billed
+  microVM runtime, not a cost basis (v1 stores no per-phase timestamps — spec 04 OQ-5). It
+  exceeds wall clock whenever jobs run in parallel, which is the question it answers.
+- **Completeness** is split into two halves, so neither side can lie on its own. The **server**
+  returns `complete` on `GET /api/runs`, answering only *were any job rows dropped from this
+  response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
+  cursor, plus the integrity of the join between its live head page and its appended older
+  pages. Whole runs are folded only when every loaded page said `complete`, the cursor is
+  spent, **and** that join is intact; otherwise **every** group in the window is stamped
+  `partial`, badged in the UI, and its status/job count/flavor/durations render as lower bounds,
+  while its **start time** renders as an *upper* bound (`≤`) — the earliest LOADED job's queue
+  time, which an unread earlier sibling would push back. Bounding the durations but not the
+  start time would leave one value on the row still asserted as fact.
+  The head/older join is the third signal because the head page is re-polled every 5 s while
+  the older pages sit in client state, and GSI2 is sorted by the immutable `createdAt`: a newly
+  queued job pushes a row off the bottom of the fixed-size head page into a gap the older pages
+  begin below, so the window develops a hole in the middle while the cursor and server verdict
+  both still say exact. The client therefore remembers the key of the head row directly above
+  the first older row and treats the window as partial once that row is no longer on the head
+  page (`headSeamIntact`) — identity, not a row count, because the count is unchanged by the
+  shift. The seam is armed by the paging **hop**, not by the arrival of appended rows: a repo
+  page can come back empty with a live cursor when `collectVisible` spent its page budget on
+  another tenant's rows, and that hop moved the cursor off the head page just the same. It is
+  also captured from the head snapshot the cursor was read from, before the request, so the
+  recorded row and the resume point belong to one snapshot. Re-fetching the whole appended
+  history on every poll was rejected: it would multiply
+  the 5 s read cost by the number of pages walked to fix a case the operator resolves by
+  reloading.
+  Paging is also asynchronous while the filter controls reset the window, so each older-page
+  request carries its filter identity (`pageQueryKey`) and is discarded if the repo/status
+  changed before it landed — applying it would append the previous repo's jobs under the newly
+  selected one and continue paging the old index.
+  Keeping the two halves apart matters: a repo-filtered head page always carries an open cursor
+  while history remains, so folding exhaustion into the server's flag would leave such a window
+  permanently partial no matter how far the operator paged. The dropped-rows half in turn cannot
+  be computed client-side: the merged multi-status view queries each status index for `limit`
+  rows and applies the installation-visibility filter *afterwards*, so a response shortened by
+  filtering out another tenant's rows would look like proof of exhaustion while this operator's
+  sibling jobs sit unread past the boundary. Only the route sees the raw per-status cursors
+  (`mergedResponseComplete`); the repo path never slices, so it reports
+  `repoResponseComplete`.
+  A `status=` filter drops sibling jobs by construction and therefore always reports
+  `complete: false`, including when combined with `repo=` — in which case `repo` picks the index
+  and `status` rides along as a post-query predicate rather than being ignored.
+**Why**: no new API surface — `complete` is one added response field on an existing read, so
+the change needs no infrastructure and no schema change. Server-side **grouping** was rejected
+for v1: it would mean a run-keyed index (GSI3) or a fan-out read per run, i.e. a hot-path
+schema change to fix a presentation problem. Per-run job fetch on expand was rejected as
+insufficient on its own: it fixes the *expanded* view but the collapsed row still shows a
+rollup, so completeness would still have to be labelled. Flagging only the run that owns the
+page-boundary row would be unsound — a straddling run's oldest *loaded* job need not be the
+boundary row — so the flag is per window, deliberately conservative.
+**Consequences**: a truncated window marks runs partial even when most are in fact whole; that
+is the accepted direction of error (a labelled lower bound over a confident wrong number).
+Clearing the status filter or exhausting the cursor with a repo filter yields exact rollups.
+Run/job ids move to small dim text with a copy button (`CopyId`), which must
+`stopPropagation` because it sits inside a click-through row. **Est. cost leaves this screen**:
+a cost figure belongs on a Reports screen with a window and grouping, so `formatCost` and
+`flavorRatePerMinute` stay in place unused-by-Runs, and Reports is tracked separately (M5).
+If per-run cost/latency reporting arrives, a run-keyed index becomes worth revisiting and this
+ADR is the place to record the reversal.
 
 ## ADR-034 — Settings shows verified evidence, and platform config writes go through a control-plane broker (M4)
 **Status**: Accepted (v1) · extends [ADR-025](#adr-025), honors [ADR-027](#adr-027)
@@ -950,3 +1185,348 @@ Platform admins receive both in full: they already hold environment-wide authori
 reviewing a relink needs the complete picture. Everything else — env/region, App linkage,
 effective labels, webhook evidence, flavors, diagnostics — stays visible so a fresh environment
 can still show its own state, which is the whole point of the screen.
+
+## ADR-036 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
+**Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
+[ADR-024](#adr-024)
+**Context**: The dev console shipped on CloudFront's generated name
+(`https://<id>.cloudfront.net`). That name is not cosmetic — it is load-bearing in three
+coupled places, all of which break if the distribution is ever replaced:
+1. `PUBLIC_ORIGIN` on the Mgmt λ (OAuth redirect URI + post-login redirect),
+2. the GitHub App's OAuth **callback URL**, and
+3. the first-party session cookie's origin (ADR-024).
+(2) is the expensive one: GitHub exposes **no REST endpoint for App settings** (verified
+2026-07-28 — `PATCH /app` does not exist), so a domain change is a browser-only edit and
+login stays broken until a human performs it. The generated name is also only knowable
+*after* WebStack's first deploy, which is the sole reason ADR-024 required a second
+`-c publicOrigin=...` deploy pass.
+**Decision**: give the console a **stable vanity hostname** and make the origin a
+**config input resolved at synth time**.
+- **Scheme** (`lib/console-domain.ts`): prod owns the bare project label, other envs are
+  prefixed — `lambdaciactions.<zone>` for prod, `<env>.lambdaciactions.<zone>` otherwise.
+  Prod therefore gets its permanent name on its **first** deploy, so a raw-CloudFront
+  callback URL is never registered for prod at all. `LCA_CONSOLE_DOMAIN` overrides the
+  scheme when a hostname must be exact.
+- **Config location**: `.env.local` (the same machine-local, gitignored file as the ADR-018
+  deploy pin), keys `LCA_CONSOLE_HOSTED_ZONE_ID` + `LCA_CONSOLE_ZONE_NAME`, each overridable
+  by `-c consoleHostedZoneId=` / `-c consoleZoneName=` / `-c consoleDomain=`. Not checked in:
+  a hosted zone is an account-specific resource.
+- **Certificate**: its own stack, `LCA-Cert-<env>`, with `env.region` **hard-pinned to
+  us-east-1** and a constructor assertion that refuses any other region. CloudFront accepts
+  viewer certs only from us-east-1 regardless of where the distribution's stack lives.
+  WebStack consumes the ARN via `crossRegionReferences: true` on both stacks. Validation is
+  DNS against the same public zone that holds the alias, so issuance is hands-off.
+- **Alias**: `domainNames` + `certificate` on the distribution, plus **A *and* AAAA** alias
+  records. Both zone references use `fromHostedZoneAttributes` (id + name), never
+  `fromLookup`, so credential-less `cdk synth` keeps working (ADR-018's CI exemption).
+- **Fallback**: with no `LCA_CONSOLE_*` config, `resolveConsoleDomain` returns `null` and
+  every custom-domain resource is skipped — a fresh account owning no domain still deploys
+  on the raw CloudFront name, and the ADR-024 two-pass bootstrap still applies there.
+**Why**: the origin becomes knowable before any resource exists, which (a) removes the
+two-pass deploy for domained envs — `PUBLIC_ORIGIN` is just config now — and (b) decouples
+all three coupling points from CloudFront's generated name, so a future distribution
+replacement no longer requires a browser edit to restore login. The us-east-1 pin is
+enforced in code because the wrong region is the classic trap here: it synths cleanly and
+fails at `cdk deploy` on the distribution update, *after* the cert has been issued.
+**Consequences**:
+- Config is **all-or-nothing**: a half-configured domain (zone id without zone name, or a
+  hostname outside the zone) **throws** rather than falling back. A silent fallback is the
+  dangerous case — the distribution would come up with no alias while `PUBLIC_ORIGIN`
+  pointed at the vanity name, and login would fail with a misleading `invalid OAuth state`
+  that reads like a cookie bug.
+- The cert stack is the repo's **first** stack outside `LCA_DEPLOY_REGION`, so a domained env
+  needs the CDK bootstrap stack in **us-east-1** too. Missing it fails the deploy instantly
+  (bootstrap-version SSM parameter not found) before ACM does anything; docs/DEPLOY-M4.md
+  Phase 2 carries the one-time `cdk bootstrap aws://<account>/us-east-1`. The no-domain path
+  keeps every stack in one region and needs no extra bootstrap.
+- First deploy of a new hostname is **slower**: ACM writes a `_<hash>` CNAME and polls, and
+  CloudFormation blocks the cert until `ISSUED`, so the distribution can never come up with
+  an alias whose cert is pending. A cert stuck in `PENDING_VALIDATION` means the CNAME never
+  resolved publicly (wrong zone, or a zone that is not authoritative).
+- Migration off an existing raw-CloudFront origin requires **both** callbacks registered on
+  the App simultaneously — add the vanity one, flip `PUBLIC_ORIGIN`, verify, then remove the
+  old one. This is possible because a GitHub App accepts up to **10** callback URLs (matched
+  exactly; OAuth Apps allow only one, with prefix matching). `-c publicOrigin=` still wins
+  over config precisely so an operator can pin a transitional origin mid-flip. Removing the
+  old entry first breaks login instantly.
+- During that flip the console is reachable on **two** hosts but only **one** can complete
+  OAuth: the `state` cookie is host-only (no `Domain` attribute) and `redirect_uri` is built
+  from the single `PUBLIC_ORIGIN`, so a login started on the other host returns to a callback
+  that never received the cookie → `invalid OAuth state`. Operators must stay on whichever
+  host `PUBLIC_ORIGIN` names until the flip completes; docs/DEPLOY-M4.md orders the steps
+  accordingly. Widening the cookie to the parent domain would fix the window at the cost of
+  scoping the session above the console — rejected.
+- Existing sessions do not survive the origin flip: the session cookie is scoped to the old
+  host, so operators re-authenticate once. That is the same revocation lever as rotating the
+  session secret (ADR-022), not a new failure mode.
+- **Apex override caveat**: `LCA_CONSOLE_DOMAIN` may name the zone apex (`example.com`), and
+  the alias records are then created at the apex (`recordName: undefined`). Two consequences
+  the derived scheme does not have: (a) the console's HSTS header carries
+  `includeSubdomains` with a one-year max-age, so serving the console at the apex pins
+  **every** host in that zone to HTTPS in any browser that has loaded it — including
+  unrelated subdomains; (b) an apex zone typically already carries other records. The derived
+  scheme puts the console under its own `lambdaciactions` label precisely so the HSTS scope
+  and the record namespace stay inside the console's own subtree. Use an apex override only
+  for a zone dedicated to this console.
+- `test/console-domain.test.mjs` pins the scheme + the refuse-on-partial-config behavior;
+  `test/console-domain-infra.test.mjs` pins the us-east-1 assertion, the A+AAAA pair, the
+  apex-override record shape, and the no-domain fallback (no alias, no cert, no records).
+## ADR-037 — Installation enumeration reconciles unindexed rows on read (M4 fix)
+**Status**: Accepted (v1) · follows [ADR-009](#adr-009), [ADR-022](#adr-022)
+**Context**: `listInstallations()` enumerates installations from the GSI1 `INSTALLS`
+partition so the console never table-scans. The `gsi1pk=INSTALLS` / `gsi1sk=<accountLogin>`
+write only arrived with M4 (commit 63069ff, 2026-07-28), so an INSTALL row written by M2-era
+code carries no index keys and is **invisible** to that query. Observed on dev: installation
+`146431062` (`jsamuel1`) served 30 granted repos and claimed jobs normally — the ingest hot
+path reads by primary key (`getRepo`) — while `GET /api/installations` returned `[]` and the
+Setup screen rendered "You have no LambdaCIActions App installations". GitHub does not
+re-send `installation.created` for an existing install, so nothing re-writes the row: the
+only workaround was uninstall/reinstall. DEPLOY-M4's claim that this "self-heals with
+activity" was wrong — job activity never touches the installation row.
+**Decision**: two parts.
+1. **Reconcile-on-read, bounded by the caller's grants.** `listInstallations(reconcileIds)`
+   keeps the GSI1 query as the primary path, then — for any id in `reconcileIds` the index
+   did not return — does a single `GetItem` by primary key and, when the row exists without
+   `gsi1pk`, repairs it in place (`SET gsi1pk, gsi1sk` conditional on
+   `attribute_not_exists(gsi1pk)`). The Mgmt handler passes `session.installations`, i.e.
+   exactly the installations the operator is *already* authorized to see (ADR-022 freezes
+   these at login from GitHub, independent of our table).
+2. **A one-shot backfill** — `npm run backfill:installs` (`scripts/backfill-installs.mjs`,
+   dry-run by default) stamps every unindexed installation row, so an existing environment is
+   fully repaired in one command rather than lazily per operator login. Both paths select on
+   the same signal — the key shape (`INSTALL#<id>` / `INSTALL`) plus a missing `gsi1pk`, not
+   the optional `entity` attribute — so neither can repair a row the other cannot.
+**Why not a fallback scan**: the obvious alternative — "if the GSI query comes back empty,
+scan with a filter" — is triggered by the wrong signal. Empty-index is not the failure mode;
+*partially* indexed is (one M4-era install indexed, one M2-era install not), and a scan that
+only fires on total emptiness still hides the legacy row. Firing the scan unconditionally
+puts a table scan on a polled console endpoint (ADR-026 polls), and its cost grows with run
+history, which dwarfs installation count. The grant list gives an exact, already-authorized
+candidate set: worst case one `GetItem` per installation the operator administers (a handful),
+paid once because the read self-heals. Reconcile also needs no new IAM — the Mgmt λ already
+holds `dynamodb:UpdateItem` for repo config (ADR-025), and this write touches only index
+attributes on a row keyed by an id the session is authorized for.
+**Consequences**: the invariant "an installation the platform is demonstrably serving is
+never absent from the console" holds for any operator with a grant for it, even on an
+un-backfilled environment. A legacy installation nobody holds a grant for stays invisible
+until the backfill runs — acceptable, since nobody can view it anyway. A repair failure is
+logged and swallowed: the row is already in the response, so the read must not fail. The
+repair is idempotent and concurrency-safe (conditional write; a losing racer is a no-op).
+`upsertInstallation` now stamps the keys via the shared `installGsi1Keys()` helper, and
+`test/install-store-gsi1.test.mjs` pins that every write path carries them — the regression
+class here is "a new write path forgets the index stamp". The reconciled list is re-sorted by
+account login so a recovered row occupies the same position it will hold once the index alone
+serves it — by **UTF-8 byte order** (`byGsi1sk`), not locale collation, since
+that is how DynamoDB orders a String sort key: locale puts `abc` before `Acme`, the index does
+the reverse, and the mismatch would be the same row-jump wearing a disguise.
+> **ADR numbering note.** This block was originally authored as 030..033 and has been renumbered
+> to **038..041** to vacate a collision: the concurrent branch `kermes/task-tidal-hawk` claims
+> 030..033 for entirely different subjects (adopt-mode label claiming, the auto-rewrite PR, EMF
+> metrics, the per-environment config module). ADR numbers are a shared mutable namespace, and
+> 038+ was the lowest free range at the time of renumbering (`kermes/task-nervous-mountain`
+> holds 034/035, `kermes/task-admiring-beetle` 036, `kermes/task-bouncing-toad` 037). Renumbering
+> unconditionally — rather than deferring it to whichever branch lands second — means neither
+> branch has to renumber at merge time. If a branch holding 034..037 is abandoned the gap stays;
+> a gap in the sequence is cheaper than a duplicate number.
+
+## ADR-038 — Flavor `vcpu` is descriptive; only `minimumMemoryInMiB` is requestable (M5)
+**Status**: Accepted (v1) · corrects the flavor-size claims in [spec 02](specs/02-microvm-runners.md) and the cost model in [spec 04](specs/04-web-ui.md)
+**Context**: `microvm/flavors.json` carries `vcpu` + `memoryMb` per flavor, spec 02's flavor
+table advertises "2 / 4 GB" and "4 / 8 GB", `docs/VERIFY-M3.md` prices runs off those pairs,
+and `src/mgmt/views.ts` derives `flavorRatePerMinute` from `vcpu * VCPU_USD_PER_MINUTE +
+GB * GB_USD_PER_MINUTE`. Checked against the GA `lambda-microvms` API surface (CLI 2.35.17+,
+API 2025-09-09):
+- **`run-microvm` has no sizing parameter at all** — the full option set is
+  `--ingress/egress-network-connectors --image-identifier --image-version
+  --execution-role-arn --idle-policy --logging --run-hook-payload
+  --maximum-duration-in-seconds --client-token`. A VM's shape is fixed by its **image**.
+- **`create-microvm-image` accepts `--resources minimumMemoryInMiB` (a single-element list,
+  memory only) and `--cpu-configurations architecture=ARM_64`.** There is **no vCPU knob**:
+  `cpu-configurations` carries `architecture` alone, whose only permitted value is `ARM_64`.
+- `scripts/build-images.mjs` passes **neither**. Every flavor is therefore built at the
+  service default shape, and always has been.
+Consequence: `vcpu` has never influenced a real microVM, `memoryMb` was equally inert, and
+the M3 `docker`-vs-`base` boot/cost deltas were attributed to a "4 vCPU / 8 GB snapshot"
+that was never requested. The measured 32–39 s `dockerd` init is real; the "on 4 vCPU
+Graviton" qualifier on it is not established.
+**Decision**:
+1. `build-images.mjs` forwards `--resources minimumMemoryInMiB=<memoryMb>` from the catalog,
+   so `memoryMb` becomes the **actual** floor the service honors, and
+   `--cpu-configurations architecture=ARM_64` to make the arm64-only hard rule explicit at
+   the API rather than implicit in the Dockerfile's `--platform`.
+2. `vcpu` is **retained but redocumented as descriptive** — an operator-facing indication of
+   the shape a flavor is *intended* for and the second sort key in
+   `smallestWithCapability`. It is NOT a request, and no code may present it as provisioned
+   capacity. Renaming it now would churn the catalog, the `FlavorDef` type, the API view and
+   the UI for no behavioral gain; the honest fix is that the one field the API accepts is
+   actually sent.
+3. The cost model keeps its two-term formula (memory *is* requestable, and microVM quota is
+   denominated in total memory of `RUNNING`/`SUSPENDED` VMs per spec 02), but every
+   surfaced figure stays labelled an **estimate** — as `estimateCostUsd` already does.
+**Why**: silently keeping two size fields where the API accepts one is how the M3 cost table
+came to state a shape nobody requested. Sending memory makes the more consequential half
+real (it drives both quota consumption and the OOM behavior of a `docker`/`rust` job) at the
+cost of one CLI flag.
+**Consequences**: the next `npm run build:images` changes the requested memory floor for
+every flavor, so it is a **deploy-touching** change and re-baselines boot latency —
+`docs/VERIFY-M3.md`'s per-flavor figures predate it and its cost floors should be re-measured
+rather than carried forward. `test/image-content.test.mjs` pins that the build script
+forwards both flags, and that no flavor `description` advertises a vCPU count — the catalog's
+descriptions render verbatim on the console's Flavors screen, so a "4 vCPU / 8 GB" footprint
+there contradicts that screen's own footnote in the same view (the `docker` description was
+exactly this sweep miss). Revisit if the API later exposes a vCPU request, at which point `vcpu`
+becomes requestable and this ADR's point 2 is superseded.
+
+## ADR-039 — Expanded standard flavor set with prebaked runner tool cache (M5)
+**Status**: Accepted (v1) · extends the catalog established in [ADR-020](#adr-020)
+**Context**: The catalog shipped `base`, `node`, `docker`. Any other language runtime meant a
+workflow either used a `setup-*` action (a per-job download on every run) or the repo went
+back to GitHub-hosted runners. Adding a runtime today requires a Dockerfile + a catalog entry
++ a Lambda redeploy, because the catalog is a static `import` in three call sites.
+**Decision**: add **`python`, `java`, `go`, `rust`** as standard flavors, each a
+`Dockerfile.base` clone plus one pinned toolchain layer, and **prebake the GitHub runner tool
+cache** (`/opt/hostedtoolcache`, `RUNNER_TOOL_CACHE`) so `actions/setup-python@v5`,
+`actions/setup-java@v4`, `actions/setup-go@v5` and `actions/setup-node@v4` resolve from cache
+instead of downloading. Deliberately **excluded**:
+- **`dotnet`** — the SDK is the largest of the candidates and no verified consumer asked for
+  it; snapshot size is a boot-latency and storage cost paid by every job of that flavor.
+  Left to the custom-flavor path (ADR-040) until a real workload justifies it.
+- A combined "kitchen sink" flavor — it would pay every toolchain's snapshot cost on every
+  job. One toolchain per flavor keeps the cost proportional to what the job asked for.
+Each new flavor declares a capability equal to its name (`python`, `java`, `go`, `rust`),
+keeps the unprivileged `USER runner` entrypoint and **no** `osCapabilities` (only `docker`
+gets `ALL`, per ADR-020), and pins toolchain versions rather than tracking `latest` so a
+rebuild is reproducible. Expanding the set also forced the label-precedence rule to become
+explicit: "most specific wins" was unambiguous while the catalog held one label per length,
+but `lambda-ci-python`/`lambda-ci-docker` are both 16 characters and `-node`/`-java`/`-rust`
+all 14, so a pure length sort left those ties to `Array#sort` stability — i.e. to the order of
+entries in `flavors.json`, where reordering the catalog would silently re-route live jobs.
+Equal-specificity ties now break by **flavor name ascending**, which is catalog-order
+independent and puts the one collision that matters on its safe side (`python`+`docker` →
+`docker`: a present daemon, rather than docker steps failing on a missing socket the labels
+said should work). Baked environment variables follow what each action actually does:
+`JAVA_HOME` is baked (setup-java `exportVariable`s it, so the action always wins), `GOROOT` is
+deliberately **not** (setup-go sets it only for Go < 1.9, so a baked value would override a
+job's chosen toolchain and pair its binary with the baked stdlib), and rust's `RUSTUP_HOME` +
+`CARGO_HOME` are both runner-writable because `dtolnay/rust-toolchain` and cargo write into
+them — safe because a microVM is single-use and runs exactly one job.
+**Why**: the wall-clock win is in the tool cache, not the runtime binary — a `setup-python`
+download+extract dominates a short job. Prebaking the cache is what makes a flavor faster
+than `base` + `setup-*`; without it the flavor only saves the download for jobs that skip the
+setup action entirely. Layering on `base` (rather than a shared registry base image) is
+forced by the build model: `create-microvm-image` builds a snapshot from one staged
+`Dockerfile` in an uploaded context, so each flavor's Dockerfile must be self-contained —
+hence the duplicated base layers, which `test/image-content.test.mjs` guards.
+**Consequences**: four more images to build, and `npm run build:images` gets proportionally
+slower (it is serial per flavor). Signal-driven upgrade still only understands
+`needs_docker` — a job that needs Python does **not** auto-upgrade off `base`; label or
+`FlavorMap`/`defaultFlavor` selects these. Extending signal inference to language runtimes is
+a separate change (it needs parser support for `setup-*` steps and a policy for what to do
+when a job needs two runtimes).
+One-toolchain-per-flavor also makes the existing docker signal upgrade a **replacement rather
+than an addition**, which the pre-expansion catalog hid: upgrading `base` → `docker` lost
+nothing, but upgrading `python` → `docker` for a `services:` block hands the job a daemon and
+**no Python**, so it dies at its first `pip` step with a command-not-found after having asked
+for Python explicitly. The upgrade still happens (a missing daemon is the harder failure), but
+it is no longer silent: `resolveFlavor`'s reason names the dropped capabilities and `compat`
+raises `toolchain-dropped`, both derived from the catalog. A job that genuinely needs a runtime
+*and* a daemon wants a custom flavor (ADR-040) or an in-job toolchain install — the standard set
+deliberately does not carry a `python`+`docker` image. The pinned versions are now a **patch-day obligation**: they
+age silently, and a stale pin is invisible until a workflow needs a newer runtime.
+The pin rule covers **package managers too**, not just the language runtime: `corepack prepare
+pnpm@latest` / `npm install -g npm@latest` resolve at build time, so a floating tag beside a
+pinned runtime is a half-kept promise — `test/image-content.test.mjs` now rejects any `@latest`
+/`@stable`/`@next` install in a flavor Dockerfile.
+A prebaked runtime is also not a self-sufficient job environment: `node`, `python`, `go` and
+`rust` carry `build-essential`, because node-gyp (npm's fallback whenever a dependency ships no
+prebuilt binary), a source-only sdist (arm64 wheels are still commonly absent), cgo, and cargo's
+link step all shell out to a compiler the shared apt line does not install. Verified in a
+container: that line yields no `gcc`/`cc`/`g++`/`make`/`ld`. Without it the failure surfaces
+mid-job as `command 'gcc' failed` / `gyp ERR! ... not found: make`, after the download cost is
+already paid. `base`/`java`/`docker` skip it deliberately — `base` carries no runtime to compile
+against, Temurin builds consume published JARs, and a docker job compiles inside its own
+container; it is ~200 MB of snapshot each.
+And a new flavor is **not reachable from its label until
+`/lca/<env>/config/runner-labels` lists it**: `shouldClaim` is an allowlist consulted *before*
+resolution, seeded by hand per DEPLOY-M1, so an omitted label makes those jobs sit queued on
+GitHub with a 202 `claimed:false` and nothing logged as an error. That seed is now pinned
+against the catalog by `test/filter.test.mjs`.
+
+## ADR-040 — Custom flavors live in the store and are merged over the built-in catalog (M5)
+**Status**: Accepted (v1) · shapes work deferred from this milestone
+**Context**: An operator cannot bring their own image. The catalog is `import
+flavorsCatalog from '../../microvm/flavors.json'` in `src/provision/flavor.ts`,
+`src/mgmt/views.ts` and `src/ingest/compat.ts` — compiled into each Lambda bundle at build
+time, so it is physically not writable at runtime. Spec 02 has always listed a `custom-*`
+row, and the Phase 3 backlog has "custom per-repo images", but nothing implements it.
+**Decision**:
+1. **Storage** — a per-installation flavor record in the shared table (ADR-009), keyed
+   `pk=INSTALL#<installationId>`, `sk=FLAVOR#<name>`, so it shares the installation
+   partition that already holds `INSTALL` + `REPO#<repoId>` rows and is enumerable with the
+   existing `begins_with` query. The static JSON stays **read-only and build-time**.
+2. **Resolution** — the three static imports move behind a resolver that composes
+   `builtin ++ custom`. Built-in flavors always win a name collision: a custom flavor whose
+   name matches a built-in is **rejected at registration** (not silently shadowed, and not
+   silently shadowing) so an operator cannot redefine what `lambda-ci-node` means for their
+   jobs. Custom flavors are namespaced `custom-<name>` with labels
+   `lambda-ci-custom-<name>`, which makes collision structurally unlikely and keeps the
+   most-specific-label rule in `resolveFlavor` intact.
+3. **Scope** — a custom flavor is visible only to its own installation. Resolution is
+   already per-run (the provisioner knows `installationId`), and cross-tenant flavor
+   visibility would leak one operator's image names to another.
+4. **Bounds** — registration validates `minimumMemoryInMiB` against the region's microVM
+   memory quota (spec 02: quota is total memory of `RUNNING`/`SUSPENDED` VMs) and surfaces
+   the derived `flavorRatePerMinute` before save, so an operator sees the per-minute rate of
+   the shape they are about to request. Per ADR-038 memory is the only requestable
+   dimension, so it is the only one bounds-checked.
+5. **Behavior with no custom flavors registered must be byte-identical** to today — the
+   resolver returns the built-in catalog and performs no I/O when the installation has no
+   flavor rows.
+**Why**: making the JSON writable is impossible (it is bundled), and a second static catalog
+would duplicate the source of truth. The installation partition is the natural home: the same
+partition already carries the config the console writes, and per-installation scoping falls
+out of the key rather than needing an authorization filter.
+**Consequences**: flavor resolution gains a table read on the provision hot path — it must
+degrade to built-in-only on a DynamoDB fault (fail open, matching ADR-027's gates) rather
+than failing the launch. `flavorNames()` (used by `validateFlavorMap`/`validateRepoPatch`) and
+`buildFlavorViews` become async/installation-scoped, which changes the Mgmt API's validation
+surface. Deferred to a follow-up card; this ADR fixes the shape so the standard-set work
+(ADR-039) does not have to guess it.
+
+## ADR-041 — A custom flavor is not routable until a smoke run proves it (M5)
+**Status**: Accepted (v1) · depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
+**Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
+published its image ARN, resolved correctly from its label, and then failed every single job
+because nothing in the guest could start `dockerd`. `imageAvailability()` probes only that an
+image ARN parameter *exists*. Letting an operator register an arbitrary image and route
+production jobs at it with no stronger evidence reproduces that failure mode on demand, in
+someone else's repo.
+**Decision**: a custom flavor carries a validation state — **`pending → validating → valid |
+invalid(reason)`** — and **only `valid` flavors are selectable in a `FlavorMap`, as a
+`defaultFlavor`, or resolvable from a label.** An unvalidated flavor resolves as if it did not
+exist (falling through to the normal fallback chain) with the reason recorded, so a
+half-configured flavor degrades to a working job rather than a failed one. Validation is two
+gates:
+1. **Static** — `arch === 'arm64'` (AGENTS.md hard rule); the image ARN resolves and is
+   readable by the provisioner's role; declared capabilities are drawn from a **closed
+   vocabulary** (`docker`, `node`, `python`, `java`, `go`, `rust`) because capabilities feed
+   both `smallestWithCapability` upgrades and the `compat` gate — an unknown capability
+   string would be silently inert; `minimumMemoryInMiB` within quota bounds (ADR-040).
+2. **Smoke run** — launch **one** microVM from the image with a synthetic JIT-registered
+   runner and require that the Actions agent registers, executes a trivial job, and the VM
+   self-terminates through the ADR-021 hook broker. Static checks alone would have passed the
+   broken `docker` image; only executing a job distinguishes "image built" from "image
+   works", and only observing self-terminate proves the ADR-021 path is wired.
+Re-validation is triggered automatically **when the image ARN changes** (a new ARN is a new
+artifact and inherits no evidence) and is manually triggerable from the console.
+**Why**: the state machine is the enforcement point rather than advice, because the failure it
+prevents is silent at registration time and only visible as other people's red builds.
+Terminal `invalid(reason)` — rather than an indefinite retry — keeps a deterministically
+broken image from burning microVM quota on a loop.
+**Consequences**: registration is no longer synchronous — the console shows progress and a
+failure reason, so validation needs its own status surface (a Flavors screen or a Settings
+extension). The smoke run **launches a real microVM and registers a real (throwaway) runner**,
+so it consumes quota, costs money, and needs a repo to register against; it is therefore
+**deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
+the static gates; the smoke run itself is verified against a live environment. Deferred to a
+follow-up card together with ADR-040.

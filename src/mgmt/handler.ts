@@ -12,6 +12,7 @@ import {
   SESSION_TTL_SECONDS,
   canAdminInstallation,
   canAdminPlatform,
+  grantedInstallationIds,
   decodeSession,
   encodeSession,
   parseCookies,
@@ -55,6 +56,7 @@ import {
   validateWebhookTestBody,
 } from './validate.js';
 import { collectVisible } from './paging.js';
+import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -63,10 +65,13 @@ import {
   listRunsByStatusPaged,
 } from '../shared/run-store.js';
 import {
+  getInstallation,
   getRepo,
   listInstallations,
   listRepos,
   patchRepoConfig,
+  reconcileInstallations,
+  repairInstallationIndex,
 } from '../shared/install-store.js';
 import { appendAudit, getWebhookHeartbeat, listAudit } from '../shared/config-store.js';
 // Ingest's own opt-out predicate, reused so the label-impact preview cannot drift from the
@@ -346,7 +351,10 @@ async function route_(
       });
 
     case 'listInstallations': {
-      const all = await listInstallations();
+      // Pass the session's grants so a legacy row missing the GSI1 stamp is still found
+      // (by primary key) and repaired — ADR-037. The filter below is unchanged: reconcile
+      // can only surface installations this session was already authorized for.
+      const all = await listInstallations(grantedInstallationIds(session));
       const visible = all.filter((i) => canAdminInstallation(session, i.installationId));
       return json(200, {
         installations: visible.map((i) => ({
@@ -545,13 +553,32 @@ async function listRunsRoute(
   if (q.repo !== undefined) {
     const repoId = asPositiveInt(q.repo);
     if (!repoId) return problem(400, 'repo must be a numeric repo id');
+    if (q.status !== undefined && !ALL_STATUSES.includes(q.status as RunStatus)) {
+      return problem(400, `status must be one of ${ALL_STATUSES.join(', ')}`);
+    }
+    // `repo` wins the index choice (GSI2 repo/time), but a `status` sent alongside it is
+    // honoured as a post-query predicate rather than ignored: the console can set both, and
+    // silently dropping one would show every status under a "failed" filter.
+    const status = q.status as RunStatus | undefined;
     const page = await collectVisible(
       (cursor) => listRunsByRepo(repoId, { limit, cursor }),
-      visible,
+      (runs) => visible(runs).filter((r) => status === undefined || r.status === status),
       limit,
       q.cursor,
     );
-    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
+    // `complete` reports whether rows were DROPPED from this response, not whether the index
+    // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-029).
+    // `collectVisible` never slices, so an unfiltered repo page loses nothing: every visible
+    // row the query returned is here, and a run's remaining jobs are reachable through
+    // `nextCursor`. Reporting `nextCursor === undefined` here instead would make a
+    // repo-filtered window PERMANENTLY partial: the head page always has an open cursor while
+    // history remains, and the client ANDs every page's flag, so walking to the end could
+    // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
+    return json(200, {
+      runs: page.runs.map(toRunView),
+      nextCursor: page.nextCursor ?? null,
+      complete: repoResponseComplete(status !== undefined),
+    });
   }
   if (q.status !== undefined) {
     if (!ALL_STATUSES.includes(q.status as RunStatus)) {
@@ -564,15 +591,37 @@ async function listRunsRoute(
       limit,
       q.cursor,
     );
-    return json(200, { runs: page.runs.map(toRunView), nextCursor: page.nextCursor ?? null });
+    // A status-filtered page holds only the jobs IN that status, so a run folded from it is
+    // partial by construction however far the cursor got.
+    return json(200, {
+      runs: page.runs.map(toRunView),
+      nextCursor: page.nextCursor ?? null,
+      complete: false,
+    });
   }
   const pages = await Promise.all(
     ALL_STATUSES.map((s) => listRunsByStatusPaged(s, { limit })),
   );
-  const merged = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs))).slice(0, limit);
+  const visibleRuns = sortRunsNewestFirst(visible(pages.flatMap((p) => p.runs)));
+  const merged = visibleRuns.slice(0, limit);
   // A merged multi-index view has no single coherent cursor — the client narrows by
   // status or repo to paginate deeper.
-  return json(200, { runs: merged.map(toRunView), nextCursor: null });
+  //
+  // `complete` tells the client whether any job row was dropped on the way out. This view
+  // hands back no cursor, so the client cannot recover a dropped row by paging — the flag
+  // carries the whole verdict here. It is decided HERE because only this code sees the raw
+  // per-status pages: truncation must be judged before the visibility filter, since a page
+  // filled with another tenant's rows looks short while this operator's sibling jobs sit
+  // unread past the boundary (ADR-029).
+  return json(200, {
+    runs: merged.map(toRunView),
+    nextCursor: null,
+    complete: mergedResponseComplete({
+      anyIndexTruncated: pages.some((p) => p.nextCursor !== undefined),
+      visibleRows: visibleRuns.length,
+      returnedRows: merged.length,
+    }),
+  });
 }
 
 /**
@@ -639,7 +688,7 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
       ),
       getParam(RUNNER_LABELS_PARAM, 0).catch(() => undefined),
       getParam(PLATFORM_ADMINS_PARAM, 0).catch(() => undefined),
-      listInstallations().catch(() => []),
+      listInstallations(grantedInstallationIds(session)).catch(() => []),
       getWebhookHeartbeat().catch(() => undefined),
       listAudit(10).catch(() => []),
       appLinkage(),
@@ -647,7 +696,22 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     ]);
 
   const labels = parseRunnerLabels(labelsRaw);
-  const knownIds = new Set(storedInstalls.map((i) => i.installationId));
+  // The store read above reconciles the SESSION's grants (ADR-037), which is the right scope
+  // for the fallback list below — it only ever shows this operator's installations. The
+  // `known` flag, though, is a platform-wide claim about every installation GitHub reports.
+  // An installation whose row never got its GSI1 stamp is absent from the index result, so
+  // without a second pass over the GitHub-reported ids this screen would render `known:
+  // false` for an installation the platform is actively serving — the same index blindness
+  // ADR-037 fixed, resurfacing as a false warning. Reconcile against those ids (GetItem only
+  // for ones the index really missed, repairing as it goes) before deciding `known`.
+  const reconciled = linkage?.installations?.length
+    ? await reconcileInstallations(
+        storedInstalls,
+        linkage.installations.map((i) => i.installationId),
+        { get: getInstallation, repair: repairInstallationIndex },
+      ).catch(() => storedInstalls)
+    : storedInstalls;
+  const knownIds = new Set(reconciled.map((i) => i.installationId));
 
   // Installations come from GitHub when the linkage verified (ground truth even if an
   // `installation` webhook was missed); fall back to our store when it didn't.
@@ -840,7 +904,7 @@ async function putRunnerLabelsRoute(
   if (!parsed.ok) return problem(400, 'invalid runner labels', parsed.errors);
 
   const current = parseRunnerLabels(await getParam(RUNNER_LABELS_PARAM, 0).catch(() => undefined));
-  const impact = await labelImpact(current, parsed.value.labels);
+  const impact = await labelImpact(current, parsed.value.labels, session);
 
   if (parsed.value.dryRun) {
     return json(200, { dryRun: true, applied: false, labels: current, impact });
@@ -926,10 +990,33 @@ export async function collectImpactRepos(
   return repos;
 }
 
-async function labelImpact(current: string[], proposed: string[]): Promise<LabelImpactView> {
-  const installs = await listInstallations().catch(() => []);
+/**
+ * Label-change impact.
+ *
+ * The candidate set is deliberately PLATFORM-wide, not the session's grants. This preview is
+ * the operator's only warning about jobs a label change will stop claiming, and a label change
+ * takes effect for EVERY tenant on the next webhook — so an installation missing from the
+ * GSI1 index (ADR-037) must not silently shrink the impact set and make the change look safer
+ * than it is. GitHub's own installation list is the ground truth, so it supplies the reconcile
+ * candidates; when the broker cannot verify it, the scan falls back to the index plus this
+ * session's grants and is reported as `truncated`, because it may then be missing rows.
+ */
+async function labelImpact(
+  current: string[],
+  proposed: string[],
+  session: SessionPayload,
+): Promise<LabelImpactView> {
+  const linkage = await appLinkage();
+  const verified = Boolean(linkage?.installations?.length);
+  const candidates = verified
+    ? (linkage?.installations ?? []).map((i) => i.installationId)
+    : grantedInstallationIds(session);
+  const installs = await listInstallations(candidates).catch(() => []);
   const repos = await collectImpactRepos(installs, (id) => listRepos(id));
-  const truncated = repos.length > MAX_IMPACT_REPOS;
+  // Two independent reasons the scan can be partial: the repo-count bound, and an unverifiable
+  // App linkage that left the installation enumeration incomplete. Either one means "there may
+  // be affected jobs not listed here", which is the single thing `truncated` tells the client.
+  const truncated = repos.length > MAX_IMPACT_REPOS || !verified;
   const scanned = repos.slice(0, MAX_IMPACT_REPOS);
   const withAnalyses = await Promise.all(
     scanned.map(async (r) => ({

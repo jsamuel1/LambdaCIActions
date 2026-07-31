@@ -30,6 +30,27 @@ const DOCKER_CAPABLE_FLAVORS = new Set<string>(
     .map((f) => f.name),
 );
 
+/**
+ * Catalog view used to detect a job whose explicitly requested toolchain is not in the flavor
+ * it actually resolved to. Derived from the catalog (never hard-coded) so a new flavor is
+ * covered by construction.
+ */
+const CATALOG = (
+  flavorsCatalog as {
+    flavors: { name: string; label: string; capabilities: string[] }[];
+  }
+).flavors;
+
+/** `label` (lower-cased) → the capabilities that label's flavor advertises. */
+const CAPABILITIES_BY_LABEL = new Map<string, string[]>(
+  CATALOG.map((f) => [f.label.toLowerCase(), f.capabilities]),
+);
+
+/** `name` → the capabilities that flavor advertises. */
+const CAPABILITIES_BY_FLAVOR = new Map<string, string[]>(
+  CATALOG.map((f) => [f.name, f.capabilities]),
+);
+
 /** Return the worst (highest-rank) of two levels. */
 function worse(a: CompatLevel, b: CompatLevel): CompatLevel {
   return LEVEL_RANK[a] >= LEVEL_RANK[b] ? a : b;
@@ -126,6 +147,45 @@ export function analyzeCompat(job: ParsedJob, resolution: FlavorResolution): Com
       level: 'warn',
       code: 'docker-missing',
       text: `job needs Docker but resolved flavor '${resolution.flavor}' lacks it.`,
+    });
+  }
+
+  // warn: the job asked for a toolchain that the flavor it actually resolved to does not have.
+  // Flavors are one-toolchain-per-image (ADR-039), so the resolver's docker signal upgrade is a
+  // REPLACEMENT: `runs-on: [self-hosted, lambda-ci-python]` on a job with `services:` resolves
+  // to `docker`, which carries a daemon and no Python. That job then fails at its first
+  // `python`/`pip` step with a command-not-found, having asked for Python explicitly and been
+  // told nothing.
+  //
+  // Two sources, because a label is not the only way a flavor gets requested:
+  //   1. the job's own catalog labels (`runs_on`) — covers the explicit-label route and a
+  //      FlavorMap override pointed at the wrong flavor;
+  //   2. `resolution.replaced` — the flavor a signal upgrade swapped out. This is the ONLY
+  //      signal for a selection that carried no catalog label: `FlavorMap: {ubuntu-latest:
+  //      python}` or the repo's `defaultFlavor: python`. Deriving "requested" from labels alone
+  //      left both of those upgrading to `docker` with no warning at all.
+  // Both are derived from the catalog, so a future flavor is covered without teaching the gate.
+  const resolvedCaps = CAPABILITIES_BY_FLAVOR.get(resolution.flavor) ?? [];
+  const requested = new Set<string>();
+  const noteMissing = (caps: readonly string[]) => {
+    for (const cap of caps) if (!resolvedCaps.includes(cap)) requested.add(cap);
+  };
+  for (const label of job.runs_on) {
+    noteMissing(CAPABILITIES_BY_LABEL.get(label.toLowerCase()) ?? []);
+  }
+  if (resolution.replaced) {
+    noteMissing(CAPABILITIES_BY_FLAVOR.get(resolution.replaced) ?? []);
+  }
+  if (requested.size > 0) {
+    const missing = [...requested].sort();
+    add({
+      level: 'warn',
+      code: 'toolchain-dropped',
+      text:
+        `job asked for ${missing.map((c) => `'${c}'`).join(', ')} but resolved flavor ` +
+        `'${resolution.flavor}' does not provide it — flavors carry one toolchain each, so a ` +
+        'capability upgrade replaces rather than adds. Install the toolchain in the job, or ' +
+        'register a custom flavor that has both.',
     });
   }
 

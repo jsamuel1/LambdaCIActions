@@ -51,6 +51,27 @@ test('a page of foreign runs keeps paging instead of returning empty', async () 
   assert.equal(res.nextCursor, undefined, 'index exhausted → no cursor');
 });
 
+test('a repo page can carry a status predicate without losing the visibility filter', async () => {
+  // `repo` picks the index (GSI2) and `status` rides along as a post-query predicate — the
+  // route used to ignore `status` whenever `repo` was set, so a "failed" filter listed every
+  // status. Composed exactly as the handler composes it.
+  const rows = [
+    { ...run(1, 11), status: 'failed' },
+    { ...run(2, 11), status: 'completed' },
+    { ...run(3, 99), status: 'failed' },
+  ];
+  const res = await collectVisible(
+    async () => ({ runs: rows, nextCursor: undefined }),
+    (page) => visible(page).filter((r) => r.status === 'failed'),
+    10,
+  );
+  assert.deepEqual(
+    res.runs.map((r) => r.runId),
+    [1],
+    'foreign rows and non-matching statuses both drop out',
+  );
+});
+
 test('paging stops as soon as the visible page is full', async () => {
   const pages = [
     { runs: [run(1, 11), run(2, 11)], nextCursor: 'c1' },

@@ -31,10 +31,10 @@ export function Flavors(): JSX.Element {
               <td>{f.label}</td>
               <td>{f.arch}</td>
               <td>
-                {f.vcpu} vCPU / {Math.round(f.memoryMb / 1024)} GB
+                {f.vcpu} vCPU&dagger; / {Math.round(f.memoryMb / 1024)} GB
               </td>
               <td>{f.capabilities.join(', ') || '—'}</td>
-              <td>${f.usdPerMinute.toFixed(4)}</td>
+              <td>~${f.usdPerMinute.toFixed(4)}</td>
               <td>
                 {f.imageAvailable ? (
                   <span className="badge ok">built</span>
@@ -49,6 +49,10 @@ export function Flavors(): JSX.Element {
       <p className="muted">
         arm64 only (Graviton). Images are built out-of-band by `npm run build:images`, which
         publishes each ARN to SSM.
+      </p>
+      <p className="muted">
+        &dagger; vCPU is indicative only — the microVM API accepts a memory request
+        (`minimumMemoryInMiB`) but exposes no vCPU knob, so per-minute rates are estimates.
       </p>
     </div>
   );
