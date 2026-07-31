@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, type LabelImpact, type RelinkResult, type Settings as SettingsData } from '../api.js';
+import { api, relinkFailureFrom, type LabelImpact, type RelinkResult, type Settings as SettingsData } from '../api.js';
 import { useApi } from '../hooks.js';
 import { Badge, ErrorBox, Loading, formatTime } from '../components.js';
 
@@ -200,25 +200,35 @@ function RelinkForm({
     if (!allowHookDesync) setDesyncRefusal(undefined);
     try {
       const res = await api.relinkGithubApp({ ...creds, ...(allowHookDesync ? { allowHookDesync } : {}) });
-      setResult(res);
-      if (res.applied) {
-        setDesyncRefusal(undefined);
-        setCreds(EMPTY_CREDS); // drop the plaintext as soon as it is no longer needed
-        // A hook-sync failure needs the operator's attention here, so keep the panel open
-        // rather than collapsing it — the warning would otherwise vanish on close.
-        if (res.hookSynced !== false) onDone();
-        else reload();
-      } else if (res.hookSynced === false) {
-        // Webhook-secret desync refusal: keep the (still-populated) form so the operator can
-        // confirm after fixing the secret at GitHub, rather than re-typing every credential.
-        setDesyncRefusal(res.error ?? 'GitHub webhook configuration could not be updated');
-      } else {
-        setError(res.error ?? 'relink failed');
-      }
+      applyRelinkOutcome(res);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // A refusal arrives as a rejected 422 carrying a structured body (`relinkFailureFrom`).
+      // Without recovering it, the desync retry and the rollback handle would be unreachable and
+      // the operator would see only an error string.
+      const refusal = relinkFailureFrom(err);
+      if (refusal) applyRelinkOutcome(refusal);
+      else setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /** Route a relink outcome (success, or a recovered 422 refusal) to the right UI state. */
+  function applyRelinkOutcome(res: RelinkResult): void {
+    setResult(res);
+    if (res.applied) {
+      setDesyncRefusal(undefined);
+      setCreds(EMPTY_CREDS); // drop the plaintext as soon as it is no longer needed
+      // A hook-sync failure needs the operator's attention here, so keep the panel open
+      // rather than collapsing it — the warning would otherwise vanish on close.
+      if (res.hookSynced !== false) onDone();
+      else reload();
+    } else if (res.hookSynced === false) {
+      // Webhook-secret desync refusal: keep the (still-populated) form so the operator can
+      // confirm after fixing the secret at GitHub, rather than re-typing every credential.
+      setDesyncRefusal(res.error ?? 'GitHub webhook configuration could not be updated');
+    } else {
+      setError(res.error ?? 'relink failed');
     }
   }
 
@@ -256,6 +266,17 @@ function RelinkForm({
   }
 
   const complete = Object.values(creds).every((v) => v.trim().length > 0);
+  /**
+   * Whether a rollback is still meaningful. A relink that SUCCEEDED can be undone; a refusal
+   * that already rolled itself back cannot (offering the button would re-restore the versions
+   * that are already in effect and read as though the environment were still broken). A refusal
+   * whose own rollback FAILED is exactly the case that needs the button.
+   */
+  const rollbackOffered =
+    result !== undefined &&
+    result.rolledBack !== true &&
+    ((result.replacedVersions && Object.keys(result.replacedVersions).length > 0) ||
+      (result.createdParams && result.createdParams.length > 0));
 
   return (
     <div className="subcard gap-top">
@@ -307,8 +328,7 @@ function RelinkForm({
         <button className="primary" disabled={busy || !complete} onClick={() => submit()}>
           {busy ? 'Verifying…' : 'Verify & re-link'}
         </button>
-        {((result?.replacedVersions && Object.keys(result.replacedVersions).length > 0) ||
-          (result?.createdParams && result.createdParams.length > 0)) && (
+        {rollbackOffered && (
           <button disabled={busy} onClick={rollback}>
             Roll back to previous App
           </button>
@@ -318,10 +338,18 @@ function RelinkForm({
         <div className="subcard gap-top">
           <p className="error">{desyncRefusal}</p>
           <p className="muted">
-            Nothing was changed — the credentials were verified and then rolled back. Set the new
-            webhook secret on the App at GitHub yourself (Settings → Webhook → Secret), then
-            confirm below. Until GitHub and this environment agree on the secret, every delivery is
-            rejected and no job is claimed.
+            {result?.rolledBack === false ? (
+              <>
+                <strong>The rollback did not complete</strong> — some credential parameters may
+                still hold the submitted values. Check CloudWatch, then use the rollback button
+                above before retrying.{' '}
+              </>
+            ) : (
+              <>Nothing was changed — the credentials were verified and then rolled back. </>
+            )}
+            Set the new webhook secret on the App at GitHub yourself (Settings → Webhook →
+            Secret), then confirm below. Until GitHub and this environment agree on the secret,
+            every delivery is rejected and no job is claimed.
           </p>
           <button className="danger" disabled={busy || !complete} onClick={() => submit(true)}>
             {busy ? 'Re-linking…' : 'I set the secret at GitHub — re-link anyway'}

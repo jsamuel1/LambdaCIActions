@@ -254,6 +254,12 @@ would otherwise leave a broken environment that looks fine:
   config (they set the secret at GitHub by hand first). When the submitted secret is *unchanged*,
   GitHub and Ingest still agree, so the failure is advisory (`hookSynced: false` + a UI warning)
   and the relink stands.
+- **A refusal is a structured 422, and the console must read its body.** The refusal is not just
+  a message: `hookSynced: false` is the cue for the `allowHookDesync` retry, and
+  `replacedVersions` / `createdParams` / `rolledBack` are the rollback handle for a refusal that
+  could *not* roll itself back. A client that discards non-2xx bodies leaves the operator with no
+  supported way forward, so `ApiError` carries the parsed body and the relink form recovers it
+  (`relinkFailureFrom`). Pinned by `test/web-api-error.test.mjs`.
 
 An explicit rollback reads **every** historical value before it writes any of them. A
 read-then-write loop that faulted midway would leave a mixed credential set — some parameters

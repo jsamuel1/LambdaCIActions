@@ -16,11 +16,27 @@ export class UnauthorizedError extends Error {
 export class ApiError extends Error {
   readonly status: number;
   readonly details?: unknown;
-  constructor(status: number, message: string, details?: unknown) {
+  /**
+   * The parsed JSON body of the failing response, when there was one.
+   *
+   * Some API failures are *structured refusals the UI must act on*, not just messages to print.
+   * The relink route is the load-bearing case: a webhook-secret desync answers **422** with
+   * `{ applied: false, hookSynced: false, rolledBack, replacedVersions, createdParams }`, and
+   * both the only legitimate way forward (the explicit `allowHookDesync` retry) and the rollback
+   * handle live in that body. Discarding it at the throw makes those controls unreachable.
+   */
+  readonly body?: Record<string, unknown>;
+  constructor(
+    status: number,
+    message: string,
+    details?: unknown,
+    body?: Record<string, unknown>,
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.details = details;
+    this.body = body;
   }
 }
 
@@ -44,7 +60,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     }
   }
   if (!res.ok) {
-    throw new ApiError(res.status, String(body.error ?? `HTTP ${res.status}`), body.details);
+    throw new ApiError(res.status, String(body.error ?? `HTTP ${res.status}`), body.details, body);
   }
   return body as T;
 }
@@ -273,6 +289,41 @@ export interface RelinkResult {
   hookError?: string;
   error?: string;
   rolledBack?: boolean;
+}
+
+/**
+ * Turn a thrown relink failure back into a `RelinkResult`.
+ *
+ * `request` rejects on every non-2xx, and the relink route answers a *refusal* with 422 plus a
+ * structured body. That body is not decoration: a webhook-secret desync refusal carries
+ * `hookSynced: false` (the console's cue to offer the explicit `allowHookDesync` retry) and the
+ * `replacedVersions` / `createdParams` rollback handle for a refusal that could NOT roll itself
+ * back. Treating the rejection as a bare message would strand the operator with no supported way
+ * forward — they would have to hand-craft the retry.
+ *
+ * Returns undefined when the failure carries no relink body (a 500, an edge error page, a
+ * non-`ApiError` network fault), so the caller falls back to plain error text. Pure, so the
+ * decision is testable without a DOM.
+ */
+export function relinkFailureFrom(err: unknown): RelinkResult | undefined {
+  if (!(err instanceof ApiError) || !err.body) return undefined;
+  const body = err.body;
+  // `applied` is the field the route always sets on a refusal; its absence means this is not a
+  // relink refusal (a generic 403/503 problem+json, say) and there is nothing structured to act on.
+  if (body.applied !== false) return undefined;
+  const versions = body.replacedVersions;
+  const created = body.createdParams;
+  return {
+    applied: false,
+    error: typeof body.error === 'string' ? body.error : err.message,
+    rolledBack: body.rolledBack === true,
+    ...(body.hookSynced === false ? { hookSynced: false } : {}),
+    ...(typeof body.hookError === 'string' ? { hookError: body.hookError } : {}),
+    ...(versions && typeof versions === 'object' && !Array.isArray(versions)
+      ? { replacedVersions: versions as Record<string, number> }
+      : {}),
+    ...(Array.isArray(created) ? { createdParams: created.filter((p) => typeof p === 'string') } : {}),
+  };
 }
 
 export interface LogPage {
