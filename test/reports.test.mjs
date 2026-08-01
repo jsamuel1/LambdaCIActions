@@ -746,6 +746,62 @@ test('an empty export is complete, not truncated', () => {
   assert.equal(bounded.complete, true);
 });
 
+test('the byte backstop ships every row that fits, not the first power-of-two that does', () => {
+  // The bound used to halve repeatedly and never come back up, so the first overshoot was
+  // permanent: 10 000 rows of realistic long tenant names is ~4.9 MiB of JSON, one halving
+  // shipped 5 000 rows at 2.5 MiB, and 8 460 rows would have fit. It reported `complete: false`,
+  // so it was not a silent lie — it just threw away 41% of the data the operator asked for from
+  // the one feature whose job is to hand them the underlying rows. Both shapes cost O(log n)
+  // measurements, so tightness is free.
+  //
+  // Asserting "within a row of the true optimum" rather than a magic number: it pins the
+  // property (maximal prefix under the backstop) and a halving implementation fails it by
+  // thousands of rows.
+  const wide = 'y'.repeat(120);
+  const rows = toExportRows(
+    Array.from({ length: MAX_EXPORT_ROWS }, (_, i) =>
+      job({ jobId: i + 1, repoFullName: `acme/${wide}-${i}`, workflowName: wide, jobName: wide }),
+    ),
+    NOW,
+  );
+
+  for (const [name, measure] of [
+    ['csv', (r) => Buffer.byteLength(toCsv(r))],
+    ['json', (r) => Buffer.byteLength(JSON.stringify(r))],
+  ]) {
+    assert.ok(measure(rows) > MAX_EXPORT_BYTES, `${name} fixture is not actually oversized`);
+    const bounded = boundExportRows(rows, measure);
+
+    // Independent bisect for the true largest fitting prefix.
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (measure(rows.slice(0, mid)) <= MAX_EXPORT_BYTES) lo = mid;
+      else hi = mid - 1;
+    }
+
+    assert.ok(measure(bounded.rows) <= MAX_EXPORT_BYTES, `${name} body is over the backstop`);
+    assert.equal(bounded.complete, false, `${name} dropped rows but claimed complete`);
+    assert.ok(
+      bounded.rows.length >= lo - 1,
+      `${name} shipped ${bounded.rows.length} rows when ${lo} fit — ${lo - bounded.rows.length} rows were discarded for nothing`,
+    );
+    // And it must not overshoot the optimum either — that would mean an over-cap body.
+    assert.ok(bounded.rows.length <= lo, `${name} shipped more rows than actually fit`);
+  }
+});
+
+test('a single row wider than the backstop yields no rows rather than an illegal body', () => {
+  // Shipping it anyway is a Lambda invocation error — an opaque 502 for the whole download,
+  // which is precisely what the bound exists to prevent. Zero rows plus `complete: false` is
+  // the honest answer.
+  const rows = toExportRows([job({ jobName: 'z'.repeat(64) })], NOW);
+  const bounded = boundExportRows(rows, () => MAX_EXPORT_BYTES + 1);
+  assert.deepEqual(bounded.rows, []);
+  assert.equal(bounded.complete, false);
+});
+
 test('the export cap is published in the report so the UI can warn before the click', () => {
   // A download that comes back quietly shorter than the `rowCount` shown above it is the same
   // class of failure as a silently truncated report. The limit rides in the result, and the
@@ -761,6 +817,18 @@ test('the export cap is published in the report so the UI can warn before the cl
     screen,
     /report\.rowCount > report\.exportRowLimit/,
     'the screen must warn when a download will be capped',
+  );
+  // The row limit is a CEILING, not a promise: the byte backstop can bind first when tenant
+  // names are long, so the notice must not claim the file will carry exactly that many rows.
+  assert.match(
+    screen,
+    /carries at most/,
+    'the export notice must state the row limit as a maximum',
+  );
+  assert.match(
+    screen,
+    /size-capped/,
+    'the export notice must say a long-name export can be shorter than the row limit',
   );
 });
 

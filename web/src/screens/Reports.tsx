@@ -382,9 +382,13 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
         {report.complete && report.rowCount > report.exportRowLimit && (
           // An export is one synchronous Lambda response, so it is capped independently of the
           // read budget. Say so here rather than letting a download come back quietly shorter
-          // than the row count above it.
+          // than the row count above it. The row limit is a CEILING, not a promise: repo /
+          // workflow / job names are tenant-controlled and unbounded, so a byte backstop can
+          // bind first and ship fewer rows than this. The downloaded file carries the verdict
+          // (`complete` in JSON, `X-Report-Complete` on the CSV).
           <p className="gap-top muted tight">
-            Export is capped at {report.exportRowLimit} of {report.rowCount} job rows — narrow the
+            Export carries at most {report.exportRowLimit} of {report.rowCount} job rows — fewer if
+            repo or workflow names are long, since one response is size-capped too. Narrow the
             window or the repo filter to export the rest. The charts above cover every row.
           </p>
         )}

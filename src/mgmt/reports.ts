@@ -691,26 +691,41 @@ export interface ExportBody {
 /**
  * Trim export rows to what one response can safely carry.
  *
- * Applies the row cap first, then measures the serialized width of what survives and drops from
- * the tail until it fits the byte backstop. `measure` is injected because CSV and JSON have
+ * Applies the row cap first, then — only if the survivors still exceed the byte backstop —
+ * BISECTS for the largest prefix that fits. `measure` is injected because CSV and JSON have
  * materially different overheads per row, and guessing at one of them is how a "safe" cap ends
  * up unsafe for the other.
+ *
+ * The bisect matters, it is not tidiness. Repeated halving (the previous implementation) only
+ * ever divides and never comes back up, so the first overshoot is permanent: measured against
+ * these serializers, 10 000 rows of realistic long tenant names is ~4.9 MiB of JSON, one halving
+ * ships 5 000 rows at 2.5 MiB — and 8 460 rows would have fit. That silently drops 41% of the
+ * operator's data from a feature whose entire job is to hand them the underlying rows. Both
+ * shapes cost O(log n) measurements; only one of them is tight, so `test/reports.test.mjs`
+ * pins the result to within a row of optimal (a halving implementation fails it).
+ *
+ * A single row wider than the backstop yields ZERO rows, not that row: shipping an over-cap body
+ * is a Lambda invocation error (an opaque 502 for the whole download), which is the exact failure
+ * this bound exists to prevent. `complete: false` reports it either way.
  */
 export function boundExportRows(
   rows: ExportRow[],
   measure: (rows: ExportRow[]) => number,
 ): ExportBody {
-  let out = rows.length > MAX_EXPORT_ROWS ? rows.slice(0, MAX_EXPORT_ROWS) : rows;
-  let complete = out.length === rows.length;
-  // Halve-and-refine rather than re-serializing per row: measuring is O(n) in the body size, so
-  // a per-row loop over 10 000 rows would be quadratic in the worst case.
-  while (out.length > 0 && measure(out) > MAX_EXPORT_BYTES) {
-    const keep = Math.max(1, Math.floor(out.length / 2));
-    if (keep === out.length) break;
-    out = out.slice(0, keep);
-    complete = false;
+  const capped = rows.length > MAX_EXPORT_ROWS ? rows.slice(0, MAX_EXPORT_ROWS) : rows;
+  if (measure(capped) <= MAX_EXPORT_BYTES) {
+    return { rows: capped, complete: capped.length === rows.length };
   }
-  return { rows: out, complete };
+  // Largest k in [0, capped.length) whose prefix fits. Body size is monotonic in the row count
+  // (every row adds bytes), so a prefix bisect is exact rather than a heuristic.
+  let lo = 0;
+  let hi = capped.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (measure(capped.slice(0, mid)) <= MAX_EXPORT_BYTES) lo = mid;
+    else hi = mid - 1;
+  }
+  return { rows: capped.slice(0, lo), complete: false };
 }
 
 /** Row shape of a report export — the underlying jobs, not the aggregate. */

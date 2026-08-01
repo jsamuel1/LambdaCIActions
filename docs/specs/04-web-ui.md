@@ -265,10 +265,15 @@ repo/workflow/job names, and 7.2–9.8 MiB as JSON — so the unbounded form fai
 before it fails the row budget, and over the limit is not a short file but an invocation error the
 operator sees as a 502. So `MAX_EXPORT_ROWS` (10 000) caps the row count and `MAX_EXPORT_BYTES`
 (4.5 MB) is a byte backstop for the case the row cap cannot cover — names are unbounded, so a row
-has no fixed width. Both truncation sources are folded into the SAME `complete` /
+has no fixed width. When the backstop binds, the bound **bisects** for the largest prefix that
+fits rather than halving: halving never comes back up, so a body 8% over the backstop shipped
+half the rows it could have (measured: 5 000 JSON rows where 8 460 fit). Both cost O(log n)
+measurements. Both truncation sources are folded into the SAME `complete` /
 `X-Report-Complete` channel, and the row limit is published in the report result
 (`exportRowLimit`) so the console warns that a download will be capped *before* the operator
-clicks, rather than handing back a file quietly shorter than the row count beside it.
+clicks, rather than handing back a file quietly shorter than the row count beside it. That limit
+is stated as a **ceiling**, not a promise — with long tenant names the byte backstop binds first
+and the file is shorter still, which is why the download carries the completeness verdict too.
 
 **Tenant isolation (ADR-043).** Unlike run lists, reporting does **not** post-filter. It resolves
 the operator's visible repos first and queries only those GSI2 partitions, so a foreign row is
