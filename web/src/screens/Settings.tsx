@@ -359,12 +359,20 @@ function RelinkForm({
         </label>
         <label className="field">
           <span>Private key (PEM)</span>
+          {/*
+            `autoComplete="off"` for the same reason as the secret inputs above, and it matters
+            MORE here: a textarea's content is what Firefox's session store persists to DISK for
+            session-restore and back-navigation. Without it the App PEM — the highest-value
+            secret in the platform — outlives the tab that typed it, breaking this component's
+            own contract that the plaintext lives in memory only and is dropped on success.
+          */}
           <textarea
             className="pem"
             value={creds.pem}
             onChange={set('pem')}
             placeholder="-----BEGIN RSA PRIVATE KEY-----"
             spellCheck={false}
+            autoComplete="off"
           />
         </label>
       </div>

@@ -231,3 +231,48 @@ test('an empty installation list names WHICH fact made it empty', () => {
     'empty',
   );
 });
+
+// ---- relink intake keeps the plaintext out of browser-persisted state -------
+
+test('every relink credential field opts out of browser autofill/session-restore', () => {
+  const screen = fs.readFileSync(
+    path.join(repoRoot, 'web', 'src', 'screens', 'Settings.tsx'),
+    'utf8',
+  );
+
+  // The relink form is a write-only intake: the component drops the plaintext on success and
+  // writes nothing to localStorage. Browser-managed persistence would defeat that on its own —
+  // and the textarea is the weak spot, because a textarea's VALUE is what Firefox's session
+  // store writes to disk for session-restore and back-navigation, so an App PEM would outlive
+  // the tab that typed it. `tsc` cannot see a missing attribute, hence a source assertion.
+  const pem = /<textarea[^>]*className="pem"[^>]*>/s.exec(screen);
+  assert.ok(pem, 'the PEM textarea should still exist in the relink form');
+  assert.match(
+    pem[0],
+    /autoComplete="off"/,
+    'the PEM textarea must opt out of autofill/session-restore',
+  );
+  assert.match(pem[0], /spellCheck=\{false\}/, 'the PEM must not go to a remote spellchecker');
+
+  // The secret <input>s alongside it must stay opted out too. `new-password` is the correct
+  // opt-out for a credential input (plain "off" is widely ignored by password managers).
+  for (const field of ['clientSecret', 'webhookSecret']) {
+    const input = new RegExp(`value=\\{creds\\.${field}\\}[\\s\\S]{0,200}?/>`).exec(screen);
+    assert.ok(input, `the ${field} input should still exist`);
+    assert.match(
+      input[0],
+      /autoComplete="(new-password|off)"/,
+      `${field} must opt out of autofill`,
+    );
+  }
+
+  // Nothing in the screen may hand a credential to browser-managed storage. Matching on real
+  // MEMBER ACCESS, not the bare word: the component's own docstring says "never localStorage",
+  // and a prose mention must not read as a violation.
+  assert.doesNotMatch(
+    screen,
+    /\b(?:localStorage|sessionStorage)\s*(?:\.\s*\w+|\[)/,
+    'credentials must never reach localStorage/sessionStorage',
+  );
+  assert.doesNotMatch(screen, /document\s*\.\s*cookie/);
+});
