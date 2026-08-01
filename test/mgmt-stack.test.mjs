@@ -13,13 +13,21 @@ import { DEFAULT_MODEL_ID } from '../dist/src/mgmt/nl-report.js';
 import { envConfig } from '../dist/lib/env-config.js';
 
 function synth(over = {}) {
+  return Template.fromStack(stackFor('test', over));
+}
+
+/**
+ * Build MgmtStack for a named environment. Split out of `synth` so a test can assert a
+ * PER-ENVIRONMENT config value (run retention differs dev/prod) rather than only the dev shape.
+ */
+function stackFor(envName, over = {}) {
   const app = new App();
   const env = { account: '123456789012', region: 'us-west-2' };
-  const data = new DataStack(app, 'Data', { env, envName: 'test', ssmPrefix: '/lca/test' });
-  const mgmt = new MgmtStack(app, 'Mgmt', {
+  const data = new DataStack(app, 'Data', { env, envName, ssmPrefix: `/lca/${envName}` });
+  return new MgmtStack(app, 'Mgmt', {
     env,
-    envName: 'test',
-    ssmPrefix: '/lca/test',
+    envName,
+    ssmPrefix: `/lca/${envName}`,
     table: data.table,
     discoveryQueueUrl: 'https://sqs.us-west-2.amazonaws.com/123456789012/lca-test-discovery',
     discoveryQueueArn: 'arn:aws:sqs:us-west-2:123456789012:lca-test-discovery',
@@ -27,9 +35,8 @@ function synth(over = {}) {
     // Reports-assistant knobs live in EnvConfig, not in stack props (ADR-033 wiring note): a
     // prop nothing passes is a knob no operator can reach, so the override goes through the
     // same path `bin/lca.ts` uses for `-c reportsNl=` / `-c reportsModel=`.
-    config: envConfig('test', over),
+    config: envConfig(envName, over),
   });
-  return Template.fromStack(mgmt);
 }
 
 /** Every action string granted by any policy in the template. */
@@ -231,4 +238,23 @@ test('the run table exposes the M4 repo/time index (ADR-023)', () => {
       },
     ],
   });
+});
+
+test('the λ is given the run retention its report window cap depends on', () => {
+  // `maxRangeDays()` in src/mgmt/reports.ts reads RUN_RETENTION_DAYS to cap a report window,
+  // because terminal rows carry a TTL of exactly that many days (ADR-033: dev 30, prod 90).
+  // Without this variable every environment silently falls back to 90, so a dev console offers
+  // a 90-day report over a table that keeps 30 — and answers it as `complete`.
+  const dev = Template.fromStack(stackFor('test'));
+  dev.hasResourceProperties('AWS::Lambda::Function', {
+    Environment: { Variables: Match.objectLike({ RUN_RETENTION_DAYS: '30' }) },
+  });
+  const prod = Template.fromStack(stackFor('prod'));
+  prod.hasResourceProperties('AWS::Lambda::Function', {
+    Environment: { Variables: Match.objectLike({ RUN_RETENTION_DAYS: '90' }) },
+  });
+  // Same value the control plane's writers stamp the TTL with — one config field, so the
+  // reader and the writers cannot disagree about how long a row lives.
+  assert.equal(String(envConfig('test').runRetentionDays), '30');
+  assert.equal(String(envConfig('prod').runRetentionDays), '90');
 });

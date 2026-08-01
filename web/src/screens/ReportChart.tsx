@@ -177,7 +177,11 @@ export function ReportTable({ report }: { report: Report }): JSX.Element {
         {!report.points.length && (
           <tr>
             <td colSpan={secondary ? 4 : 3} className="muted">
-              No jobs in this window.
+              {/* Same distinction as the panel above: an empty window is not the same thing as a
+                  window whose jobs this metric cannot measure. */}
+              {report.rowCount === 0
+                ? 'No jobs in this window.'
+                : `No ${report.metric.label} measurable over the ${report.rowCount} jobs in this window.`}
             </td>
           </tr>
         )}

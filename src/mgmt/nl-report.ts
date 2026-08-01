@@ -7,7 +7,7 @@ import {
   DIMENSIONS,
   METRICS,
   METRIC_CATALOG,
-  RANGE_PRESETS,
+  availablePresets,
   validateReportSpec,
   type ReportSpec,
 } from './reports.js';
@@ -127,6 +127,11 @@ export function buildSystemPrompt(): string {
   const catalog = METRIC_CATALOG.map(
     (m) => `- ${m.metric}: ${m.label}. Unit: ${m.unit}. ${m.definition}`,
   ).join('\n');
+  // Only the presets this environment's run retention can serve. Listing `90d` where terminal
+  // rows age out at 30 days invites the model to propose a spec the validator then rejects —
+  // the operator gets a refusal for a perfectly reasonable question.
+  const presets = availablePresets();
+  const widest = presets[presets.length - 1];
   return [
     'You translate an operator question about CI job history into a report specification.',
     'You do NOT answer the question and you do NOT write code, queries, HTML or markup.',
@@ -139,7 +144,7 @@ export function buildSystemPrompt(): string {
     `metric: ${METRICS.join(' | ')}`,
     `dimension: ${DIMENSIONS.join(' | ')}`,
     `chart: ${CHART_TYPES.join(' | ')}`,
-    `preset: ${RANGE_PRESETS.join(' | ')}`,
+    `preset: ${presets.join(' | ')}`,
     `flavors: ${flavorNames().join(' | ')}`,
     'statuses: queued | provisioning | running | completed | failed | timed_out',
     '',
@@ -151,6 +156,7 @@ export function buildSystemPrompt(): string {
     '- Never include repository ids or names; repository scope is applied by the server.',
     '- Omit "filters" entirely when the question implies no filter.',
     '- Default to preset "7d" when the question names no time range.',
+    `- Never propose a wider window than "${widest}" — this deployment retains no run history beyond it.`,
     '- Choose "table" only when the question asks for a list rather than a comparison.',
     '- If the question cannot be answered by one of these metrics, reply exactly: {"unsupported": true}',
   ].join('\n');

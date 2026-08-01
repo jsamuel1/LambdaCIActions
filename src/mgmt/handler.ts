@@ -41,12 +41,12 @@ import {
   METRIC_CATALOG,
   CHART_TYPES,
   DIMENSIONS,
-  RANGE_PRESETS,
-  MAX_RANGE_DAYS,
   MAX_EXPORT_ROWS,
   applyFilters,
+  availablePresets,
   boundExportRows,
   computeReport,
+  maxRangeDays,
   specFromQuery,
   specToQuery,
   toCsv,
@@ -561,8 +561,12 @@ async function route_(
         metrics: METRIC_CATALOG,
         dimensions: DIMENSIONS,
         charts: CHART_TYPES,
-        presets: RANGE_PRESETS,
-        maxRangeDays: MAX_RANGE_DAYS,
+        // Only the presets this environment's run retention can actually fill. Offering `90d`
+        // where terminal rows age out at 30 days hands the operator a window the store cannot
+        // serve, and the report would read a partly aged-out span while reporting itself
+        // complete (ADR-043).
+        presets: availablePresets(),
+        maxRangeDays: maxRangeDays(),
         // The UI needs the operator's repo list to offer a repo filter; it is the SAME
         // authorization-resolved set the executor reads from, so the picker cannot offer a
         // repo the report would refuse.

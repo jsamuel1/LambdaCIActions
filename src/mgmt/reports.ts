@@ -53,18 +53,46 @@ export type ReportDimension = (typeof DIMENSIONS)[number];
 export const CHART_TYPES = ['bar', 'stackedBar', 'line', 'table'] as const;
 export type ChartType = (typeof CHART_TYPES)[number];
 
-/** Time-range presets. Bounded by run-row retention — see `MAX_RANGE_DAYS`. */
+/** Time-range presets. Bounded by run-row retention — see `maxRangeDays()`. */
 export const RANGE_PRESETS = ['24h', '7d', '30d', '90d'] as const;
 export type RangePreset = (typeof RANGE_PRESETS)[number];
 
 /**
- * Hard ceiling on a report window: terminal run rows carry a 90-day DynamoDB TTL
- * (`TERMINAL_TTL_SECONDS` in run-store), so a wider window cannot return more data — it
- * would just cost more reads and imply a completeness the store cannot deliver.
+ * Fallback ceiling on a report window, used when the λ was given no `RUN_RETENTION_DAYS`.
+ * Matches `DEFAULT_RUN_RETENTION_DAYS` in run-store for the same reason it exists there: an
+ * unset var must not silently shrink what an existing deployment can report on.
  */
-export const MAX_RANGE_DAYS = 90;
+export const DEFAULT_MAX_RANGE_DAYS = 90;
+
+/**
+ * Hard ceiling on a report window — the store's actual terminal-row retention.
+ *
+ * Terminal run rows carry a DynamoDB TTL of `RUN_RETENTION_DAYS` days (`terminalTtlSeconds`
+ * in run-store), and that is **per-environment** (ADR-033: dev 30, prod 90). A window wider
+ * than retention cannot return more data, so accepting one is not merely wasteful — the report
+ * reads a partially aged-out window and still says `complete: true`, which is the silent-floor
+ * failure every other budget path in this feature reports honestly. Read per call (not captured
+ * at module load) and validated the same way run-store validates it, so a missing or malformed
+ * value falls back instead of poisoning the container.
+ */
+export function maxRangeDays(): number {
+  const raw = process.env.RUN_RETENTION_DAYS;
+  const days = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  return Number.isSafeInteger(days) && days > 0 ? days : DEFAULT_MAX_RANGE_DAYS;
+}
 
 const PRESET_HOURS: Record<RangePreset, number> = { '24h': 24, '7d': 168, '30d': 720, '90d': 2160 };
+
+/**
+ * Presets retention can actually serve. A `90d` option in an environment that ages terminal
+ * rows out at 30 days offers the operator a window the store cannot fill — the picker must not
+ * list it, and `validateReportSpec` rejects it if something else asks for it anyway.
+ */
+export function availablePresets(max: number = maxRangeDays()): RangePreset[] {
+  const allowed = RANGE_PRESETS.filter((p) => PRESET_HOURS[p] / 24 <= max);
+  // Never offer nothing: a pathologically short retention still supports its narrowest window.
+  return allowed.length ? allowed : [RANGE_PRESETS[0]];
+}
 
 /** Which chart types make sense for a metric+dimension pair (the UI and the model share this). */
 export const DEFAULT_CHART: Record<ReportMetric, ChartType> = {
@@ -209,6 +237,8 @@ export function presetWindow(preset: RangePreset, now: Date = new Date()): { fro
 export function validateReportSpec(input: unknown, now: Date = new Date()): SpecResult {
   if (!isPlainObject(input)) return { ok: false, errors: ['spec must be a JSON object'] };
   const errors: string[] = [];
+  const maxDays = maxRangeDays();
+  const presets = availablePresets(maxDays);
   const allowed = new Set(['metric', 'dimension', 'chart', 'filters', 'from', 'to', 'preset']);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) errors.push(`unknown field "${key}"`);
@@ -240,7 +270,15 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
   let preset: RangePreset | undefined;
   if (input.preset !== undefined) {
     if (typeof input.preset !== 'string' || !(RANGE_PRESETS as readonly string[]).includes(input.preset)) {
-      errors.push(`preset must be one of ${RANGE_PRESETS.join(', ')}`);
+      errors.push(`preset must be one of ${presets.join(', ')}`);
+    } else if (!(presets as readonly string[]).includes(input.preset)) {
+      // A preset wider than retention is REJECTED, not clamped: clamping would answer a
+      // different question than the one asked while reporting `complete: true`. Reachable via a
+      // shared 90d URL opened against an environment that keeps 30 days.
+      errors.push(
+        `preset ${input.preset} exceeds the ${maxDays}-day run retention of this environment ` +
+          `(available: ${presets.join(', ')})`,
+      );
     } else {
       preset = input.preset as RangePreset;
     }
@@ -252,8 +290,8 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
     if (toMs === undefined) errors.push('to must be an ISO8601 timestamp');
     if (fromMs !== undefined && toMs !== undefined) {
       if (toMs <= fromMs) errors.push('to must be after from');
-      else if (toMs - fromMs > MAX_RANGE_DAYS * 86_400_000) {
-        errors.push(`window exceeds the ${MAX_RANGE_DAYS}-day run retention`);
+      else if (toMs - fromMs > maxDays * 86_400_000) {
+        errors.push(`window exceeds the ${maxDays}-day run retention`);
       } else {
         from = new Date(fromMs).toISOString();
         to = new Date(toMs).toISOString();
@@ -261,10 +299,13 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
       }
     }
   } else {
-    const win = presetWindow(preset ?? '7d', now);
+    // Default window: 7d where retention allows it, otherwise the widest preset it does.
+    const fallback = presets.includes('7d') ? '7d' : presets[presets.length - 1];
+    const chosen = preset ?? fallback;
+    const win = presetWindow(chosen, now);
     from = win.from;
     to = win.to;
-    preset = preset ?? '7d';
+    preset = chosen;
   }
 
   const filters: ReportFilters = {};
@@ -426,6 +467,14 @@ export interface ReportResult {
   complete: boolean;
   /** Fraction of contributing rows whose value was measured rather than inferred (0-1). */
   coverage: number;
+  /**
+   * Rows in `coverage`'s DENOMINATOR — how many rows could have contributed to this metric at
+   * all. Zero means the ratio is vacuous (0/0), which `coverage` reports as 1: without this a
+   * report over 500 queued jobs claims "Coverage 100%" on a metric that measured NOTHING. The
+   * UI reads this to say so instead, and to tell "no rows in the window" apart from "rows, but
+   * none this metric can measure" — two states that both produce an empty series.
+   */
+  coverageSampleSize: number;
   /** Human note about what the coverage/estimate caveat means for this metric. */
   caveat?: string;
   /**
@@ -610,6 +659,7 @@ export function computeReport(
     rowCount: runs.length,
     complete: opts.complete ?? true,
     coverage: coverageDen === 0 ? 1 : round(coverageNum / coverageDen, 4),
+    coverageSampleSize: coverageDen,
     caveat: caveatFor(spec.metric),
     exportRowLimit: MAX_EXPORT_ROWS,
     generatedAt: now.toISOString(),

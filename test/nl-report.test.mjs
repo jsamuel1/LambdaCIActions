@@ -235,3 +235,41 @@ test('proposeSpec runs the model output through the same validator', async () =>
 test('the default model id is pinned, not latest-floating', () => {
   assert.match(DEFAULT_MODEL_ID, /^anthropic\.claude-3-5-sonnet-\d{8}-v\d:\d$/);
 });
+
+// ---- the model's menu tracks real retention ---------------------------------
+
+function withRetention(days, fn) {
+  const prev = process.env.RUN_RETENTION_DAYS;
+  if (days === undefined) delete process.env.RUN_RETENTION_DAYS;
+  else process.env.RUN_RETENTION_DAYS = String(days);
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.RUN_RETENTION_DAYS;
+    else process.env.RUN_RETENTION_DAYS = prev;
+  }
+}
+
+test('the prompt never offers a window this environment cannot serve', () => {
+  // The prompt and the validator must show the same menu. Run retention is per-environment
+  // (ADR-033: dev 30, prod 90), so a fixed `90d` in the prompt asks the model to propose specs
+  // the validator then rejects — the operator gets a refusal for a reasonable question, on a
+  // path whose entire availability story is "degrade gracefully".
+  const dev = withRetention(30, () => buildSystemPrompt());
+  assert.match(dev, /^preset: 24h \| 7d \| 30d$/m);
+  assert.ok(!/90d/.test(dev), 'the prompt offers a preset the validator would reject');
+  assert.match(dev, /Never propose a wider window than "30d"/);
+
+  const prod = withRetention(90, () => buildSystemPrompt());
+  assert.match(prod, /^preset: 24h \| 7d \| 30d \| 90d$/m);
+  assert.match(prod, /Never propose a wider window than "90d"/);
+});
+
+test('a model-proposed window beyond THIS environment\'s retention is refused', () => {
+  withRetention(30, () => {
+    const r = specFromCompletion('{"metric":"spend","dimension":"repo","preset":"90d"}', NOW);
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'invalid-spec');
+    assert.match((r.errors ?? []).join(' '), /30-day run retention/);
+  });
+});

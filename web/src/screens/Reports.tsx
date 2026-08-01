@@ -290,6 +290,12 @@ function Picker({
               last {p}
             </option>
           ))}
+          {/* A shared link can name a preset this environment's retention cannot serve (a `90d`
+              URL opened against a 30-day deployment). The catalog omits it, so without this the
+              select renders blank and the server's rejection looks unrelated to the control. */}
+          {query.preset && !catalog.presets.includes(query.preset) && (
+            <option value={query.preset}>last {query.preset} (beyond retention)</option>
+          )}
           {!query.preset && <option value="custom">custom</option>}
         </select>
 
@@ -367,7 +373,12 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
         </p>
         {report.caveat && (
           <p className="gap-top muted tight">
-            Coverage {Math.round(report.coverage * 100)}%. {report.caveat}
+            {report.coverageSampleSize === 0
+              ? // Coverage is 0/0 here. Printing the ratio would say "100%" about a metric that
+                // measured nothing — the one number on this screen that must never overstate.
+                'No jobs in this window could contribute to this metric. '
+              : `Coverage ${Math.round(report.coverage * 100)}%. `}
+            {report.caveat}
           </p>
         )}
         {!report.complete && (
@@ -400,7 +411,16 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
           // The chart is mounted ONLY with a non-empty series: it owns an ECharts instance bound
           // to its host div, so an internal empty-state return would strand that instance (see
           // ReportChart). Mount/unmount instead, and let React dispose it.
-          <p className="muted">No jobs in this window.</p>
+          //
+          // Two DIFFERENT states land here and must not share one sentence: an empty window, and
+          // a window with jobs none of which this metric can measure (500 queued jobs under
+          // `duration`, say). Saying "no jobs" for the second contradicts the job count printed
+          // directly above it.
+          <p className="muted">
+            {report.rowCount === 0
+              ? 'No jobs in this window.'
+              : `${report.rowCount} jobs in this window, but none of them can be measured by ${report.metric.label} — see the note above.`}
+          </p>
         ) : (
           <>
             <ReportChart report={report} />

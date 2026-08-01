@@ -118,6 +118,11 @@ export class MgmtStack extends Stack {
         OAUTH_CLIENT_SECRET_PARAM: `${ssmPrefix}/github/client-secret`,
         RUN_LOG_GROUP: runLogGroupName,
         TABLE_NAME: table.tableName,
+        // Terminal-row retention (ADR-033). The control plane's writers already get this to
+        // set the TTL; Reports needs the SAME number to cap a report window, or the console
+        // offers a 90-day report in an environment that ages rows out at 30 and the result
+        // reads a partly aged-out window while reporting itself complete (ADR-043).
+        RUN_RETENTION_DAYS: String(config.runRetentionDays),
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
         REWRITE_QUEUE_URL: props.rewriteQueueUrl ?? '',
         REWRITE_ENABLED: config.rewriteEnabled ? 'true' : 'false',

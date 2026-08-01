@@ -13,14 +13,16 @@ import {
   DIMENSIONS,
   CHART_TYPES,
   METRIC_CATALOG,
-  MAX_RANGE_DAYS,
+  DEFAULT_MAX_RANGE_DAYS,
   MAX_EXPORT_BYTES,
   MAX_EXPORT_ROWS,
   applyFilters,
+  availablePresets,
   billableSeconds,
   boundExportRows,
   computeReport,
   jobCostUsd,
+  maxRangeDays,
   metricDoc,
   percentiles,
   presetWindow,
@@ -33,6 +35,32 @@ import {
 } from '../dist/src/mgmt/reports.js';
 
 const NOW = new Date('2026-07-15T12:00:00.000Z');
+
+/**
+ * Slice a source file between two anchors, FAILING if either is missing.
+ *
+ * `String.prototype.indexOf` returns -1 for a missing anchor, and `s.slice(start, -1)` is a
+ * perfectly valid call that returns almost the whole file. So the obvious guard
+ * (`start >= 0 && body.length > 0`) passes on a slice that is silently unbounded, and every
+ * `!/pattern/.test(body)` assertion below it then searches the entire file instead of the
+ * function it meant to pin — a rename of the terminating function turns a regression guard into
+ * a no-op without failing. Assert both anchors and a plausible size instead.
+ */
+function sliceBetween(source, startAnchor, endAnchor, maxChars) {
+  const start = source.indexOf(startAnchor);
+  assert.ok(start >= 0, `start anchor not found: ${startAnchor}`);
+  const end = source.indexOf(endAnchor, start + startAnchor.length);
+  assert.ok(end > start, `end anchor not found after the start anchor: ${endAnchor}`);
+  const body = source.slice(start, end);
+  assert.ok(body.length > 0, `empty slice between ${startAnchor} and ${endAnchor}`);
+  if (maxChars !== undefined) {
+    assert.ok(
+      body.length <= maxChars,
+      `slice from ${startAnchor} is ${body.length} chars (> ${maxChars}) — it likely ran past its terminator, which would make the assertions below unbounded`,
+    );
+  }
+  return body;
+}
 
 function job(over = {}) {
   return {
@@ -129,7 +157,7 @@ test('a window wider than run retention is rejected', () => {
     NOW,
   );
   assert.equal(r.ok, false);
-  assert.match(r.errors.join(' '), new RegExp(`${MAX_RANGE_DAYS}-day`));
+  assert.match(r.errors.join(' '), new RegExp(`${maxRangeDays()}-day`));
 });
 
 test('an inverted window is rejected', () => {
@@ -476,10 +504,7 @@ test('every chart type in the vocabulary is one the frontend actually renders', 
     new URL('../web/src/screens/ReportChart.tsx', import.meta.url),
     'utf8',
   );
-  const map = renderer.slice(
-    renderer.indexOf('CHART_RENDERING'),
-    renderer.indexOf('};', renderer.indexOf('CHART_RENDERING')),
-  );
+  const map = sliceBetween(renderer, 'CHART_RENDERING', '};', 400);
   for (const chart of CHART_TYPES) {
     assert.ok(
       new RegExp(`\\b${chart}:`).test(map),
@@ -513,9 +538,7 @@ test('the chart host is unconditional and the empty series is gated by the calle
   );
   // Bounded to ReportChart itself: ReportTable follows it and legitimately has its own
   // empty-row branch, which is fine — it owns no ECharts instance.
-  const start = chart.indexOf('export function ReportChart');
-  const body = chart.slice(start, chart.indexOf('export function ReportTable', start));
-  assert.ok(start >= 0 && body.length > 0, 'could not isolate the ReportChart body');
+  const body = sliceBetween(chart, 'export function ReportChart', 'export function ReportTable', 2000);
   assert.ok(
     !/report\.points\.length/.test(body),
     'ReportChart returns early on an empty series again — that strands its ECharts instance',
@@ -542,9 +565,7 @@ test('the assistant provenance line is dropped once the picker moves off its spe
     new URL('../web/src/screens/Reports.tsx', import.meta.url),
     'utf8',
   );
-  const start = screen.indexOf('function Assistant');
-  const body = screen.slice(start, screen.indexOf('function specToQuery', start));
-  assert.ok(start >= 0 && body.length > 0, 'could not isolate the Assistant body');
+  const body = sliceBetween(screen, 'function Assistant', 'function specToQuery', 4000);
   assert.ok(
     /query:\s*ReportQuery/.test(body),
     'Assistant cannot detect staleness without seeing the live query',
@@ -619,12 +640,11 @@ test('the assistant route returns a spec and never executes the report itself', 
   // answer, with the first result discarded. Source-level, matching the other handler/SPA
   // assertions in this file — this repo drives pure helpers and has no handler harness.
   const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
-  const start = handler.indexOf('async function askReportRoute');
-  const body = handler.slice(start, handler.indexOf('async function settingsRoute', start));
-  assert.ok(start >= 0 && body.length > 0, 'could not isolate askReportRoute');
-  assert.ok(
-    body.length < 3000,
-    'the askReportRoute slice ran past its terminator — the assertions below would be unbounded',
+  const body = sliceBetween(
+    handler,
+    'async function askReportRoute',
+    'async function settingsRoute',
+    3000,
   );
   assert.ok(
     !/executeReport/.test(body),
@@ -641,7 +661,10 @@ test('the assistant route returns a spec and never executes the report itself', 
     /onSpec\(specToQuery\(res\.spec\)\)/.test(screen),
     'the console must adopt the returned spec as picker state',
   );
-  const view = screen.slice(screen.indexOf('function ReportView'));
+  const viewStart = screen.indexOf('function ReportView');
+  assert.ok(viewStart >= 0, 'could not find ReportView');
+  const view = screen.slice(viewStart);
+  assert.ok(view.length > 0, 'could not isolate ReportView');
   assert.ok(
     !/resolved\.points|resolved\.total/.test(view),
     'the rendered view must come from /api/reports/run, not the ask response',
@@ -655,9 +678,12 @@ test('a truncated CSV export declares its truncation, since the body cannot', ()
   // no operator sees is not a disclosure. Source-level, matching the SPA assertions above:
   // this repo drives pure helpers in tests and has no handler/DOM harness.
   const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
-  const start = handler.indexOf('async function exportReportRoute');
-  const body = handler.slice(start, handler.indexOf('async function askReportRoute', start));
-  assert.ok(start >= 0 && body.length > 0, 'could not isolate exportReportRoute');
+  const body = sliceBetween(
+    handler,
+    'async function exportReportRoute',
+    'async function askReportRoute',
+    4000,
+  );
   assert.ok(
     /'X-Report-Complete': String\(fetched\.complete && bounded\.complete\)/.test(body),
     'the CSV export must publish its completeness in a header',
@@ -837,10 +863,12 @@ test('both export formats fold the export cap into the completeness they publish
   // dropped on the way out", or a capped export reports itself as a full one through the exact
   // channel built to disclose truncation. Source-level, matching the other handler assertions.
   const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
-  const start = handler.indexOf('async function exportReportRoute');
-  const body = handler.slice(start, handler.indexOf('async function askReportRoute', start));
-  assert.ok(start >= 0 && body.length > 0, 'could not isolate exportReportRoute');
-  assert.ok(body.length < 4000, 'the exportReportRoute slice ran past its terminator');
+  const body = sliceBetween(
+    handler,
+    'async function exportReportRoute',
+    'async function askReportRoute',
+    4000,
+  );
 
   // Both formats bound before serializing...
   assert.equal(
@@ -857,5 +885,150 @@ test('both export formats fold the export cap into the completeness they publish
   assert.ok(
     /'X-Report-Complete': String\(fetched\.complete && bounded\.complete\)/.test(body),
     'the CSV header must reflect the export cap as well as the read budget',
+  );
+});
+
+// ---- window cap follows real retention -------------------------------------
+
+/** Run a body with RUN_RETENTION_DAYS set, restoring whatever was there before. */
+function withRetention(days, fn) {
+  const prev = process.env.RUN_RETENTION_DAYS;
+  if (days === undefined) delete process.env.RUN_RETENTION_DAYS;
+  else process.env.RUN_RETENTION_DAYS = String(days);
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.RUN_RETENTION_DAYS;
+    else process.env.RUN_RETENTION_DAYS = prev;
+  }
+}
+
+test('the report window cap is the environment\'s real run retention, not a hardcoded 90', () => {
+  // Terminal rows carry a TTL of RUN_RETENTION_DAYS days, and that is PER-ENVIRONMENT
+  // (ADR-033: dev 30, prod 90). A 90-day cap in a 30-day environment accepts a window most of
+  // which has already aged out of the table — and the report then answers over a partially
+  // deleted span while reporting `complete: true`, which is precisely the silent floor every
+  // other budget path in this feature discloses.
+  assert.equal(withRetention(30, () => maxRangeDays()), 30);
+  assert.equal(withRetention(90, () => maxRangeDays()), 90);
+  // Unset / malformed falls back rather than shrinking an existing deployment's reports.
+  assert.equal(withRetention(undefined, () => maxRangeDays()), DEFAULT_MAX_RANGE_DAYS);
+  assert.equal(withRetention('abc', () => maxRangeDays()), DEFAULT_MAX_RANGE_DAYS);
+  assert.equal(withRetention(0, () => maxRangeDays()), DEFAULT_MAX_RANGE_DAYS);
+});
+
+test('a preset wider than retention is REJECTED, not silently clamped', () => {
+  // Reachable without any hostile input: a `90d` report URL shared from prod, opened against a
+  // 30-day environment. Clamping would answer a different question than the link names while
+  // still reporting itself complete, so it has to be an error the operator can read.
+  withRetention(30, () => {
+    const r = validateReportSpec({ metric: 'spend', preset: '90d' }, NOW);
+    assert.equal(r.ok, false);
+    assert.match(r.errors.join(' '), /30-day run retention/);
+    // …and the error names what IS available, so the message is actionable.
+    assert.match(r.errors.join(' '), /24h, 7d, 30d/);
+  });
+  // The same preset is fine where retention actually covers it.
+  withRetention(90, () => {
+    const r = validateReportSpec({ metric: 'spend', preset: '90d' }, NOW);
+    assert.equal(r.ok, true);
+  });
+});
+
+test('an explicit window is capped by retention too', () => {
+  withRetention(30, () => {
+    const r = validateReportSpec(
+      { metric: 'spend', from: '2026-05-01T00:00:00.000Z', to: '2026-07-15T00:00:00.000Z' },
+      NOW,
+    );
+    assert.equal(r.ok, false);
+    assert.match(r.errors.join(' '), /30-day run retention/);
+  });
+});
+
+test('the picker and the model are only offered presets retention can fill', () => {
+  assert.deepEqual(withRetention(30, () => availablePresets()), ['24h', '7d', '30d']);
+  assert.deepEqual(withRetention(90, () => availablePresets()), ['24h', '7d', '30d', '90d']);
+  assert.deepEqual(withRetention(1, () => availablePresets()), ['24h']);
+  // Never empty: a pathologically short retention still serves its narrowest window, or the
+  // screen would have no window control at all.
+  assert.deepEqual(withRetention(0, () => availablePresets(0)), ['24h']);
+});
+
+test('the default window degrades when retention cannot serve 7d', () => {
+  withRetention(1, () => {
+    const r = validateReportSpec({ metric: 'spend' }, NOW);
+    assert.equal(r.ok, true);
+    assert.equal(r.value.preset, '24h');
+  });
+});
+
+test('the Mgmt λ is actually given the retention it caps windows with', () => {
+  // `maxRangeDays()` reads RUN_RETENTION_DAYS. If MgmtStack never passes it, the knob is
+  // unreachable and every environment silently gets the 90-day fallback — the defect class
+  // ADR-033 names ("a config knob that nothing reads is worse than no knob"). Asserted at the
+  // source because the stack test suite covers the synthesized template separately.
+  const stack = fs.readFileSync(new URL('../lib/mgmt-stack.ts', import.meta.url), 'utf8');
+  assert.match(
+    stack,
+    /RUN_RETENTION_DAYS: String\(config\.runRetentionDays\)/,
+    'MgmtStack must pass the env config retention to the λ',
+  );
+});
+
+// ---- coverage over an empty sample -----------------------------------------
+
+test('a metric that measured nothing does not report 100% coverage', () => {
+  // `coverage` is num/den and den can legitimately be 0 — a spend report over jobs that never
+  // launched, or a duration report over jobs still queued. Reported as the ratio it would be
+  // "100%", i.e. the screen claims everything was measured about a metric that measured
+  // nothing. `coverageSampleSize` is the denominator, so the UI can say so instead.
+  const queued = [
+    job({ jobId: 1, status: 'queued', flavor: undefined, runningAt: undefined }),
+    job({ jobId: 2, status: 'queued', flavor: undefined, runningAt: undefined }),
+  ];
+  const spend = computeReport(queued, SPEC({ metric: 'spend' }), { now: NOW });
+  assert.equal(spend.coverageSampleSize, 0, 'no row was priced, so the ratio is vacuous');
+  assert.equal(spend.total, 0);
+  assert.equal(spend.rowCount, 2, 'the rows are still counted — they exist');
+
+  // A priced row makes the denominator real again.
+  const priced = computeReport([...queued, job({ jobId: 3 })], SPEC({ metric: 'spend' }), { now: NOW });
+  assert.equal(priced.coverageSampleSize, 1);
+  assert.equal(priced.coverage, 1);
+});
+
+test('rows in the window with nothing measurable are not reported as "no jobs"', () => {
+  // A duration report over 2 queued jobs produces an EMPTY series while `rowCount` is 2. The
+  // panel used to render one flat "No jobs in this window." for both the genuinely empty window
+  // and this one, contradicting the job count printed directly above it.
+  const inflight = [
+    job({ jobId: 1, status: 'queued', runningAt: undefined }),
+    job({ jobId: 2, status: 'running' }),
+  ];
+  const r = computeReport(inflight, SPEC({ metric: 'duration' }), { now: NOW });
+  assert.equal(r.points.length, 0, 'no terminal row, so no point');
+  assert.equal(r.rowCount, 2, 'but the rows are there');
+  assert.equal(r.coverageSampleSize, 2, 'they COULD have contributed — none did');
+  assert.equal(r.coverage, 0);
+
+  // A truly empty window is the distinguishable case: no rows at all.
+  const empty = computeReport([], SPEC({ metric: 'duration' }), { now: NOW });
+  assert.equal(empty.rowCount, 0);
+  assert.equal(empty.coverageSampleSize, 0);
+
+  // The screen must branch on both, not print one sentence for all three states.
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  const view = sliceBetween(screen, 'function ReportView', '\n}\n', 6000);
+  assert.ok(
+    /coverageSampleSize === 0/.test(view),
+    'the coverage line must not print a ratio over an empty sample',
+  );
+  assert.ok(
+    /rowCount === 0/.test(view),
+    'the empty panel must tell an empty window apart from an unmeasurable one',
   );
 });

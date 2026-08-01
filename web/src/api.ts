@@ -253,6 +253,12 @@ export interface Report {
   /** False when the fan-out spent its page budget — the numbers are a floor. */
   complete: boolean;
   coverage: number;
+  /**
+   * Rows in `coverage`'s denominator. Zero means the ratio is vacuous (0/0, reported as 1), so
+   * the UI must not print "100%" — nothing was measured. It also separates "no rows in the
+   * window" from "rows, but none this metric can measure", which look identical in `points`.
+   */
+  coverageSampleSize: number;
   caveat?: string;
   /**
    * Rows an export of this report will carry at most. A CSV/JSON download is one synchronous

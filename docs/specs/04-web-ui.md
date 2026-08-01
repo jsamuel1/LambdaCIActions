@@ -221,9 +221,15 @@ assistant's prompt is generated from it so the two cannot drift):
 Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days, else daily),
 `none`. Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
 a wish list, so a spec can never resolve to a chart type that silently falls through to a
-different one. Windows: `24h`/`7d`/`30d`/`90d`
-presets or an explicit `from`/`to`, capped at **90 days** because terminal rows carry a 90-day
-TTL. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
+different one. Windows: the `24h`/`7d`/`30d`/`90d` presets **that this environment's run
+retention can actually fill**, or an explicit `from`/`to` capped at the same number. That cap is
+`RUN_RETENTION_DAYS` (ADR-033: dev 30, prod 90), not a fixed 90 — terminal rows age out at
+exactly that TTL, so a wider window reads a partly deleted span and would report itself
+`complete`. A preset beyond retention (a `90d` link shared into a 30-day deployment) is rejected
+with an error naming the presets that are available; the picker still shows the requested value
+labelled `(beyond retention)` so the refusal is legible against the control that caused it, and
+the assistant's prompt lists only servable presets so a fair question is not answered with a
+refusal. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
 p90 invents a value between two real jobs. A row whose span cannot be measured (unparseable or
 inverted timestamps — `createdAt` and `runningAt` are written by different λ invocations) is
 **excluded from the sample and counted as uncovered**, never folded in as a 0-second job, which
@@ -247,7 +253,15 @@ microVM bill is still outstanding
 **Every report reports its own completeness.** `complete: false` means the read budget was spent
 before the window was exhausted, and the UI renders the numbers as a floor with advice to narrow
 the window — it never silently truncates. `coverage` and the metric's `caveat` are shown
-alongside every chart. The transparency block separates the two repo counts that a partial read
+alongside every chart, and `coverageSampleSize` reports that ratio's **denominator** so a vacuous
+one is never dressed up as a good result: a spend report over jobs that never launched, or a
+duration report over jobs still queued, has a 0/0 coverage that would print as *“100%”* — i.e.
+the screen claiming it measured everything about a metric that measured nothing. Where the sample
+is empty the UI says so instead of printing a ratio. The same number separates two states that
+both produce an empty series and must not share one sentence: an empty window (*“No jobs in this
+window”*) and a window whose jobs the chosen metric cannot measure (*“N jobs in this window, but
+none of them can be measured by …”*), the second of which otherwise contradicts the job count
+printed directly above it. The transparency block separates the two repo counts that a partial read
 makes different: `repoCount` is the operator's authorization scope, `repoCountRead` is the repos a
 query was actually issued for. They diverge only when the row budget stopped the fan-out, and the
 UI then reads *“M of N repos read”* rather than implying the numbers cover the whole scope.

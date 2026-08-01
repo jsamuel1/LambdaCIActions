@@ -1880,8 +1880,17 @@ exactly the post-filter hazard this ADR exists to eliminate.
 newest-first, so paging stops at the first row older than the window — a 24 h report costs one
 page per repo. Spending a budget sets `complete: false`, which the API returns and the UI
 renders as "treat these numbers as a floor"; it never silently truncates. Report windows are
-capped at 90 days because terminal rows carry a 90-day TTL, so a wider window cannot return
-more data. An operator with hundreds of active repos and a 90-day window is the case this
+capped at the environment's **actual** terminal-row retention (`RUN_RETENTION_DAYS`, ADR-033:
+dev 30, prod 90) rather than a fixed 90, and the Mgmt λ is given that same config value the
+control-plane writers stamp the TTL with. A fixed 90-day cap was wrong in a way that mattered:
+in a 30-day environment it accepted a window most of which had already aged out of the table,
+and the report answered over that partially deleted span while reporting `complete: true` — the
+exact silent floor every other budget path here discloses. A preset or explicit window wider
+than retention is **rejected with a readable error naming the available presets**, not clamped
+(clamping answers a different question than the shared link names), and both the picker's option
+list and the assistant's prompt menu are generated from the same number so neither offers a
+window the validator would refuse. An operator with hundreds of active repos and a 90-day window
+is the case this
 design serves worst; if that becomes real, rollups keyed *per installation* are the next step.
 `test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the
 platform-wide total is strictly larger than the tenant total (so the test is actually
