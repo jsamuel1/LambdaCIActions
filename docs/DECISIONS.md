@@ -1914,9 +1914,14 @@ in one place. The Mgmt λ's posture widens by exactly one action on one resource
 **Cost / abuse controls**: `POST` (never a prefetchable `GET`); question capped at 400 chars and
 validated before any spend; per-actor sliding window of 10 invocations/minute keyed on the
 server-derived session login; a per-container ceiling of 500 invocations as a crude spend cap.
-Every invocation is logged with the actor, the model id, the outcome and the question *length* —
-never its content, which is operator-authored text. A durable cross-container budget belongs in
-the run table and is deferred rather than faked.
+**And the route does not execute the report.** `/api/reports/ask` returns the validated spec plus
+its provenance; the console adopts that spec as picker state, which fetches
+`GET /api/reports/run`. Executing in both places ran the authorization fan-out TWICE per question
+(up to 2 × `MAX_TOTAL_ROWS` = 40 000 row reads) and discarded the first result, since the console
+only ever rendered the deterministic fetch. One executor also means an assistant answer and the
+shared URL for it cannot drift apart. Every invocation is logged with the actor, the model id, the
+outcome and the question *length* — never its content, which is operator-authored text. A durable
+cross-container budget belongs in the run table and is deferred rather than faked.
 **Consequences**: the console now has a per-request marginal cost on one interaction it did not
 have before, and a Bedrock regional dependency. Throttling, an unconfigured model, or a
 malformed response degrade to the manual picker (ADR-045), never to an error page.
@@ -1932,11 +1937,14 @@ gets executed or rendered is an injection sink with a straight path to another t
 report spec — one of 5 metrics, one of 6 dimensions, one of 4 chart types, a preset window, and
 optional flavor/status filters — which is parsed as data and passed through
 `validateReportSpec`, the *same* validator the manual picker's query params go through. The
-backend executes the deterministic report; the frontend renders it with pre-built components.
+backend then executes the deterministic report **through the one report route**
+(`GET /api/reports/run`); the frontend renders it with pre-built components.
 Specifically:
 - **No `eval`, no `new Function`, no `dangerouslySetInnerHTML`, no model-authored JS/JSX/HTML**,
   and no model-authored DynamoDB expression. Unknown fields are rejected, not ignored, so a
-  spec carrying `html`, `component`, `query` or `KeyConditionExpression` fails closed.
+  spec carrying `html`, `component`, `query` or `KeyConditionExpression` fails closed. An
+  ill-typed field is rejected too, never coerced: an explicit `dimension: null` is an error, not
+  a silent default, because a repaired spec answers a question nobody asked.
 - **Authorization is not a spec field.** Scope comes from the session's installations
   (ADR-043). A spec naming a foreign repo id contributes zero rows.
 - **No tenant data in the prompt.** Repo/workflow/job names are never sent, so a repo named

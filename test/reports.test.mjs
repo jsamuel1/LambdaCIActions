@@ -556,6 +556,95 @@ test('the assistant provenance line is dropped once the picker moves off its spe
   );
 });
 
+test('an explicit null dimension is rejected, not coerced to a default', () => {
+  // `input.dimension ?? 'none'` silently repaired this into a different report than the one
+  // asked for. ADR-045 promises ill-typed spec input is REJECTED; the `chart` branch already
+  // behaved that way, so the coercion was also an internal inconsistency. An ABSENT dimension
+  // still defaults — that is the documented shorthand.
+  for (const bad of [null, 42, ['repo'], { d: 'repo' }]) {
+    const r = validateReportSpec({ metric: 'spend', dimension: bad }, NOW);
+    assert.equal(r.ok, false, `dimension ${JSON.stringify(bad)} was accepted`);
+    assert.ok(r.errors.some((e) => e.includes('dimension must be one of')));
+  }
+  const absent = validateReportSpec({ metric: 'spend' }, NOW);
+  assert.ok(absent.ok);
+  assert.equal(absent.value.dimension, 'none');
+});
+
+test('an unmeasurable span is excluded from percentiles rather than folded in as zero', () => {
+  // A fabricated 0s is indistinguishable from a genuinely instant job and drags p50/p90 down,
+  // which is precisely what both percentile metrics promise not to do. `runningAt` and
+  // `createdAt` are written by different λ invocations, so an inverted pair is reachable.
+  const spec = SPEC({ metric: 'queueLatency', dimension: 'none' });
+  const good = [
+    job({ jobId: 1, createdAt: '2026-07-15T11:00:00.000Z', runningAt: '2026-07-15T11:00:30.000Z' }),
+    job({ jobId: 2, createdAt: '2026-07-15T11:00:00.000Z', runningAt: '2026-07-15T11:00:40.000Z' }),
+  ];
+  const skewed = job({
+    jobId: 3,
+    createdAt: '2026-07-15T11:00:00.000Z',
+    runningAt: '2026-07-15T10:59:00.000Z', // watermark BEFORE queued
+  });
+  const unparseable = job({ jobId: 4, createdAt: '2026-07-15T11:00:00.000Z', runningAt: 'nope' });
+
+  const clean = computeReport(good, spec, { now: NOW });
+  const dirty = computeReport([...good, skewed, unparseable], spec, { now: NOW });
+
+  assert.equal(dirty.points[0].sampleSize, 2, 'an unmeasurable row entered the sample');
+  assert.equal(dirty.points[0].value, clean.points[0].value, 'p50 was dragged down by a fake 0');
+  assert.equal(dirty.points[0].secondary, clean.points[0].secondary);
+  // And it is reported as uncovered, not silently covered: 2 of 4 rows measured.
+  assert.equal(dirty.coverage, 0.5);
+});
+
+test('duration excludes a terminal row whose span cannot be measured', () => {
+  const spec = SPEC({ metric: 'duration', dimension: 'none' });
+  const rows = [
+    job({ jobId: 1, createdAt: '2026-07-15T11:00:00.000Z', updatedAt: '2026-07-15T11:01:00.000Z' }),
+    // Terminal, but updatedAt precedes createdAt — no measurable span.
+    job({ jobId: 2, createdAt: '2026-07-15T11:00:00.000Z', updatedAt: '2026-07-15T10:00:00.000Z' }),
+  ];
+  const res = computeReport(rows, spec, { now: NOW });
+  assert.equal(res.points[0].sampleSize, 1);
+  assert.equal(res.points[0].value, 60);
+  assert.equal(res.coverage, 0.5, 'the unmeasurable row must count as uncovered');
+});
+
+test('the assistant route returns a spec and never executes the report itself', () => {
+  // Two full authorization fan-outs per question (once in `ask`, once when the console adopts
+  // the spec and fetches /api/reports/run) is up to 2 x MAX_TOTAL_ROWS of DynamoDB reads for one
+  // answer, with the first result discarded. Source-level, matching the other handler/SPA
+  // assertions in this file — this repo drives pure helpers and has no handler harness.
+  const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  const start = handler.indexOf('async function askReportRoute');
+  const body = handler.slice(start, handler.indexOf('async function settingsRoute', start));
+  assert.ok(start >= 0 && body.length > 0, 'could not isolate askReportRoute');
+  assert.ok(
+    body.length < 3000,
+    'the askReportRoute slice ran past its terminator — the assertions below would be unbounded',
+  );
+  assert.ok(
+    !/executeReport/.test(body),
+    'askReportRoute executes the report again — that doubles the fan-out per question',
+  );
+  assert.ok(/spec: proposal\.spec/.test(body), 'ask must hand back the validated spec');
+
+  // …and the client must render from the deterministic route, not from the ask response.
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.ok(
+    /onSpec\(specToQuery\(res\.spec\)\)/.test(screen),
+    'the console must adopt the returned spec as picker state',
+  );
+  const view = screen.slice(screen.indexOf('function ReportView'));
+  assert.ok(
+    !/resolved\.points|resolved\.total/.test(view),
+    'the rendered view must come from /api/reports/run, not the ask response',
+  );
+});
+
 test('a truncated CSV export declares its truncation, since the body cannot', () => {
   // The JSON export carries `complete` in its payload; CSV has nowhere to put it, so a
   // budget-truncated download would look like a full one and its row count would be read as a

@@ -871,8 +871,14 @@ async function exportReportRoute(
  *   operator question → model → JSON spec → validateReportSpec → executeReport
  *
  * The model's output is data. It is parsed, validated against the closed catalog, and either
- * executed by the SAME deterministic code path as the manual picker or refused. Nothing it
+ * handed back as a spec the SAME deterministic route then executes, or refused. Nothing it
  * returns is evaluated or rendered, and it cannot influence which repos are read.
+ *
+ * This route deliberately does NOT execute the report. The console adopts the returned spec as
+ * picker state, which makes it fetch `GET /api/reports/run` for that spec — so executing here
+ * too would run the authorization fan-out TWICE per question (up to 2 x MAX_TOTAL_ROWS row
+ * reads) and throw the first result away. `/api/reports/run` stays the single executor, which
+ * also means a shared URL and an assistant answer are byte-identical by construction.
  */
 async function askReportRoute(
   session: SessionPayload,
@@ -926,8 +932,16 @@ async function askReportRoute(
       fallback: 'manual',
     });
   }
-  const report = await executeReport(session, proposal.spec);
-  return json(200, { ...report, source: { kind: 'model', modelId: proposal.modelId } });
+  // Spec + provenance only. The client renders from the deterministic route.
+  return json(200, {
+    spec: proposal.spec,
+    source: { kind: 'model', modelId: proposal.modelId },
+    resolved: {
+      query: specToQuery(proposal.spec),
+      /** Restates that scope came from the session, never from the request or the model. */
+      scope: 'operator installations',
+    },
+  });
 }
 
 /**

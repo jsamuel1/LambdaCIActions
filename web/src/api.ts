@@ -264,8 +264,20 @@ export interface Report {
     repoCountRead: number;
     scope: string;
   };
-  /** Present when the spec came from the model rather than the picker. */
-  source?: { kind: 'model'; modelId: string };
+}
+
+/**
+ * A model-proposed report: the validated spec and its provenance, WITHOUT a result.
+ *
+ * `/api/reports/ask` deliberately does not execute the report. The screen adopts this spec as
+ * picker state, which fetches `/api/reports/run` — so returning a result here too would run the
+ * authorization fan-out twice per question and discard the first one. One executor also means an
+ * assistant answer and a shared URL cannot differ.
+ */
+export interface AskResult {
+  spec: ReportSpec;
+  source: { kind: 'model'; modelId: string };
+  resolved: { query: string; scope: string };
 }
 
 /** A refused NL question — the UI degrades to the manual picker on any of these. */
@@ -381,11 +393,12 @@ export const api = {
   reportExportUrl: (q: ReportQuery, format: 'csv' | 'json' = 'csv') =>
     `/api/reports/export?${reportQueryString(q)}&format=${format}`,
   /**
-   * Ask for a report in natural language. A refusal is an `ApiError` whose `body` carries the
-   * machine-readable `reason`, so the caller can fall back to the picker rather than surfacing a
-   * stack of validation noise.
+   * Ask for a report in natural language. Returns the validated SPEC (not a result) — the
+   * caller renders it through `report()`, so the model never becomes a second executor. A
+   * refusal is an `ApiError` whose `body` carries the machine-readable `reason`, so the caller
+   * can fall back to the picker rather than surfacing a stack of validation noise.
    */
   askReport: (question: string) =>
-    request<Report>('/api/reports/ask', { method: 'POST', body: JSON.stringify({ question }) }),
+    request<AskResult>('/api/reports/ask', { method: 'POST', body: JSON.stringify({ question }) }),
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 };

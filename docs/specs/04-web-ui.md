@@ -167,7 +167,7 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/reports/catalog` | Metric catalog + vocabulary + the operator's reportable repos + assistant availability | ✅ |
 | `GET /api/reports/run` | Execute a report spec from query params | ✅ |
 | `GET /api/reports/export` | CSV/JSON download of the underlying job rows (`format=csv\|json`) | ✅ |
-| `POST /api/reports/ask` | NL question → validated spec → rendered report (ADR-044/045) | ✅ |
+| `POST /api/reports/ask` | NL question → validated spec (the console then renders it via `/api/reports/run` — ADR-044/045) | ✅ |
 | `GET /api/repos/{repoId}/rewrite-pr` | Auto-rewrite **dry run** — always available, writes nothing | ✅ M5 |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)); 409 unless the deployment flag **and** the repo opt-in are both on | ✅ M5 |
 
@@ -214,9 +214,9 @@ assistant's prompt is generated from it so the two cannot drift):
 |---|---|---|
 | `spend` | USD | Σ per-job billable minutes × flavor rate. **Estimate** — see below. |
 | `runCount` | jobs | Job rows created in the window, by queued timestamp. |
-| `duration` | seconds | p50 / p90 of queued→last-transition wall clock, **terminal jobs only**. |
+| `duration` | seconds | p50 / p90 of queued→last-transition wall clock, **terminal jobs only**, and only where that span is measurable. |
 | `failureRate` | ratio | (failed + timed_out) ÷ terminal jobs. In-flight jobs excluded from **both** sides. |
-| `queueLatency` | seconds | p50 / p90 of queued→`runningAt`, over jobs carrying the watermark. |
+| `queueLatency` | seconds | p50 / p90 of queued→`runningAt`, over jobs carrying a **measurable** watermark. |
 
 Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days, else daily),
 `none`. Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
@@ -224,7 +224,10 @@ a wish list, so a spec can never resolve to a chart type that silently falls thr
 different one. Windows: `24h`/`7d`/`30d`/`90d`
 presets or an explicit `from`/`to`, capped at **90 days** because terminal rows carry a 90-day
 TTL. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
-p90 invents a value between two real jobs.
+p90 invents a value between two real jobs. A row whose span cannot be measured (unparseable or
+inverted timestamps — `createdAt` and `runningAt` are written by different λ invocations) is
+**excluded from the sample and counted as uncovered**, never folded in as a 0-second job, which
+would be indistinguishable from a genuinely instant one and would drag both percentiles down.
 
 **Cost honesty.** `spend` is an estimate and is labelled as one everywhere. The rate comes from
 the flavor's vCPU/GB footprint (OQ-3), and billable time comes from the `runningAt` watermark
@@ -264,7 +267,11 @@ larger than the tenant total, so the test is provably isolating something.
 **Assistant (ADR-044 / ADR-045).** `POST /api/reports/ask` sends the operator's question to
 Bedrock, which replies with a JSON spec — never code, never a query, never markup. The spec goes
 through the *same* validator as the picker's query params; anything outside the vocabulary is
-rejected, not repaired. The resolved spec is written into the URL, so a generated report is a
+rejected, not repaired, and an ill-typed field (an explicit `dimension: null`, say) is an error
+rather than a silent default. The route returns **the spec, not a result**: the console adopts it
+as picker state and renders through `GET /api/reports/run`, so there is exactly one executor and
+one fan-out per question — executing in both places doubled the DynamoDB read cost and threw the
+first result away. The resolved spec is written into the URL, so a generated report is a
 plain shareable link that re-runs deterministically without the model. The assistant's
 *“resolved to …”* provenance line is dropped as soon as a picker change moves the screen off that
 spec, so it can never describe a report that is no longer rendered. Refusals (disabled,

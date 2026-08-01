@@ -218,9 +218,20 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
   if (typeof metric !== 'string' || !(METRICS as readonly string[]).includes(metric)) {
     errors.push(`metric must be one of ${METRICS.join(', ')}`);
   }
-  const dimension = input.dimension ?? 'none';
-  if (typeof dimension !== 'string' || !(DIMENSIONS as readonly string[]).includes(dimension)) {
+  // `=== undefined` rather than `??`: an ABSENT dimension defaults to `none`, but an explicitly
+  // supplied `null` (or any non-string) is rejected. Coercing it would repair a spec into a
+  // different report than the one asked for, which is exactly what ADR-045 forbids — and the
+  // `chart` branch below already behaves this way, so `??` was also an inconsistency.
+  let dimension: ReportDimension | undefined;
+  if (input.dimension === undefined) {
+    dimension = 'none';
+  } else if (
+    typeof input.dimension !== 'string' ||
+    !(DIMENSIONS as readonly string[]).includes(input.dimension)
+  ) {
     errors.push(`dimension must be one of ${DIMENSIONS.join(', ')}`);
+  } else {
+    dimension = input.dimension as ReportDimension;
   }
 
   // Window: an explicit from/to pair wins; otherwise a preset; otherwise the 7d default.
@@ -312,14 +323,14 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
     chart = input.chart as ChartType;
   }
 
-  if (errors.length || !from || !to || !chart) {
+  if (errors.length || !from || !to || !chart || !dimension) {
     return { ok: false, errors: errors.length ? errors : ['spec could not be resolved'] };
   }
   return {
     ok: true,
     value: {
       metric: metric as ReportMetric,
-      dimension: dimension as ReportDimension,
+      dimension,
       chart,
       filters,
       from,
@@ -525,12 +536,18 @@ export function computeReport(
         break;
       case 'duration': {
         const terminal = g.runs.filter((r) => TERMINAL_STATUSES.has(r.status));
+        // A terminal row whose span is unmeasurable (unparseable or inverted timestamps) is
+        // EXCLUDED, not folded in as 0s. A fabricated zero is indistinguishable from a genuinely
+        // instant job and drags p50/p90 down, which is the failure this metric's contract
+        // explicitly rules out.
+        const secs = terminal
+          .map((r) => measuredSpanSeconds(r.createdAt, r.updatedAt))
+          .filter((s): s is number => s !== undefined);
         coverageDen += g.runs.length;
-        coverageNum += terminal.length;
-        if (!terminal.length) break;
-        const secs = terminal.map((r) => wallClockSeconds(r));
+        coverageNum += secs.length;
+        if (!secs.length) break;
         const { p50, p90 } = percentiles(secs);
-        points.push({ key, label: g.label, value: p50, secondary: p90, sampleSize: terminal.length });
+        points.push({ key, label: g.label, value: p50, secondary: p90, sampleSize: secs.length });
         break;
       }
       case 'failureRate': {
@@ -548,18 +565,23 @@ export function computeReport(
         break;
       }
       case 'queueLatency': {
-        const withWatermark = g.runs.filter((r) => !!r.runningAt);
+        // Same exclusion rule as `duration`: a row carrying a `runningAt` we cannot subtract
+        // from `createdAt` (clock skew, unparseable value) is dropped from BOTH the sample and
+        // the coverage numerator. Counting it as covered while contributing a 0s sample was the
+        // one way this metric could still report a zero it had not measured.
+        const secs = g.runs
+          .map((r) => (r.runningAt ? measuredSpanSeconds(r.createdAt, r.runningAt) : undefined))
+          .filter((s): s is number => s !== undefined);
         coverageDen += g.runs.length;
-        coverageNum += withWatermark.length;
-        if (!withWatermark.length) break;
-        const secs = withWatermark.map((r) => queueSeconds(r));
+        coverageNum += secs.length;
+        if (!secs.length) break;
         const { p50, p90 } = percentiles(secs);
         points.push({
           key,
           label: g.label,
           value: p50,
           secondary: p90,
-          sampleSize: withWatermark.length,
+          sampleSize: secs.length,
         });
         break;
       }
@@ -592,28 +614,31 @@ function caveatFor(metric: ReportMetric): string | undefined {
     case 'spend':
       return 'Estimate. Coverage is the share of PRICED jobs whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES cost. Jobs that never launched a microVM are priced at 0 and counted in neither share.';
     case 'duration':
-      return 'Coverage is the share of jobs that reached a terminal status; in-flight jobs are excluded.';
+      return 'Coverage is the share of jobs that reached a terminal status AND whose span was measurable; in-flight jobs are excluded.';
     case 'failureRate':
       return 'Coverage is the share of jobs that reached a terminal status; in-flight jobs are excluded from numerator and denominator.';
     case 'queueLatency':
-      return 'Coverage is the share of jobs carrying a runningAt watermark; the rest are excluded, not counted as zero. A watermark is absent on pre-M5 rows and on jobs that finished before the running transition landed, so the excluded rows are biased towards FAST jobs and these percentiles read slightly high.';
+      return 'Coverage is the share of jobs carrying a measurable runningAt watermark; the rest are excluded, not counted as zero. A watermark is absent on pre-M5 rows and on jobs that finished before the running transition landed, so the excluded rows are biased towards FAST jobs and these percentiles read slightly high.';
     case 'runCount':
       return undefined;
   }
 }
 
-function wallClockSeconds(run: Pick<RunRecord, 'createdAt' | 'updatedAt'>): number {
-  const a = Date.parse(run.createdAt);
-  const b = Date.parse(run.updatedAt);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return 0;
+/**
+ * Seconds between two ISO timestamps, or `undefined` when the span cannot be measured
+ * (either endpoint unparseable, or end before start). Percentile metrics use this so an
+ * unmeasurable row is excluded rather than contributing a fabricated 0 — `wallClockSeconds`
+ * below deliberately clamps to 0 instead, because an EXPORT column has to carry a number.
+ */
+function measuredSpanSeconds(startIso: string, endIso: string): number | undefined {
+  const a = Date.parse(startIso);
+  const b = Date.parse(endIso);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return undefined;
   return Math.round((b - a) / 1000);
 }
 
-function queueSeconds(run: Pick<RunRecord, 'createdAt' | 'runningAt'>): number {
-  const a = Date.parse(run.createdAt);
-  const b = run.runningAt ? Date.parse(run.runningAt) : Number.NaN;
-  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return 0;
-  return Math.round((b - a) / 1000);
+function wallClockSeconds(run: Pick<RunRecord, 'createdAt' | 'updatedAt'>): number {
+  return measuredSpanSeconds(run.createdAt, run.updatedAt) ?? 0;
 }
 
 function round(n: number, dp: number): number {

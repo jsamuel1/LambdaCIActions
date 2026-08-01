@@ -4,6 +4,7 @@ import {
   api,
   reportQueryString,
   type AskRefusal,
+  type AskResult,
   type ChartType,
   type RangePreset,
   type Report,
@@ -11,6 +12,7 @@ import {
   type ReportDimension,
   type ReportMetric,
   type ReportQuery,
+  type ReportSpec,
 } from '../api.js';
 import { useApi } from '../hooks.js';
 import { ErrorBox, Loading, formatTime } from '../components.js';
@@ -24,9 +26,11 @@ import { CHART_RENDERING, ReportChart, ReportTable, formatValue } from './Report
  *  - the **manual picker** (metric × dimension × window × filters), whose state lives entirely
  *    in the URL hash so any report is a shareable link; and
  *  - the **assistant**, which sends a question to `/api/reports/ask`, gets back a *validated
- *    spec plus its result*, and then writes that spec into the same URL. So a generated report
- *    is indistinguishable from a hand-picked one once it lands — reloading the link re-runs the
- *    deterministic report and never re-invokes the model (ADR-045).
+ *    spec* (not a result — executing there too would run the authorization fan-out twice per
+ *    question), and writes it into the same URL. So a generated report is indistinguishable from
+ *    a hand-picked one once it lands: the SAME `/api/reports/run` call renders both, and
+ *    reloading the link re-runs the deterministic report and never re-invokes the model
+ *    (ADR-045).
  *
  * Every refusal from the assistant (disabled, unsupported question, invalid spec, model
  * unavailable, rate limited) leaves the picker fully usable and shows why.
@@ -124,14 +128,14 @@ function Assistant({
   const [question, setQuestion] = useState('');
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<{ message: string; reason?: string } | undefined>();
-  const [resolved, setResolved] = useState<Report | undefined>();
+  const [resolved, setResolved] = useState<AskResult | undefined>();
 
   // Drop the provenance line as soon as the report on screen is no longer the one the
   // assistant resolved. `ask` adopts the model's spec as picker state, so the query matches
   // right after a successful ask; any later picker change (metric, window, repo) makes the
   // "Resolved to …" claim describe a report that is no longer rendered. Comparing the
   // serialized query is the same identity the report fetch is keyed on.
-  const resolvedQuery = resolved ? reportQueryString(specToQuery(resolved)) : undefined;
+  const resolvedQuery = resolved ? reportQueryString(specToQuery(resolved.spec)) : undefined;
   const stale = resolvedQuery !== undefined && resolvedQuery !== reportQueryString(query);
 
   if (!catalog.nl.enabled) {
@@ -151,9 +155,9 @@ function Assistant({
     try {
       const res = await api.askReport(question);
       setResolved(res);
-      // Adopt the model's spec as picker state. From here on the report is a plain URL and
-      // the model is out of the loop entirely.
-      onSpec(specToQuery(res));
+      // Adopt the model's spec as picker state. That fetch is the ONLY execution of the report,
+      // so from here on it is a plain URL and the model is out of the loop entirely.
+      onSpec(specToQuery(res.spec));
     } catch (e) {
       if (e instanceof ApiError) {
         const body = e.body as unknown as AskRefusal | undefined;
@@ -194,19 +198,23 @@ function Assistant({
       )}
       {resolved && !refusal && !stale && (
         <p className="gap-top muted tight">
-          Resolved to <strong>{resolved.metric.label}</strong>{' '}
-          {DIMENSION_LABELS[resolved.spec.dimension]}, {windowLabel(resolved)} — rendered from the{' '}
-          {resolved.source ? 'assistant' : 'picker'} but pinned as a plain URL. Model:{' '}
-          {resolved.source?.modelId ?? '—'}.
+          Resolved to <strong>{metricLabel(catalog, resolved.spec.metric)}</strong>{' '}
+          {DIMENSION_LABELS[resolved.spec.dimension]}, {windowLabel(resolved.spec)} — rendered by the
+          deterministic report below and pinned as a plain URL. Scope: {resolved.resolved.scope}.
+          Model: {resolved.source.modelId}.
         </p>
       )}
     </div>
   );
 }
 
+/** Metric label from the catalog — the assistant returns a spec, not a projected metric doc. */
+function metricLabel(catalog: ReportCatalog, metric: ReportMetric): string {
+  return catalog.metrics.find((m) => m.metric === metric)?.label ?? metric;
+}
+
 /** Project a server-resolved spec back onto picker query state. */
-function specToQuery(report: Report): ReportQuery {
-  const s = report.spec;
+function specToQuery(s: ReportSpec): ReportQuery {
   return {
     metric: s.metric,
     dimension: s.dimension,
@@ -318,10 +326,10 @@ function Picker({
 
 // ---- result ----------------------------------------------------------------
 
-function windowLabel(report: Report): string {
-  return report.spec.preset
-    ? `last ${report.spec.preset}`
-    : `${formatTime(report.spec.from)} → ${formatTime(report.spec.to)}`;
+function windowLabel(spec: ReportSpec): string {
+  return spec.preset
+    ? `last ${spec.preset}`
+    : `${formatTime(spec.from)} → ${formatTime(spec.to)}`;
 }
 
 function ReportView({ report, query }: { report: Report; query: ReportQuery }): JSX.Element {
@@ -344,7 +352,7 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
             {report.resolved.repoCountRead < report.resolved.repoCount
               ? `${report.resolved.repoCountRead} of ${report.resolved.repoCount} repos read`
               : `${report.resolved.repoCount} repos`}{' '}
-            · {windowLabel(report)}
+            · {windowLabel(report.spec)}
           </span>
           <a className="badge" href={api.reportExportUrl(query, 'csv')} download>
             CSV
