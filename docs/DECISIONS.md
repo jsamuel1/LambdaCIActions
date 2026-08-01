@@ -1889,7 +1889,14 @@ exact silent floor every other budget path here discloses. A preset or explicit 
 than retention is **rejected with a readable error naming the available presets**, not clamped
 (clamping answers a different question than the shared link names), and both the picker's option
 list and the assistant's prompt menu are generated from the same number so neither offers a
-window the validator would refuse. An operator with hundreds of active repos and a 90-day window
+window the validator would refuse. Width is not the whole cap: an explicit window is **also**
+rejected when its `from` predates the retention horizon (`now − RUN_RETENTION_DAYS`), however
+narrow it is. A 10-day window 200 days ago is inside every width limit and behind the horizon
+entirely, and a report pinned by URL carries `from`/`to` verbatim — so any bookmarked or shared
+custom-window report becomes an aged-out one by the passage of time alone, and answering it
+`complete: true` over rows the TTL deleted prints "No jobs in this window" about jobs that ran.
+The horizon is inclusive, so the widest legal preset's own window still resolves through the
+explicit branch. An operator with hundreds of active repos and a 90-day window
 is the case this
 design serves worst; if that becomes real, rollups keyed *per installation* are the next step.
 `test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the

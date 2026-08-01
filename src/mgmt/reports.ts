@@ -71,9 +71,11 @@ export const DEFAULT_MAX_RANGE_DAYS = 90;
  * in run-store), and that is **per-environment** (ADR-033: dev 30, prod 90). A window wider
  * than retention cannot return more data, so accepting one is not merely wasteful — the report
  * reads a partially aged-out window and still says `complete: true`, which is the silent-floor
- * failure every other budget path in this feature reports honestly. Read per call (not captured
- * at module load) and validated the same way run-store validates it, so a missing or malformed
- * value falls back instead of poisoning the container.
+ * failure every other budget path in this feature reports honestly. The same number is also the
+ * AGE limit: `validateReportSpec` refuses an explicit window starting before `now − this`, since
+ * a narrow window behind the horizon is aged out just as completely as a too-wide one. Read per
+ * call (not captured at module load) and validated the same way run-store validates it, so a
+ * missing or malformed value falls back instead of poisoning the container.
  */
 export function maxRangeDays(): number {
   const raw = process.env.RUN_RETENTION_DAYS;
@@ -265,6 +267,7 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
   }
 
   // Window: an explicit from/to pair wins; otherwise a preset; otherwise the 7d default.
+  // Both forms are bounded by retention in TWO ways — width, and age of the window's start.
   let from: string | undefined;
   let to: string | undefined;
   let preset: RangePreset | undefined;
@@ -289,9 +292,27 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
     if (fromMs === undefined) errors.push('from must be an ISO8601 timestamp');
     if (toMs === undefined) errors.push('to must be an ISO8601 timestamp');
     if (fromMs !== undefined && toMs !== undefined) {
+      const horizonMs = now.getTime() - maxDays * 86_400_000;
       if (toMs <= fromMs) errors.push('to must be after from');
       else if (toMs - fromMs > maxDays * 86_400_000) {
         errors.push(`window exceeds the ${maxDays}-day run retention`);
+      } else if (fromMs < horizonMs) {
+        // WIDTH is not the whole cap: a NARROW window that starts before the retention horizon
+        // is entirely (or partly) aged out of the table, so the report reads rows the store has
+        // already deleted and answers `complete: true` over them — the same silent floor the
+        // preset branch above refuses, reached by the other door. Not hypothetical: a report
+        // pinned by URL carries `from`/`to` verbatim (`specToQuery`), so any bookmarked or
+        // shared custom-window report becomes an aged-out one simply by the passage of time,
+        // and the console then says "No jobs in this window" about jobs that did run.
+        //
+        // Rejected rather than clamped forward, for the reason the preset branch gives: a
+        // clamped window answers a different question than the link names while still claiming
+        // completeness. The error states the horizon so the operator can re-pick a window.
+        errors.push(
+          `from ${new Date(fromMs).toISOString()} predates the ${maxDays}-day run retention of ` +
+            `this environment (no run history before ${new Date(horizonMs).toISOString()}; ` +
+            `available presets: ${presets.join(', ')})`,
+        );
       } else {
         from = new Date(fromMs).toISOString();
         to = new Date(toMs).toISOString();

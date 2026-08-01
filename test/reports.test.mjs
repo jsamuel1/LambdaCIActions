@@ -946,6 +946,73 @@ test('an explicit window is capped by retention too', () => {
   });
 });
 
+test('an explicit window that STARTS before retention is rejected, however narrow it is', () => {
+  // The width check alone does not cap a window: a 10-day window 200 days ago is well inside
+  // the 30-day WIDTH limit while lying entirely behind the retention horizon, so the fan-out
+  // reads partitions the TTL has already emptied and the report answers `complete: true` over
+  // deleted rows. That is the same silent floor the preset branch refuses, reached by the
+  // other door — and the console then prints "No jobs in this window" about jobs that did run.
+  withRetention(30, () => {
+    const r = validateReportSpec(
+      { metric: 'spend', from: '2026-01-13T00:00:00.000Z', to: '2026-01-23T00:00:00.000Z' },
+      NOW,
+    );
+    assert.equal(r.ok, false, 'an aged-out window must not be answered as a complete report');
+    assert.match(r.errors.join(' '), /predates the 30-day run retention/);
+    // Actionable: the error states the horizon and what the picker can still offer.
+    assert.match(r.errors.join(' '), /no run history before 2026-06-15T12:00:00\.000Z/);
+    assert.match(r.errors.join(' '), /24h, 7d, 30d/);
+  });
+});
+
+test('a pinned custom-window report ages out into a refusal rather than a false empty', () => {
+  // The reachable path, with no hostile input at all: `specToQuery` pins a non-preset spec as
+  // `from`/`to` verbatim, so a bookmarked or shared custom-window report is re-executed with
+  // the SAME absolute window weeks later. It must stop being answerable, not quietly answer
+  // zero. Same URL, two different `now`s.
+  const pinned = { metric: 'spend', from: '2026-07-01T00:00:00.000Z', to: '2026-07-08T00:00:00.000Z' };
+  withRetention(30, () => {
+    const fresh = validateReportSpec(pinned, NOW);
+    assert.equal(fresh.ok, true, 'a window inside retention must still resolve');
+    const later = validateReportSpec(pinned, new Date('2026-09-15T12:00:00.000Z'));
+    assert.equal(later.ok, false, 'the same pinned window is aged out 2 months later');
+    assert.match(later.errors.join(' '), /predates the 30-day run retention/);
+  });
+});
+
+test('the retention horizon is inclusive, so a preset-width explicit window still resolves', () => {
+  // A `30d` window in a 30-day environment is the widest LEGAL report, and the picker resolves
+  // exactly that window through the preset branch. The explicit branch must agree with it at
+  // the boundary, or a shared link built from the preset's own `from`/`to` would be refused.
+  withRetention(30, () => {
+    const boundary = validateReportSpec(
+      { metric: 'spend', from: '2026-06-15T12:00:00.000Z', to: '2026-07-15T12:00:00.000Z' },
+      NOW,
+    );
+    assert.equal(boundary.ok, true, JSON.stringify(boundary.errors ?? []));
+    // One millisecond older is not.
+    const past = validateReportSpec(
+      { metric: 'spend', from: '2026-06-15T11:59:59.999Z', to: '2026-07-15T11:59:59.999Z' },
+      NOW,
+    );
+    assert.equal(past.ok, false);
+  });
+});
+
+test('an inverted window reports only the ordering error, not an age error too', () => {
+  // Error messages are the operator's only handle on a refused spec: reporting an aged-out
+  // horizon for a window whose real defect is `to` before `from` sends them to fix the wrong
+  // control.
+  withRetention(30, () => {
+    const r = validateReportSpec(
+      { metric: 'spend', from: '2026-01-10T00:00:00.000Z', to: '2026-01-01T00:00:00.000Z' },
+      NOW,
+    );
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.errors, ['to must be after from']);
+  });
+});
+
 test('the picker and the model are only offered presets retention can fill', () => {
   assert.deepEqual(withRetention(30, () => availablePresets()), ['24h', '7d', '30d']);
   assert.deepEqual(withRetention(90, () => availablePresets()), ['24h', '7d', '30d', '90d']);

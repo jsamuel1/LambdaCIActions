@@ -222,14 +222,19 @@ Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days,
 `none`. Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
 a wish list, so a spec can never resolve to a chart type that silently falls through to a
 different one. Windows: the `24h`/`7d`/`30d`/`90d` presets **that this environment's run
-retention can actually fill**, or an explicit `from`/`to` capped at the same number. That cap is
+retention can actually fill**, or an explicit `from`/`to` that is both no wider than that number
+and no older than it. That cap is
 `RUN_RETENTION_DAYS` (ADR-033: dev 30, prod 90), not a fixed 90 — terminal rows age out at
 exactly that TTL, so a wider window reads a partly deleted span and would report itself
 `complete`. A preset beyond retention (a `90d` link shared into a 30-day deployment) is rejected
 with an error naming the presets that are available; the picker still shows the requested value
 labelled `(beyond retention)` so the refusal is legible against the control that caused it, and
 the assistant's prompt lists only servable presets so a fair question is not answered with a
-refusal. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
+refusal. An explicit window whose `from` predates the horizon (`now − RUN_RETENTION_DAYS`) is
+rejected the same way even when it is narrow — a pinned report keeps its absolute `from`/`to`, so
+a bookmarked custom window ages out on its own and must refuse rather than answer zero jobs as
+though none had run. The horizon is inclusive, so the widest servable preset's own window still
+resolves when pinned. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
 p90 invents a value between two real jobs. A row whose span cannot be measured (unparseable or
 inverted timestamps — `createdAt` and `runningAt` are written by different λ invocations) is
 **excluded from the sample and counted as uncovered**, never folded in as a 0-second job, which
