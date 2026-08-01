@@ -379,6 +379,15 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
             </span>
           </p>
         )}
+        {report.complete && report.rowCount > report.exportRowLimit && (
+          // An export is one synchronous Lambda response, so it is capped independently of the
+          // read budget. Say so here rather than letting a download come back quietly shorter
+          // than the row count above it.
+          <p className="gap-top muted tight">
+            Export is capped at {report.exportRowLimit} of {report.rowCount} job rows — narrow the
+            window or the repo filter to export the rest. The charts above cover every row.
+          </p>
+        )}
       </div>
       <div className="card">
         {CHART_RENDERING[report.spec.chart] === 'table' ? (

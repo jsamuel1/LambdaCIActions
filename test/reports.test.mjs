@@ -14,8 +14,11 @@ import {
   CHART_TYPES,
   METRIC_CATALOG,
   MAX_RANGE_DAYS,
+  MAX_EXPORT_BYTES,
+  MAX_EXPORT_ROWS,
   applyFilters,
   billableSeconds,
+  boundExportRows,
   computeReport,
   jobCostUsd,
   metricDoc,
@@ -656,11 +659,11 @@ test('a truncated CSV export declares its truncation, since the body cannot', ()
   const body = handler.slice(start, handler.indexOf('async function askReportRoute', start));
   assert.ok(start >= 0 && body.length > 0, 'could not isolate exportReportRoute');
   assert.ok(
-    /'X-Report-Complete': String\(fetched\.complete\)/.test(body),
+    /'X-Report-Complete': String\(fetched\.complete && bounded\.complete\)/.test(body),
     'the CSV export must publish its completeness in a header',
   );
   assert.ok(
-    /complete: fetched\.complete/.test(body),
+    /complete: fetched\.complete && bounded\.complete/.test(body),
     'the JSON export must keep carrying `complete` in its body',
   );
 
@@ -672,5 +675,119 @@ test('a truncated CSV export declares its truncation, since the body cannot', ()
     screen,
     /export is\s*\n?\s*truncated/,
     'the partial-report notice must tell the operator the export is truncated too',
+  );
+});
+
+// ---- export size bound -----------------------------------------------------
+
+test('an export is bounded to what one Lambda response can carry', () => {
+  // The fan-out budget is MAX_TOTAL_ROWS = 20 000, but a CSV/JSON export is a single
+  // SYNCHRONOUS Lambda response and those are capped at 6 MB. Measured against these exact
+  // serializers, 20 000 rows is ~3.8 MiB of CSV with short tenant names, ~6.5 MiB with realistic
+  // long repo/workflow/job names, and 7.2-9.8 MiB as JSON. Over the cap is not a short file: the
+  // invocation errors and the operator gets an opaque 502 — worst for whoever has most history.
+  const rows = toExportRows(
+    Array.from({ length: 20_000 }, (_, i) => job({ jobId: i + 1 })),
+    NOW,
+  );
+  const csv = boundExportRows(rows, (r) => Buffer.byteLength(toCsv(r)));
+  const jsonForm = boundExportRows(rows, (r) => Buffer.byteLength(JSON.stringify(r)));
+
+  for (const [name, bounded, measure] of [
+    ['csv', csv, (r) => Buffer.byteLength(toCsv(r))],
+    ['json', jsonForm, (r) => Buffer.byteLength(JSON.stringify(r))],
+  ]) {
+    assert.ok(bounded.rows.length <= MAX_EXPORT_ROWS, `${name} exceeded the row cap`);
+    assert.equal(bounded.complete, false, `${name} dropped rows but claimed to be complete`);
+    assert.ok(
+      measure(bounded.rows) <= MAX_EXPORT_BYTES,
+      `${name} body is ${measure(bounded.rows)} bytes, over the backstop`,
+    );
+    // The whole point: comfortably inside Lambda's hard limit, not merely near it.
+    assert.ok(measure(bounded.rows) < 6_000_000, `${name} body would still fail the 6 MB cap`);
+  }
+});
+
+test('the byte backstop binds before the row cap when tenant names are pathological', () => {
+  // MAX_EXPORT_ROWS alone is NOT a size guarantee: repo / workflow / job names are
+  // tenant-controlled and unbounded, so a row has no fixed width. A repo that names itself 400
+  // characters makes the row cap irrelevant, and only the byte budget keeps the response legal.
+  const wide = 'x'.repeat(400);
+  const rows = toExportRows(
+    Array.from({ length: MAX_EXPORT_ROWS }, (_, i) =>
+      job({ jobId: i + 1, repoFullName: `acme/${wide}`, workflowName: wide, jobName: wide }),
+    ),
+    NOW,
+  );
+  const measure = (r) => Buffer.byteLength(toCsv(r));
+  assert.ok(measure(rows) > MAX_EXPORT_BYTES, 'fixture is not actually oversized');
+  const bounded = boundExportRows(rows, measure);
+  assert.ok(
+    bounded.rows.length < MAX_EXPORT_ROWS,
+    'the byte backstop did not trim a row-cap-legal but oversized body',
+  );
+  assert.ok(measure(bounded.rows) <= MAX_EXPORT_BYTES);
+  assert.equal(bounded.complete, false);
+});
+
+test('an export inside both budgets is returned whole and reported complete', () => {
+  // Mutation guard the other way: the bound must not trim a normal export or report a
+  // truncation that did not happen, which would put a permanent false caveat on every download.
+  const rows = toExportRows(Array.from({ length: 25 }, (_, i) => job({ jobId: i + 1 })), NOW);
+  const bounded = boundExportRows(rows, (r) => Buffer.byteLength(toCsv(r)));
+  assert.equal(bounded.rows.length, 25);
+  assert.equal(bounded.complete, true);
+  assert.deepEqual(bounded.rows, rows);
+});
+
+test('an empty export is complete, not truncated', () => {
+  const bounded = boundExportRows([], (r) => Buffer.byteLength(toCsv(r)));
+  assert.deepEqual(bounded.rows, []);
+  assert.equal(bounded.complete, true);
+});
+
+test('the export cap is published in the report so the UI can warn before the click', () => {
+  // A download that comes back quietly shorter than the `rowCount` shown above it is the same
+  // class of failure as a silently truncated report. The limit rides in the result, and the
+  // screen compares it against rowCount rather than waiting for the file to be wrong.
+  const res = computeReport([job()], SPEC({ dimension: 'none' }), { now: NOW });
+  assert.equal(res.exportRowLimit, MAX_EXPORT_ROWS);
+
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    screen,
+    /report\.rowCount > report\.exportRowLimit/,
+    'the screen must warn when a download will be capped',
+  );
+});
+
+test('both export formats fold the export cap into the completeness they publish', () => {
+  // `complete` already meant "the read budget was not spent". It must now ALSO mean "no row was
+  // dropped on the way out", or a capped export reports itself as a full one through the exact
+  // channel built to disclose truncation. Source-level, matching the other handler assertions.
+  const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  const start = handler.indexOf('async function exportReportRoute');
+  const body = handler.slice(start, handler.indexOf('async function askReportRoute', start));
+  assert.ok(start >= 0 && body.length > 0, 'could not isolate exportReportRoute');
+  assert.ok(body.length < 4000, 'the exportReportRoute slice ran past its terminator');
+
+  // Both formats bound before serializing...
+  assert.equal(
+    (body.match(/boundExportRows\(/g) ?? []).length,
+    2,
+    'both the CSV and JSON export paths must bound their rows',
+  );
+  // ...and both publish the conjunction, not just the fan-out's verdict.
+  assert.equal(
+    (body.match(/fetched\.complete && bounded\.complete/g) ?? []).length,
+    2,
+    'a capped export must report itself incomplete in both formats',
+  );
+  assert.ok(
+    /'X-Report-Complete': String\(fetched\.complete && bounded\.complete\)/.test(body),
+    'the CSV header must reflect the export cap as well as the read budget',
   );
 });

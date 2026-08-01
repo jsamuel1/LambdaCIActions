@@ -428,6 +428,12 @@ export interface ReportResult {
   coverage: number;
   /** Human note about what the coverage/estimate caveat means for this metric. */
   caveat?: string;
+  /**
+   * Rows a CSV/JSON export of this report will carry at most. Published so the console can warn
+   * that a download will be capped BEFORE the operator clicks, rather than handing them a file
+   * that is quietly shorter than `rowCount`.
+   */
+  exportRowLimit: number;
   generatedAt: string;
 }
 
@@ -605,6 +611,7 @@ export function computeReport(
     complete: opts.complete ?? true,
     coverage: coverageDen === 0 ? 1 : round(coverageNum / coverageDen, 4),
     caveat: caveatFor(spec.metric),
+    exportRowLimit: MAX_EXPORT_ROWS,
     generatedAt: now.toISOString(),
   };
 }
@@ -647,6 +654,64 @@ function round(n: number, dp: number): number {
 }
 
 // ---- export ----------------------------------------------------------------
+
+/**
+ * Rows a single export response will carry.
+ *
+ * The fan-out budget (`MAX_TOTAL_ROWS` = 20 000) is far too large to serialize into one Lambda
+ * reply: a synchronous Lambda response is capped at **6 MB**, and measured against these very
+ * serializers 20 000 rows is 3.8 MiB of CSV with short tenant names, 6.5 MiB with realistic
+ * long repo/workflow/job names, and 7.2–9.8 MiB as JSON. Exceeding the cap is not a truncated
+ * download — it is a Lambda invocation error surfacing as an opaque 502, i.e. the export fails
+ * hardest exactly for the operator with the most history.
+ *
+ * So an export is capped, and the cap is DISCLOSED rather than silent: the row limit is
+ * published in the report result (`exportRowLimit`) so the console can warn before the operator
+ * clicks, and a truncated export reports `complete: false` through the same channel a
+ * budget-truncated report already uses (the JSON body, and `X-Report-Complete` for CSV).
+ */
+export const MAX_EXPORT_ROWS = 10_000;
+
+/**
+ * Byte backstop for an export body. `MAX_EXPORT_ROWS` alone is not a size guarantee — repo,
+ * workflow and job names are tenant-controlled and unbounded, so a row has no fixed width. This
+ * keeps the serialized body comfortably under the 6 MB Lambda ceiling even when every name is
+ * pathological, and it is the limit that actually binds in that case.
+ */
+export const MAX_EXPORT_BYTES = 4_500_000;
+
+/** Export rows trimmed to fit one response, plus whether anything was dropped. */
+export interface ExportBody {
+  /** The rows this response will actually carry. */
+  rows: ExportRow[];
+  /** False when the row cap or the byte backstop dropped rows from this response. */
+  complete: boolean;
+}
+
+/**
+ * Trim export rows to what one response can safely carry.
+ *
+ * Applies the row cap first, then measures the serialized width of what survives and drops from
+ * the tail until it fits the byte backstop. `measure` is injected because CSV and JSON have
+ * materially different overheads per row, and guessing at one of them is how a "safe" cap ends
+ * up unsafe for the other.
+ */
+export function boundExportRows(
+  rows: ExportRow[],
+  measure: (rows: ExportRow[]) => number,
+): ExportBody {
+  let out = rows.length > MAX_EXPORT_ROWS ? rows.slice(0, MAX_EXPORT_ROWS) : rows;
+  let complete = out.length === rows.length;
+  // Halve-and-refine rather than re-serializing per row: measuring is O(n) in the body size, so
+  // a per-row loop over 10 000 rows would be quadratic in the worst case.
+  while (out.length > 0 && measure(out) > MAX_EXPORT_BYTES) {
+    const keep = Math.max(1, Math.floor(out.length / 2));
+    if (keep === out.length) break;
+    out = out.slice(0, keep);
+    complete = false;
+  }
+  return { rows: out, complete };
+}
 
 /** Row shape of a report export — the underlying jobs, not the aggregate. */
 export const EXPORT_COLUMNS = [

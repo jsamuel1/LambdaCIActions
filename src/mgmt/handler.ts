@@ -43,7 +43,9 @@ import {
   DIMENSIONS,
   RANGE_PRESETS,
   MAX_RANGE_DAYS,
+  MAX_EXPORT_ROWS,
   applyFilters,
+  boundExportRows,
   computeReport,
   specFromQuery,
   specToQuery,
@@ -840,25 +842,34 @@ async function exportReportRoute(
   // One instant for the whole response, so an in-flight row's billable window is consistent
   // across every exported row and with the filename stamp.
   const now = new Date();
-  const rows = toExportRows(applyFilters(fetched.runs, spec), now);
+  const all = toExportRows(applyFilters(fetched.runs, spec), now);
   const stamp = now.toISOString().slice(0, 10);
   const filename = `lca-${spec.metric}-${stamp}`;
   if ((q.format ?? 'csv') === 'json') {
-    return json(200, { rows, complete: fetched.complete }, {
-      headers: { 'Content-Disposition': `attachment; filename="${filename}.json"` },
-    });
+    // Bounded before serialization: the fan-out budget allows 20 000 rows, which is 7-10 MiB of
+    // JSON and therefore OVER Lambda's 6 MB synchronous response cap. Exceeding it is not a
+    // short file, it is an invocation error the operator sees as a 502.
+    const bounded = boundExportRows(all, (rows) => Buffer.byteLength(JSON.stringify(rows)));
+    return json(
+      200,
+      // `complete` is the conjunction: the read may have been truncated by the fan-out budget,
+      // the response by the export cap, and either one means these rows are not the whole story.
+      { rows: bounded.rows, complete: fetched.complete && bounded.complete, rowLimit: MAX_EXPORT_ROWS },
+      { headers: { 'Content-Disposition': `attachment; filename="${filename}.json"` } },
+    );
   }
+  const bounded = boundExportRows(all, (rows) => Buffer.byteLength(toCsv(rows)));
   return {
     statusCode: 200,
-    raw: toCsv(rows),
+    raw: toCsv(bounded.rows),
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}.csv"`,
       // A CSV body has nowhere to put the `complete` flag the JSON export carries, so a
       // truncated fan-out would hand the operator a silently short file. State it in a header
       // (and in the UI beside the download link) rather than letting the row count imply a
-      // total it is not.
-      'X-Report-Complete': String(fetched.complete),
+      // total it is not. Covers BOTH truncation sources: the read budget and the export cap.
+      'X-Report-Complete': String(fetched.complete && bounded.complete),
       // Tenant-controlled strings ride in this body; never let a browser sniff it as HTML.
       'X-Content-Type-Options': 'nosniff',
     },

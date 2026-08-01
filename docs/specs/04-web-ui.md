@@ -258,6 +258,18 @@ tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Exce
 export is truncated by the same budget as its report: the JSON form carries `complete`, and the
 CSV form — which has nowhere in the body to put it — carries `X-Report-Complete`.
 
+An export is **additionally** capped independently of the read budget, because it is one
+synchronous Lambda response and those are limited to **6 MB**. The read budget allows 20 000 job
+rows, which measures 3.8 MiB of CSV with short tenant names, 6.5 MiB with realistic long
+repo/workflow/job names, and 7.2–9.8 MiB as JSON — so the unbounded form fails the platform limit
+before it fails the row budget, and over the limit is not a short file but an invocation error the
+operator sees as a 502. So `MAX_EXPORT_ROWS` (10 000) caps the row count and `MAX_EXPORT_BYTES`
+(4.5 MB) is a byte backstop for the case the row cap cannot cover — names are unbounded, so a row
+has no fixed width. Both truncation sources are folded into the SAME `complete` /
+`X-Report-Complete` channel, and the row limit is published in the report result
+(`exportRowLimit`) so the console warns that a download will be capped *before* the operator
+clicks, rather than handing back a file quietly shorter than the row count beside it.
+
 **Tenant isolation (ADR-043).** Unlike run lists, reporting does **not** post-filter. It resolves
 the operator's visible repos first and queries only those GSI2 partitions, so a foreign row is
 never fetched. `filters.repoIds` can only narrow that set. A zero-grant session gets 403, as on

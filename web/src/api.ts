@@ -254,6 +254,12 @@ export interface Report {
   complete: boolean;
   coverage: number;
   caveat?: string;
+  /**
+   * Rows an export of this report will carry at most. A CSV/JSON download is one synchronous
+   * Lambda response (6 MB cap), so it is capped independently of the read budget — surfaced so
+   * the UI can say the download will be short BEFORE the operator clicks.
+   */
+  exportRowLimit: number;
   generatedAt: string;
   /** What the server actually resolved + read (ADR-045 transparency). */
   resolved: {

@@ -1886,6 +1886,15 @@ design serves worst; if that becomes real, rollups keyed *per installation* are 
 `test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the
 platform-wide total is strictly larger than the tenant total (so the test is actually
 isolating), and that a repo granted via two installations is not double-counted.
+One consequence of the row budget is not about reads at all: **an export cannot carry it.** A
+CSV/JSON download is a single synchronous Lambda response (6 MB cap), and 20 000 job rows measures
+3.8–6.5 MiB as CSV and 7.2–9.8 MiB as JSON depending on how long the tenant-controlled
+repo/workflow/job names are — so the read budget exceeds the platform's response limit, and the
+failure is an invocation error surfacing as a 502 rather than a short file. Exports are therefore
+capped separately (`MAX_EXPORT_ROWS` 10 000, with a `MAX_EXPORT_BYTES` 4.5 MB backstop because
+names are unbounded and a row has no fixed width), both truncation sources feed the same
+`complete` / `X-Report-Complete` disclosure, and the cap is published in the report result so the
+UI warns before the download rather than after.
 
 ## ADR-044 — Reports assistant on Bedrock: Claude Sonnet, one pinned model, one scoped grant (M5)
 **Status**: Accepted (v1) · security boundary in [ADR-045](#adr-045)
