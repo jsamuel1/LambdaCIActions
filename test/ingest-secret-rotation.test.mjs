@@ -22,6 +22,7 @@ process.env.TABLE_NAME = 'lca-test-table';
 
 const {
   verifyWithRotation,
+  looksLikeGithubDelivery,
   _resetSecretRecheck,
   RUNNER_LABELS_TTL_MS,
   WEBHOOK_SECRET_TTL_MS,
@@ -208,5 +209,47 @@ test('a forced (ttlMs=0) read leaves an already-expired entry, not a warm cache'
     cacheEntryUsable(normal, 0, now + 1),
     false,
     'ttlMs=0 must bypass a live cache entry — that is what makes the re-read uncached',
+  );
+});
+
+// ---- rejection heartbeat is gated on a plausible delivery -------------------
+//
+// The rejection heartbeat drives an operator-facing DIAGNOSIS: `foldWebhookState` reads
+// `lastRejectedAt` and the Settings screen prints "N rejected — the webhook secret at GitHub does
+// not match the stored one". `/webhook` is public and unauthenticated, so recording every refused
+// request would let any stranger — or an ordinary internet scanner — publish that false verdict
+// and hold the badge at `degraded`. Only a request carrying BOTH of GitHub's delivery markers is
+// evidence about our credentials.
+test('an unsigned probe is not recorded as a webhook secret mismatch', () => {
+  assert.equal(looksLikeGithubDelivery(undefined, 'workflow_job'), false);
+  assert.equal(looksLikeGithubDelivery('', 'workflow_job'), false);
+  assert.equal(
+    looksLikeGithubDelivery('Bearer something', 'workflow_job'),
+    false,
+    'a signature that is not GitHub-shaped never claimed to be a delivery',
+  );
+});
+
+test('a signed request with no event header is not recorded either', () => {
+  assert.equal(looksLikeGithubDelivery(sign(BODY, OLD_SECRET), undefined), false);
+  assert.equal(looksLikeGithubDelivery(sign(BODY, OLD_SECRET), '   '), false);
+});
+
+test('a signed delivery that fails HMAC IS recorded — that is the rotation symptom', () => {
+  // Signed with the WRONG secret: exactly what GitHub sends mid-rotation, and the one case the
+  // heartbeat exists to make visible.
+  assert.equal(looksLikeGithubDelivery(sign(BODY, 'some-other-secret'), 'workflow_job'), true);
+});
+
+test('the rejection gate is the same signature shape the re-read requires', async () => {
+  // Both gates key off the `sha256=` prefix; if they diverged, a delivery could trigger an SSM
+  // re-read but never be recorded (or vice versa).
+  _resetSecretRecheck();
+  const gated = 'sha256=deadbeef';
+  assert.equal(looksLikeGithubDelivery(gated, 'push'), true);
+  assert.equal(
+    await verifyWithRotation(BODY, gated, OLD_SECRET, reader(NEW_SECRET).read),
+    false,
+    'a well-formed but wrong signature still fails — the gate is about recording, not accepting',
   );
 });

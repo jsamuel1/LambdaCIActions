@@ -112,9 +112,18 @@ export async function handler(
     // Record the rejection (best-effort): GitHub reaching us with a signature we can't
     // verify is the signature of a half-finished secret rotation, and the Settings screen
     // must be able to distinguish it from silence (spec 04 § webhook health).
-    await recordWebhookRejection().catch((err) =>
-      console.error(JSON.stringify({ msg: 'webhook rejection heartbeat failed', error: errMsg(err) })),
-    );
+    //
+    // ONLY for a request that plausibly IS a GitHub delivery. `/webhook` is public and
+    // unauthenticated, so recording every rejection would let any stranger (or an ordinary
+    // internet scanner) drive the Settings badge to `degraded` and publish "the webhook secret
+    // at GitHub does not match the stored one" — a specific, actionable, and false diagnosis on
+    // the one screen whose whole purpose is that a badge means something. Unsigned junk is
+    // still refused 401; it just isn't evidence about our credentials.
+    if (looksLikeGithubDelivery(signature, ghEvent)) {
+      await recordWebhookRejection().catch((err) =>
+        console.error(JSON.stringify({ msg: 'webhook rejection heartbeat failed', error: errMsg(err) })),
+      );
+    }
     return json(401, { error: 'invalid signature' });
   }
 
@@ -203,6 +212,30 @@ export async function verifyWithRotation(
 /** Test hook: reset the re-read throttle. */
 export function _resetSecretRecheck(): void {
   lastSecretRecheck = 0;
+}
+
+/**
+ * Whether a refused request is plausibly a real GitHub delivery, and therefore evidence worth
+ * recording on the Settings screen (spec 04 § webhook health).
+ *
+ * The rejection heartbeat exists to make ONE symptom visible: GitHub is reaching us but its
+ * signature no longer verifies — a half-finished webhook-secret rotation. That symptom requires
+ * a delivery that carries both of GitHub's markers: a well-formed `sha256=` signature and an
+ * event name. Anything else (an empty probe, a scanner, a hand-rolled POST) proves nothing about
+ * our credentials, and counting it would let an anonymous caller publish a false credential
+ * diagnosis — the same public-endpoint reasoning that rate-bounds the write itself
+ * (`recordWebhookRejection`) and the secret re-read (`SECRET_RECHECK_MS`).
+ *
+ * Deliberately NOT a stronger check: nothing available here can prove the sender is GitHub (that
+ * is what the HMAC does, and it just failed). This only filters out traffic that never even
+ * claimed to be a delivery.
+ */
+export function looksLikeGithubDelivery(
+  signature: string | undefined,
+  ghEvent: string | undefined,
+): boolean {
+  if (!signature || !signature.startsWith('sha256=')) return false;
+  return Boolean(ghEvent && ghEvent.trim().length > 0);
 }
 
 /** Route a signature-verified delivery to its handler. */

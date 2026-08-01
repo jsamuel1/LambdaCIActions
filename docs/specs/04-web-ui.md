@@ -305,6 +305,14 @@ Evidence from **both directions**, because neither alone is conclusive:
   than** the newest accepted delivery is the exact symptom of a half-finished secret rotation,
   and must not read as silence. One fixed-key `UpdateItem` per delivery, best-effort — a failed
   heartbeat degrades the screen, never a webhook.
+
+  The rejection counter is recorded only for a request that plausibly **is** a delivery — a
+  well-formed `sha256=` signature *and* an `X-GitHub-Event` header (`looksLikeGithubDelivery`).
+  `/webhook` is public and unauthenticated, so counting every refusal would let a stranger or an
+  ordinary internet scanner publish a specific false verdict ("the webhook secret at GitHub does
+  not match the stored one") and hold the badge at `degraded`. Unsigned traffic is still refused
+  `401`; it is simply not evidence about our credentials. The write is additionally rate-bounded
+  to one per minute for the same public-endpoint reason.
 - **Outbound** — GitHub's own `GET /app/hook/deliveries` log (status codes, durations,
   redelivery flag) shows deliveries that never arrived: wrong URL after a redeploy, 5xx, TLS.
 - **Configuration** — the URL GitHub is configured to POST to (`GET /app/hook/config`) next to
