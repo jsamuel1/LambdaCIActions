@@ -1904,11 +1904,15 @@ no IAM for one.
 **Decision**: `@aws-sdk/client-bedrock-runtime` (pinned exact, per repo convention), invoked
 from the existing Mgmt λ — not a new function — with `bedrock:InvokeModel` granted on **exactly
 one model id** in the deploy region. Default model: `anthropic.claude-3-5-sonnet-20241022-v2:0`.
-The id is a stack prop that flows to the λ as `REPORTS_MODEL_ID` *and* into the IAM resource
-ARN, so the policy and the runtime can never disagree; `test/mgmt-stack.test.mjs` asserts the
-stack default equals the handler default (a drift there is a runtime 403). The NL path is
-**enabled by default** and can be switched off per-env with `REPORTS_NL_ENABLED=false`, which
-also drops the Bedrock grant from the template entirely.
+The id is an **EnvConfig knob** (ADR-033) that flows to the λ as `REPORTS_MODEL_ID` *and* into
+the IAM resource ARN from the same value, so the policy and the runtime can never disagree;
+`test/mgmt-stack.test.mjs` asserts the stack default equals the handler default (a drift there is
+a runtime 403). The NL path is **enabled by default** and switched off per-env with
+`-c reportsNl=false`, which also drops the Bedrock grant from the template entirely; the model is
+overridden with `-c reportsModel=…`. Both live in EnvConfig rather than as stack props for the
+reason ADR-033's wiring note gives — the first cut made them props `bin/lca.ts` never passed, so
+this paragraph described a switch no operator could reach, and the only field workaround
+(hand-editing the λ's env) breaks the grant and 403s.
 **Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto a
 5-metric × 6-dimension × 4-chart menu plus a time window is a small *structured* problem where
 a wrong-but-valid answer is worse than a refusal: an invalid spec is rejected and the operator

@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { App } from 'aws-cdk-lib';
-import { Template } from 'aws-cdk-lib/assertions';
+import { Template, Match } from 'aws-cdk-lib/assertions';
 import { DataStack } from '../dist/lib/data-stack.js';
 import { MgmtStack, DEFAULT_REPORTS_MODEL_ID } from '../dist/lib/mgmt-stack.js';
 import { DEFAULT_MODEL_ID } from '../dist/src/mgmt/nl-report.js';
@@ -24,8 +24,10 @@ function synth(over = {}) {
     discoveryQueueUrl: 'https://sqs.us-west-2.amazonaws.com/123456789012/lca-test-discovery',
     discoveryQueueArn: 'arn:aws:sqs:us-west-2:123456789012:lca-test-discovery',
     publicOrigin: 'https://console.example.com',
-    config: envConfig('test'),
-    ...over,
+    // Reports-assistant knobs live in EnvConfig, not in stack props (ADR-033 wiring note): a
+    // prop nothing passes is a knob no operator can reach, so the override goes through the
+    // same path `bin/lca.ts` uses for `-c reportsNl=` / `-c reportsModel=`.
+    config: envConfig('test', over),
   });
   return Template.fromStack(mgmt);
 }
@@ -154,6 +156,19 @@ test('a custom model id moves the IAM grant with it', () => {
   assert.equal(grants.includes(DEFAULT_REPORTS_MODEL_ID), false, 'stale default still granted');
 });
 
+test('the assistant knobs are reachable from EnvConfig, not just stack props', () => {
+  // Regression guard for the defect ADR-033's wiring note names: the model id and the
+  // enablement flag were MgmtStack props that `bin/lca.ts` never passed, so the ADR described
+  // a per-env switch the deployment did not have. Only route to change either was editing
+  // source — or hand-editing the λ's env, which silently breaks the IAM grant (pinned on the
+  // CDK side) and produces a runtime 403.
+  assert.equal(envConfig('dev').reportsNlEnabled, true);
+  assert.equal(envConfig('prod').reportsNlEnabled, true);
+  assert.equal(envConfig('dev').reportsModelId, DEFAULT_REPORTS_MODEL_ID);
+  assert.equal(envConfig('prod', { reportsNlEnabled: false }).reportsNlEnabled, false);
+  assert.equal(envConfig('dev', { reportsModelId: 'other.model-v1:0' }).reportsModelId, 'other.model-v1:0');
+});
+
 test('the stack default model id matches the handler default (no split-brain grant)', () => {
   // If these drift, IAM authorizes one model while the λ invokes another → runtime 403.
   assert.equal(DEFAULT_REPORTS_MODEL_ID, DEFAULT_MODEL_ID);
@@ -168,6 +183,21 @@ test('the assistant model id and enablement reach the λ as env, not code', () =
       },
     },
   });
+  // ...and a disabled env really reaches the handler as `false`, which is the string
+  // `nlEnabled()` tests for. `true` here would leave the route live with no Bedrock grant.
+  synth({ reportsNlEnabled: false }).hasResourceProperties('AWS::Lambda::Function', {
+    Environment: { Variables: Match.objectLike({ REPORTS_NL_ENABLED: 'false' }) },
+  });
+});
+
+test('a custom model id reaches the λ env and the grant from the same value', () => {
+  // One source (EnvConfig) feeds both, so they cannot drift into a 403.
+  const custom = 'anthropic.claude-3-haiku-20240307-v1:0';
+  const t = synth({ reportsModelId: custom });
+  t.hasResourceProperties('AWS::Lambda::Function', {
+    Environment: { Variables: Match.objectLike({ REPORTS_MODEL_ID: custom }) },
+  });
+  assert.ok(JSON.stringify(t.findResources('AWS::IAM::Policy')).includes(custom));
 });
 
 test('the API exposes only /api and /auth routes', () => {

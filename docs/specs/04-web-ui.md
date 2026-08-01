@@ -289,7 +289,9 @@ plain shareable link that re-runs deterministically without the model. The assis
 spec, so it can never describe a report that is no longer rendered. Refusals (disabled,
 unsupported, invalid spec, unavailable, rate-limited) leave the manual picker fully usable and
 show why. No tenant data enters the prompt; authorization is never a spec field. Limits: 400-char
-question, 10 invocations/minute per actor, 500 per container.
+question, 10 invocations/minute per actor, 500 per container. The assistant is an EnvConfig knob
+(ADR-033): `-c reportsNl=false` disables it and drops the Bedrock grant from the template,
+`-c reportsModel=…` moves both the λ env and the IAM grant to another model.
 
 ## Auth
 

@@ -41,7 +41,10 @@ import { flavorNames } from './views.js';
  * Model id. Sonnet (ADR-044): the task is small but genuinely structured — it maps loose
  * operator phrasing onto a 5-metric × 6-dimension × 4-chart menu plus a time window, and a
  * wrong-but-valid spec is worse than a refusal because it silently answers a different
- * question. Overridable per-env without a code change.
+ * question. Mirrors `DEFAULT_REPORTS_MODEL_ID` in `lib/env-config.ts` (a λ must not import a
+ * CDK module); `test/mgmt-stack.test.mjs` asserts the two agree, because a drift means IAM
+ * authorizes one model while this handler invokes another. Overridden per-env with
+ * `-c reportsModel=…`, which moves the IAM grant with it.
  */
 export const DEFAULT_MODEL_ID = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
 

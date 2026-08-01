@@ -70,13 +70,26 @@ const tagPrefix = 'lca';
 //   -c alarmEmail=oncall@example.com   subscribe the alarm topic (unsubscribed by default)
 //   -c rewrite=true                    enable the auto-rewrite PR capability (OFF by default;
 //                                      requires the App to hold contents:write — ADR-031)
+//   -c reportsNl=false                 disable the Reports NL assistant (ON by default; also
+//                                      drops the Bedrock grant — ADR-044)
+//   -c reportsModel=<bedrock-model-id> override the assistant's model (moves the IAM grant
+//                                      with it, so the two cannot disagree)
 const alarmEmail = app.node.tryGetContext('alarmEmail') as string | undefined;
 const rewriteCtx = app.node.tryGetContext('rewrite') as string | boolean | undefined;
+const reportsNlCtx = app.node.tryGetContext('reportsNl') as string | boolean | undefined;
+const reportsModelCtx = app.node.tryGetContext('reportsModel') as string | undefined;
 const config = envConfig(envName, {
   alarmEmail,
   // Only the exact string `true` (or boolean true) enables it: `-c rewrite=1` or a typo must
   // NOT switch on a capability that writes to customer repositories.
   ...(rewriteCtx === undefined ? {} : { rewriteEnabled: rewriteCtx === true || rewriteCtx === 'true' }),
+  // Inverse of `rewrite`: the assistant is ON by default, so only the exact string `false`
+  // turns it off. A typo (`-c reportsNl=fasle`) must not silently disable a shipped feature
+  // and leave the console showing its degraded state with no explanation.
+  ...(reportsNlCtx === undefined
+    ? {}
+    : { reportsNlEnabled: !(reportsNlCtx === false || reportsNlCtx === 'false') }),
+  ...(reportsModelCtx ? { reportsModelId: reportsModelCtx } : {}),
 });
 
 // Phase 1: compute-plane image infra (deploy first; images built out-of-band by

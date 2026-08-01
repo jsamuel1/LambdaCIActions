@@ -36,14 +36,6 @@ export interface MgmtStackProps extends StackProps {
    */
   publicOrigin?: string;
   /**
-   * Bedrock model backing the Reports assistant (ADR-044). Defaults to Claude 3.5 Sonnet.
-   * The IAM grant is scoped to exactly this model id — changing it here changes the policy,
-   * so the Mgmt λ can never invoke a model the stack didn't authorize.
-   */
-  reportsModelId?: string;
-  /** Set false to ship the Reports screen with the deterministic picker only. */
-  reportsNlEnabled?: boolean;
-  /**
    * Rewrite queue coordinates (ControlStack, M5). The console enqueues an auto-rewrite
    * request here; the rewrite λ (which holds the App credential the management plane
    * deliberately lacks — ADR-025) does the writing.
@@ -55,11 +47,13 @@ export interface MgmtStackProps extends StackProps {
 }
 
 /**
- * Default Reports assistant model. Mirrors `DEFAULT_MODEL_ID` in src/mgmt/nl-report.ts; the
- * constant is duplicated rather than imported because CDK synth must not pull the Lambda's
- * AWS-SDK imports into the app bundle. `test/mgmt-stack.test.mjs` asserts they agree.
+ * Default Reports assistant model. Re-exported from `env-config` (where it is the default for
+ * the `reportsModelId` knob) so importers of this stack keep a single name for it, and mirrored
+ * by `DEFAULT_MODEL_ID` in src/mgmt/nl-report.ts — the λ cannot import a CDK module, so
+ * `test/mgmt-stack.test.mjs` asserts the two agree instead. A drift is a runtime 403: IAM would
+ * authorize one model while the handler invoked another.
  */
-export const DEFAULT_REPORTS_MODEL_ID = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
+export { DEFAULT_REPORTS_MODEL_ID } from './env-config.js';
 
 /**
  * MgmtStack — the management plane (spec 04, M4).
@@ -128,11 +122,12 @@ export class MgmtStack extends Stack {
         REWRITE_QUEUE_URL: props.rewriteQueueUrl ?? '',
         REWRITE_ENABLED: config.rewriteEnabled ? 'true' : 'false',
         PUBLIC_ORIGIN: props.publicOrigin ?? '',
-        // Reports assistant (ADR-044). Enabled by default; `REPORTS_NL_ENABLED=false` turns
-        // the NL path off without redeploying IAM, and the console degrades to the manual
-        // report picker rather than erroring.
-        REPORTS_NL_ENABLED: String(props.reportsNlEnabled ?? true),
-        REPORTS_MODEL_ID: props.reportsModelId ?? DEFAULT_REPORTS_MODEL_ID,
+        // Reports assistant (ADR-044). Enabled by default; `-c reportsNl=false` turns the NL
+        // path off (and drops the Bedrock grant below), and the console degrades to the manual
+        // report picker rather than erroring. Both values come from EnvConfig so the knob is
+        // reachable without a code edit — ADR-033's wiring note.
+        REPORTS_NL_ENABLED: String(config.reportsNlEnabled),
+        REPORTS_MODEL_ID: config.reportsModelId,
       },
     });
 
@@ -199,8 +194,9 @@ export class MgmtStack extends Stack {
     // Reports assistant (ADR-044): InvokeModel on EXACTLY the configured model, in this
     // region only. `InvokeModelWithResponseStream` is deliberately NOT granted — the NL path
     // wants one small JSON spec, not a stream. Foundation-model ARNs are account-less.
-    const reportsModel = props.reportsModelId ?? DEFAULT_REPORTS_MODEL_ID;
-    if (props.reportsNlEnabled ?? true) {
+    // Same `config` value the λ receives as env, so the policy and the runtime cannot disagree.
+    if (config.reportsNlEnabled) {
+      const reportsModel = config.reportsModelId;
       fn.addToRolePolicy(
         new iam.PolicyStatement({
           sid: 'InvokeReportsModel',
