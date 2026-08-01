@@ -15,13 +15,31 @@ const cache = new Map<string, { value: string; expires: number }>();
 const TTL_MS = 5 * 60 * 1000; // re-read secrets every 5 min at most
 
 /**
+ * Whether a cache entry may serve THIS read. Split out so the semantics are testable without
+ * an SSM stub, because one of them is load-bearing and counter-intuitive:
+ *
+ * A forced read (`ttlMs=0`) stores `expires: now + 0`, i.e. an entry that is already expired the
+ * moment it is written. So a forced read does NOT warm the cache for later callers — the next
+ * read of that name pays a fresh `GetParameter`. Ingest's webhook-secret rotation recovery depends
+ * on that being true (see `verifyWithRotation`): its uncached re-read is what makes the following
+ * delivery observe the rotated secret, and it does so by re-reading, not by leaving a warm entry.
+ */
+export function cacheEntryUsable(
+  entry: { value: string; expires: number } | undefined,
+  ttlMs: number,
+  now: number,
+): boolean {
+  return entry !== undefined && entry.expires > now && ttlMs > 0;
+}
+
+/**
  * Read a parameter (decrypting SecureStrings). Cached briefly to cut API calls on the hot
  * path. `ttlMs=0` forces a fresh read.
  */
 export async function getParam(name: string, ttlMs = TTL_MS): Promise<string> {
   const now = Date.now();
   const hit = cache.get(name);
-  if (hit && hit.expires > now && ttlMs > 0) return hit.value;
+  if (hit !== undefined && cacheEntryUsable(hit, ttlMs, now)) return hit.value;
 
   const res = await client.send(
     new GetParameterCommand({ Name: name, WithDecryption: true }),

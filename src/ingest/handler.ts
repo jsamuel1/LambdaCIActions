@@ -158,9 +158,14 @@ let lastSecretRecheck = 0;
  * against the PREVIOUS secret for up to that long after a relink rotated it — while GitHub already
  * signs with the new one. GitHub does NOT retry a delivery that failed verification, so every
  * `workflow_job` in that window would be silently lost. One bounded uncached re-read collapses the
- * window to the FIRST failing delivery instead of waiting out the TTL; because it goes through
- * `getParam(name, 0)` it also refreshes the container's cache, so subsequent deliveries verify on
- * the first attempt.
+ * window to the FIRST failing delivery instead of waiting out the TTL.
+ *
+ * Note what the re-read does NOT do: it goes through `getParam(name, 0)`, which stores its result
+ * with `expires: now + 0` — an already-expired entry — so it leaves no warm cache behind. The next
+ * delivery therefore pays one fresh `GetParameter` and verifies against the rotated secret on its
+ * first attempt; it is that fresh read, not a warmed cache, that makes the recovery stick. Cost is
+ * one extra uncached read per rotation recovery, on a path where read cost is the reason the
+ * re-read is throttled at all. Pinned by `test/ingest-secret-rotation.test.mjs`.
  *
  * This is an optimization on top of the TTL, not the guarantee: the re-read is rate-bounded, and
  * an anonymous caller posting junk with a well-formed `sha256=` prefix can hold that window spent.

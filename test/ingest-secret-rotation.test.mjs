@@ -26,6 +26,7 @@ const {
   RUNNER_LABELS_TTL_MS,
   WEBHOOK_SECRET_TTL_MS,
 } = await import('../dist/src/ingest/handler.js');
+const { cacheEntryUsable } = await import('../dist/src/shared/ssm.js');
 
 const OLD_SECRET = 'old-webhook-secret-value';
 const NEW_SECRET = 'new-webhook-secret-value';
@@ -165,5 +166,47 @@ test('the webhook-secret read is bounded by its own TTL, not only by the re-read
   assert.ok(
     WEBHOOK_SECRET_TTL_MS <= 30_000,
     'the TTL must not exceed the re-read throttle window it exists to back up',
+  );
+});
+
+// ---- the uncached re-read leaves NO warm cache -----------------------------------------------
+//
+// A code comment previously claimed the rotation re-read "also refreshes the container's cache,
+// so subsequent deliveries verify on the first attempt". The conclusion is right; the mechanism
+// is not, and the difference is a real `GetParameter` on the PUBLIC `/webhook` path — which is
+// the same read cost that forces the re-read to be throttled in the first place.
+//
+// `getParam(name, 0)` stores `expires: now + 0`, so the entry it writes is already expired. The
+// next delivery therefore does a FRESH read (and that is what makes it observe the rotated
+// secret); it is not served a warmed entry. Asserted against `getParam`'s own predicate rather
+// than a re-implementation of it, so the two cannot drift apart.
+test('a forced (ttlMs=0) read leaves an already-expired entry, not a warm cache', () => {
+  const now = 1_000;
+  // What `getParam(name, 0)` writes.
+  const forced = { value: 'rotated-secret', expires: now + 0 };
+
+  assert.equal(
+    cacheEntryUsable(forced, WEBHOOK_SECRET_TTL_MS, now),
+    false,
+    'the entry a forced read writes must not serve a later cached read at the same instant',
+  );
+  assert.equal(
+    cacheEntryUsable(forced, WEBHOOK_SECRET_TTL_MS, now + 1),
+    false,
+    'nor one instant later — the next delivery pays a fresh GetParameter',
+  );
+  // Control: an entry written by a NORMAL ttl read does serve within its window, so the
+  // assertions above are about the forced read and not a broken predicate.
+  const normal = { value: 'rotated-secret', expires: now + WEBHOOK_SECRET_TTL_MS };
+  assert.equal(
+    cacheEntryUsable(normal, WEBHOOK_SECRET_TTL_MS, now + 1),
+    true,
+    'a normal cached read is still served inside its TTL',
+  );
+  // And a forced read never consumes the cache on the way IN, whatever is stored.
+  assert.equal(
+    cacheEntryUsable(normal, 0, now + 1),
+    false,
+    'ttlMs=0 must bypass a live cache entry — that is what makes the re-read uncached',
   );
 });
