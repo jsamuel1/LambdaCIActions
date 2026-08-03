@@ -691,7 +691,8 @@ test('grouping by workflow labels rows with no workflow name honestly and withou
   // "(unknown)" read like a real workflow whose name could not be determined, so the label
   // names the GAP. It must not name a CAUSE either: the field is absent both on a pre-M5 row
   // and on a current row whose `workflow_job` event carried no `workflow_name` (optional and
-  // nullable on the wire, coalesced by both ingest paths, omitted when falsy by the run store).
+  // nullable on the wire, null-coalesced by Ingest's one run-row write, omitted when falsy by
+  // the run store).
   // Dating the bucket would repeat the `runningAt` error — right number, false explanation.
   assert.match(res.points[0].label, /no workflow name recorded/);
   assert.doesNotMatch(res.points[0].label, /unknown/i);

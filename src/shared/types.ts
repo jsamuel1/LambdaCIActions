@@ -211,8 +211,9 @@ export interface RunRecord {
    *
    * Absent for two independent reasons, only one of which is about age: the row predates M5
    * persisting it, **or** the event carried no `workflow_name` — it is optional and nullable on
-   * the wire (see `WorkflowJobEvent` above), both ingest paths coalesce it, and
-   * `buildQueuedItem` omits a falsy value. Reports must therefore label the gap, not date it.
+   * the wire (see `WorkflowJobEvent` above), Ingest's `putQueuedRun` call coalesces a null to
+   * absent, and `buildQueuedItem` omits a falsy value. That call is the only writer of this
+   * field, so Reports must label the gap, not date it.
    */
   workflowName?: string;
   /** Job display name from the `workflow_job` event. */

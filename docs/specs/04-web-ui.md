@@ -226,9 +226,9 @@ whose name could not be determined and invites an operator to treat a data gap a
 activity. The label names the gap and deliberately **not** a cause, because there are two and
 only one is about age: the row predates ingest persisting the field (M5), **or**
 `workflow_job.workflow_name` was absent on the event itself — it is optional and nullable on the
-wire, both ingest paths coalesce it, and the run store omits a falsy value, so a brand-new row
-lands in the same bucket. Naming it a pre-M5 row would repeat the `runningAt` error corrected
-above: right number, false explanation for a reachable current row.
+wire, Ingest's single run-row write coalesces a null to absent, and the run store omits a falsy
+value, so a brand-new row lands in the same bucket. Naming it a pre-M5 row would repeat the
+`runningAt` error corrected above: right number, false explanation for a reachable current row.
 That bucket's group key is namespaced so it cannot collide with a workflow
 literally named the same thing: `workflowName` is copied verbatim off the `workflow_job` webhook,
 so it is tenant-controlled, and merging the two would attribute real activity to the gap

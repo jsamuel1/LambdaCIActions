@@ -589,8 +589,10 @@ function groupKey(run: RunRecord, spec: ReportSpec): { key: string; label: strin
       // name a cause, because there are two and only one of them is about age:
       //   - the row predates ingest persisting `workflowName` (M5), or
       //   - `workflow_job.workflow_name` was absent on the event itself — it is optional and
-      //     nullable on the wire (`src/shared/types.ts`), both ingest paths coalesce it, and
-      //     `run-store.ts` omits a falsy value, so a BRAND-NEW row lands here too.
+      //     nullable on the wire (`src/shared/types.ts`), Ingest's `putQueuedRun` call coalesces
+      //     a null to absent, and `buildQueuedItem` omits a falsy value rather than writing
+      //     `undefined` (a DynamoDB validation error), so a BRAND-NEW row lands here too. That
+      //     one write is the only place a run row's `workflowName` comes from.
       // Calling this bucket a pre-M5 row would repeat the `runningAt` mistake: numbers right,
       // explanation false for a reachable current row.
       return run.workflowName === undefined || run.workflowName === ''
