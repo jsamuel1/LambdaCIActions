@@ -1,5 +1,5 @@
 import type { RunRecord, RunStatus } from '../shared/types.js';
-import { ALL_STATUSES, billableSeconds, isCostEligible, flavorRatePerMinute, flavorNames } from './views.js';
+import { ALL_STATUSES, billableSeconds, hasRunMicrovm, isCostEligible, flavorRatePerMinute, flavorNames } from './views.js';
 
 /**
  * Reporting read model (spec 04 § Reports, ADR-043/044/045).
@@ -168,10 +168,12 @@ export const METRIC_CATALOG: readonly MetricDoc[] = [
     definition:
       'Sum of per-job billable microVM time in minutes — the same billable window `spend` is ' +
       'priced from (runningAt watermark to the last transition, or to now while in flight), so ' +
-      'this is that estimate with the flavor rate taken out. Jobs that never launched a microVM ' +
-      'contribute 0. ESTIMATE: rows without a watermark fall back to queue-to-finish wall clock, ' +
-      'which OVERSTATES consumption. This is an ABSOLUTE figure, not a percentage of any ' +
-      'capacity ceiling — the microVM concurrency quota is not read anywhere yet.',
+      'this is that estimate with the flavor rate taken out. Measured from timestamps, so a job ' +
+      'whose flavor has no rate in the catalog still counts its minutes even though `spend` ' +
+      'cannot price it. Jobs that never launched a microVM contribute 0. ESTIMATE: rows without ' +
+      'a watermark fall back to queue-to-finish wall clock, which OVERSTATES consumption. This ' +
+      'is an ABSOLUTE figure, not a percentage of any capacity ceiling — the microVM concurrency ' +
+      'quota is not read anywhere yet.',
     estimate: true,
   },
   {
@@ -635,19 +637,26 @@ export function computeReport(
     switch (spec.metric) {
       case 'spend':
       case 'billableMinutes': {
-        // One arm for both, deliberately. They read the SAME billable window off the SAME
-        // eligibility gate and differ only in whether the flavor rate is applied, so splitting
-        // them into two folds is how a report could start claiming spend over a window it did
-        // not charge minutes for. `billableMinutes` is `spend` with the rate taken out.
+        // One arm for both, deliberately. They read the SAME billable window (ADR-042) and differ
+        // only in whether the flavor rate is applied, so splitting them into two folds is how a
+        // report could start claiming spend over a window it did not charge minutes for.
+        //
+        // They do NOT share the eligibility gate, because the two questions differ by exactly
+        // the rate: money needs a price list, compute does not. `isCostEligible` = a microVM ran
+        // AND its flavor has a rate; `hasRunMicrovm` is the launch evidence alone. Gating minutes
+        // on the pricing predicate silently drops real compute (a flavor renamed or removed from
+        // `microvm/flavors.json` orphans every historical row inside the retention window, and
+        // custom flavors would make it routine) and then reports 100% coverage over a total
+        // missing whole rows — the one number on this screen that must never overstate.
+        const eligible = spec.metric === 'spend' ? isCostEligible : hasRunMicrovm;
         let value = 0;
         for (const r of g.runs) {
-          // Coverage is over the rows that were actually PRICED, not every row in the group.
-          // A queued / launch-failure row contributes 0 (`isCostEligible`), so counting it in
-          // the denominator understated coverage on exactly the metric whose caveat then
-          // claimed the uncovered share was measured on overstating wall clock — it was not
-          // measured at all. An ineligible row is silent in both, so the ratio means what the
-          // caveat says it means.
-          if (!isCostEligible(r)) continue;
+          // Coverage is over the rows the metric could actually MEASURE, not every row in the
+          // group. A queued / launch-failure row contributes 0, so counting it in the denominator
+          // understated coverage on exactly the metric whose caveat then claimed the uncovered
+          // share was measured on overstating wall clock — it was not measured at all. An
+          // ineligible row is silent in both, so the ratio means what the caveat says it means.
+          if (!eligible(r)) continue;
           value +=
             spec.metric === 'spend' ? jobCostUsd(r, now) : billableSeconds(r, now).seconds / 60;
           coverageDen += 1;

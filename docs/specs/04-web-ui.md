@@ -213,7 +213,7 @@ assistant's prompt is generated from it so the two cannot drift):
 | Metric | Unit | Definition |
 |---|---|---|
 | `spend` | USD | Σ per-job billable minutes × flavor rate. **Estimate** — see below. |
-| `billableMinutes` | minutes | Σ per-job billable microVM time — `spend`'s window with the flavor rate taken out. **Estimate**; an **absolute** figure, not a share of any ceiling. |
+| `billableMinutes` | minutes | Σ per-job billable microVM time — `spend`'s window with the flavor rate taken out, so a job whose flavor has no rate still counts its minutes. **Estimate**; an **absolute** figure, not a share of any ceiling. |
 | `runCount` | jobs | Job rows created in the window, by queued timestamp. |
 | `duration` | seconds | p50 / p90 of queued→last-transition wall clock, **terminal jobs only**, and only where that span is measurable. |
 | `failureRate` | ratio | (failed + timed_out) ÷ terminal jobs. In-flight jobs excluded from **both** sides. |
@@ -273,10 +273,21 @@ microVM bill is still outstanding
 
 **Utilisation.** `billableMinutes` answers *how much microVM compute did we consume*, and it is
 the same fold as `spend` with the rate divided out — one arm in `computeReport`, sharing ADR-042's
-billable window and the `isCostEligible` gate, so consumption and cost can never be measured over
-different windows. It inherits the estimate caveat for the same reason `spend` has one: a row on a
+billable window, so consumption and cost can never be measured over different windows. It
+inherits the estimate caveat for the same reason `spend` has one: a row on a
 `wallClock` basis counts queue and provisioning time as compute and therefore **overstates**
 consumption, and `coverage` is the measured share exactly as it is for spend.
+
+The two metrics deliberately do **not** share an eligibility gate, because they differ by exactly
+the rate: money needs a price list, compute does not. Spend counts a job only if a microVM ran
+*and* its flavor has a rate (`isCostEligible`); minutes count a job if a microVM ran
+(`hasRunMicrovm`), whether or not it can be priced. Gating minutes on the pricing predicate would
+drop real compute out of the total **and** out of its own coverage denominator, so the screen
+would report 100% coverage over a number missing whole rows. That is reachable with no new
+feature: rates resolve against the static `microvm/flavors.json`, so renaming or removing an entry
+orphans every historical run row still inside the retention window that stored the old name, and
+custom flavors (ADR-040/041) would make it routine. A job whose flavor has no rate therefore
+contributes its minutes and is priced at 0.
 
 It is deliberately an **absolute** figure and not a percentage. A utilisation *ratio* needs a
 capacity ceiling as its denominator — the microVM service's concurrency quota (spec 05 § Quotas &

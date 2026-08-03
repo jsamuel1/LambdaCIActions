@@ -34,6 +34,7 @@ import {
   toExportRows,
   validateReportSpec,
 } from '../dist/src/mgmt/reports.js';
+import { flavorRatePerMinute } from '../dist/src/mgmt/views.js';
 
 const NOW = new Date('2026-07-15T12:00:00.000Z');
 
@@ -187,7 +188,7 @@ test('a wallClock-basis row lowers billableMinutes coverage and the caveat says 
 test('billableMinutes does not credit compute to a job that never ran a microVM', () => {
   const spec = SPEC({ metric: 'billableMinutes', dimension: 'none' });
   // A mint/launch failure carries the intended flavor for support but never had a VM
-  // (`isCostEligible`). Counting its wall clock as consumed compute would report utilisation
+  // (`hasRunMicrovm`). Counting its wall clock as consumed compute would report utilisation
   // that physically did not happen — worst, exactly when provisioning is broken.
   const launchFailure = job({ jobId: 2, status: 'failed', microvmId: undefined });
   const queued = job({ jobId: 3, status: 'queued', microvmId: undefined, runningAt: undefined });
@@ -199,6 +200,46 @@ test('billableMinutes does not credit compute to a job that never ran a microVM'
   assert.equal(res.coverageSampleSize, 1, 'only the row that ran is measurable');
   assert.equal(res.points[0].sampleSize, 3, 'sampleSize still reports every row in the group');
 });
+
+test('billableMinutes counts compute on a flavor spend cannot price', () => {
+  // Minutes are measured from timestamps; a PRICE needs the flavor's rate. Gating consumption on
+  // the pricing predicate (`isCostEligible`, which also demands a rate) drops real compute out of
+  // the total AND out of its own coverage denominator — so the screen reports 100% coverage over
+  // a number missing whole rows, which is the one thing a coverage figure must never do.
+  //
+  // Reachable with no new feature: `flavorRatePerMinute` resolves against the static
+  // `microvm/flavors.json`, so renaming or removing an entry orphans every historical row still
+  // inside the retention window that stored the old name. Custom flavors (ADR-040/041) make it
+  // routine. The row below is exactly that shape: a real microVM, a flavor with no rate.
+  const orphaned = job({ jobId: 2, flavor: 'retired-flavor-name', microvmId: 'vm-real-1' });
+  assert.equal(flavorRatePerMinute(orphaned.flavor), undefined, 'this row must be unpriceable to be the case under test');
+  assert.ok(orphaned.microvmId, 'and it must be real evidence a microVM ran');
+
+  const minutes = computeReport([orphaned], SPEC({ metric: 'billableMinutes', dimension: 'none' }), { now: NOW });
+  assert.equal(
+    minutes.total,
+    round6(billableSeconds(orphaned, NOW).seconds / 60),
+    'compute on an unpriceable flavor vanished from the utilisation total',
+  );
+  assert.equal(minutes.coverage, 1, 'the row was measured from a watermark, so coverage is honest at 1');
+  assert.equal(minutes.coverageSampleSize, 1, 'an unpriceable-but-real row belongs in the minutes denominator');
+
+  // Spend keeps the rate requirement: there is no honest price without one, so the row is silent
+  // in both shares rather than priced at a guess.
+  const usd = computeReport([orphaned], SPEC({ metric: 'spend', dimension: 'none' }), { now: NOW });
+  assert.equal(usd.total, 0, 'an unpriceable row must not be given a price');
+  assert.equal(usd.coverageSampleSize, 0, 'and must not enter the spend coverage denominator');
+
+  // The two denominators genuinely differ on this row — that difference IS the fix.
+  assert.ok(
+    minutes.coverageSampleSize > usd.coverageSampleSize,
+    'minutes and spend share the pricing gate again',
+  );
+});
+
+function round6(n) {
+  return Math.round(n * 1e6) / 1e6;
+}
 
 test('billableMinutes is an absolute figure, never a share of a capacity ceiling', () => {
   // Utilisation-as-a-ratio needs the microVM concurrency quota as a denominator, which nothing
