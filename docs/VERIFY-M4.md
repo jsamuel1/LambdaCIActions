@@ -97,8 +97,8 @@ Verified by observation:
 |---|---|
 | SPA shell served at the console root | `GET /` → `200 text/html`, 401 bytes, `<div id="root">`, `<script type="module" src="/main.js">`; `Strict-Transport-Security: max-age=31536000; includeSubDomains`; `Content-Security-Policy: default-src 'none'; script-src 'self'; …` |
 | `/auth/login` issues a signed-state cookie | `Set-Cookie: lca_oauth_state=…; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600` |
-| A forged `state` is refused | `GET /auth/callback?code=fake-code&state=forged.notasignature` → **`400 {"error":"invalid OAuth state"}"`**, no session cookie set |
-| Every `/api/*` route refuses an unauthenticated caller | `/api/me`, `/api/installations`, `/api/repos`, `/api/runs`, `/api/flavors`, `/api/settings`, `/api/health` → **all `401 {"error":"not authenticated"}"** |
+| A forged `state` is refused | `GET /auth/callback?code=fake-code&state=forged.notasignature` → **`400 {"error":"invalid OAuth state"}`**, no session cookie set |
+| Every `/api/*` route refuses an unauthenticated caller | `/api/me`, `/api/installations`, `/api/repos`, `/api/runs`, `/api/flavors`, `/api/settings`, `/api/health` → **all `401 {"error":"not authenticated"}`** |
 | A valid session lands in the console, not the login card | `.shell` visible, `.login` absent, nav renders `Dashboard · Repos · Runs · Flavors · Settings · Setup`, header shows `jsamuel1` — `02-dashboard-signed-in.png` |
 
 **Not verified:** the GitHub authorization screen and the `code` → access-token exchange,
@@ -173,7 +173,9 @@ would have self-healed on first login without the backfill.
 `#/repos` listed **139 repos** for installation `146431062`, each row carrying an
 enable/disable button, a `label`/`adopt`/`off` mode selector, a default-flavor override
 (`(catalog default)` · `base` · `node` · `docker`) and a compat rollup (`no workflows` for
-repos never scanned). `04-repos-list.png`.
+repos never scanned).
+
+![repos list](evidence/m4/04-repos-list.png)
 
 The fixture repo was already enabled, so the control was exercised by flipping it away and
 back — every click was a real click on the deployed console, and each was checked through to
@@ -185,8 +187,10 @@ DynamoDB:
 | click `Enable` | `Disable` | `200` `{…"enabled":true…}` | `enabled=true`, `updatedAt=2026-08-03T06:18:47.918Z`, `updatedBy=jsamuel1` |
 
 UI state, API response and stored row agreed on every transition, and the write is audited
-with the operator's login (spec 04 § auditability). `repos-toggle-enabled-after.png`,
-`repos-toggle-disabled-after.png`.
+with the operator's login (spec 04 § auditability).
+
+![repo row after Enable](evidence/m4/repos-toggle-enabled-after.png)
+![repo row after Disable](evidence/m4/repos-toggle-disabled-after.png)
 
 ## Step 5 — Repo detail: parsed workflows, routing preview, compat
 
@@ -211,11 +215,13 @@ the documented per-workflow behaviour, not a defect.
 
 ![repo detail](evidence/m4/05-repo-detail.png)
 
-The Flavors screen (`05b-flavors.png`) listed all three flavors as `built`, `arm64`, with
+The Flavors screen listed all three flavors as `built`, `arm64`, with
 labels and per-minute rates. Note the sizes shown (`2 vCPU / 4 GB`, `4 vCPU / 8 GB`) are the
 pre-ADR-038 catalog values baked into the deployed M4 bundle; ADR-038 (M5, on `main`,
 undeployed) establishes that those shapes were never actually requested. Cosmetic here, and
 already corrected upstream.
+
+![flavors](evidence/m4/05b-flavors.png)
 
 ## Step 6 — Push a commit, watch the run advance without reloading
 
@@ -240,9 +246,9 @@ All GitHub conclusions `success`. Statuses **as rendered by the console**:
 
 | Status | Where seen | Evidence |
 |---|---|---|
-| `queued` | Runs list, 06:28:09Z | run `30790275739` row read straight from the DOM — `06b-runs-list-queued.png` |
-| `provisioning` | Runs list, 06:35:0xZ | run `30790672874 / 91613320319` badge — `06d-runs-list-provisioning.png` |
-| `running` | Run detail, 06:22:13Z / 06:28:15Z / 06:30:23Z / 06:32:24Z | `06-rundetail-1-running.png` |
+| `queued` | Runs list, 06:28:09Z | run `30790275739` row read straight from the DOM — [`06b-runs-list-queued.png`](evidence/m4/06b-runs-list-queued.png) |
+| `provisioning` | Runs list, 06:35:0xZ | run `30790672874 / 91613320319` badge — [`06d-runs-list-provisioning.png`](evidence/m4/06d-runs-list-provisioning.png) |
+| `running` | Run detail, 06:22:13Z / 06:28:15Z / 06:30:23Z / 06:32:24Z | [`06-rundetail-1-running.png`](evidence/m4/06-rundetail-1-running.png) |
 | `completed` | Run detail, 06:23:31Z / 06:28:51Z / 06:31:14Z / 06:33:39Z | `07-rundetail-final-completed.png` |
 
 `running → completed` was observed **in-place four times** with no reload — e.g. run
