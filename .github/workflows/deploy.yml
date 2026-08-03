@@ -1,0 +1,182 @@
+name: Deploy (dev)
+
+# Continuous deployment of the M4 management plane, running on our OWN microVM runners
+# (ADR-047). Dogfooding the platform for deploys, not just tests: if LambdaCIActions cannot
+# deploy LambdaCIActions, it is not a credible runner replacement.
+#
+# Identity is GitHub OIDC — NOT the runner's own AWS role. `lca-<env>-microvm-exec` is one
+# role shared by every microVM in the environment, and those VMs execute untrusted workflow
+# code from every onboarded repo; ADR-021 deliberately cut it to a log group plus one
+# `lambda:InvokeFunction`. Deploy authority there would be platform-deploy (and destroy)
+# power for every job in every tenant repo. The OIDC role's trust is pinned to this repo and
+# `refs/heads/main` only (lib/deploy-stack.ts).
+#
+# The role is created by `LCA-Deploy-dev`, which is deployed FROM A WORKSTATION and is not in
+# this workflow's allowlist — CD must not be able to widen its own credential.
+#
+# Workstation `cdk deploy` remains the documented escape hatch for when CD or the runner
+# plane is broken: see docs/DEPLOY-M4.md § Manual escape hatch.
+
+on:
+  # Manual only for now. A `push:` trigger on main is the intended follow-up; it is left off
+  # deliberately so the first CD runs are observed rather than automatic.
+  workflow_dispatch:
+
+# `id-token: write` is what mints the OIDC JWT. Verified to be injected into jobs on our own
+# JIT runners (ADR-016 registers JIT-by-ref, but the id-token endpoint rides the job message,
+# not the runner config) — probe run 30789251216.
+permissions:
+  id-token: write
+  contents: read
+
+# Deploy-target pin (ADR-018, extended by ADR-047). A CI checkout is a fresh clone with no
+# gitignored `.env.local`, so the pin is declared here. These are NOT secrets — an account id
+# and a region — and the pin is only a declaration of intent: bin/lca.ts still compares it
+# against the STS caller identity and refuses on mismatch.
+env:
+  LCA_DEPLOY_ACCOUNT: '863638663908'
+  LCA_DEPLOY_REGION: us-west-2
+  LCA_DEPLOY_ENV: dev
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    # node flavor: npm + esbuild are required for `build:web`.
+    runs-on: [self-hosted, lambda-ci-node]
+    # Serialize: two concurrent deploys of the same stacks race in CloudFormation.
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Must match the node flavor's baked tool-cache pin (Dockerfile.node NODE_VERSION),
+      # same as ci.yml — asking for an unbaked major is a silent cache miss.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # The SPA bundle is an asset of LCA-Web-dev. Building it BEFORE synth is not optional:
+      # a missing bundle silently deploys an empty site.
+      - name: Build console SPA
+        run: npm run build:web
+
+      - name: Assume deploy role (GitHub OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::863638663908:role/lca-dev-github-deploy
+          aws-region: us-west-2
+          role-session-name: lca-cd-${{ github.run_id }}
+
+      - name: Confirm identity matches the pin
+        run: |
+          set -euo pipefail
+          acct=$(aws sts get-caller-identity --query Account --output text)
+          echo "caller account: $acct"
+          [ "$acct" = "$LCA_DEPLOY_ACCOUNT" ] || { echo "::error::identity $acct != pin $LCA_DEPLOY_ACCOUNT"; exit 1; }
+
+      # PASS 1 — management plane + console hosting.
+      #
+      # `--exclusively` is LOAD-BEARING, not tidiness. LCA-Mgmt-dev declares CDK stack
+      # dependencies on LCA-Data-dev and LCA-Control-dev, and `cdk deploy <stack>` deploys a
+      # stack's DEPENDENCIES too by default. Without `-e` this "Mgmt + Web only" line would
+      # quietly redeploy the control plane — the plane that owns the runners executing this
+      # very job. A bad control-plane deploy would kill the runner that would deploy the fix.
+      #
+      # Never `--all`. Never LCA-Image-* / LCA-Control-* / LCA-Data-* / LCA-Deploy-* from CI.
+      # (test/deploy-workflow.test.mjs asserts this allowlist stays intact.)
+      - name: Deploy management plane (pass 1)
+        run: |
+          set -euo pipefail
+          npx cdk deploy LCA-Mgmt-dev LCA-Web-dev \
+            --exclusively \
+            -c env=dev \
+            --require-approval never \
+            --progress events
+
+      # The console origin is CloudFront's generated domain, which does not exist until
+      # WebStack's first deploy — hence the two-pass bootstrap (docs/DEPLOY-M4.md). `dev` has
+      # no vanity domain, so this pass does the real work. An env that DOES have one must
+      # (a) declare LCA_CONSOLE_HOSTED_ZONE_ID + LCA_CONSOLE_ZONE_NAME in the `env:` block
+      # above — that config lives in `.env.local` on a workstation and a runner has no such
+      # file, so without it the synth would drop the CloudFront alias and cert and rewrite
+      # PUBLIC_ORIGIN to the raw CloudFront name, breaking login (ADR-036/ADR-047) — and
+      # (b) have `LCA-Cert-<env>` already deployed FROM A WORKSTATION: it is us-east-1 and on
+      # this workflow's forbidden list, so `--exclusively` skips it rather than deploying it.
+      - name: Read ConsoleUrl from LCA-Web-dev
+        id: console
+        run: |
+          set -euo pipefail
+          url=$(aws cloudformation describe-stacks \
+            --stack-name LCA-Web-dev \
+            --query "Stacks[0].Outputs[?OutputKey=='ConsoleUrl'].OutputValue" \
+            --output text)
+          [ -n "$url" ] && [ "$url" != "None" ] || { echo "::error::ConsoleUrl output missing"; exit 1; }
+          echo "console_url=$url" >> "$GITHUB_OUTPUT"
+          echo "ConsoleUrl: $url"
+
+      # PASS 2 — PUBLIC_ORIGIN. The mgmt λ builds its OAuth redirect URI from this, so it must
+      # match the GitHub App's registered callback exactly; a guessed value is an open-redirect
+      # target, so login fails loudly rather than silently accepting a wrong origin.
+      - name: Set PUBLIC_ORIGIN (pass 2)
+        run: |
+          set -euo pipefail
+          npx cdk deploy LCA-Mgmt-dev \
+            --exclusively \
+            -c env=dev \
+            -c publicOrigin='${{ steps.console.outputs.console_url }}' \
+            --require-approval never \
+            --progress events
+
+      - name: Verify PUBLIC_ORIGIN landed on the mgmt function
+        run: |
+          set -euo pipefail
+          fn=$(aws cloudformation describe-stacks \
+            --stack-name LCA-Mgmt-dev \
+            --query "Stacks[0].Outputs[?OutputKey=='MgmtFunctionName'].OutputValue" \
+            --output text)
+          [ -n "$fn" ] && [ "$fn" != "None" ] || { echo "::error::MgmtFunctionName output missing"; exit 1; }
+          got=$(aws lambda get-function-configuration --function-name "$fn" \
+            --query 'Environment.Variables.PUBLIC_ORIGIN' --output text)
+          echo "PUBLIC_ORIGIN on $fn: $got"
+          [ "$got" = '${{ steps.console.outputs.console_url }}' ] \
+            || { echo "::error::PUBLIC_ORIGIN is '$got', expected '${{ steps.console.outputs.console_url }}'"; exit 1; }
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## LambdaCIActions CD — dev"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| ConsoleUrl | ${{ steps.console.outputs.console_url }} |"
+            echo "| account / region | ${LCA_DEPLOY_ACCOUNT} / ${LCA_DEPLOY_REGION} |"
+            echo "| stacks deployed | LCA-Mgmt-dev, LCA-Web-dev (\`--exclusively\`) |"
+            echo "| stacks NOT touched | LCA-Image-dev, LCA-Control-dev, LCA-Data-dev, LCA-Deploy-dev |"
+            echo "| commit | ${GITHUB_SHA} |"
+            echo "| runner | self-hosted microVM (lambda-ci-node) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p .agents/cd-artifacts
+          {
+            echo "console_url=${{ steps.console.outputs.console_url }}"
+            echo "account=${LCA_DEPLOY_ACCOUNT}"
+            echo "region=${LCA_DEPLOY_REGION}"
+            echo "stacks=LCA-Mgmt-dev,LCA-Web-dev"
+            echo "commit=${GITHUB_SHA}"
+            echo "run_id=${GITHUB_RUN_ID}"
+          } > .agents/cd-artifacts/deploy-summary.txt
+
+      - name: Upload deploy summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-deploy-summary
+          path: .agents/cd-artifacts/deploy-summary.txt
+          if-no-files-found: warn

@@ -12,9 +12,11 @@ Design: [spec 04](specs/04-web-ui.md) · [ADR-022](DECISIONS.md#adr-022) (auth) 
 
 ## Phase -1 — deploy-target pin (ADR-018)
 
-Same rule as every other deploy: `.env.local` must pin `LCA_DEPLOY_ACCOUNT` +
-`LCA_DEPLOY_REGION` and your credentials must resolve to that account, or the command
-refuses. `cdk synth` without credentials stays exempt.
+Same rule as every other deploy: `LCA_DEPLOY_ACCOUNT` + `LCA_DEPLOY_REGION` must be pinned and
+your credentials must resolve to that account, or the command refuses. On a workstation the pin
+lives in `.env.local`; in CI it comes from the job environment (ADR-047) because a fresh clone
+has no gitignored file. `.env.local` wins if both exist. `cdk synth` without credentials stays
+exempt.
 
 ## Phase -0.5 — console origin: vanity domain or raw CloudFront (ADR-036)
 
@@ -198,6 +200,184 @@ whole reason the origin is worth pinning to a domain you control (ADR-036).
    **Test delivery** (asks GitHub to re-deliver its most recent delivery — the "last received"
    timestamp advancing is the proof the round-trip landed). Without the allow-list every
    action is hidden and the API answers 403.
+
+## Deploy via CI (steady state — ADR-047)
+
+The phases above are the **manual** path. Steady state for `dev` is
+`.github/workflows/deploy.yml`, which runs on **our own microVM runners** (`[self-hosted,
+lambda-ci-node]`) and deploys `LCA-Mgmt-dev` + `LCA-Web-dev` under a GitHub-OIDC role. If
+LambdaCIActions cannot deploy LambdaCIActions, it is not a credible runner replacement.
+
+Identity is **GitHub OIDC, never the runner's own AWS role**: `lca-<env>-microvm-exec` is one
+role shared by every microVM in the environment and it runs untrusted workflow code from every
+onboarded repo, so deploy authority there would be platform-deploy power for every tenant
+(ADR-021). The OIDC role's trust is pinned to this repo and `refs/heads/main` only.
+
+### One-time setup per environment
+
+`LCA-Deploy-<env>` is deployed **from a workstation** and is deliberately *not* in CD's
+allowlist — CD must not be able to widen its own credential.
+
+First, does the account already have a GitHub OIDC provider? It is an **account-level
+singleton** keyed by issuer URL, so there can only ever be one:
+
+```sh
+aws iam list-open-id-connect-providers \
+  --query "OpenIDConnectProviderList[?contains(Arn,'token.actions.githubusercontent.com')].Arn" \
+  --output text
+```
+
+**If that prints an ARN (the common case — any prior GitHub-OIDC workload created it), just
+deploy.** The stack references the provider by its canonical ARN by default:
+
+```sh
+npx cdk deploy LCA-Deploy-<env> -c env=<env>
+```
+
+**If it prints nothing**, the account is fresh and the provider has to be created — opt in
+explicitly:
+
+```sh
+npx cdk deploy LCA-Deploy-<env> -c env=<env> -c createGithubOidcProvider=true
+```
+
+Creation is opt-in rather than automatic for two reasons: `CreateOpenIDConnectProvider` fails
+with `EntityAlreadyExists` if one is present (so a wrong guess breaks the whole deploy), and the
+CDK construct that creates it drags in a custom-resource Lambda whose role holds
+`iam:CreateOpenIDConnectProvider` on `Resource: "*"` — a wildcard IAM write inside the stack
+whose entire purpose is least privilege. Referencing also means a teardown of `LCA-Deploy-<env>`
+cannot delete a provider that unrelated workloads depend on.
+
+Other context flags: `-c deployRepo=owner/repo` (default `jsamuel1/LambdaCIActions`),
+`-c deployRefs=refs/heads/main` (comma-separated, **exact refs only** — wildcards are rejected
+at synth, since `refs/heads/*` would let any fork PR assume the role),
+`-c githubOidcProviderArn=` to override the referenced ARN, and `-c bootstrapQualifier=` if the
+account was bootstrapped with a non-default qualifier.
+
+The stack outputs `GitHubDeployRoleArn`. `deploy.yml` hardcodes the `dev` ARN
+(`arn:aws:iam::863638663908:role/lca-dev-github-deploy`); a new environment needs that line
+updated or moved to a repo variable.
+
+### Running it
+
+```sh
+gh workflow run deploy.yml --ref main
+gh run watch "$(gh run list --workflow=deploy.yml --limit 1 --json databaseId -q '.[0].databaseId')"
+```
+
+`workflow_dispatch` only, on purpose — a `push:`-to-main trigger is a follow-up so the first CD
+runs are watched rather than automatic.
+
+What the job does: `npm ci` → `npm run build` → `npm run build:web` → assume the OIDC role →
+`cdk deploy LCA-Mgmt-dev LCA-Web-dev --exclusively` → read `ConsoleUrl` from `LCA-Web-dev`'s
+outputs → `cdk deploy LCA-Mgmt-dev --exclusively -c publicOrigin=<ConsoleUrl>` → assert
+`PUBLIC_ORIGIN` actually landed on the mgmt function. `ConsoleUrl` and the deployed stack list
+go to the run summary and to a `cd-deploy-summary` artifact.
+
+The pin (`LCA_DEPLOY_ACCOUNT`/`LCA_DEPLOY_REGION`/`LCA_DEPLOY_ENV`) is declared inline in the
+workflow's `env:` block. It is not a secret — an account id and a region — and it is only a
+declaration: `bin/lca.ts` still compares it against the STS caller identity and refuses on
+mismatch.
+
+### What CD may and may not touch
+
+`LCA-Mgmt-dev` and `LCA-Web-dev`. That is the whole list, and `--exclusively` is what enforces
+it: `LCA-Mgmt-dev` declares CDK dependencies on `LCA-Data-dev` and `LCA-Control-dev`, and
+`cdk deploy <stack>` deploys a stack's dependencies **by default** — so without `-e`, a
+"Mgmt + Web only" command line would quietly redeploy the control plane, which owns the runner
+executing that very job. A bad control-plane deploy leaves no runner to deploy the fix. Never
+`--all`; never `LCA-Image-*`, `LCA-Control-*`, `LCA-Data-*` or `LCA-Deploy-*` from CI.
+`test/deploy-workflow.test.mjs` fails the build if that allowlist is widened.
+
+Confirm after a CD run that nothing else moved:
+
+```sh
+aws cloudformation describe-stacks \
+  --query 'Stacks[?starts_with(StackName,`LCA-`)].{N:StackName,U:LastUpdatedTime}' --output table
+```
+
+The deploy role's own permissions are `sts:AssumeRole` on the four CDK bootstrap roles, plus
+two read-only grants for the workflow's own steps: `cloudformation:DescribeStacks` on the two
+stacks above, and `lambda:GetFunctionConfiguration` on `lca-<env>-mgmt`. Those reads need
+explicit grants because `cdk deploy` runs under the *assumed* bootstrap roles while every
+`aws ...` step runs as the deploy role itself — a missing one fails the run *after* both
+deploys have already landed. **Be clear-eyed about the ceiling:** the bootstrap
+`cfn-exec-role` carries `AdministratorAccess` (the CDKToolkit default), so anything CD pushes
+through CloudFormation executes with admin. Narrowing that needs a re-bootstrap with
+`--cloudformation-execution-policies` — out of scope, tracked as a follow-up. Containment comes
+from the trust policy (one repo, one ref) and the stack allowlist.
+
+### CD and the vanity console domain (ADR-036)
+
+`dev` has no vanity domain, so CD's two-pass `-c publicOrigin=` bootstrap does the real work.
+**An environment that does have one must declare it in the workflow's `env:` block**
+(`LCA_CONSOLE_HOSTED_ZONE_ID`, `LCA_CONSOLE_ZONE_NAME`, optionally `LCA_CONSOLE_DOMAIN`).
+That config is machine-local `.env.local` state for the same reason the pin is — a hosted zone
+is account-specific — and a runner has no such file, so `resolveConsoleDomain` reads the same
+keys from the process environment at the lowest precedence (context → `.env.local` →
+environment). Skip it and CD synthesizes the env *as if it had no domain*: the CloudFront alias
+and the us-east-1 certificate are removed and `PUBLIC_ORIGIN` is rewritten to the raw
+CloudFront name, so login breaks against the callback URL registered on the GitHub App — which
+is browser-only to fix.
+
+**The certificate stack is a hand-deploy prerequisite.** `LCA-Cert-<env>` lives in us-east-1
+(CloudFront rejects viewer certs from anywhere else) and is on CD's forbidden list, so
+`--exclusively` **skips** it as a `LCA-Web-<env>` dependency instead of deploying it. Deploy it
+from a workstation once per environment — and again after any change to the hostname or zone —
+before dispatching CD:
+
+```sh
+npx cdk deploy LCA-Cert-<env> -c env=<env>       # us-east-1, workstation only
+```
+
+CD then consumes the cert ARN through the cross-region reference. A CD run against an env whose
+cert stack does not exist yet fails at `LCA-Web-<env>` when that reference cannot resolve. CD
+needs no us-east-1 authority of its own for this: the reference is resolved by a custom resource
+running with the deployed stack's role, not by the CLI's bootstrap roles, which is why the
+deploy role holds bootstrap roles in the deploy region only.
+
+### Manual escape hatch (CD or the runner plane is broken)
+
+CD runs **on the platform it deploys**, so it is circular by construction: if the control plane
+is broken, the compute plane is down, or the runner image is bad, no CD job will ever start.
+The workstation path is the fix path, and it stays first-class.
+
+```sh
+cd /path/to/LambdaCIActions
+
+# 1. Pin the target (ADR-018). Once per checkout.
+cp .env.local.example .env.local
+$EDITOR .env.local            # LCA_DEPLOY_ACCOUNT, LCA_DEPLOY_REGION, LCA_DEPLOY_ENV=dev
+
+# 2. Credentials for THAT account. The pin is checked against STS, so a wrong
+#    profile refuses instead of deploying to the wrong place.
+export AWS_PROFILE=<profile-for-that-account>
+aws sts get-caller-identity --query Account --output text     # must equal the pin
+
+# 3. Build, including the SPA bundle — LCA-Web's asset. Skipping it deploys an empty site.
+npm ci && npm run build && npm run build:web
+
+# 4. Same two passes CD runs, same --exclusively for the same reason.
+npx cdk deploy LCA-Mgmt-dev LCA-Web-dev --exclusively -c env=dev --require-approval never
+
+url=$(aws cloudformation describe-stacks --stack-name LCA-Web-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='ConsoleUrl'].OutputValue" --output text)
+echo "$url"
+
+npx cdk deploy LCA-Mgmt-dev --exclusively -c env=dev -c publicOrigin="$url" \
+  --require-approval never
+```
+
+Notes:
+- Do **not** copy the workflow's pin into your shell as `LCA_DEPLOY_*` exports and skip
+  `.env.local`. It works (ADR-047), but the file is the durable, reviewable declaration for a
+  checkout, and it wins over the environment precisely so a stale export cannot retarget you.
+- With a vanity domain configured (ADR-036) the second pass is a no-op — `PUBLIC_ORIGIN` came
+  from `.env.local` config at synth time. Harmless; leave it in the muscle memory. (CD gets
+  that config from the workflow environment instead — see § CD and the vanity console domain.)
+- If the runner plane itself is what is broken, fixing it means deploying `LCA-Control-<env>`
+  or rebuilding images — neither of which CD is allowed to do. That is the same manual path,
+  minus `--exclusively`, per [DEPLOY-M1](DEPLOY-M1.md).
 
 ## Migrating an existing console onto a vanity domain (ADR-036)
 

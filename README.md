@@ -79,7 +79,7 @@ docs/
     04-web-ui.md           Management console + management API
     05-infrastructure.md   CDK stacks, secrets, deploy phases
 bin/        CDK app entrypoint (lca.ts)
-lib/        CDK stacks (image-, data-, control-, mgmt-, web-, cert-stack.ts) + env-config.ts
+lib/        CDK stacks (image-, data-, control-, mgmt-, web-, cert-, deploy-stack.ts) + env-config.ts
 src/        Lambda source (ingest/, discover/, provision/, reaper/, mgmt/, rewrite/, shared/)
 web/        Console SPA (React + TypeScript, esbuild → web/dist)
 microvm/    microVM image Dockerfiles + run-hook lifecycle server
