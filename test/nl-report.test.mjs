@@ -23,7 +23,7 @@ import {
   resetRateLimits,
   specFromCompletion,
 } from '../dist/src/mgmt/nl-report.js';
-import { CHART_TYPES, DIMENSIONS, METRICS, METRIC_CATALOG } from '../dist/src/mgmt/reports.js';
+import { CHART_TYPES, DIMENSIONS, METRICS, METRIC_CATALOG, availablePresets, defaultPreset } from '../dist/src/mgmt/reports.js';
 import fs from 'node:fs';
 
 const NOW = new Date('2026-07-15T12:00:00.000Z');
@@ -301,6 +301,53 @@ test('the prompt never offers a window this environment cannot serve', () => {
   const prod = withRetention(90, () => buildSystemPrompt());
   assert.match(prod, /^preset: 24h \| 7d \| 30d \| 90d$/m);
   assert.match(prod, /Never propose a wider window than "90d"/);
+});
+
+test('the prompt tells the model to default to a preset the validator would accept', () => {
+  // The DEFAULT line was the one place in this prompt still carrying a hardcoded `7d` while
+  // every other window statement was derived from `availablePresets()`. Below a week of
+  // retention the prompt therefore contradicted itself in three consecutive lines — `preset:
+  // 24h`, "default to 7d", "never propose wider than 24h" — and the model's default became a
+  // spec `validateReportSpec` refuses. That is worse than the wide-preset case this file's
+  // neighbouring test covers: there the model has to be asked for a long window, here it is
+  // instructed into the refusal by the prompt itself, so a question naming no time range at all
+  // fails. Both halves now come from `defaultPreset`, the same function the validator fills an
+  // absent window from.
+  for (const days of [1, 3, 6, 7, 30, 90, undefined]) {
+    const { prompt, presets, expected } = withRetention(days, () => ({
+      prompt: buildSystemPrompt(),
+      presets: availablePresets(),
+      expected: defaultPreset(),
+    }));
+    const quoted = prompt.match(/Default to preset "([^"]+)"/);
+    assert.ok(quoted, `retention ${days}: the prompt states no default window`);
+    assert.equal(
+      quoted[1],
+      expected,
+      `retention ${days}: the prompt's default disagrees with the validator's`,
+    );
+    assert.ok(
+      presets.includes(quoted[1]),
+      `retention ${days}: the prompt defaults to "${quoted[1]}", which is not in the menu it just listed (${presets.join(', ')})`,
+    );
+    // And it cannot be wider than the ceiling stated two lines below it.
+    const widest = prompt.match(/Never propose a wider window than "([^"]+)"/);
+    assert.equal(
+      presets.indexOf(quoted[1]) <= presets.indexOf(widest[1]),
+      true,
+      `retention ${days}: the default window is wider than the prompt's own ceiling`,
+    );
+  }
+
+  // The rule is still `7d` wherever retention serves it — the fix must not have quietly
+  // narrowed the default for the environments that actually ship (dev 30 / prod 90).
+  for (const days of [7, 30, 90]) {
+    assert.match(
+      withRetention(days, () => buildSystemPrompt()),
+      /Default to preset "7d"/,
+      `retention ${days} should still default to 7d`,
+    );
+  }
 });
 
 test('a model-proposed window beyond THIS environment\'s retention is refused', () => {

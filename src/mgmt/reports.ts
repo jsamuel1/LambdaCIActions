@@ -101,6 +101,27 @@ export function availablePresets(max: number = maxRangeDays()): RangePreset[] {
   return allowed.length ? allowed : [RANGE_PRESETS[0]];
 }
 
+/**
+ * The window to report on when nothing named one: `7d` where retention serves it, otherwise the
+ * widest preset it does.
+ *
+ * Exported and shared rather than restated, because there are three places that need this answer
+ * and each restatement is a place it can drift out of the servable list: `validateReportSpec`
+ * (which fills the window when a spec names none), the assistant's system prompt (which tells the
+ * model what to default to), and the SPA's own default query. A hardcoded `7d` in any of them is
+ * a value the validator refuses whenever retention is shorter than a week — and in the prompt it
+ * is worse than a refusal, because the model is told to default to `7d` in the same breath as
+ * being told the only servable preset is `24h` and never to exceed it. It then emits either a
+ * spec the validator rejects (an operator gets a refusal for a fair question, the exact failure
+ * `availablePresets` exists in the prompt to prevent) or an arbitrary guess.
+ *
+ * Not reachable with the shipped dev 30 / prod 90 retention (ADR-033); it is reachable the moment
+ * an environment sets `RUN_RETENTION_DAYS` below 7, which is a one-variable change.
+ */
+export function defaultPreset(presets: readonly RangePreset[] = availablePresets()): RangePreset {
+  return presets.includes('7d') ? '7d' : presets[presets.length - 1];
+}
+
 /** Which chart types make sense for a metric+dimension pair (the UI and the model share this). */
 export const DEFAULT_CHART: Record<ReportMetric, ChartType> = {
   spend: 'bar',
@@ -346,9 +367,10 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
       }
     }
   } else {
-    // Default window: 7d where retention allows it, otherwise the widest preset it does.
-    const fallback = presets.includes('7d') ? '7d' : presets[presets.length - 1];
-    const chosen = preset ?? fallback;
+    // Default window: `defaultPreset` — 7d where retention allows it, otherwise the widest
+    // preset it does. Shared with the assistant's prompt so the two cannot name different
+    // defaults, which would make the model's default a spec this validator refuses.
+    const chosen = preset ?? defaultPreset(presets);
     const win = presetWindow(chosen, now);
     from = win.from;
     to = win.to;

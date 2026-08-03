@@ -596,12 +596,22 @@ test('every metric declares whether it is additive, and the doc matches the pred
   }
 
   // The field's own documentation must name the same set, since that comment is what the next
-  // author reads before extending the chain.
+  // author reads before extending the chain. Asserted as an EXACT set, not as presence: a
+  // presence loop passes while the comment also names a metric that is NOT additive, which is
+  // the more misleading direction (it tells the next author to expect a total the code omits).
+  // Backticked identifiers are the anchor — the comment names additive metrics in backticks and
+  // refers to the excluded ones descriptively ("p50 durations", "failure ratios"), so a bare
+  // word match would also hit those and could not tell the two apart.
   const src = fs.readFileSync(new URL('../src/mgmt/reports.ts', import.meta.url), 'utf8');
   const doc = sliceBetween(src, 'Total across every point', 'total?: number;', 500);
-  for (const metric of ADDITIVE) {
-    assert.match(doc, new RegExp(metric), `the total? doc comment omits the additive metric ${metric}`);
-  }
+  const named = [...doc.matchAll(/`([A-Za-z]+)`/g)]
+    .map((m) => m[1])
+    .filter((w) => METRICS.includes(w));
+  assert.deepEqual(
+    [...new Set(named)].sort(),
+    [...ADDITIVE].sort(),
+    'the total? doc comment names a different additive set than the predicate implements',
+  );
 });
 
 test('queue latency excludes rows with no watermark instead of counting them as zero', () => {

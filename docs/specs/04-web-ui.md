@@ -333,7 +333,11 @@ CSV form — which has nowhere in the body to put it — carries `X-Report-Compl
 
 An export **reconciles with the report it was downloaded from**, and both reconcile with Run
 detail: summing `billableSeconds` ÷ 60
-yields the `billableMinutes` total, and summing `estimatedCostUsd` yields `spend`. Both
+yields the `billableMinutes` total, and summing `estimatedCostUsd` yields `spend` — over the rows
+the export actually carries. A file the row/byte cap truncated sums *lower* than the figure beside
+it, which is what `complete: false` and `X-Report-Complete` are for; the reconciliation is a
+statement about the per-row definitions agreeing, not a promise that a capped download totals the
+headline. Both
 per-row columns are gated on the same predicate their aggregate folds over — a job that never
 ran a microVM exports `0` billable seconds, `0` cost and an **empty** `costBasis`, because a
 basis names which clock measured a billable window and such a row has none. Ungated, a
