@@ -285,7 +285,7 @@ live footgun, and it also left "which account is dev?" undiscoverable from the r
 optional `AWS_PROFILE`. A shared guard (`lib/deploy-env.ts`, zero npm deps) is enforced
 by every deploy-touching entry point:
 - **CDK app** (`bin/lca.ts`): if credentials are present (`CDK_DEFAULT_ACCOUNT` set) or
-  `.env.local` exists, the pin is mandatory and must match the ambient account; stacks
+  a pin exists, the pin is mandatory and must match the ambient account; stacks
   get `env = { account: pin, region: pin }`. Credential-less synth (the CI gate, fresh
   worktrees) proceeds unpinned — it cannot deploy anything.
 - **`scripts/build-images.mjs` / `scripts/create-github-app.mjs`**: refuse to start
@@ -302,6 +302,19 @@ convention, and one TS module shared via `dist/` avoids two divergent implementa
 **Consequences**: first deploy on a fresh clone requires `cp .env.local.example
 .env.local` + editing two values (deliberate one-time friction). Dev/prod account
 separation (M5) becomes trivial: each checkout/env pins its own account.
+
+**Amended by [ADR-047](#adr-047--cd-runs-on-our-own-microvm-runners-under-a-github-oidc-deploy-role-m4)
+(M4 CD)**: the pin may also come from the **process environment** — `LCA_DEPLOY_ACCOUNT` /
+`LCA_DEPLOY_REGION` / `LCA_DEPLOY_ENV` — when no `.env.local` exists. A CI checkout is a fresh
+clone, so it cannot carry a gitignored file, and committing one would publish the deploy target
+and defeat the point. `.env.local` **wins** when both are present, so an ambient exported
+variable cannot silently retarget a workstation deploy.
+
+The identity check is **unchanged and applies identically to both sources**: the pin is still
+compared against the real STS caller account and still refuses on mismatch. There is no
+"trusted CI" branch and no variable that switches the guard off — a pin was never the safety
+property, the identity match is. A pin declares intent; a partial or malformed one (from either
+source) fails loudly rather than degrading to "unpinned".
 
 **M5 review fix — the pin also binds the ENVIRONMENT, not just the account.** The paragraph
 above was optimistic: `-c env=prod` / `--env prod` selected resource names, retention,
@@ -1806,3 +1819,141 @@ so it consumes quota, costs money, and needs a repo to register against; it is t
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
 the static gates; the smoke run itself is verified against a live environment. Deferred to a
 follow-up card together with ADR-040.
+
+> **ADR numbering note.** This block takes **047** because 042..046 are claimed by the
+> concurrent branch `kermes/task-jolly-dove` (spend/run analytics) and 034/035 by
+> `kermes/task-nervous-mountain`. ADR numbers are a shared mutable namespace across branches;
+> a gap is cheaper than a duplicate.
+
+## ADR-047 — CD runs on our own microVM runners under a GitHub-OIDC deploy role (M4)
+**Status**: Accepted (v1) · amends [ADR-018](#adr-018--deploy-target-pin-envlocal-required-for-all-deploy-touching-commands) · constrained by [ADR-021](#adr-021--microvms-hold-no-ambient-aws-authority-brokered-run-hook-operations-m3)
+
+**Context**: The management plane (`LCA-Mgmt-<env>` + `LCA-Web-<env>`) was deployed by hand
+from a workstation. CI (`ci.yml`) already dogfoods the platform for *tests* — 100% self-hosted
+on our own microVMs — but the deploy itself did not, so the platform's claim to replace
+self-hosted runners stopped short of the workload that matters most. Three things blocked a CD
+job:
+
+1. **No identity.** A workflow job had no AWS credentials.
+2. **ADR-018.** `bin/lca.ts` requires a pin from `.env.local` whenever credentials resolve,
+   and `.env.local` is gitignored — a CI checkout is a fresh clone and cannot have one.
+3. **Unverified assumption.** Our runners register **JIT-by-ref** (ADR-016) rather than as
+   long-lived registered runners, and it was not known whether the Actions service still
+   injects the id-token endpoint into such a job.
+
+**Decision**:
+
+**(a) Identity is GitHub OIDC. The shared microVM exec role is not an option.** The tempting
+shortcut — let the runner's own AWS identity deploy — is closed by ADR-021.
+`lca-<env>-microvm-exec` is **one role shared by every microVM in the environment**, and those
+VMs execute untrusted workflow code from every onboarded repo; ADR-021 deliberately cut it to
+its own log group plus `lambda:InvokeFunction` on the hook broker. Attaching deploy authority
+there would hand platform-deploy *and teardown* power to every job in every tenant repo — the
+exact cross-tenant escalation ADR-021 exists to remove. A GitHub OIDC JWT instead binds the
+authority to a `repo` + `ref` claim that code inside a VM cannot forge.
+
+Verified before building anything (probe run **30789251216**, `runs-on: [self-hosted,
+lambda-ci-node]`): a job declaring `id-token: write` on our own JIT runner **does** receive
+`ACTIONS_ID_TOKEN_REQUEST_URL`/`_TOKEN`, and the endpoint mints a JWT with
+`sub=repo:jsamuel1/LambdaCIActions:ref:refs/heads/<branch>`, `aud=sts.amazonaws.com`. The
+endpoint rides the job message, not the runner registration, so JIT-by-ref is irrelevant to it.
+
+**(b) ADR-018 accepts a pin from the process environment, with the identity check unchanged.**
+`loadEnvLocal()` falls back to `LCA_DEPLOY_ACCOUNT`/`LCA_DEPLOY_REGION`/`LCA_DEPLOY_ENV` read
+from the environment when no `.env.local` exists; **`.env.local` wins when both are present**,
+so an ambient exported variable cannot silently retarget a workstation deploy. What does *not*
+change is the STS comparison: the pin is still checked against the real caller identity and
+still refuses on mismatch. There is no "skip in CI" branch and no variable that disables the
+guard, because a pin was never the safety property — the identity match is. A pin is a
+declaration of intent; a partial or malformed one fails loudly rather than degrading to
+"unpinned". Credential-less `cdk synth` stays exempt (the CI build gate needs no account).
+
+The pin is declared inline in the workflow (`env:`), not as a secret: an account id and a
+region are not secrets, and hiding the deploy target from review is precisely what ADR-018 was
+written to stop.
+
+**(c) The deploy identity is its own stack, `LCA-Deploy-<env>`** (`lib/deploy-stack.ts`),
+deployed from a workstation and **never** in CD's own allowlist. It holds the credential CD
+uses; if CD could deploy it, a CD run could widen its own trust policy, and a broken deploy
+would take out the identity needed to deploy the fix.
+
+Trust is `StringEquals` on the exact `sub`
+(`repo:jsamuel1/LambdaCIActions:ref:refs/heads/main`) and `aud=sts.amazonaws.com`. Wildcards
+are **rejected at synth**, not documented as a hazard: a `StringLike` with `repo:owner/*` or
+`ref:refs/heads/*` would let any fork's pull-request workflow — i.e. any GitHub user — assume
+the role. The account's `token.actions.githubusercontent.com` provider **already existed**
+(created 2025-06-27 for an unrelated project), and an OIDC provider is an account-level
+singleton keyed by issuer URL — so the stack **references** it by its canonical ARN and creates
+one only on explicit opt-in (`-c createGithubOidcProvider=true`). Referencing is the safe
+default twice over: `CreateOpenIDConnectProvider` fails with `EntityAlreadyExists` when one is
+present, and the creating construct synthesizes a custom-resource role holding
+`iam:CreateOpenIDConnectProvider` on `Resource: "*"` — a wildcard IAM write inside the stack
+whose whole purpose is least privilege. It also keeps a teardown of this stack from deleting a
+provider other workloads depend on.
+
+**(d) Permissions: `sts:AssumeRole` on the four CDK bootstrap roles, plus two read-only
+grants the workflow's own steps need — `DescribeStacks` on the two CD-deployed stacks and
+`lambda:GetFunctionConfiguration` on `lca-<env>-mgmt`. Nothing else.** No managed policies, no
+`iam:` action, no `Resource: "*"`. Assume-bootstrap-roles is the smallest grant that can run
+`cdk deploy`, and it does not have to be revised every time the deployed stacks grow a resource
+type. The two reads are separate because `cdk deploy` runs under the *assumed* bootstrap roles
+while every `aws ...` step in the workflow runs as this role: the `ConsoleUrl` lookup between
+passes and the closing `PUBLIC_ORIGIN` assertion would otherwise fail with `AccessDenied`
+*after* both deploys had already landed. `test/deploy-role-iam.test.mjs` cross-checks the
+workflow's `aws` verbs against the granted actions so that pairing cannot silently drift.
+
+**This is admin-by-proxy, and the honest statement matters more than the shape of the policy.**
+`cdk-hnb659fds-cfn-exec-role-863638663908-us-west-2` carries **`AdministratorAccess`** — the
+CDKToolkit default, `CloudFormationExecutionPolicies` is empty in the bootstrap stack — so
+anything the deploy role pushes through CloudFormation executes with admin. Writing direct
+CFN/S3/Lambda/`iam:PassRole` statements *instead* would not fix that: `iam:PassRole` on the
+same admin `cfn-exec-role` reaches the identical ceiling while being longer, more brittle and
+easier to over-grant. Lowering the ceiling requires re-bootstrapping the account with
+`--cloudformation-execution-policies` (**out of scope; follow-up**). The real containment is
+therefore the trust policy (one repo, one ref) plus the workflow's stack allowlist — both
+asserted by tests, because both are the kind of control that rots silently.
+
+**(e) CD deploys `LCA-Mgmt-<env>` + `LCA-Web-<env>` only, with `--exclusively`.** Never
+`--all`; never the image, control, data or deploy stacks. `--exclusively` is load-bearing, not
+tidiness: `LCA-Mgmt-<env>` declares CDK dependencies on the data and control stacks, and
+`cdk deploy <stack>` deploys a stack's dependencies by default — so naming only Mgmt+Web
+*without* `-e` would quietly redeploy the control plane, i.e. the plane that owns the runner
+executing that very job. A bad control-plane deploy leaves no runner to deploy the fix.
+
+**(f) Workstation `cdk deploy` becomes the documented escape hatch**, not the steady state
+(docs/DEPLOY-M4.md § Manual escape hatch). CD depends on the runner plane it deploys onto, so a
+non-CD path has to stay first-class and correct for exactly the case where the platform is down.
+
+**Consequences**:
+- `workflow_dispatch` only for now; a `push:`-to-main trigger is a deliberate follow-up so the
+  first CD runs are observed rather than automatic.
+- The two-pass `-c publicOrigin=` bootstrap (docs/DEPLOY-M4.md Phase 3) is now automated: CD
+  reads `ConsoleUrl` from `LCA-Web-<env>`'s outputs between passes, then asserts
+  `PUBLIC_ORIGIN` actually landed on the mgmt λ — a green `cdk deploy` does not prove the
+  second pass took effect.
+- **A vanity domain (ADR-036) must be declared in the workflow environment for a CD deploy.**
+  Console-domain config is machine-local (`.env.local`) for the same reason the pin is, and a
+  runner has no such file — so `resolveConsoleDomain` also reads `LCA_CONSOLE_*` from the
+  process environment, at the LOWEST precedence (context → `.env.local` → environment). Without
+  that source, CD would synth an env that HAS a vanity domain as if it had none: the CloudFront
+  alias and the us-east-1 cert would be removed and `PUBLIC_ORIGIN` rewritten to the raw
+  CloudFront name, breaking login against the callback registered on the App — which is
+  browser-only to fix. `dev` has no vanity domain today, so `deploy.yml` declares no
+  `LCA_CONSOLE_*` and pass 2 does the real work.
+- **A vanity-domain env also needs `LCA-Cert-<env>` deployed by hand before CD can run.** The
+  us-east-1 ACM certificate is its own stack (ADR-036) and it is on CD's forbidden list, so
+  `--exclusively` skips it as a `LCA-Web-<env>` dependency rather than deploying it. The
+  workstation deploys it once (and again on any change to the hostname or zone); CD then
+  consumes the cert ARN through the cross-region reference. A CD run against an env whose cert
+  stack does not exist yet fails at `LCA-Web-<env>` when that reference cannot resolve — loudly,
+  which is the correct failure, but only if the operator sequence is known. CD itself needs no
+  us-east-1 authority for this: the reference is resolved by a custom resource running with the
+  deployed stack's own role, not by the CLI's bootstrap roles, so the deploy role is granted
+  bootstrap roles in the deploy region only.
+- A pin can now come from the environment, so an operator debugging locally with exported
+  `LCA_DEPLOY_*` variables gets the CI code path. The STS match still gates it, and the file
+  still wins, so the failure mode is a refusal rather than a mis-target.
+- `LCA-Deploy-<env>` must be deployed by hand once per environment before CD can run at all,
+  and the role ARN is hardcoded in the workflow (derived from `envName`, so prod needs its own
+  line or a repo variable).
+- The `cfn-exec-role` admin ceiling is accepted and recorded, not fixed.

@@ -76,6 +76,7 @@ CDK v2 (TypeScript). Split so the compute plane can be built before the control 
 | `MgmtStack` | HTTP API `/api/*` + `/auth/*`, Mgmt API λ | Management plane (M4). IAM boundary per ADR-025 |
 | `WebStack` | S3 (OAC, private) + CloudFront; API attached as `/api/*` + `/auth/*` behaviors; vanity alias + A/AAAA records when a console domain is configured | Hosts the SPA; single origin per ADR-024, vanity domain per ADR-036 |
 | `CertStack` | ACM certificate for the console's vanity hostname, DNS-validated | **us-east-1 only** — CloudFront accepts viewer certs from no other region. Created ONLY when `LCA_CONSOLE_*` is configured (ADR-036); needs a us-east-1 CDK bootstrap |
+| `DeployStack` | CI deploy identity: the `lca-<env>-github-deploy` role (GitHub OIDC), trust pinned to one repo + `refs/heads/main`; `sts:AssumeRole` on the four CDK bootstrap roles plus two read-only grants CD's own steps need | **Workstation deploy only** — never in CD's allowlist, or a CD run could widen its own credential (ADR-047). No stack dependencies. References the account's OIDC provider (an account-level singleton) unless `-c createGithubOidcProvider=true` |
 | ~~`AuthStack`~~ | — | **Dropped**: auth is GitHub OAuth + a signed session cookie, no Cognito user pool (ADR-022). The only resource it would own is the session secret — an out-of-band SecureString. |
 
 Cross-stack refs kept minimal; config values (image ARNs, table names) flow via SSM
@@ -111,9 +112,15 @@ metadata only (ADR-025).
 
 ## Phased deployment
 
-Same three-step shape as the reference, generalized:
+Same three-step shape as the reference (infra → images → orchestrator), generalized — plus a
+console-origin pass, and a one-time step 0 when CD is used:
 
 ```
+0. CI deploy identity   →  cdk deploy DeployStack   # once per env, FROM A WORKSTATION
+   (only if CD is used)    (LCA-Deploy-<env>: the GitHub-OIDC role CD assumes. Outside this
+                            sequence's dependency chain, and deliberately NOT deployable by
+                            CD itself — ADR-047. Steps 1-4 need no OIDC role at all.)
+
 1. deploy infra        →  cdk deploy ImageStack DataStack
                           (bucket + build role + tables; no orchestrator yet —
                            image ARNs don't exist)
@@ -137,6 +144,12 @@ Same three-step shape as the reference, generalized:
                            exists — two-pass by design, ADR-024. With LCA_CONSOLE_* set the
                            origin comes from config and this step disappears, ADR-036)
 ```
+
+Steps 3–4 for `MgmtStack` + `WebStack` are what CD automates once step 0 is done
+(`.github/workflows/deploy.yml`, ADR-047) — always with `--exclusively`, because `MgmtStack`
+declares CDK dependencies on `DataStack` + `ControlStack` and CD must never redeploy the
+control plane that owns the runner executing the job. Steps 1–2, `ControlStack` and
+`CertStack` stay workstation-only. Runbook: [DEPLOY-M4](../DEPLOY-M4.md) § Deploy via CI.
 
 Re-running step 2 rebuilds images (e.g. patch day); steps 3–4 are idempotent. Full console
 runbook: [DEPLOY-M4](../DEPLOY-M4.md).
