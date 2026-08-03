@@ -101,9 +101,12 @@ jobs:
             --progress events
 
       # The console origin is CloudFront's generated domain, which does not exist until
-      # WebStack's first deploy — hence the two-pass bootstrap (docs/DEPLOY-M4.md). With a
-      # vanity domain configured (ADR-036) the origin is known at synth time and pass 2 is a
-      # no-op, which is fine: it stays in the workflow so both configurations work.
+      # WebStack's first deploy — hence the two-pass bootstrap (docs/DEPLOY-M4.md). `dev` has
+      # no vanity domain, so this pass does the real work. An env that DOES have one must
+      # declare LCA_CONSOLE_HOSTED_ZONE_ID + LCA_CONSOLE_ZONE_NAME in the `env:` block above:
+      # that config lives in `.env.local` on a workstation, and a runner has no such file, so
+      # without it the synth would drop the CloudFront alias and cert and rewrite
+      # PUBLIC_ORIGIN to the raw CloudFront name — breaking login (ADR-036/ADR-047).
       - name: Read ConsoleUrl from LCA-Web-dev
         id: console
         run: |
@@ -132,10 +135,11 @@ jobs:
       - name: Verify PUBLIC_ORIGIN landed on the mgmt function
         run: |
           set -euo pipefail
-          fn=$(aws cloudformation describe-stack-resources \
+          fn=$(aws cloudformation describe-stacks \
             --stack-name LCA-Mgmt-dev \
-            --query "StackResources[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
-            --output text | tr '\t' '\n' | head -1)
+            --query "Stacks[0].Outputs[?OutputKey=='MgmtFunctionName'].OutputValue" \
+            --output text)
+          [ -n "$fn" ] && [ "$fn" != "None" ] || { echo "::error::MgmtFunctionName output missing"; exit 1; }
           got=$(aws lambda get-function-configuration --function-name "$fn" \
             --query 'Environment.Variables.PUBLIC_ORIGIN' --output text)
           echo "PUBLIC_ORIGIN on $fn: $got"

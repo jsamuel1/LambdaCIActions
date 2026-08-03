@@ -266,12 +266,29 @@ aws cloudformation describe-stacks \
   --query 'Stacks[?starts_with(StackName,`LCA-`)].{N:StackName,U:LastUpdatedTime}' --output table
 ```
 
-The deploy role's own permissions are `sts:AssumeRole` on the four CDK bootstrap roles plus
-`cloudformation:DescribeStacks` on the two stacks above. **Be clear-eyed about the ceiling:**
-the bootstrap `cfn-exec-role` carries `AdministratorAccess` (the CDKToolkit default), so
-anything CD pushes through CloudFormation executes with admin. Narrowing that needs a
-re-bootstrap with `--cloudformation-execution-policies` — out of scope, tracked as a follow-up.
-Containment comes from the trust policy (one repo, one ref) and the stack allowlist.
+The deploy role's own permissions are `sts:AssumeRole` on the four CDK bootstrap roles, plus
+two read-only grants for the workflow's own steps: `cloudformation:DescribeStacks` on the two
+stacks above, and `lambda:GetFunctionConfiguration` on `lca-<env>-mgmt`. Those reads need
+explicit grants because `cdk deploy` runs under the *assumed* bootstrap roles while every
+`aws ...` step runs as the deploy role itself — a missing one fails the run *after* both
+deploys have already landed. **Be clear-eyed about the ceiling:** the bootstrap
+`cfn-exec-role` carries `AdministratorAccess` (the CDKToolkit default), so anything CD pushes
+through CloudFormation executes with admin. Narrowing that needs a re-bootstrap with
+`--cloudformation-execution-policies` — out of scope, tracked as a follow-up. Containment comes
+from the trust policy (one repo, one ref) and the stack allowlist.
+
+### CD and the vanity console domain (ADR-036)
+
+`dev` has no vanity domain, so CD's two-pass `-c publicOrigin=` bootstrap does the real work.
+**An environment that does have one must declare it in the workflow's `env:` block**
+(`LCA_CONSOLE_HOSTED_ZONE_ID`, `LCA_CONSOLE_ZONE_NAME`, optionally `LCA_CONSOLE_DOMAIN`).
+That config is machine-local `.env.local` state for the same reason the pin is — a hosted zone
+is account-specific — and a runner has no such file, so `resolveConsoleDomain` reads the same
+keys from the process environment at the lowest precedence (context → `.env.local` →
+environment). Skip it and CD synthesizes the env *as if it had no domain*: the CloudFront alias
+and the us-east-1 certificate are removed and `PUBLIC_ORIGIN` is rewritten to the raw
+CloudFront name, so login breaks against the callback URL registered on the GitHub App — which
+is browser-only to fix.
 
 ### Manual escape hatch (CD or the runner plane is broken)
 
@@ -310,7 +327,8 @@ Notes:
   `.env.local`. It works (ADR-047), but the file is the durable, reviewable declaration for a
   checkout, and it wins over the environment precisely so a stale export cannot retarget you.
 - With a vanity domain configured (ADR-036) the second pass is a no-op — `PUBLIC_ORIGIN` came
-  from config. Harmless; leave it in the muscle memory.
+  from `.env.local` config at synth time. Harmless; leave it in the muscle memory. (CD gets
+  that config from the workflow environment instead — see § CD and the vanity console domain.)
 - If the runner plane itself is what is broken, fixing it means deploying `LCA-Control-<env>`
   or rebuilding images — neither of which CD is allowed to do. That is the same manual path,
   minus `--exclusively`, per [DEPLOY-M1](DEPLOY-M1.md).

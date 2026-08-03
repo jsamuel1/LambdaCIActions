@@ -1891,10 +1891,16 @@ present, and the creating construct synthesizes a custom-resource role holding
 whose whole purpose is least privilege. It also keeps a teardown of this stack from deleting a
 provider other workloads depend on.
 
-**(d) Permissions: `sts:AssumeRole` on the four CDK bootstrap roles, plus `DescribeStacks` on
-the two CD-deployed stacks. Nothing else.** No managed policies, no `iam:` action, no
-`Resource: "*"`. That is the smallest grant that can run `cdk deploy`, and it does not have to
-be revised every time the deployed stacks grow a resource type.
+**(d) Permissions: `sts:AssumeRole` on the four CDK bootstrap roles, plus two read-only
+grants the workflow's own steps need — `DescribeStacks` on the two CD-deployed stacks and
+`lambda:GetFunctionConfiguration` on `lca-<env>-mgmt`. Nothing else.** No managed policies, no
+`iam:` action, no `Resource: "*"`. Assume-bootstrap-roles is the smallest grant that can run
+`cdk deploy`, and it does not have to be revised every time the deployed stacks grow a resource
+type. The two reads are separate because `cdk deploy` runs under the *assumed* bootstrap roles
+while every `aws ...` step in the workflow runs as this role: the `ConsoleUrl` lookup between
+passes and the closing `PUBLIC_ORIGIN` assertion would otherwise fail with `AccessDenied`
+*after* both deploys had already landed. `test/deploy-role-iam.test.mjs` cross-checks the
+workflow's `aws` verbs against the granted actions so that pairing cannot silently drift.
 
 **This is admin-by-proxy, and the honest statement matters more than the shape of the policy.**
 `cdk-hnb659fds-cfn-exec-role-863638663908-us-west-2` carries **`AdministratorAccess`** — the
@@ -1922,8 +1928,20 @@ non-CD path has to stay first-class and correct for exactly the case where the p
 - `workflow_dispatch` only for now; a `push:`-to-main trigger is a deliberate follow-up so the
   first CD runs are observed rather than automatic.
 - The two-pass `-c publicOrigin=` bootstrap (docs/DEPLOY-M4.md Phase 3) is now automated: CD
-  reads `ConsoleUrl` from `LCA-Web-<env>`'s outputs between passes. With a vanity domain
-  (ADR-036) pass 2 is a no-op, which is why it stays unconditional.
+  reads `ConsoleUrl` from `LCA-Web-<env>`'s outputs between passes, then asserts
+  `PUBLIC_ORIGIN` actually landed on the mgmt λ — a green `cdk deploy` does not prove the
+  second pass took effect.
+- **A vanity domain (ADR-036) must be declared in the workflow environment for a CD deploy.**
+  Console-domain config is machine-local (`.env.local`) for the same reason the pin is, and a
+  runner has no such file — so `resolveConsoleDomain` also reads `LCA_CONSOLE_*` from the
+  process environment, at the LOWEST precedence (context → `.env.local` → environment). Without
+  that source, CD would synth an env that HAS a vanity domain as if it had none: the CloudFront
+  alias and the us-east-1 cert would be removed and `PUBLIC_ORIGIN` rewritten to the raw
+  CloudFront name, breaking login against the callback registered on the App — which is
+  browser-only to fix. `dev` has no vanity domain today, so `deploy.yml` declares no
+  `LCA_CONSOLE_*` and pass 2 does the real work; an env that adds one must add those variables
+  to the workflow (and the deploy role needs the us-east-1 bootstrap roles, which
+  `bin/lca.ts` grants when a domain resolves).
 - A pin can now come from the environment, so an operator debugging locally with exported
   `LCA_DEPLOY_*` variables gets the CI code path. The STS match still gates it, and the file
   still wins, so the failure mode is a refusal rather than a mis-target.

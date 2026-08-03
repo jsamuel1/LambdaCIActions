@@ -71,10 +71,12 @@ const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
  * (`createProvider`) — see the constructor for why that default matters.
  *
  * ## Permissions and their ceiling
- * The role gets `sts:AssumeRole` on the four CDK bootstrap roles and NOTHING else — no CFN,
- * S3, Lambda or IAM statements of its own. That is the smallest grant that can run
- * `cdk deploy`, and it keeps this stack from silently drifting behind the resource surface
- * of the stacks CD deploys.
+ * The role gets `sts:AssumeRole` on the four CDK bootstrap roles — that is the whole of what
+ * `cdk deploy` needs, and it keeps this stack from silently drifting behind the resource
+ * surface of the stacks CD deploys. Two read-only grants are added for the workflow's own
+ * steps: `cloudformation:DescribeStacks` on the two CD-deployed stacks (to read `ConsoleUrl`
+ * between passes) and `lambda:GetFunctionConfiguration` on the mgmt function (to assert
+ * `PUBLIC_ORIGIN` actually landed). No IAM action, no `Resource: "*"`, no managed policy.
  *
  * **It is nonetheless admin-by-proxy, and honesty about that matters more than the shape of
  * the policy:** the bootstrap `cfn-exec-role` in this account carries `AdministratorAccess`
@@ -191,7 +193,8 @@ export class DeployStack extends Stack {
 
     // Read-only, and needed by the workflow itself: after the first pass it reads the
     // console URL out of LCA-Web-<env>'s outputs to feed the second (`-c publicOrigin=`)
-    // pass. Scoped to this env's stack ARNs so it cannot enumerate unrelated stacks.
+    // pass, and the mgmt function's name out of LCA-Mgmt-<env>'s outputs for the assertion
+    // below. Scoped to this env's stack ARNs so it cannot enumerate unrelated stacks.
     this.role.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ReadOwnStackOutputs',
@@ -199,6 +202,22 @@ export class DeployStack extends Stack {
         resources: [
           `arn:${Aws.PARTITION}:cloudformation:${this.region}:${this.account}:stack/LCA-Mgmt-${envName}/*`,
           `arn:${Aws.PARTITION}:cloudformation:${this.region}:${this.account}:stack/LCA-Web-${envName}/*`,
+        ],
+      }),
+    );
+
+    // The last CD step asserts PUBLIC_ORIGIN actually landed on the mgmt λ — a green
+    // `cdk deploy` does not prove the second pass took effect, and a wrong origin breaks
+    // login (ADR-024/ADR-036) rather than failing the deploy. Reading it needs an explicit
+    // grant: `cdk deploy` runs under the ASSUMED bootstrap roles, but the workflow's own
+    // `aws lambda` call runs as this role. Read-only, and scoped to the one function whose
+    // physical name is fixed by MgmtStack (`lca-<env>-mgmt`).
+    this.role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadMgmtFunctionConfig',
+        actions: ['lambda:GetFunctionConfiguration'],
+        resources: [
+          `arn:${Aws.PARTITION}:lambda:${this.region}:${this.account}:function:lca-${envName}-mgmt`,
         ],
       }),
     );

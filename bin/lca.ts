@@ -130,6 +130,12 @@ controlStack.addDependency(dataStack);
 const consoleDomain = resolveConsoleDomain({
   envName,
   envLocal,
+  // CI has no gitignored `.env.local` (ADR-047), so an env whose console runs on a vanity
+  // domain must be able to declare it in the workflow environment. Lowest precedence: the
+  // file still wins on a workstation. Without this, a CD deploy of such an env would synth
+  // with no domain — dropping the CloudFront alias + cert and rewriting PUBLIC_ORIGIN to the
+  // raw CloudFront name, which breaks login against the App's registered callback.
+  processEnv: process.env as Record<string, string>,
   contextDomain: app.node.tryGetContext('consoleDomain') as string | undefined,
   contextHostedZoneId: app.node.tryGetContext('consoleHostedZoneId') as string | undefined,
   contextZoneName: app.node.tryGetContext('consoleZoneName') as string | undefined,

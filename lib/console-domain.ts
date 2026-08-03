@@ -91,6 +91,16 @@ export interface ResolveConsoleDomainInput {
   envName: string;
   /** Parsed `.env.local` (ADR-018 pin file), or null when absent (CI synth). */
   envLocal: EnvLocal | null;
+  /**
+   * Lowest-precedence source, read only when a key is set neither in context nor in
+   * `envLocal`. On a CI runner there is no gitignored `.env.local` to read (ADR-047), so a
+   * CD deploy of an env that HAS a vanity domain would otherwise synth with no domain at
+   * all — silently removing the CloudFront alias + cert and rewriting `PUBLIC_ORIGIN` to the
+   * raw CloudFront name, which breaks login against the App's registered callback. Passing
+   * the process environment here lets the workflow declare `LCA_CONSOLE_*` the same way it
+   * declares the deploy pin. Defaults to `{}` so nothing changes for callers that omit it.
+   */
+  processEnv?: EnvLocal;
   /** `-c consoleDomain=` — full hostname override, bypasses the scheme. */
   contextDomain?: string;
   /** `-c consoleHostedZoneId=` */
@@ -102,9 +112,15 @@ export interface ResolveConsoleDomainInput {
 /**
  * Resolve the console's custom domain, or `null` when none is configured (→ raw CloudFront).
  *
- * Precedence per field: CDK context → `.env.local` → unset. Required pair when enabled:
- * a hosted zone id AND a zone name (the zone name is needed to build the hostname and to
- * construct the zone reference without an AWS lookup, so credential-less synth still works).
+ * Precedence per field: CDK context → `.env.local` → process environment → unset. Required
+ * pair when enabled: a hosted zone id AND a zone name (the zone name is needed to build the
+ * hostname and to construct the zone reference without an AWS lookup, so credential-less synth
+ * still works).
+ *
+ * The process environment sits LAST for the same reason `.env.local` beats the environment for
+ * the deploy pin (ADR-018/ADR-047): the file is the operator's standing declaration for a
+ * checkout, an exported variable is ambient. It is read at all so that CI — which has no
+ * gitignored file — can configure a domain rather than silently deploying without one.
  *
  * Configuring a domain is opt-in and **all-or-nothing**: a half-configured domain throws
  * rather than silently falling back, because a silent fallback would deploy a distribution
@@ -112,9 +128,9 @@ export interface ResolveConsoleDomainInput {
  * an `invalid OAuth state` that looks like a cookie bug.
  */
 export function resolveConsoleDomain(input: ResolveConsoleDomainInput): ConsoleDomainConfig | null {
-  const { envName, envLocal } = input;
+  const { envName, envLocal, processEnv = {} } = input;
   const pick = (ctx: string | undefined, key: string): string | undefined => {
-    const v = ctx ?? envLocal?.[key];
+    const v = ctx ?? envLocal?.[key] ?? processEnv[key];
     const trimmed = typeof v === 'string' ? v.trim() : '';
     return trimmed === '' ? undefined : trimmed;
   };

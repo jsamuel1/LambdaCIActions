@@ -229,3 +229,83 @@ test('an env name that is not a legal DNS label is rejected in every spelling', 
   assert.equal(consoleHostname('dev-2', 'example.com'), `dev-2.${CONSOLE_LABEL}.example.com`);
   assert.equal(consoleHostname('a', 'example.com'), `a.${CONSOLE_LABEL}.example.com`);
 });
+
+// --- process-environment source (ADR-047 CI path) ---------------------------
+//
+// A CI runner checks out a fresh clone: there is no gitignored `.env.local`. Without a
+// process-environment source, a CD deploy of an env whose console runs on a vanity domain
+// would synth with NO domain — removing the CloudFront alias and cert and rewriting
+// PUBLIC_ORIGIN to the raw CloudFront name, which breaks login against the callback URL
+// registered on the GitHub App (browser-only to fix). So the workflow must be able to declare
+// LCA_CONSOLE_* the same way it declares the deploy pin — at the LOWEST precedence, because
+// the file is a checkout's standing declaration and an exported variable is ambient.
+
+test('processEnv supplies the domain when there is no .env.local (CI)', () => {
+  const d = resolveConsoleDomain({ envName: 'dev', envLocal: null, processEnv: ZONE });
+  assert.equal(d.hostname, `dev.${CONSOLE_LABEL}.example.com`);
+  assert.equal(d.origin, `https://dev.${CONSOLE_LABEL}.example.com`);
+  assert.equal(d.hostedZoneId, ZONE.LCA_CONSOLE_HOSTED_ZONE_ID);
+});
+
+test('processEnv is ignored per-key when .env.local sets it', () => {
+  const d = resolveConsoleDomain({
+    envName: 'dev',
+    envLocal: ZONE,
+    processEnv: {
+      LCA_CONSOLE_HOSTED_ZONE_ID: 'Z0000000000000000000',
+      LCA_CONSOLE_ZONE_NAME: 'stray.example.net',
+    },
+  });
+  assert.equal(d.zoneName, 'example.com', 'the file wins');
+  assert.equal(d.hostedZoneId, ZONE.LCA_CONSOLE_HOSTED_ZONE_ID);
+});
+
+test('context still beats processEnv', () => {
+  const d = resolveConsoleDomain({
+    envName: 'dev',
+    envLocal: null,
+    processEnv: ZONE,
+    contextZoneName: 'other.example.org',
+    contextHostedZoneId: 'Z11111111111111111111',
+  });
+  assert.equal(d.zoneName, 'other.example.org');
+  assert.equal(d.hostedZoneId, 'Z11111111111111111111');
+});
+
+test('processEnv with no LCA_CONSOLE_* keys stays null (dev today, and CI synth)', () => {
+  // The real process environment carries hundreds of unrelated variables; only the
+  // LCA_CONSOLE_* trio may switch a domain on, and an absent trio must not.
+  assert.equal(
+    resolveConsoleDomain({
+      envName: 'dev',
+      envLocal: null,
+      processEnv: { PATH: '/usr/bin', LCA_DEPLOY_ACCOUNT: '863638663908', HOME: '/home/x' },
+    }),
+    null,
+  );
+  // Empty/whitespace values are not configuration either (an unset repo variable expands to '').
+  assert.equal(
+    resolveConsoleDomain({
+      envName: 'dev',
+      envLocal: null,
+      processEnv: { LCA_CONSOLE_HOSTED_ZONE_ID: '', LCA_CONSOLE_ZONE_NAME: '   ' },
+    }),
+    null,
+  );
+});
+
+test('a half-configured processEnv throws rather than silently deploying undomained', () => {
+  assert.throws(
+    () => resolveConsoleDomain({ envName: 'dev', envLocal: null, processEnv: { LCA_CONSOLE_ZONE_NAME: 'example.com' } }),
+    /hosted zone id is required/,
+  );
+  assert.throws(
+    () =>
+      resolveConsoleDomain({
+        envName: 'dev',
+        envLocal: null,
+        processEnv: { LCA_CONSOLE_HOSTED_ZONE_ID: ZONE.LCA_CONSOLE_HOSTED_ZONE_ID },
+      }),
+    /zone name is required/,
+  );
+});

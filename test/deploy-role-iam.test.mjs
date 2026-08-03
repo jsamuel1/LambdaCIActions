@@ -7,9 +7,14 @@
 // Both are asserted against the real synthesized template.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { DeployStack } from '../dist/lib/deploy-stack.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const ACCOUNT = '111122223333';
 const REGION = 'us-west-2';
@@ -104,10 +109,45 @@ test('no managed policies at all (never AdministratorAccess)', () => {
   assert.deepEqual(props.ManagedPolicyArns ?? [], []);
 });
 
-test('the role holds exactly assume-bootstrap-roles + DescribeStacks', () => {
+test('the role holds exactly assume-bootstrap-roles + the two workflow reads', () => {
   const stmts = deployRoleStatements(synth().template);
   const actions = [...new Set(stmts.flatMap(actionsOf))].sort();
-  assert.deepEqual(actions, ['cloudformation:DescribeStacks', 'sts:AssumeRole']);
+  assert.deepEqual(actions, [
+    'cloudformation:DescribeStacks',
+    'lambda:GetFunctionConfiguration',
+    'sts:AssumeRole',
+  ]);
+});
+
+test('the workflow\u2019s own AWS calls are all covered by the role', () => {
+  // `cdk deploy` runs under the ASSUMED bootstrap roles, but every `aws ...` step in
+  // deploy.yml runs as THIS role. A call the policy does not cover fails with AccessDenied
+  // AFTER both deploys have already landed — a red CD run on a successful deploy, which is
+  // the worst shape of failure. Pin the exact set the workflow uses.
+  const stmts = deployRoleStatements(synth().template);
+  const granted = new Set(stmts.flatMap(actionsOf).map(String));
+  const workflow = fs.readFileSync(
+    path.join(REPO_ROOT, '.github', 'workflows', 'deploy.yml'),
+    'utf8',
+  );
+  // aws CLI verb -> the IAM action it needs. get-caller-identity needs none (sts:* is
+  // implicitly allowed for the caller's own identity).
+  const needs = [
+    ['cloudformation describe-stacks', 'cloudformation:DescribeStacks'],
+    ['cloudformation describe-stack-resources', 'cloudformation:DescribeStackResources'],
+    ['cloudformation list-exports', 'cloudformation:ListExports'],
+    ['lambda get-function-configuration', 'lambda:GetFunctionConfiguration'],
+    ['lambda get-function ', 'lambda:GetFunction'],
+    ['ssm get-parameter', 'ssm:GetParameter'],
+  ];
+  const flat = workflow.replace(/\\\n\s*/g, ' ');
+  for (const [cli, action] of needs) {
+    if (!flat.includes(`aws ${cli}`)) continue;
+    assert.ok(
+      granted.has(action),
+      `deploy.yml calls \`aws ${cli}\` but the deploy role lacks ${action}`,
+    );
+  }
 });
 
 test('assume-role targets the four bootstrap roles in this account/region only', () => {
@@ -171,6 +211,19 @@ test('DescribeStacks is scoped to this env\u2019s two CD-deployed stacks', () =>
       `${forbidden} must not be reachable from the CD role`,
     );
   }
+});
+
+test('the Lambda read is one named function, not the account\u2019s functions', () => {
+  // MgmtStack fixes the physical name (`lca-<env>-mgmt`), so this needs no wildcard. A
+  // `function:*` here would let CD read every function's environment — which is where the
+  // platform's SSM parameter paths and queue URLs live.
+  const stmts = deployRoleStatements(synth().template);
+  const read = stmts.find((s) => actionsOf(s).includes('lambda:GetFunctionConfiguration'));
+  const resources = resourcesOf(read).map((r) => JSON.stringify(r));
+  assert.equal(resources.length, 1);
+  // Fn::Join-wrapped ARN: the function segment must be the LAST thing in it.
+  assert.match(resources[0], /:function:lca-test-mgmt"\]\]\}$/);
+  assert.doesNotMatch(resources[0], /\*/);
 });
 
 test('the role description is ASCII — IAM rejects the repo’s usual em dash', () => {
