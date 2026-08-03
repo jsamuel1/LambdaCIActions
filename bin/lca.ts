@@ -5,9 +5,11 @@
 // ControlStack (webhook → ingest → SQS → provision → microVM). DataStack lands with M2,
 // MgmtStack + WebStack with M4 (management plane + console).
 //
-// Environment selection: `-c env=dev|prod` (default dev). Account/region are PINNED in
-// `.env.local` (ADR-018, see .env.local.example) — deploys refuse to run against ambient
-// credentials that don't match the pin. Credential-less `cdk synth` (CI gate) is exempt.
+// Environment selection: `-c env=dev|prod` (default dev). Account/region are PINNED — in
+// `.env.local` on a workstation (ADR-018, see .env.local.example) or in the process
+// environment on a CI runner, which has no gitignored file to read (ADR-047). Deploys refuse
+// to run against ambient credentials that don't match the pin, whichever source it came from.
+// Credential-less `cdk synth` (CI build gate) is exempt.
 // Secrets are NEVER defined here — they are created out-of-band (ADR-008) and referenced
 // by ARN/path inside the stacks.
 //
@@ -25,6 +27,7 @@ import { DataStack } from '../lib/data-stack.js';
 import { MgmtStack } from '../lib/mgmt-stack.js';
 import { WebStack } from '../lib/web-stack.js';
 import { CertStack } from '../lib/cert-stack.js';
+import { DeployStack } from '../lib/deploy-stack.js';
 import { loadEnvLocal, validateTarget } from '../lib/deploy-env.js';
 import { envConfig } from '../lib/env-config.js';
 import { resolveConsoleDomain } from '../lib/console-domain.js';
@@ -34,10 +37,11 @@ const app = new App();
 const envName = (app.node.tryGetContext('env') as string | undefined) ?? 'dev';
 const requestedRegion = (app.node.tryGetContext('region') as string | undefined) ?? null;
 
-// Deploy-target pin (ADR-018). CDK_DEFAULT_ACCOUNT is only set when the CDK CLI resolved
-// real credentials — i.e. any invocation that COULD reach an account (deploy, diff,
-// credentialed synth). In that case .env.local is mandatory and must match the ambient
-// account. Credential-less synth (CI build gate, fresh worktrees) proceeds unpinned.
+// Deploy-target pin (ADR-018, extended by ADR-047). CDK_DEFAULT_ACCOUNT is only set when
+// the CDK CLI resolved real credentials — i.e. any invocation that COULD reach an account
+// (deploy, diff, credentialed synth). In that case a pin is mandatory (`.env.local`, else
+// LCA_DEPLOY_* from the environment) and must match the ambient account. Credential-less
+// synth (CI build gate, fresh worktrees) proceeds unpinned.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const envLocal = loadEnvLocal(repoRoot);
 const ambientAccount = process.env.CDK_DEFAULT_ACCOUNT;
@@ -48,9 +52,9 @@ if (ambientAccount || envLocal) {
   const target = validateTarget(envLocal, { region: requestedRegion, env: envName });
   if (ambientAccount && ambientAccount !== target.account) {
     throw new Error(
-      `Deploy-target mismatch: credentials resolve to account ${ambientAccount}, but .env.local ` +
-        `pins LCA_DEPLOY_ACCOUNT=${target.account}.\n` +
-        'Switch AWS_PROFILE/credentials to the pinned account, or update .env.local deliberately.',
+      `Deploy-target mismatch: credentials resolve to account ${ambientAccount}, but the deploy ` +
+        `pin sets LCA_DEPLOY_ACCOUNT=${target.account}.\n` +
+        'Switch AWS_PROFILE/credentials to the pinned account, or update the pin deliberately.',
     );
   }
   account = target.account;
@@ -162,7 +166,7 @@ if (consoleDomain && !account) {
   throw new Error(
     `A console domain (${consoleDomain.hostname}) is configured, but no deploy account is ` +
       'resolved. The us-east-1 certificate is a cross-region reference and needs a concrete ' +
-      'account.\nFix: pin LCA_DEPLOY_ACCOUNT in .env.local (ADR-018), or drop the console-domain ' +
+      'account.\nFix: pin LCA_DEPLOY_ACCOUNT (ADR-018/ADR-047), or drop the console-domain ' +
       'context flags for a credential-less synth.',
   );
 }
@@ -185,5 +189,43 @@ const webStack = new WebStack(app, `LCA-Web-${envName}`, {
 });
 webStack.addDependency(mgmtStack);
 if (certStack) webStack.addDependency(certStack);
+
+// CI deploy identity (ADR-047). Its own stack ON PURPOSE: it holds the credential CD uses to
+// deploy the management plane, so it must be deployable from a workstation independently and
+// must never appear in CD's own stack allowlist — a CD run must not be able to widen its own
+// trust policy, and a broken deploy must not take out the identity needed to deploy the fix.
+// No stack dependencies for the same reason.
+//
+//   -c createGithubOidcProvider=true
+//        CREATE the account's GitHub OIDC provider. Off by default, and the default is the
+//        safe one: the provider is an account-level singleton keyed by issuer URL, so this
+//        stack references its canonical ARN unless told otherwise. Creating a second one fails
+//        the stack (EntityAlreadyExists), and the creating path also synthesizes a
+//        custom-resource role holding `iam:CreateOpenIDConnectProvider` on `Resource: "*"`.
+//        Set it only for a genuinely fresh account — check first:
+//          aws iam list-open-id-connect-providers
+//   -c githubOidcProviderArn=...     override the referenced ARN (rarely needed)
+//   -c deployRepo=owner/repo         (default jsamuel1/LambdaCIActions)
+//   -c deployRefs=refs/heads/main    comma-separated; exact refs only, wildcards rejected
+const deployRepo = (app.node.tryGetContext('deployRepo') as string | undefined) ?? 'jsamuel1/LambdaCIActions';
+const deployRefs = ((app.node.tryGetContext('deployRefs') as string | undefined) ?? 'refs/heads/main')
+  .split(',')
+  .map((r) => r.trim())
+  .filter(Boolean);
+const createOidcCtx = app.node.tryGetContext('createGithubOidcProvider') as string | boolean | undefined;
+new DeployStack(app, `LCA-Deploy-${envName}`, {
+  env,
+  envName,
+  githubRepo: deployRepo,
+  githubRefs: deployRefs,
+  existingProviderArn: app.node.tryGetContext('githubOidcProviderArn') as string | undefined,
+  // Only the exact string `true` (or boolean true) opts in — `-c createGithubOidcProvider=1`
+  // or a typo must not switch on a path that adds a wildcard IAM write.
+  createProvider: createOidcCtx === true || createOidcCtx === 'true',
+  bootstrapQualifier: (app.node.tryGetContext('bootstrapQualifier') as string | undefined) ?? undefined,
+  // With a vanity domain the console cert lives in us-east-1 (ADR-036), so a CD deploy of
+  // WebStack has to publish assets through that region's bootstrap roles too.
+  additionalBootstrapRegions: consoleDomain ? ['us-east-1'] : [],
+});
 
 app.synth();
