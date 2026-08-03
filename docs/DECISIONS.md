@@ -1942,11 +1942,12 @@ overridden with `-c reportsModel=…`. Both live in EnvConfig rather than as sta
 reason ADR-033's wiring note gives — the first cut made them props `bin/lca.ts` never passed, so
 this paragraph described a switch no operator could reach, and the only field workaround
 (hand-editing the λ's env) breaks the grant and 403s.
-**Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto a
-5-metric × 6-dimension × 4-chart menu plus a time window is a small *structured* problem where
-a wrong-but-valid answer is worse than a refusal: an invalid spec is rejected and the operator
-sees the picker, but a plausible-but-wrong spec renders a chart that silently answers a
-different question. Sonnet's stronger instruction-following buys accuracy on exactly that
+**Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto the
+enumerated metric × dimension × chart catalog in `src/mgmt/reports.ts` plus a time window is a
+small *structured* problem where a wrong-but-valid answer is worse than a refusal: an invalid
+spec is rejected and the operator sees the picker, but a plausible-but-wrong spec renders a chart
+that silently answers a different question. Sonnet's stronger instruction-following buys accuracy
+on exactly that
 failure mode, and the cost is bounded by a ~400-token prompt, `max_tokens: 400`,
 `temperature: 0` and the caps below. `InvokeModelWithResponseStream` is deliberately NOT
 granted — one small JSON object needs no stream.

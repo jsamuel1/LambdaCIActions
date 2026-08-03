@@ -1239,11 +1239,28 @@ test('USD is rendered by exactly one formatter in the console', () => {
   for (const file of ['screens/ReportChart.tsx', 'screens/RunDetail.tsx', 'screens/Dashboard.tsx', 'screens/Platform.tsx']) {
     const src = fs.readFileSync(new URL(`../web/src/${file}`, import.meta.url), 'utf8');
     assert.match(src, /formatCost/, `${file} renders money without the shared formatter`);
-    // A second `$${…toFixed}` anywhere in the console is a second precision rule by definition.
-    assert.doesNotMatch(
-      src,
-      /\$\$\{[^}]*toFixed/,
-      `${file} formats a USD figure inline instead of delegating to formatCost`,
+
+    // Any `toFixed` in a money screen is a precision rule, and the rule is supposed to live in
+    // exactly one place. Matching on the currency SYMBOL cannot enforce that: a template literal
+    // spells it `` `$${x.toFixed(4)}` `` but JSX spells the identical output `~${x.toFixed(4)}`,
+    // where the `$` is literal text and the braces are a JSX expression — indistinguishable from
+    // the non-currency `${(v * 100).toFixed(1)}%`. A symbol-shaped regex therefore passes the
+    // exact form this change removed from `Platform.tsx`.
+    //
+    // So the rule is structural instead: a money screen may not call `toFixed` at all, except on
+    // a line that names a unit which is explicitly NOT currency. That is one line today
+    // (`ratio 0-1` in the chart's unit renderer), and it catches both inversions — re-inlining
+    // the chart's USD branch, and re-introducing a JSX-inline `~${…toFixed(4)}` money cell.
+    const offending = src
+      .split('\n')
+      .map((line, i) => [i + 1, line])
+      .filter(([, line]) => line.includes('toFixed') && !/'ratio 0-1'/.test(line));
+    assert.deepEqual(
+      offending,
+      [],
+      `${file} formats a figure inline instead of delegating to formatCost: ${offending
+        .map(([n, l]) => `L${n}: ${l.trim()}`)
+        .join(' / ')}`,
     );
   }
 
