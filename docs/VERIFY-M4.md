@@ -1,6 +1,7 @@
 # M4 verification — operator walkthrough of the deployed console
 
-**Verdict: M4 exit criterion NOT met — 8 of 9 steps pass, log reading fails.**
+**Verdict: M4 exit criterion NOT met — 8 of 9 steps pass (step 2 server-side only; GitHub's
+consent screen needs a human), log reading fails.**
 
 > 🎯 *An operator installs the App, enables a repo, watches a run to completion, and reads
 > its logs — all from the UI.* — `docs/ROADMAP.md` § M4
@@ -316,8 +317,15 @@ filter-log-events  --log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'  ->
 
 `src/mgmt/logs.ts` has **zero diff between `63069ff` and `main` @ `d8d23f1`**, so this is
 live on `main` — deploying newer code will not fix it. Filed as
-**`task-1785738322-0bb6`** (P2) with a fix sketch. The existing unit tests pass because their
-fixtures use the microVM id as the entire stream name, which is what let this ship.
+**`task-1785738322-0bb6`** (P2) with a fix sketch.
+
+Why the existing unit tests never caught it: `test/mgmt-logs.test.mjs` stubs the CloudWatch
+client with a **scripted response queue that ignores `logStreamNamePrefix` entirely** — it
+replies with the next canned page whatever prefix is sent, so no test in the file can observe
+a wrong locator direction. Its fixture stream names (`vm-1/x`, with `microvmId: 'vm-1'`) also
+happen to be prefixed by the id, so even a prefix-aware stub would have matched. A regression
+test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only bites if the stub is
+first taught to filter by prefix the way CloudWatch does.
 
 ![run detail, log pane empty](evidence/m4/07-rundetail-final-completed.png)
 
