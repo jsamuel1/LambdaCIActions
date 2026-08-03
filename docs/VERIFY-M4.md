@@ -29,7 +29,7 @@ GitHub's own authorize screen. Both need interactive GitHub credentials.
 |---|---|
 | Account / region | `863638663908` / `us-west-2` (pinned via `.env.local`, ADR-018) |
 | Stacks | `LCA-Mgmt-dev` (`UPDATE_COMPLETE`), `LCA-Web-dev` (`CREATE_COMPLETE`), `LCA-Control-dev`, `LCA-Data-dev`, `LCA-Image-dev` |
-| Deployed source | **`63069ff`** "M4: Web UI & Management API" — Mgmt λ `LastModified 2026-07-28T23:37:30Z`, console bundle `main.js` `2026-07-28 23:36:08`. Every later `main` commit is **not** deployed: `10d4d01`, `d74e54a`, `e1bd40e`, `d8d23f1` (vanity origin, ADR-037 install fix, M5 flavors, M5 adopt mode), then `064e26b`..`d3dd0de` (PR #27, M4 CD / ADR-047 — landed 07:39Z, after this walkthrough) |
+| Deployed source | **`63069ff`** "M4: Web UI & Management API" — Mgmt λ `LastModified 2026-07-28T23:37:30Z`, console bundle `main.js` `2026-07-28 23:36:08`. Every later `main` commit is **not** deployed — the full range `63069ff..d3dd0de` is: `da38edc` (ADR-028 boot broker budget), **`94360ca` (ADR-029 — run-primary Runs screen)**, `10d4d01`, `d74e54a`, `e1bd40e`, `d8d23f1` (vanity origin, ADR-037 install fix, M5 flavors, M5 adopt mode), then `064e26b`..`d3dd0de` (PR #27, M4 CD / ADR-047 — landed 07:39Z, after this walkthrough). **ADR-029 matters for reading the screenshots below**: it rewrote `web/src/screens/Runs.tsx` + `src/mgmt/run-rollup.ts` to nest jobs under runs and drop the Runs-list cost column. The deployed vintage here is pre-ADR-029, so every Runs-list and Dashboard shot shows **flat per-job rows with a cost column**. Superseded presentation, not a defect — the same class of skew as the flavor sizes noted in step 5 |
 | Verifying tree | `main` @ `d8d23f1` during the walkthrough (06:15–06:35Z); this document lands on `d3dd0de`. `git diff d8d23f1 d3dd0de -- src/ web/` is **empty**, so nothing between them changes a claim below |
 | `ConsoleUrl` | `https://d2x4qcl1ibd2ax.cloudfront.net` (raw CloudFront — no vanity domain configured in this account) |
 | Mgmt API | `https://q2s2zkcji8.execute-api.us-west-2.amazonaws.com` (same-origin behind CloudFront, ADR-024) |
@@ -273,9 +273,9 @@ rendered by the console**:
 
 | Status | Where seen | Evidence |
 |---|---|---|
-| `queued` | Runs list, 06:28:09Z | run `30790275739` row read straight from the DOM — [`06b-runs-list-queued.png`](evidence/m4/06b-runs-list-queued.png) |
+| `queued` | Runs list, 06:28:09Z | run `30790275739` row read straight from the DOM. **No screenshot** — the Runs-list shot for that run ([`06b-runs-list-running.png`](evidence/m4/06b-runs-list-running.png)) was captured ~25 s late and already shows it `running` (14 s elapsed), so the `queued` reading rests on the DOM text alone |
 | `provisioning` | Runs list, 06:35:0xZ | run `30790672874 / 91613320319` badge — [`06d-runs-list-provisioning.png`](evidence/m4/06d-runs-list-provisioning.png) |
-| `running` | Run detail, 06:22:13Z / 06:28:15Z / 06:30:23Z / 06:32:24Z | [`06-rundetail-1-running.png`](evidence/m4/06-rundetail-1-running.png) |
+| `running` | Run detail, 06:22:13Z / 06:28:15Z / 06:30:23Z / 06:32:24Z | [`06-rundetail-1-running.png`](evidence/m4/06-rundetail-1-running.png); also on the Runs list — [`06b-runs-list-running.png`](evidence/m4/06b-runs-list-running.png) |
 | `completed` | Run detail, 06:23:31Z / 06:28:51Z / 06:31:14Z / 06:33:39Z | [`07-rundetail-final-completed.png`](evidence/m4/07-rundetail-final-completed.png) |
 
 `running → completed` was observed **in-place four times** with no reload — e.g. run
@@ -439,6 +439,7 @@ a human. Both are preconditions for marking.
 | `provisioning` rarely visible on `base` | Real timing property: ~0.9 s between the transition and VM launch. Caught on `docker` (~60 s dwell). |
 | Stale `diag*.yml` rows on repo detail | Parse history for deleted workflow files; documented behaviour. |
 | Flavor sizes shown as `2 vCPU / 4 GB` etc. | Pre-ADR-038 catalog text in the deployed M4 bundle; corrected on `main`. |
+| Runs list / Dashboard show flat per-job rows with a cost column | Pre-ADR-029 presentation. `94360ca` (undeployed here) makes Runs run-primary with nested jobs and drops that column. Superseded presentation, not a defect — see the Deployed source row above. |
 | Run `30790210060` failed | **My fixture error** — appended `//` to YAML. Invalid workflow, GitHub failed it before any `workflow_job` event, so no run row. Not a platform fault. |
 | `DEPLOY-M4.md` ADR cross-link anchors | Already correct on `main` (`#adr-022`, `#adr-024`, `#adr-025`). The card's note is stale; no fix applied. |
 | Unauthenticated authorize-URL probe reads as a callback-URL check | **It is not one.** GitHub defers `redirect_uri` validation until after login, so a bogus value 302s to `/login` identically (probe in step 1). An earlier draft of this document drew the opposite conclusion; retracted. |
