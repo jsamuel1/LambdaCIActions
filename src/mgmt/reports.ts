@@ -885,8 +885,25 @@ export interface ExportRow {
   [k: string]: string | number;
 }
 
+/**
+ * Project run rows onto export rows.
+ *
+ * `billableSeconds` / `costBasis` are gated on `hasRunMicrovm`, the SAME predicate the
+ * `billableMinutes` aggregate folds over — an export must reconcile with the report it was
+ * downloaded from. Ungated, a launch-failure or queued row exported its whole queue-to-finish
+ * wall clock as billable while contributing 0 to the on-screen total, so summing the column
+ * overstated consumption (a 4-minute report exported as 9 minutes on two rows). That is the
+ * same contradiction the priced column already avoids by going through `jobCostUsd`, and it is
+ * worse in this column because there is no currency symbol to make the magnitude look wrong.
+ *
+ * A row that never ran a VM therefore exports `0` and an EMPTY basis, not `wallClock`: a basis
+ * names which clock produced a billable window, and this row has no billable window to have
+ * measured. Nothing is lost — `createdAt`/`updatedAt`/`wallClockSeconds` still carry the row's
+ * real span, and `status` says why it has no compute.
+ */
 export function toExportRows(runs: RunRecord[], now: Date = new Date()): ExportRow[] {
   return runs.map((r) => {
+    const ran = hasRunMicrovm(r);
     const billable = billableSeconds(r, now);
     return {
       repoId: r.repoId,
@@ -901,8 +918,8 @@ export function toExportRows(runs: RunRecord[], now: Date = new Date()): ExportR
       runningAt: r.runningAt ?? '',
       updatedAt: r.updatedAt,
       wallClockSeconds: wallClockSeconds(r),
-      billableSeconds: billable.seconds,
-      costBasis: billable.basis,
+      billableSeconds: ran ? billable.seconds : 0,
+      costBasis: ran ? billable.basis : '',
       estimatedCostUsd: round(jobCostUsd(r, now), 6),
     };
   });

@@ -45,7 +45,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
 | **Runs** | Filterable, run-primary history | run + folded status, flavor rollup, duration, job count, expandable jobs | `#/runs` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
-| **Reports** | Spend + run analytics over a window, and an NL report assistant | spend/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
+| **Reports** | Spend + utilisation + run analytics over a window, and an NL report assistant | spend/billable compute minutes/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
 | **Settings** | Secret/config presence, env identity | SSM param presence (**not values**), env, region | `#/settings` |
 
@@ -326,6 +326,17 @@ fields are RFC-4180 quoted **and** formula-defanged: repo/workflow/job names are
 tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Excel/Sheets. An
 export is truncated by the same budget as its report: the JSON form carries `complete`, and the
 CSV form — which has nowhere in the body to put it — carries `X-Report-Complete`.
+
+An export **reconciles with the report it was downloaded from**: summing `billableSeconds` ÷ 60
+yields the `billableMinutes` total, and summing `estimatedCostUsd` yields `spend`. Both
+per-row columns are gated on the same predicate their aggregate folds over — a job that never
+ran a microVM exports `0` billable seconds, `0` cost and an **empty** `costBasis`, because a
+basis names which clock measured a billable window and such a row has none. Ungated, a
+launch-failure or queued row exported its whole queue-to-finish wall clock as billable while
+contributing 0 on screen, so the column summed higher than the figure it drills into — and in a
+seconds column there is no currency symbol to make the magnitude look wrong. The row's real span
+is still exported under `wallClockSeconds`/`createdAt`/`updatedAt`, and `status` says why it has
+no compute.
 
 An export is **additionally** capped independently of the read budget, because it is one
 synchronous Lambda response and those are limited to **6 MB**. The read budget allows 20 000 job

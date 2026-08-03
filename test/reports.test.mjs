@@ -414,6 +414,52 @@ test('a spend report and its export agree with Run detail on the same row', () =
   assert.equal(row.estimatedCostUsd, 0, 'the export must not contradict the aggregate');
 });
 
+test('summing an export column reproduces the aggregate it was downloaded from', () => {
+  // The export is the report's own drill-down, so an operator summing a column must land on the
+  // headline figure. `estimatedCostUsd` already held this (it goes through `jobCostUsd`, which
+  // gates on eligibility); `billableSeconds` did NOT, so a launch-failure row exported its whole
+  // queue-to-finish wall clock as billable while contributing 0 to the on-screen total — a
+  // 4-minute report downloaded as 9 minutes across these two rows. Unlike a leaked price there
+  // is no currency symbol to make the magnitude look wrong, and it errs upward on the one figure
+  // that must never overstate.
+  const real = job({ jobId: 1, microvmId: 'mv-1' });
+  const launchFailure = job({ jobId: 9, status: 'failed', microvmId: undefined });
+  const queued = job({ jobId: 3, status: 'queued', microvmId: undefined, runningAt: undefined });
+  const rows = [real, launchFailure, queued];
+  const exported = toExportRows(rows, NOW);
+
+  assert.equal(exported.length, rows.length, 'every row in the window must still be exported');
+
+  for (const [metric, column, scale] of [
+    ['billableMinutes', 'billableSeconds', 60],
+    ['spend', 'estimatedCostUsd', 1],
+  ]) {
+    const report = computeReport(rows, SPEC({ metric, dimension: 'none' }), { now: NOW });
+    const summed = exported.reduce((s, r) => s + r[column] / scale, 0);
+    assert.ok(
+      Math.abs(summed - report.total) < 1e-6,
+      `${column} sums to ${summed} but the ${metric} report totals ${report.total}`,
+    );
+    assert.ok(report.total > 0, `${metric} must measure the real row, or this proves nothing`);
+  }
+
+  // The rows that contribute nothing say so, and do not claim a basis for a window they never
+  // had: a `costBasis` names which clock measured billable time, and there is none here.
+  for (const r of exported.filter((e) => e.jobId !== 1)) {
+    assert.equal(r.billableSeconds, 0, `job ${r.jobId} exported compute it never used`);
+    assert.equal(r.costBasis, '', `job ${r.jobId} claims a billable clock it never started`);
+    assert.equal(r.estimatedCostUsd, 0);
+    // Nothing is lost: the row's real span is still exported, under a column that means it.
+    assert.ok(r.wallClockSeconds > 0, 'the row still carries its real elapsed span');
+    assert.equal(r.createdAt, real.createdAt);
+  }
+
+  // And the row that DID run is untouched — the gate must not flatten real compute.
+  const [ran] = exported.filter((e) => e.jobId === 1);
+  assert.equal(ran.billableSeconds, billableSeconds(real, NOW).seconds);
+  assert.equal(ran.costBasis, 'measured');
+});
+
 test('measured cost is strictly lower than the wall-clock fallback', () => {
   const measured = jobCostUsd(job());
   const fallback = jobCostUsd(job({ runningAt: undefined }));
