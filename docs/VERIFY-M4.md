@@ -211,10 +211,12 @@ DynamoDB:
 | click `Enable` | `Disable` | `200` `{…"enabled":true…}` | `enabled=true`, `updatedAt=2026-08-03T06:18:47.918Z`, `updatedBy=jsamuel1` |
 
 UI state, API response and stored row agreed on every transition, and the write is audited
-with the operator's login (spec 04 § auditability).
-
-![repo row after Enable](evidence/m4/repos-toggle-enabled-after.png)
-![repo row after Disable](evidence/m4/repos-toggle-disabled-after.png)
+with the operator's login (spec 04 § auditability). Evidence for **this** cycle is the API
+response and the stored row above — **the two row screenshots in this document are not from
+it.** Their visible `updatedAt` stamps (`6:35:19 AM`, `6:37:26 AM`) date them to the step-9
+toggle cycle, ~17 minutes later, so they are captioned and placed there rather than passed off
+as these clicks — see [step 9](#step-9--adr-027-repo-opt-out-gate). The rendered row is the
+same control in both cycles; only the timestamps differ.
 
 ## Step 5 — Repo detail: parsed workflows, routing preview, compat
 
@@ -410,6 +412,12 @@ was pushed at `06:35:36Z`. Ingest refused both jobs, verbatim:
 Consequence confirmed at GitHub: runs `30790711449` and `30790711604` stayed `queued` with no
 runner claiming them (cancelled afterwards to clean up), and **no run rows were written** for
 them. The repo was then re-enabled from the UI (`enabled=true`, audited).
+
+Both halves of this cycle are screenshotted from the repos list, and the visible `updatedAt`
+stamps date each shot to this step:
+
+![repo row after the step-9 Disable — button reads Enable, updated 6:35:19 AM](evidence/m4/repos-toggle-disabled-after.png)
+![repo row after the step-9 re-Enable — button reads Disable, updated 6:37:26 AM](evidence/m4/repos-toggle-enabled-after.png)
 
 The `202 {ok: true, claimed: false, disabled: true}` response shape is **verified by
 construction**, not observed: it is the `return json(202, …)` on the line immediately after
