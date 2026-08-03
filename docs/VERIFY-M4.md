@@ -1,18 +1,23 @@
 # M4 verification — operator walkthrough of the deployed console
 
-**Verdict: M4 exit criterion NOT met — 8 of 9 steps pass (step 2 server-side only; GitHub's
-consent screen needs a human), log reading fails.**
+**Verdict: M4 exit criterion NOT met.** 6 of 9 steps pass as observed (3, 4, 5, 6, 8, 9).
+Step 1 and the consent half of step 2 are **not verifiable without a human at `github.com`**.
+Step 7 — log reading — **fails**.
 
 > 🎯 *An operator installs the App, enables a repo, watches a run to completion, and reads
 > its logs — all from the UI.* — `docs/ROADMAP.md` § M4
 
-Walked as an operator against the live `dev` console on **2026-08-03**. Onboarding, repo
-enablement, workflow routing preview, live run tracking and the ADR-027 opt-out gate all
-work from the UI. The final clause — **"and reads its logs"** — does not: the run-detail log
-pane renders `0 events` for every run, including runs whose CloudWatch stream demonstrably
-holds the runner output. Root cause found and filed as
+Walked as an operator against the live `dev` console on **2026-08-03**. Repo enablement,
+workflow routing preview, live run tracking, presence-only Settings and the ADR-027 opt-out
+gate all work from the UI. The final clause — **"and reads its logs"** — does not: the
+run-detail log pane renders `0 events` for every run, including runs whose CloudWatch stream
+demonstrably holds the runner output. Root cause found and filed as
 [`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it is
 a two-line locator bug, **live on `main`**, not a deployment artifact.
+
+Two steps sit outside what this walkthrough could reach at all: the GitHub App's registered
+Callback URL (owner-only, and not inferable from an unauthenticated probe — see step 1) and
+GitHub's own authorize screen. Both need interactive GitHub credentials.
 
 `docs/ROADMAP.md` § M4 therefore keeps its 🎯 unmarked.
 
@@ -31,7 +36,7 @@ a two-line locator bug, **live on `main`**, not a deployment artifact.
 | GitHub App | `lambdaciactions-dev` (app id `4292494`, client id `Iv23liqxo1L0yFSPaYws`), installation **`146431062`** on `jsamuel1`, `repository_selection: all`, 139 repos |
 | Log groups | `/aws/lambda/microvms/runs/lca-dev`, `/aws/lambda/lca-dev-ingest`, `/aws/lambda/lca-dev-provision` |
 | Toolchain | AWS CLI **2.36.8** (`aws lambda-microvms` present; floor ≥ 2.35.17) |
-| Fixture repo | `jsamuel1/lca-m3-verify` (repo id **`1313438232`**), branch `m4-verify-01` |
+| Fixture repo | `jsamuel1/lca-m3-verify` (repo id **`1313438232`**), branch `m4-verify-01`; workflows `m4-verify.yml` (base) + `m4-verify-docker.yml` (docker), added on that branch for this walkthrough |
 
 Screenshots referenced below are in [`docs/evidence/m4/`](evidence/m4/).
 
@@ -65,12 +70,9 @@ operator sees X", and the OAuth handshake claims as scoped to what is stated the
 
 ## Step 1 — GitHub App callback URL
 
-**Pass (functionally verified).**
+**NOT VERIFIED — needs a human at `github.com`. Only the console's half is observable.**
 
-The callback URL cannot be read back from the API under an App JWT (`GET /app` returns
-`callback_urls: null` — it is owner-only), so this was verified the way it actually matters:
-GitHub validates `redirect_uri` against the registration at authorize time and rejects a
-mismatch with an explicit error. The redirect the console issues is accepted:
+What *is* observed: the console requests exactly the documented `redirect_uri`.
 
 ```
 GET https://d2x4qcl1ibd2ax.cloudfront.net/auth/login  ->  302
@@ -78,14 +80,29 @@ GET https://d2x4qcl1ibd2ax.cloudfront.net/auth/login  ->  302
     client_id=Iv23liqxo1L0yFSPaYws
     redirect_uri=https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback
     state=e712ad0c8d1c…  (len 76, signed)
-
-GET that authorize URL  ->  302  location: https://github.com/login?client_id=…&return_to=…
-  redirect_uri rejected: NO
 ```
 
-GitHub forwarded to its own login page rather than erroring on `redirect_uri`, so the
-registered Callback URL matches `https://<console-domain>/auth/callback`. This step remains
-a manual GitHub-UI action for a fresh deployment — it cannot be automated.
+What cannot be observed is whether GitHub's registration *matches* it. Two routes were tried
+and both are dead ends:
+
+- `GET /app` under an App JWT returns `callback_urls: null` — the field is owner-only.
+- Fetching the authorize URL unauthenticated returns `302 → github.com/login?…return_to=…`.
+  **That proves nothing.** GitHub defers `redirect_uri` validation until after login: the
+  identical 302 comes back for a deliberately bogus value on the same `client_id`.
+
+  ```
+  GET https://github.com/login/oauth/authorize?client_id=Iv23liqxo1L0yFSPaYws
+        &redirect_uri=https%3A%2F%2Fevil.example.com%2Fcb&state=x
+    ->  302  location: https://github.com/login?client_id=Iv23liqxo1L0yFSPaYws&return_to=…
+  ```
+
+  An unauthenticated probe therefore cannot distinguish a correct registration from a wrong
+  one. An earlier draft of this document read the 302 as acceptance; that inference was wrong
+  and is retracted here.
+
+This step is a manual GitHub-UI action and its confirmation is manual too: sign in, complete
+the authorize screen, and confirm no `redirect_uri` error. It shares its blocker with step 2
+— both need interactive GitHub credentials this walkthrough did not have.
 
 ## Step 2 — Sign in with GitHub
 
@@ -234,8 +251,10 @@ already corrected upstream.
 navigation the harness **never reloaded** — updates arrived via the SPA's 3 s/5 s polling
 (ADR-026).
 
-Six pushes were made to `jsamuel1/lca-m3-verify` on branch `m4-verify-01`. `main` was
-deliberately not touched, so the fixture workflow triggers on `m4-verify**`. Runs produced:
+Six pushes were made to `jsamuel1/lca-m3-verify` on branch `m4-verify-01`, plus one
+`workflow_dispatch`. `main` was deliberately not touched, so the base fixture
+(`m4-verify.yml`) and the docker fixture (`m4-verify-docker.yml`) both trigger on
+`m4-verify**`. Runs produced:
 
 | Run | Job | Flavor | microVM | Status | Created |
 |---|---|---|---|---|---|
@@ -247,7 +266,10 @@ deliberately not touched, so the fixture workflow triggers on `m4-verify**`. Run
 | `30790531634` | `91612897831` | `docker` | `microvm-b16a8825-d957-336f-b20b-39f7170e8b34` | completed | 06:32:22Z |
 | `30790672874` | `91613320319` | `docker` | `microvm-d0c65090-0cf1-395b-b09a-cf1728251227` | completed | 06:35:01Z |
 
-All GitHub conclusions `success`. Statuses **as rendered by the console**:
+All GitHub conclusions `success`. Every row above is `event: push` except `30790672874`,
+which was a `workflow_dispatch` on the same branch (`gh run list --json event` confirms) — it
+was dispatched to re-observe `provisioning` on the slower docker flavor. Statuses **as
+rendered by the console**:
 
 | Status | Where seen | Evidence |
 |---|---|---|
@@ -333,10 +355,12 @@ live on `main` — deploying newer code will not fix it. Filed as
 Why the existing unit tests never caught it: `test/mgmt-logs.test.mjs` stubs the CloudWatch
 client with a **scripted response queue that ignores `logStreamNamePrefix` entirely** — it
 replies with the next canned page whatever prefix is sent, so no test in the file can observe
-a wrong locator direction. Its fixture stream names (`vm-1/x`, with `microvmId: 'vm-1'`) also
-happen to be prefixed by the id, so even a prefix-aware stub would have matched. A regression
-test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only bites if the stub is
-first taught to filter by prefix the way CloudWatch does.
+a wrong locator direction. Worse, line 51 *asserts* the buggy direction as correct
+(`assert.equal(input.logStreamNamePrefix, 'vm-1')`), and the fixture stream names (`vm-1/x`,
+with `microvmId: 'vm-1'`) happen to be id-prefixed, so even a prefix-aware stub would match.
+A regression test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only bites if
+the stub is first taught to filter by prefix the way CloudWatch does **and** that assertion is
+inverted.
 
 ![run detail, log pane empty](evidence/m4/07-rundetail-final-completed.png)
 
@@ -413,6 +437,7 @@ card. **Live on `main`** — zero diff since `63069ff`. This is the sole blocker
 | Flavor sizes shown as `2 vCPU / 4 GB` etc. | Pre-ADR-038 catalog text in the deployed M4 bundle; corrected on `main`. |
 | Run `30790210060` failed | **My fixture error** — appended `//` to YAML. Invalid workflow, GitHub failed it before any `workflow_job` event, so no run row. Not a platform fault. |
 | `DEPLOY-M4.md` ADR cross-link anchors | Already correct on `main` (`#adr-022`, `#adr-024`, `#adr-025`). The card's note is stale; no fix applied. |
+| Unauthenticated authorize-URL probe reads as a callback-URL check | **It is not one.** GitHub defers `redirect_uri` validation until after login, so a bogus value 302s to `/login` identically (probe in step 1). An earlier draft of this document drew the opposite conclusion; retracted. |
 
 ## Reproducing
 
@@ -433,7 +458,8 @@ npm run backfill:installs -- --table lca-dev --apply
 
 # 3. sign in at the ConsoleUrl and walk #/setup, #/repos, #/repos/<id>, #/runs, #/flavors, #/settings
 
-# 4. drive a run: push to a branch the fixture workflow watches, then watch #/ and run detail
+# 4. drive a run: push to a branch the fixture workflows watch (`m4-verify**`), then watch
+#    #/ and run detail. Dispatch also works on that branch:
 gh workflow run m4-verify-docker.yml --repo <owner>/lca-m3-verify --ref m4-verify-01
 
 # 5. the log-pane defect, without a browser
