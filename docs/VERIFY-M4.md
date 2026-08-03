@@ -116,7 +116,7 @@ Verified by observation:
 | `/auth/login` issues a signed-state cookie | `Set-Cookie: lca_oauth_state=…; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600` |
 | A forged `state` is refused | `GET /auth/callback?code=fake-code&state=forged.notasignature` → **`400 {"error":"invalid OAuth state"}`**, no session cookie set |
 | Every `/api/*` route refuses an unauthenticated caller | `/api/me`, `/api/installations`, `/api/repos`, `/api/runs`, `/api/flavors`, `/api/settings`, `/api/health` → **all `401 {"error":"not authenticated"}`** |
-| A valid session lands in the console, not the login card | `.shell` visible, `.login` absent, nav renders `Dashboard · Repos · Runs · Flavors · Settings · Setup`, header shows `jsamuel1` — `02-dashboard-signed-in.png` |
+| A valid session lands in the console, not the login card | `.shell` visible, `.login` absent, nav renders `Dashboard · Repos · Runs · Flavors · Settings · Setup`, header shows `jsamuel1` — [`02-dashboard-signed-in.png`](evidence/m4/02-dashboard-signed-in.png) |
 
 **Not verified:** the GitHub authorization screen and the `code` → access-token exchange,
 i.e. that a real human clicking "Authorize" lands in the console. That needs interactive
@@ -166,7 +166,7 @@ $ npm run backfill:installs -- --table lca-dev        # idempotence
 ✓ nothing to do — every installation row already carries gsi1pk=INSTALLS
 ```
 
-After the repair the Setup screen renders (`03-setup.png`):
+After the repair the Setup screen renders ([`03-setup.png`](evidence/m4/03-setup.png)):
 
 ```
 Installations
@@ -276,7 +276,7 @@ rendered by the console**:
 | `queued` | Runs list, 06:28:09Z | run `30790275739` row read straight from the DOM — [`06b-runs-list-queued.png`](evidence/m4/06b-runs-list-queued.png) |
 | `provisioning` | Runs list, 06:35:0xZ | run `30790672874 / 91613320319` badge — [`06d-runs-list-provisioning.png`](evidence/m4/06d-runs-list-provisioning.png) |
 | `running` | Run detail, 06:22:13Z / 06:28:15Z / 06:30:23Z / 06:32:24Z | [`06-rundetail-1-running.png`](evidence/m4/06-rundetail-1-running.png) |
-| `completed` | Run detail, 06:23:31Z / 06:28:51Z / 06:31:14Z / 06:33:39Z | `07-rundetail-final-completed.png` |
+| `completed` | Run detail, 06:23:31Z / 06:28:51Z / 06:31:14Z / 06:33:39Z | [`07-rundetail-final-completed.png`](evidence/m4/07-rundetail-final-completed.png) |
 
 `running → completed` was observed **in-place four times** with no reload — e.g. run
 `30790275739`: `running` at `06:28:15.882Z`, `completed` at `06:28:51.020Z`, on the same
@@ -296,7 +296,7 @@ is written, served and rendered correctly.
 
 The Dashboard showed the fixture runs alongside real platform-wide counts
 (`ACTIVE 0 · QUEUED 0 · RUNNING 0 · ERROR RATE 15% · REPOS ENABLED 139`), with flavor and
-duration per row — `02-dashboard-signed-in.png`.
+duration per row — [`02-dashboard-signed-in.png`](evidence/m4/02-dashboard-signed-in.png).
 
 ## Step 7 — Read the run's logs from the UI
 

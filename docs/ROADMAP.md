@@ -42,7 +42,17 @@ Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md)
 - `MgmtStack` API + `WebStack` SPA + GitHub OAuth.
 - Screens: Setup, Dashboard, Repos, Repo/Workflow detail, Runs, Run detail (logs), Flavors, Settings.
 - Run history (GSI2, ADR-023) + CloudWatch log viewer; live status via polling (ADR-026).
-- 🎯 **Exit criterion NOT met — verification attempted 2026-08-03.** An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI. Evidence: [`docs/VERIFY-M4.md`](VERIFY-M4.md) — 6 of 9 walkthrough steps pass as observed against the deployed `dev` console (repo enable, routing preview, live `queued → provisioning → running → completed` with no reload, presence-only Settings, ADR-027 opt-out gate). Two steps need a human at `github.com` (the App's registered Callback URL is owner-only; the authorize screen is interactive). **Blocked on "and reads its logs"**: the run-detail log pane renders `0 events` for every run because `src/mgmt/logs.ts` passes the microVM id as `logStreamNamePrefix` while it is actually a stream-name *suffix* — live on `main`, filed as `task-1785738322-0bb6`. Re-marking this 🎯 needs **both**: that fix landed + the log pane re-walked, **and** the interactive GitHub half (steps 1–2 — registered Callback URL + the authorize screen) walked by a human, which is the 🎯's "installs the App" clause.
+- 🎯 **Exit criterion NOT met — verification attempted 2026-08-03.** An operator installs the
+  App, enables a repo, watches a run to completion, and reads its logs — all from the UI.
+  Evidence: [`docs/VERIFY-M4.md`](VERIFY-M4.md) — 6 of 9 walkthrough steps pass as observed
+  against the deployed `dev` console (repo enable, routing preview, live `queued →
+  provisioning → running → completed` with no reload, presence-only Settings, ADR-027 opt-out
+  gate). **Blocked on "and reads its logs"**: the run-detail log pane renders `0 events` for
+  every run — `src/mgmt/logs.ts` passes the microVM id as `logStreamNamePrefix` while it is a
+  stream-name *suffix*. Live on `main`; filed as `task-1785738322-0bb6`. Marking needs **both**
+  that fix landed + the pane re-walked, **and** the interactive GitHub half of steps 1–2
+  (registered Callback URL is owner-only, authorize screen is interactive) walked by a human —
+  the 🎯's "installs the App" clause.
 
 ## M5 — Drop-in & polish
 True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033,
