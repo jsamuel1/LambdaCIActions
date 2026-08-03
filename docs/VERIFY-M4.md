@@ -8,7 +8,8 @@ Step 7 — log reading — **fails**.
 > its logs — all from the UI.* — `docs/ROADMAP.md` § M4
 
 Walked as an operator against the live `dev` console on **2026-08-03**. Repo enablement,
-workflow routing preview, live run tracking, presence-only Settings and the ADR-027 opt-out
+workflow routing preview, live run tracking, presence-only Settings (since rebuilt — see
+step 8) and the ADR-027 opt-out
 gate all work from the UI. (Step 6's pass carries one scoped caveat: `provisioning`, `running`
 and `completed` are screenshotted, `queued` is an untimed DOM reading — see step 6.) The final
 clause — **"and reads its logs"** — does not: the run-detail log pane renders `0 events` for
@@ -373,6 +374,22 @@ inverted.
 ## Step 8 — Settings shows presence only
 
 **Pass — presence observed; non-disclosure is by construction, not by penetration test.**
+
+> **Superseded after this verification run (ADR-034/ADR-035).** The screen described below —
+> a flat list of SSM parameters with a `set` badge each — was the Settings screen *at the
+> revision this walkthrough was performed against*, and the screenshot is retained as evidence
+> of that tree. Settings has since been rebuilt around **verified evidence** rather than
+> parameter presence: a live-verified GitHub App identity (`GET /app` with an App JWT),
+> installation ids, the effective runner labels, and webhook health backed by a real
+> last-received delivery, plus relink / relabel / test-delivery actions behind a fail-closed
+> platform-admin allow-list. The parameter rows survive only in a collapsed **Diagnostics**
+> section. See [spec 04 § Settings](specs/04-web-ui.md#settings). Re-verifying M4 against a
+> current deployment should follow that section, not the table below.
+>
+> The load-bearing claim below is unaffected and still holds: the API returns **presence, never
+> values**, because `paramExists` uses `DescribeParameters`. ADR-034 tightened this further — the
+> Mgmt λ holds no `ssm:PutParameter` at all and cannot read the App PEM even to verify it; that
+> work happens in a control-plane broker.
 
 `#/settings` rendered `env: dev · region: us-west-2`, the note *"Presence and health only —
 values are never returned by the API or shown here"*, and eight rows **all reading `set`**:
