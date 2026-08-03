@@ -503,7 +503,12 @@ export interface ReportResult {
   spec: ReportSpec;
   metric: MetricDoc;
   points: SeriesPoint[];
-  /** Total across every point, when the metric is additive (spend, runCount). */
+  /**
+   * Total across every point, when the metric is additive — `spend`, `billableMinutes`,
+   * `runCount`. Absent otherwise: summing p50 durations, failure ratios or queue latencies
+   * across groups produces a number with no meaning, so the field is omitted rather than
+   * computed and ignored. The predicate is in `computeReport`; keep this list with it.
+   */
   total?: number;
   /** Rows read after filtering. */
   rowCount: number;

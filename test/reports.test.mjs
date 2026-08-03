@@ -554,6 +554,56 @@ test('duration reports p50 and p90 over terminal jobs only', () => {
   assert.equal(res.total, undefined, 'a percentile is not additive and must not report a total');
 });
 
+test('every metric declares whether it is additive, and the doc matches the predicate', () => {
+  // Pins the WHOLE set, not one metric's absence. `total` is a sum over points, which is
+  // meaningful only when the metric is a quantity that composes across groups; a p50, a ratio
+  // and a latency all sum to a number with no referent. The predicate that decides this is a
+  // hand-maintained `||` chain in `computeReport`, so a metric added later gets whichever
+  // answer the author happened to type — and both directions are wrong silently: a missing
+  // additive metric drops the header total (the figure the caveat's coverage is about), and a
+  // spurious one prints a sum of percentiles as if it were a quantity.
+  //
+  // `billableMinutes` is why this exists: it was correctly added to the predicate while the
+  // `ReportResult.total` doc comment still enumerated only `spend, runCount`, leaving the
+  // field's contract describing a set the code had already outgrown.
+  const ADDITIVE = new Set(['spend', 'billableMinutes', 'runCount']);
+  assert.deepEqual(
+    METRICS.filter((m) => ADDITIVE.has(m)).sort(),
+    [...ADDITIVE].sort(),
+    'this test names a metric the catalog does not have',
+  );
+
+  for (const metric of METRICS) {
+    const res = computeReport([job()], SPEC({ metric, dimension: 'none' }), { now: NOW });
+    if (ADDITIVE.has(metric)) {
+      assert.equal(
+        typeof res.total,
+        'number',
+        `${metric} is additive but reported no total — the header loses its figure`,
+      );
+      assert.equal(
+        res.total,
+        res.points.reduce((s, p) => s + p.value, 0),
+        `${metric} total is not the sum of its points`,
+      );
+    } else {
+      assert.equal(
+        res.total,
+        undefined,
+        `${metric} is not additive but reported a total — a summed ${metricDoc(metric).unit} has no referent`,
+      );
+    }
+  }
+
+  // The field's own documentation must name the same set, since that comment is what the next
+  // author reads before extending the chain.
+  const src = fs.readFileSync(new URL('../src/mgmt/reports.ts', import.meta.url), 'utf8');
+  const doc = sliceBetween(src, 'Total across every point', 'total?: number;', 500);
+  for (const metric of ADDITIVE) {
+    assert.match(doc, new RegExp(metric), `the total? doc comment omits the additive metric ${metric}`);
+  }
+});
+
 test('queue latency excludes rows with no watermark instead of counting them as zero', () => {
   const spec = SPEC({ metric: 'queueLatency', dimension: 'none' });
   const rows = [
