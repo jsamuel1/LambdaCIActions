@@ -29,8 +29,8 @@ GitHub's own authorize screen. Both need interactive GitHub credentials.
 |---|---|
 | Account / region | `863638663908` / `us-west-2` (pinned via `.env.local`, ADR-018) |
 | Stacks | `LCA-Mgmt-dev` (`UPDATE_COMPLETE`), `LCA-Web-dev` (`CREATE_COMPLETE`), `LCA-Control-dev`, `LCA-Data-dev`, `LCA-Image-dev` |
-| Deployed source | **`63069ff`** "M4: Web UI & Management API" — Mgmt λ `LastModified 2026-07-28T23:37:30Z`, console bundle `main.js` `2026-07-28 23:36:08`. Later `main` commits (`10d4d01`, `d74e54a`, `e1bd40e`, `d8d23f1`) are **not** deployed |
-| Verifying tree | `main` @ `d8d23f1` |
+| Deployed source | **`63069ff`** "M4: Web UI & Management API" — Mgmt λ `LastModified 2026-07-28T23:37:30Z`, console bundle `main.js` `2026-07-28 23:36:08`. Every later `main` commit is **not** deployed: `10d4d01`, `d74e54a`, `e1bd40e`, `d8d23f1` (vanity origin, ADR-037 install fix, M5 flavors, M5 adopt mode), then `064e26b`..`d3dd0de` (PR #27, M4 CD / ADR-047 — landed 07:39Z, after this walkthrough) |
+| Verifying tree | `main` @ `d8d23f1` during the walkthrough (06:15–06:35Z); this document lands on `d3dd0de`. `git diff d8d23f1 d3dd0de -- src/ web/` is **empty**, so nothing between them changes a claim below |
 | `ConsoleUrl` | `https://d2x4qcl1ibd2ax.cloudfront.net` (raw CloudFront — no vanity domain configured in this account) |
 | Mgmt API | `https://q2s2zkcji8.execute-api.us-west-2.amazonaws.com` (same-origin behind CloudFront, ADR-024) |
 | GitHub App | `lambdaciactions-dev` (app id `4292494`, client id `Iv23liqxo1L0yFSPaYws`), installation **`146431062`** on `jsamuel1`, `repository_selection: all`, 139 repos |
@@ -348,9 +348,9 @@ describe-log-streams --log-stream-name-prefix microvm-98c2f28c-…  ->  0
 filter-log-events  --log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'  ->  5
 ```
 
-`src/mgmt/logs.ts` has **zero diff between `63069ff` and `main` @ `d8d23f1`**, so this is
-live on `main` — deploying newer code will not fix it. Filed as
-**`task-1785738322-0bb6`** (P2) with a fix sketch.
+`src/mgmt/logs.ts` has **zero diff between `63069ff` and `main` @ `d3dd0de`** (current tip,
+and likewise at `d8d23f1`), so this is live on `main` — deploying newer code will not fix it.
+Filed as **`task-1785738322-0bb6`** (P2) with a fix sketch.
 
 Why the existing unit tests never caught it: `test/mgmt-logs.test.mjs` stubs the CloudWatch
 client with a **scripted response queue that ignores `logStreamNamePrefix` entirely** — it
