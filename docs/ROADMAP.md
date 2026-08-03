@@ -42,7 +42,7 @@ Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md)
 - `MgmtStack` API + `WebStack` SPA + GitHub OAuth.
 - Screens: Setup, Dashboard, Repos, Repo/Workflow detail, Runs, Run detail (logs), Flavors, Settings.
 - Run history (GSI2, ADR-023) + CloudWatch log viewer; live status via polling (ADR-026).
-- 🎯 An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI.
+- 🎯 **Exit criterion NOT met — verification attempted 2026-08-03.** An operator installs the App, enables a repo, watches a run to completion, and reads its logs — all from the UI. Evidence: [`docs/VERIFY-M4.md`](VERIFY-M4.md) — 8 of 9 walkthrough steps pass against the deployed `dev` console (onboarding, repo enable, routing preview, live `queued → provisioning → running → completed` with no reload, presence-only Settings, ADR-027 opt-out gate). **Blocked on "and reads its logs"**: the run-detail log pane renders `0 events` for every run because `src/mgmt/logs.ts` passes the microVM id as `logStreamNamePrefix` while it is actually a stream-name *suffix* — live on `main`, filed as `task-1785738322-0bb6`. Re-mark this 🎯 once that lands and the log pane is re-walked.
 
 ## M5 — Drop-in & polish
 True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033,
