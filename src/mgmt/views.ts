@@ -36,6 +36,14 @@ export interface RunView {
    * and the dashboard rollup (`summarizeCost`) so the two can never disagree.
    */
   costUsd?: number;
+  /**
+   * Which clock the cost came from: `measured` (the `runningAt` watermark, ADR-042) or
+   * `wallClock` (a pre-watermark row, which overstates). Exposed so the UI states the bias
+   * instead of presenting both kinds of estimate as equally tight.
+   */
+  costBasis: CostBasis;
+  /** Seconds counted as billable for the cost figure. */
+  billableSeconds: number;
 }
 
 /**
@@ -83,31 +91,43 @@ export function durationSeconds(run: Pick<RunRecord, 'createdAt' | 'updatedAt'>)
   return Math.round((end - start) / 1000);
 }
 
+/** Which clock a cost estimate was derived from — surfaced so the UI can state the bias. */
+export type CostBasis = 'measured' | 'wallClock';
+
 /** Statuses after which a run row no longer changes. */
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(['completed', 'failed', 'timed_out']);
 
 /**
- * Billable seconds behind the cost estimate.
+ * Billable seconds for a job, and which clock produced them.
  *
- * For a TERMINAL row this is queue→last-transition, exactly as before. For a row still in
- * flight it runs to `now` instead: `updatedAt` is only written on a status TRANSITION, so an
- * hour-old `running` job kept reporting the seconds it took to reach `running` — the Run
- * detail page polls, reprojects the same row, and showed a frozen estimate that materially
- * understated live spend.
+ * Two independent axes, because they answer different questions:
+ *
+ * - **Which clock starts the window** (the `basis`). The microVM service bills only while the
+ *   VM RUNS, so queue + provisioning time is not chargeable. Prefers the `runningAt` watermark
+ *   (ADR-042); falls back to `createdAt` for rows written before it existed, which OVERSTATES
+ *   cost. The basis is returned rather than hidden so Run detail and Reports label the estimate
+ *   the same way — this is the one definition of billable time in the codebase, so the two
+ *   screens cannot disagree about what the same run cost.
+ * - **Which clock ends it.** A TERMINAL row ends at its last transition. A row still in flight
+ *   runs to `now` instead: `updatedAt` is only written on a status TRANSITION, so an hour-old
+ *   `running` job kept reporting the seconds it took to REACH `running` — Run detail polls,
+ *   reprojects the same row, and showed a frozen estimate that materially understated live
+ *   spend. `now` is injected so it is deterministic in tests and one instant per API response.
  */
-function billableSeconds(
-  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'status'>,
-  now: Date,
-): number {
-  if (TERMINAL_STATUSES.has(run.status)) return durationSeconds(run);
-  const start = Date.parse(run.createdAt);
-  const end = now.getTime();
+export function billableSeconds(
+  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'runningAt' | 'status'>,
+  now: Date = new Date(),
+): { seconds: number; basis: CostBasis } {
+  const watermark = run.runningAt ? Date.parse(run.runningAt) : Number.NaN;
+  const measured = Number.isFinite(watermark);
+  const start = measured ? watermark : Date.parse(run.createdAt);
+  const end = TERMINAL_STATUSES.has(run.status) ? Date.parse(run.updatedAt) : now.getTime();
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-    // A clock skew / unparseable timestamp must not invent negative spend; fall back to the
-    // persisted window, which is itself clamped at 0.
-    return durationSeconds(run);
+    // Clock skew / an unparseable timestamp must not invent negative spend, and must not
+    // claim a `measured` basis it could not actually measure. `durationSeconds` clamps at 0.
+    return { seconds: durationSeconds(run), basis: 'wallClock' };
   }
-  return Math.round((end - start) / 1000);
+  return { seconds: Math.round((end - start) / 1000), basis: measured ? 'measured' : 'wallClock' };
 }
 
 /**
@@ -139,27 +159,27 @@ export function isCostEligible(
 const LAUNCHED_STATUSES: ReadonlySet<string> = new Set(['running', 'completed']);
 
 /**
- * Estimated cost of a run: billable minutes × flavor rate, or undefined when the row is not
- * evidence of a microVM having run (see `isCostEligible` — a mint/launch failure carries a
- * flavor but no VM).
+ * Estimated cost of a run: billable minutes × flavor rate. An ESTIMATE in two ways — the rate
+ * is derived from the flavor's vCPU/GB footprint rather than a bill (spec 04 OQ-3), and rows
+ * with no `runningAt` watermark are priced on wall clock, which overstates.
  *
- * Only the `running` phase is billed by the microVM service, but we don't persist a
- * `startedAt` per phase in v1, so this uses wall-clock as an UPPER BOUND and is labelled an
- * estimate in the UI. A non-terminal row is measured to `now`, so a live run's estimate grows
- * as it runs instead of freezing at its last transition.
+ * `undefined` when the row is not evidence of a microVM having run (see `isCostEligible` — a
+ * mint/launch failure carries a flavor but no VM). The gate lives HERE, not in a caller, so the
+ * per-run figure and the dashboard total cannot diverge again.
  */
 export function estimateCostUsd(
-  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'flavor' | 'status' | 'microvmId'>,
+  run: Pick<RunRecord, 'createdAt' | 'updatedAt' | 'runningAt' | 'flavor' | 'status' | 'microvmId'>,
   now: Date = new Date(),
 ): number | undefined {
   if (!isCostEligible(run)) return undefined;
   const rate = flavorRatePerMinute(run.flavor)!;
-  const minutes = billableSeconds(run, now) / 60;
+  const minutes = billableSeconds(run, now).seconds / 60;
   return Math.round(rate * minutes * 1e6) / 1e6;
 }
 
 /** Project a stored run row onto the API shape (adds derived duration + cost). */
 export function toRunView(run: RunRecord, now: Date = new Date()): RunView {
+  const billable = billableSeconds(run, now);
   return {
     repoId: run.repoId,
     repoFullName: run.repoFullName,
@@ -175,6 +195,8 @@ export function toRunView(run: RunRecord, now: Date = new Date()): RunView {
     updatedAt: run.updatedAt,
     durationSeconds: durationSeconds(run),
     costUsd: estimateCostUsd(run, now),
+    costBasis: billable.basis,
+    billableSeconds: billable.seconds,
   };
 }
 

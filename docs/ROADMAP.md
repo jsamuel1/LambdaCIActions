@@ -67,10 +67,13 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
   level so it doesn't mask real problems.
 - Metrics as EMF + per-env alarms + X-Ray (ADR-032); cost estimate in Run detail **and** a
   rolling per-flavor estimate on the Dashboard.
-- **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
-  (cost left Runs per ADR-029; see spec 04 OQ-6). **Still open**: the Dashboard estimate is a
-  fixed bounded sample of recent finished runs, deliberately not the windowed, groupable
-  report ADR-029 defers to this screen.
+- **Reports screen** (spec 04 § Reports): spend / job counts / duration p50-p90 / failure rate /
+  queue-to-start latency over a window, charted + CSV/JSON export, plus a natural-language
+  report assistant. Cost left Runs per ADR-029 and lands here. Aggregates are
+  authorization-first (ADR-043); phase watermarks make the cost basis honest (ADR-042); the
+  assistant emits a **validated spec**, never code (ADR-045). This is the windowed, groupable
+  report ADR-029 deferred; the Dashboard's rolling estimate remains a deliberately separate
+  fixed bounded sample of recent finished runs, not a substitute for it.
 - Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
 - `dev`/`prod` config separation (ADR-033); runbook + quotas docs.
 - 🎯 **Exit criterion not yet verified**: a brand-new repo running unchanged in `adopt` mode
