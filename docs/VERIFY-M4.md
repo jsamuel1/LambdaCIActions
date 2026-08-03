@@ -424,7 +424,11 @@ path — it does **not** establish strictness under a read fault.
 
 **`task-1785738322-0bb6`.** `logStreamNamePrefix: microvmId` in `src/mgmt/logs.ts:77`/`:118`,
 but the microVM id is a stream-name **suffix**. Evidence and fix sketch in step 7 and on the
-card. **Live on `main`** — zero diff since `63069ff`. This is the sole blocker for the M4 🎯.
+card. **Live on `main`** — zero diff since `63069ff`. This is the only *product defect* found,
+and the only blocker that is a defect at all — but it is **not** the only thing standing between
+this walkthrough and a marked 🎯. Landing it clears the criterion's *"reads its logs"* clause;
+the *"installs the App"* clause still needs the interactive GitHub half of steps 1–2 walked by
+a human. Both are preconditions for marking.
 
 ### Non-defects encountered (recorded so the next walkthrough doesn't re-litigate them)
 
