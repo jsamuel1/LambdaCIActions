@@ -9,9 +9,11 @@ Step 7 — log reading — **fails**.
 
 Walked as an operator against the live `dev` console on **2026-08-03**. Repo enablement,
 workflow routing preview, live run tracking, presence-only Settings and the ADR-027 opt-out
-gate all work from the UI. The final clause — **"and reads its logs"** — does not: the
-run-detail log pane renders `0 events` for every run, including runs whose CloudWatch stream
-demonstrably holds the runner output. Root cause found and filed as
+gate all work from the UI. (Step 6's pass carries one scoped caveat: `provisioning`, `running`
+and `completed` are screenshotted, `queued` is an untimed DOM reading — see step 6.) The final
+clause — **"and reads its logs"** — does not: the run-detail log pane renders `0 events` for
+every run, including runs whose CloudWatch stream demonstrably holds the runner output. Root
+cause found and filed as
 [`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it is
 a two-line locator bug, **live on `main`**, not a deployment artifact.
 
@@ -29,7 +31,7 @@ GitHub's own authorize screen. Both need interactive GitHub credentials.
 |---|---|
 | Account / region | `863638663908` / `us-west-2` (pinned via `.env.local`, ADR-018) |
 | Stacks | `LCA-Mgmt-dev` (`UPDATE_COMPLETE`), `LCA-Web-dev` (`CREATE_COMPLETE`), `LCA-Control-dev`, `LCA-Data-dev`, `LCA-Image-dev` |
-| Deployed source | **`63069ff`** "M4: Web UI & Management API" — Mgmt λ `LastModified 2026-07-28T23:37:30Z`, console bundle `main.js` `2026-07-28 23:36:08`. Every later `main` commit is **not** deployed — the full range `63069ff..d3dd0de` is: `da38edc` (ADR-028 boot broker budget), **`94360ca` (ADR-029 — run-primary Runs screen)**, `10d4d01`, `d74e54a`, `e1bd40e`, `d8d23f1` (vanity origin, ADR-037 install fix, M5 flavors, M5 adopt mode), then `064e26b`..`d3dd0de` (PR #27, M4 CD / ADR-047 — landed 07:39Z, after this walkthrough). **ADR-029 matters for reading the screenshots below**: it rewrote `web/src/screens/Runs.tsx` + `src/mgmt/run-rollup.ts` to nest jobs under runs and drop the Runs-list cost column. The deployed vintage here is pre-ADR-029, so every Runs-list and Dashboard shot shows **flat per-job rows with a cost column**. Superseded presentation, not a defect — the same class of skew as the flavor sizes noted in step 5 |
+| Deployed source | **`63069ff`** "M4: Web UI & Management API" — Mgmt λ `LastModified 2026-07-28T23:37:30Z`, console bundle `main.js` `2026-07-28 23:36:08`. Every later `main` commit is **not** deployed — the full range `63069ff..d3dd0de` is: `da38edc` (ADR-028 boot broker budget), **`94360ca` (ADR-029 — run-primary Runs screen)**, `10d4d01`, `d74e54a`, `e1bd40e`, `d8d23f1` (vanity origin, ADR-037 install fix, M5 flavors, M5 adopt mode), then `064e26b`..`d3dd0de` (PR #27, M4 CD / ADR-047 — landed 07:39Z, after this walkthrough). **ADR-029 matters for reading the Runs-list screenshots below**: it rewrote `web/src/screens/Runs.tsx` + `src/mgmt/run-rollup.ts` to nest jobs under runs and drop the Runs-list `EST. COST` column. The deployed vintage here is pre-ADR-029, so every **Runs-list** shot shows **flat per-job rows with a cost column** — superseded presentation, not a defect, the same class of skew as the flavor sizes noted in step 5. The **Dashboard** run table is *not* affected: `94360ca` does not touch `web/src/screens/Dashboard.tsx` and its run table is byte-identical between `63069ff` and `main`, so the Dashboard shot below shows current behaviour |
 | Verifying tree | `main` @ `d8d23f1` during the walkthrough (06:15–06:35Z); this document lands on `d3dd0de`. `git diff d8d23f1 d3dd0de -- src/ web/` is **empty**, so nothing between them changes a claim below |
 | `ConsoleUrl` | `https://d2x4qcl1ibd2ax.cloudfront.net` (raw CloudFront — no vanity domain configured in this account) |
 | Mgmt API | `https://q2s2zkcji8.execute-api.us-west-2.amazonaws.com` (same-origin behind CloudFront, ADR-024) |
@@ -247,9 +249,11 @@ already corrected upstream.
 
 ## Step 6 — Push a commit, watch the run advance without reloading
 
-**Pass.** Every status reading below is the console's own rendering; after the initial
-navigation the harness **never reloaded** — updates arrived via the SPA's 3 s/5 s polling
-(ADR-026).
+**Pass**, with one weak reading called out below. Every status reading is the console's own
+rendering; after the initial navigation the harness **never reloaded** — updates arrived via
+the SPA's 3 s/5 s polling (ADR-026). Of the four statuses, `provisioning`, `running` and
+`completed` are screenshotted; `queued` is a DOM-text observation whose recorded time does not
+reconcile (see the status table).
 
 Six pushes were made to `jsamuel1/lca-m3-verify` on branch `m4-verify-01`, plus one
 `workflow_dispatch`. `main` was deliberately not touched, so the base fixture
@@ -273,7 +277,7 @@ rendered by the console**:
 
 | Status | Where seen | Evidence |
 |---|---|---|
-| `queued` | Runs list, 06:28:09Z | run `30790275739` row read straight from the DOM. **No screenshot** — the Runs-list shot for that run ([`06b-runs-list-running.png`](evidence/m4/06b-runs-list-running.png)) was captured ~25 s late and already shows it `running` (14 s elapsed), so the `queued` reading rests on the DOM text alone |
+| `queued` | Runs list | run `30790275739` row read straight from the DOM — **uncorroborated, the weakest reading in this table**. There is **no screenshot**, and the Runs-list shot for that run ([`06b-runs-list-running.png`](evidence/m4/06b-runs-list-running.png)) cannot stand in: it already shows the row `running`. Nor can that shot be dated from its `14s` duration — `durationSeconds` is `updatedAt − createdAt` (`src/mgmt/views.ts:79`), frozen at the last transition, not live elapsed time, so `14s` dates the store's `running` transition (`createdAt 06:27:30Z` + 14 s ≈ `06:27:44Z`) and says nothing about when the pixels were taken. The harness recorded `06:28:09Z` against the `queued` DOM read, and that stamp cannot be right: the store had already moved the row to `running` by `≈06:27:44Z`, so a poll 25 s later would have rendered `running`. The screenshot is internally consistent with the store; the `queued` read's time (or its row identity) is what is suspect. Treat `queued` as seen-but-untimed. It is not load-bearing for the 🎯, which asks for a run *watched to completion* — that rests on the in-place `running → completed` transitions below |
 | `provisioning` | Runs list, 06:35:0xZ | run `30790672874 / 91613320319` badge — [`06d-runs-list-provisioning.png`](evidence/m4/06d-runs-list-provisioning.png) |
 | `running` | Run detail, 06:22:13Z / 06:28:15Z / 06:30:23Z / 06:32:24Z | [`06-rundetail-1-running.png`](evidence/m4/06-rundetail-1-running.png); also on the Runs list — [`06b-runs-list-running.png`](evidence/m4/06b-runs-list-running.png) |
 | `completed` | Run detail, 06:23:31Z / 06:28:51Z / 06:31:14Z / 06:33:39Z | [`07-rundetail-final-completed.png`](evidence/m4/07-rundetail-final-completed.png) |
@@ -439,7 +443,7 @@ a human. Both are preconditions for marking.
 | `provisioning` rarely visible on `base` | Real timing property: ~0.9 s between the transition and VM launch. Caught on `docker` (~60 s dwell). |
 | Stale `diag*.yml` rows on repo detail | Parse history for deleted workflow files; documented behaviour. |
 | Flavor sizes shown as `2 vCPU / 4 GB` etc. | Pre-ADR-038 catalog text in the deployed M4 bundle; corrected on `main`. |
-| Runs list / Dashboard show flat per-job rows with a cost column | Pre-ADR-029 presentation. `94360ca` (undeployed here) makes Runs run-primary with nested jobs and drops that column. Superseded presentation, not a defect — see the Deployed source row above. |
+| Runs list shows flat per-job rows with an `EST. COST` column | Pre-ADR-029 presentation. `94360ca` (undeployed here) makes Runs run-primary with nested jobs and drops that column. Superseded presentation, not a defect — see the Deployed source row above. **Scope note:** this applies to the Runs list only. The Dashboard run table has no cost column in any revision, and `94360ca` does not touch `Dashboard.tsx`; the Dashboard shot is current behaviour, not a superseded vintage. What `main` adds to the Dashboard is a *separate* `Cost estimate` card + `Est. spend` stat, from `d8d23f1` (M5) — also undeployed here, and likewise not a defect. |
 | Run `30790210060` failed | **My fixture error** — appended `//` to YAML. Invalid workflow, GitHub failed it before any `workflow_job` event, so no run row. Not a platform fault. |
 | `DEPLOY-M4.md` ADR cross-link anchors | Already correct on `main` (`#adr-022`, `#adr-024`, `#adr-025`). The card's note is stale; no fix applied. |
 | Unauthenticated authorize-URL probe reads as a callback-URL check | **It is not one.** GitHub defers `redirect_uri` validation until after login, so a bogus value 302s to `/login` identically (probe in step 1). An earlier draft of this document drew the opposite conclusion; retracted. |
