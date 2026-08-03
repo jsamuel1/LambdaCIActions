@@ -656,6 +656,37 @@ test('every chart type in the vocabulary is one the frontend actually renders', 
   }
 });
 
+test('every unit in the catalog is one the frontend actually renders', () => {
+  // Same contract as the chart-type guard above, for the OTHER half of what the renderer is
+  // handed. `MetricDoc.unit` is a free-form string, `formatValue` dispatches on its literal
+  // value, and the fallthrough is `String(value)` — so a metric introducing a unit the renderer
+  // does not know prints a bare number on the axis, the tooltip, the table cell AND the headline
+  // total. That is not a visibly broken chart; it is a figure whose unit silently disappeared,
+  // which on a cost/utilisation screen is a wrong answer that looks right.
+  //
+  // `billableMinutes` is the first metric to add a unit since the vocabulary was written, and it
+  // needed a new `formatValue` branch to render at all. Pinning only the `'minutes'` literal (as
+  // this file did) re-opens the gap for the next one, so the check is over the whole catalog.
+  //
+  // A unit MAY render as a plain number, but only deliberately: `jobs` needs no suffix because
+  // the metric label already reads "Job count". Adding a unit here is therefore a two-line
+  // decision — give it a renderer, or say in this list that a bare number is the intended output.
+  const RENDERED_AS_PLAIN_NUMBER = ['jobs'];
+
+  const renderer = fs.readFileSync(
+    new URL('../web/src/screens/ReportChart.tsx', import.meta.url),
+    'utf8',
+  );
+  const fmt = sliceBetween(renderer, 'function formatValue', '\n}', 600);
+  for (const unit of new Set(METRIC_CATALOG.map((m) => m.unit))) {
+    if (RENDERED_AS_PLAIN_NUMBER.includes(unit)) continue;
+    assert.ok(
+      fmt.includes(`'${unit}'`),
+      `unit "${unit}" has no formatValue branch, so its figures print as a bare number with no unit`,
+    );
+  }
+});
+
 test('every chart type and dimension in the vocabulary is a plain string enum', () => {
   // Guards against a future "chart" that carries options — the model picks from this list, so
   // anything structured here becomes model-controlled render input (ADR-045).
