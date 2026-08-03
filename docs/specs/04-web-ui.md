@@ -220,10 +220,16 @@ assistant's prompt is generated from it so the two cannot drift):
 | `queueLatency` | seconds | p50 / p90 of queued→`runningAt`, over jobs carrying a **measurable** watermark. |
 
 Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days, else daily),
-`none`. Grouping by `workflow` buckets rows written before ingest persisted `workflowName` (M5)
-under **“(not recorded — pre-M5 row)”** rather than *“(unknown)”*, which reads like a real
-workflow whose name could not be determined and invites an operator to treat a data gap as one
-workflow's activity. That bucket's group key is namespaced so it cannot collide with a workflow
+`none`. Grouping by `workflow` buckets rows carrying no `workflowName` under
+**“(no workflow name recorded)”** rather than *“(unknown)”*, which reads like a real workflow
+whose name could not be determined and invites an operator to treat a data gap as one workflow's
+activity. The label names the gap and deliberately **not** a cause, because there are two and
+only one is about age: the row predates ingest persisting the field (M5), **or**
+`workflow_job.workflow_name` was absent on the event itself — it is optional and nullable on the
+wire, both ingest paths coalesce it, and the run store omits a falsy value, so a brand-new row
+lands in the same bucket. Naming it a pre-M5 row would repeat the `runningAt` error corrected
+above: right number, false explanation for a reachable current row.
+That bucket's group key is namespaced so it cannot collide with a workflow
 literally named the same thing: `workflowName` is copied verbatim off the `workflow_job` webhook,
 so it is tenant-controlled, and merging the two would attribute real activity to the gap
 unfalsifiably from the chart. `flavor` needs no such namespacing — every resolution path gates the

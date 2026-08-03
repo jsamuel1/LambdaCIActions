@@ -168,6 +168,11 @@ test('a wallClock-basis row lowers billableMinutes coverage and the caveat says 
   assert.equal(res.coverageSampleSize, 2);
   assert.ok(res.metric.estimate, 'billableMinutes is an estimate, not measured truth');
   assert.match(res.caveat, /OVERSTATES/);
+  // The caveat must name the coverage DENOMINATOR, and it is jobs that ran a microVM — not
+  // "measured jobs", which is the numerator's own criterion and reads as a tautology
+  // ("the share of measured jobs that were measured"). `spend` says PRICED for the same reason.
+  assert.match(res.caveat, /share of jobs that RAN a microVM/);
+  assert.doesNotMatch(res.caveat, /share of MEASURED jobs/);
 
   // The overstatement is real, not just documented: the same job priced without a watermark
   // reports MORE minutes than one that has it.
@@ -519,17 +524,33 @@ test('spend coverage ignores rows that were never priced at all', () => {
 test('grouping by workflow labels rows with no workflow name honestly and without collision', () => {
   const spec = SPEC({ dimension: 'workflow' });
   const res = computeReport([job({ workflowName: undefined })], spec, { now: NOW });
-  // "(unknown)" read like a real workflow whose name could not be determined. The name is
-  // absent because the row predates ingest persisting it (M5), so the label says that.
-  assert.match(res.points[0].label, /not recorded/);
+  // "(unknown)" read like a real workflow whose name could not be determined, so the label
+  // names the GAP. It must not name a CAUSE either: the field is absent both on a pre-M5 row
+  // and on a current row whose `workflow_job` event carried no `workflow_name` (optional and
+  // nullable on the wire, coalesced by both ingest paths, omitted when falsy by the run store).
+  // Dating the bucket would repeat the `runningAt` error — right number, false explanation.
+  assert.match(res.points[0].label, /no workflow name recorded/);
   assert.doesNotMatch(res.points[0].label, /unknown/i);
+  assert.doesNotMatch(res.points[0].label, /pre-M5|predates|older|old row/i);
+  // Same for the operator-facing prose, which is where the claim would actually be read.
+  const groupKeySrc = sliceBetween(
+    fs.readFileSync(new URL('../src/mgmt/reports.ts', import.meta.url), 'utf8'),
+    'function groupKey',
+    "\n    case 'status':",
+    2000,
+  );
+  assert.match(
+    groupKeySrc,
+    /workflow_name.*(optional|absent)|absent on the event/s,
+    'the workflow gap is documented as a pre-M5 artefact only — a current event can omit the name',
+  );
 
   // `workflowName` is copied verbatim off the webhook, so a repo may contain a workflow
   // literally named like the empty bucket's label. Keying the absent case by its display
   // string merged the two into one bar — real activity attributed to a data gap, unfalsifiable
   // from the chart.
   const collide = computeReport(
-    [job({ jobId: 1, workflowName: undefined }), job({ jobId: 2, workflowName: '(not recorded — pre-M5 row)' })],
+    [job({ jobId: 1, workflowName: undefined }), job({ jobId: 2, workflowName: '(no workflow name recorded)' })],
     SPEC({ metric: 'runCount', dimension: 'workflow' }),
     { now: NOW },
   );
@@ -538,7 +559,7 @@ test('grouping by workflow labels rows with no workflow name honestly and withou
 
   // An empty-string name is a gap too, not a workflow with a blank name.
   const blank = computeReport([job({ workflowName: '' })], spec, { now: NOW });
-  assert.match(blank.points[0].label, /not recorded/);
+  assert.match(blank.points[0].label, /no workflow name recorded/);
 });
 
 test('a time-dimension report sorts chronologically, others by magnitude', () => {
@@ -1236,9 +1257,25 @@ test('USD is rendered by exactly one formatter in the console', () => {
   assert.match(formatter, /toFixed\(/, 'formatCost no longer owns the precision rule');
   assert.match(formatter, /< 1 \? 4 : 2/, 'the magnitude rule (4dp under $1, else 2dp) is not stated in code');
 
-  for (const file of ['screens/ReportChart.tsx', 'screens/RunDetail.tsx', 'screens/Dashboard.tsx', 'screens/Platform.tsx']) {
+  // Two lists, because "renders money" and "may not carry a precision rule" are different
+  // claims. `Reports.tsx` prints the aggregate total through the chart's `formatValue` rather
+  // than touching `formatCost` itself, so demanding the identifier there would force a
+  // pointless import; but it is still a money screen and must not grow its own `toFixed`.
+  const DELEGATES_TO_FORMAT_COST = [
+    'screens/ReportChart.tsx',
+    'screens/RunDetail.tsx',
+    'screens/Dashboard.tsx',
+    'screens/Platform.tsx',
+  ];
+  const NO_INLINE_PRECISION = [...DELEGATES_TO_FORMAT_COST, 'screens/Reports.tsx'];
+
+  for (const file of DELEGATES_TO_FORMAT_COST) {
     const src = fs.readFileSync(new URL(`../web/src/${file}`, import.meta.url), 'utf8');
     assert.match(src, /formatCost/, `${file} renders money without the shared formatter`);
+  }
+
+  for (const file of NO_INLINE_PRECISION) {
+    const src = fs.readFileSync(new URL(`../web/src/${file}`, import.meta.url), 'utf8');
 
     // Any `toFixed` in a money screen is a precision rule, and the rule is supposed to live in
     // exactly one place. Matching on the currency SYMBOL cannot enforce that: a template literal

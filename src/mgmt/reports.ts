@@ -553,10 +553,10 @@ function bucketKey(iso: string, bucket: 'hour' | 'day'): string {
  *
  * `key` and `label` are NOT interchangeable for `workflow`. `workflowName` is copied verbatim
  * off the `workflow_job` webhook, so it is tenant-controlled and a repo may legitimately contain
- * a workflow literally named `(not recorded)`. Keying the absent case by its own display string
- * would merge those rows into one bar and attribute real workflow activity to a data gap (and
- * vice versa), which is unfalsifiable from the chart. So the absent case gets a key that no
- * webhook value can produce, and every present name is namespaced under `name:`.
+ * a workflow literally named like the absent bucket's label. Keying the absent case by its own
+ * display string would merge those rows into one bar and attribute real workflow activity to a
+ * data gap (and vice versa), which is unfalsifiable from the chart. So the absent case gets a
+ * key that no webhook value can produce, and every present name is namespaced under `name:`.
  *
  * `flavor` needs no such namespacing: every resolution path in `src/provision/flavor.ts` gates
  * the chosen name through `byName()`, so `run.flavor` is always a catalog entry — a tenant's
@@ -570,13 +570,18 @@ function groupKey(run: RunRecord, spec: ReportSpec): { key: string; label: strin
     case 'flavor':
       return { key: run.flavor ?? '(not launched)', label: run.flavor ?? '(not launched)' };
     case 'workflow':
-      // Labelled "not recorded", not "unknown": the name is absent because the row was written
-      // before ingest persisted `workflowName` (M5) — the workflow itself is perfectly well
-      // known, it just was not stored. "(unknown)" reads like a real workflow whose name could
-      // not be determined, which invites an operator to treat the bucket as one workflow's
-      // activity. Any row written after that deploy carries a name.
+      // Labelled "no workflow name recorded", not "unknown": "(unknown)" reads like a real
+      // workflow whose name could not be determined, which invites an operator to treat the
+      // bucket as one workflow's activity. The label names the GAP and deliberately does NOT
+      // name a cause, because there are two and only one of them is about age:
+      //   - the row predates ingest persisting `workflowName` (M5), or
+      //   - `workflow_job.workflow_name` was absent on the event itself — it is optional and
+      //     nullable on the wire (`src/shared/types.ts`), both ingest paths coalesce it, and
+      //     `run-store.ts` omits a falsy value, so a BRAND-NEW row lands here too.
+      // Calling this bucket a pre-M5 row would repeat the `runningAt` mistake: numbers right,
+      // explanation false for a reachable current row.
       return run.workflowName === undefined || run.workflowName === ''
-        ? { key: 'workflow:unrecorded', label: '(not recorded — pre-M5 row)' }
+        ? { key: 'workflow:unrecorded', label: '(no workflow name recorded)' }
         : { key: `name:${run.workflowName}`, label: run.workflowName };
     case 'status':
       return { key: run.status, label: run.status };
@@ -739,7 +744,7 @@ function caveatFor(metric: ReportMetric): string | undefined {
     case 'spend':
       return 'Estimate. Coverage is the share of PRICED jobs whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES cost. Jobs that never launched a microVM are priced at 0 and counted in neither share.';
     case 'billableMinutes':
-      return 'Estimate, and an ABSOLUTE figure — not a share of any capacity ceiling. Coverage is the share of MEASURED jobs whose billable window came from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES consumption by the queue and provisioning time it wrongly includes. Jobs that never launched a microVM contribute 0 and are counted in neither share.';
+      return 'Estimate, and an ABSOLUTE figure — not a share of any capacity ceiling. Coverage is the share of jobs that RAN a microVM whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES consumption by the queue and provisioning time it wrongly includes. Jobs that never launched a microVM contribute 0 and are counted in neither share.';
     case 'duration':
       return 'Coverage is the share of jobs that reached a terminal status AND whose span was measurable; in-flight jobs are excluded.';
     case 'failureRate':
