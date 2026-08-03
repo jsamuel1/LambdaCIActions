@@ -11,7 +11,7 @@ enablement, workflow routing preview, live run tracking and the ADR-027 opt-out 
 work from the UI. The final clause — **"and reads its logs"** — does not: the run-detail log
 pane renders `0 events` for every run, including runs whose CloudWatch stream demonstrably
 holds the runner output. Root cause found and filed as
-[`task-1785738322-0bb6`](#defect-1-run-detail-log-pane-can-never-show-runner-output-p2); it is
+[`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it is
 a two-line locator bug, **live on `main`**, not a deployment artifact.
 
 `docs/ROADMAP.md` § M4 therefore keeps its 🎯 unmarked.
