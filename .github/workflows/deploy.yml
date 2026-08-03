@@ -103,10 +103,12 @@ jobs:
       # The console origin is CloudFront's generated domain, which does not exist until
       # WebStack's first deploy — hence the two-pass bootstrap (docs/DEPLOY-M4.md). `dev` has
       # no vanity domain, so this pass does the real work. An env that DOES have one must
-      # declare LCA_CONSOLE_HOSTED_ZONE_ID + LCA_CONSOLE_ZONE_NAME in the `env:` block above:
-      # that config lives in `.env.local` on a workstation, and a runner has no such file, so
-      # without it the synth would drop the CloudFront alias and cert and rewrite
-      # PUBLIC_ORIGIN to the raw CloudFront name — breaking login (ADR-036/ADR-047).
+      # (a) declare LCA_CONSOLE_HOSTED_ZONE_ID + LCA_CONSOLE_ZONE_NAME in the `env:` block
+      # above — that config lives in `.env.local` on a workstation and a runner has no such
+      # file, so without it the synth would drop the CloudFront alias and cert and rewrite
+      # PUBLIC_ORIGIN to the raw CloudFront name, breaking login (ADR-036/ADR-047) — and
+      # (b) have `LCA-Cert-<env>` already deployed FROM A WORKSTATION: it is us-east-1 and on
+      # this workflow's forbidden list, so `--exclusively` skips it rather than deploying it.
       - name: Read ConsoleUrl from LCA-Web-dev
         id: console
         run: |

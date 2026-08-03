@@ -269,3 +269,32 @@ test('creation is opt-in only (fresh-account path)', () => {
 test('createProvider + existingProviderArn is refused rather than silently ignored', () => {
   assert.throws(() => synth({ createProvider: true }), /mutually exclusive/);
 });
+
+// --- app wiring --------------------------------------------------------------
+
+test('bin/lca.ts does not infer extra bootstrap regions from the console domain', () => {
+  // A vanity domain puts the console cert in us-east-1 (ADR-036), which reads like "CD needs
+  // that region's bootstrap roles". It does not: `LCA-Cert-<env>` is on CD's forbidden list and
+  // `--exclusively` skips it, so CD never deploys into us-east-1 — the cert stack is a
+  // workstation hand-deploy, WebStack's cross-region reference is resolved by a custom resource
+  // running with the deployed stack's own role, and no stack uses `fromLookup`. Deriving the
+  // grant from config would add four unusable admin-by-proxy assume-role targets to the one
+  // stack whose stated property is that it holds nothing else (ADR-047 (d)). Asserted
+  // lexically, in the same style as deploy-env.test.mjs's entrypoint check, because the CDK app
+  // entrypoint has no unit-test harness.
+  const src = fs.readFileSync(path.join(REPO_ROOT, 'bin', 'lca.ts'), 'utf8');
+  const call = src.slice(src.indexOf('new DeployStack('));
+  assert.ok(call.length > 0, 'DeployStack is not instantiated in bin/lca.ts');
+  // Comments stripped: that block deliberately EXPLAINS the us-east-1 reasoning, so matching raw
+  // text would assert against the explanation instead of the code.
+  const code = call
+    .split('\n')
+    .filter((l) => !l.trim().startsWith('//'))
+    .join('\n');
+  assert.doesNotMatch(
+    code,
+    /additionalBootstrapRegions/,
+    'bin/lca.ts must not pass additionalBootstrapRegions — CD deploys in one region only',
+  );
+  assert.doesNotMatch(code, /us-east-1/, 'no us-east-1 bootstrap grant for the CD role');
+});

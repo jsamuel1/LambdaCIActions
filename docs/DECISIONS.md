@@ -1939,9 +1939,17 @@ non-CD path has to stay first-class and correct for exactly the case where the p
   alias and the us-east-1 cert would be removed and `PUBLIC_ORIGIN` rewritten to the raw
   CloudFront name, breaking login against the callback registered on the App — which is
   browser-only to fix. `dev` has no vanity domain today, so `deploy.yml` declares no
-  `LCA_CONSOLE_*` and pass 2 does the real work; an env that adds one must add those variables
-  to the workflow (and the deploy role needs the us-east-1 bootstrap roles, which
-  `bin/lca.ts` grants when a domain resolves).
+  `LCA_CONSOLE_*` and pass 2 does the real work.
+- **A vanity-domain env also needs `LCA-Cert-<env>` deployed by hand before CD can run.** The
+  us-east-1 ACM certificate is its own stack (ADR-036) and it is on CD's forbidden list, so
+  `--exclusively` skips it as a `LCA-Web-<env>` dependency rather than deploying it. The
+  workstation deploys it once (and again on any change to the hostname or zone); CD then
+  consumes the cert ARN through the cross-region reference. A CD run against an env whose cert
+  stack does not exist yet fails at `LCA-Web-<env>` when that reference cannot resolve — loudly,
+  which is the correct failure, but only if the operator sequence is known. CD itself needs no
+  us-east-1 authority for this: the reference is resolved by a custom resource running with the
+  deployed stack's own role, not by the CLI's bootstrap roles, so the deploy role is granted
+  bootstrap roles in the deploy region only.
 - A pin can now come from the environment, so an operator debugging locally with exported
   `LCA_DEPLOY_*` variables gets the CI code path. The STS match still gates it, and the file
   still wins, so the failure mode is a refusal rather than a mis-target.

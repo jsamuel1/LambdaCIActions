@@ -229,9 +229,18 @@ new DeployStack(app, `LCA-Deploy-${envName}`, {
   // or a typo must not switch on a path that adds a wildcard IAM write.
   createProvider: createOidcCtx === true || createOidcCtx === 'true',
   bootstrapQualifier: (app.node.tryGetContext('bootstrapQualifier') as string | undefined) ?? undefined,
-  // With a vanity domain the console cert lives in us-east-1 (ADR-036), so a CD deploy of
-  // WebStack has to publish assets through that region's bootstrap roles too.
-  additionalBootstrapRegions: consoleDomain ? ['us-east-1'] : [],
+  // Deliberately NO extra bootstrap regions, even when a console domain resolves. With a
+  // vanity domain the cert lives in us-east-1 (ADR-036) — but `LCA-Cert-<env>` is on CD's
+  // forbidden list and `--exclusively` skips it as a WebStack dependency, so CD never deploys
+  // into us-east-1 at all: that stack is hand-deployed from a workstation under the operator's
+  // own credentials (docs/DEPLOY-M4.md § CD and the vanity console domain). Nothing else in a
+  // CD run reaches that region either — WebStack's cross-region cert reference is resolved at
+  // deploy time by a custom resource running with the deployed stack's own role, not by the
+  // CLI's bootstrap roles, and no stack uses `fromLookup`. Granting them anyway would add four
+  // more admin-by-proxy assume-role targets that CD cannot use, inside the one stack whose
+  // stated property is that it holds nothing else (ADR-047 (d)). The construct keeps
+  // `additionalBootstrapRegions` for a future CD job that genuinely deploys across regions; it
+  // is not inferred from console config.
 });
 
 app.synth();

@@ -290,6 +290,22 @@ and the us-east-1 certificate are removed and `PUBLIC_ORIGIN` is rewritten to th
 CloudFront name, so login breaks against the callback URL registered on the GitHub App — which
 is browser-only to fix.
 
+**The certificate stack is a hand-deploy prerequisite.** `LCA-Cert-<env>` lives in us-east-1
+(CloudFront rejects viewer certs from anywhere else) and is on CD's forbidden list, so
+`--exclusively` **skips** it as a `LCA-Web-<env>` dependency instead of deploying it. Deploy it
+from a workstation once per environment — and again after any change to the hostname or zone —
+before dispatching CD:
+
+```sh
+npx cdk deploy LCA-Cert-<env> -c env=<env>       # us-east-1, workstation only
+```
+
+CD then consumes the cert ARN through the cross-region reference. A CD run against an env whose
+cert stack does not exist yet fails at `LCA-Web-<env>` when that reference cannot resolve. CD
+needs no us-east-1 authority of its own for this: the reference is resolved by a custom resource
+running with the deployed stack's role, not by the CLI's bootstrap roles, which is why the
+deploy role holds bootstrap roles in the deploy region only.
+
 ### Manual escape hatch (CD or the runner plane is broken)
 
 CD runs **on the platform it deploys**, so it is circular by construction: if the control plane
