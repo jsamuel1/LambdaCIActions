@@ -1948,8 +1948,14 @@ small *structured* problem where a wrong-but-valid answer is worse than a refusa
 spec is rejected and the operator sees the picker, but a plausible-but-wrong spec renders a chart
 that silently answers a different question. Sonnet's stronger instruction-following buys accuracy
 on exactly that
-failure mode, and the cost is bounded by a ~400-token prompt, `max_tokens: 400`,
-`temperature: 0` and the caps below. `InvokeModelWithResponseStream` is deliberately NOT
+failure mode, and the cost is bounded by `max_tokens: 400`, `temperature: 0`, a system prompt
+capped at **3 600 characters (~900 tokens)** and the caps below. That prompt figure is a
+test-enforced budget (`MAX_SYSTEM_PROMPT_CHARS`), not an estimate: the prompt is generated from
+`METRIC_CATALOG`, so it is the fixed input cost of *every* question and adding a metric — or
+widening one metric's prose — raises that bill on a route whose model choice is justified partly
+by the bill being small. An earlier revision of this paragraph quoted "~400 tokens" while the
+generated prompt was already past 600, which is exactly the drift the test now prevents.
+`InvokeModelWithResponseStream` is deliberately NOT
 granted — one small JSON object needs no stream.
 **Why the existing λ**: a separate Reports λ would need its own DynamoDB read grant, its own
 session-secret read, and a second copy of the authorization logic that ADR-043 exists to keep

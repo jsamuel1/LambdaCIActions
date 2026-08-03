@@ -40,9 +40,13 @@ export interface RunView {
    * Which clock the cost came from: `measured` (the `runningAt` watermark, ADR-042) or
    * `wallClock` (a pre-watermark row, which overstates). Exposed so the UI states the bias
    * instead of presenting both kinds of estimate as equally tight.
+   *
+   * **Absent** when no microVM ran (`hasRunMicrovm`): a basis names which clock produced a
+   * billable window, and such a row has none. Reporting `wallClock` there claimed the row was
+   * priced on an overstating clock when it was not priced at all — see `toRunView`.
    */
-  costBasis: CostBasis;
-  /** Seconds counted as billable for the cost figure. */
+  costBasis?: CostBasis;
+  /** Seconds counted as billable for the cost figure. `0` when no microVM ran. */
   billableSeconds: number;
 }
 
@@ -198,8 +202,22 @@ export function estimateCostUsd(
   return Math.round(rate * minutes * 1e6) / 1e6;
 }
 
-/** Project a stored run row onto the API shape (adds derived duration + cost). */
+/**
+ * Project a stored run row onto the API shape (adds derived duration + cost).
+ *
+ * The billable pair is gated on `hasRunMicrovm`, the SAME predicate the `billableMinutes`
+ * aggregate folds over and its export column is gated on (`toExportRows`) — Run detail, the
+ * report and the download must agree about one row, which is the whole point of ADR-042 having
+ * one definition of billable time. Ungated, a launch-failure row reported its entire
+ * queue-to-finish wall clock as billable seconds on a `wallClock` basis while both aggregates
+ * and the export said 0, and the Run detail prose then explained the row as "priced on total
+ * wall clock, an overstatement" — a row that was never priced at all. Numbers right, explanation
+ * false, which is exactly the failure `costBasis` exists to prevent.
+ *
+ * `costUsd` was already gated (`estimateCostUsd`), so only these two were divergent.
+ */
 export function toRunView(run: RunRecord, now: Date = new Date()): RunView {
+  const ran = hasRunMicrovm(run);
   const billable = billableSeconds(run, now);
   return {
     repoId: run.repoId,
@@ -216,8 +234,8 @@ export function toRunView(run: RunRecord, now: Date = new Date()): RunView {
     updatedAt: run.updatedAt,
     durationSeconds: durationSeconds(run),
     costUsd: estimateCostUsd(run, now),
-    costBasis: billable.basis,
-    billableSeconds: billable.seconds,
+    costBasis: ran ? billable.basis : undefined,
+    billableSeconds: ran ? billable.seconds : 0,
   };
 }
 

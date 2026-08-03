@@ -327,7 +327,8 @@ tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Exce
 export is truncated by the same budget as its report: the JSON form carries `complete`, and the
 CSV form — which has nowhere in the body to put it — carries `X-Report-Complete`.
 
-An export **reconciles with the report it was downloaded from**: summing `billableSeconds` ÷ 60
+An export **reconciles with the report it was downloaded from**, and both reconcile with Run
+detail: summing `billableSeconds` ÷ 60
 yields the `billableMinutes` total, and summing `estimatedCostUsd` yields `spend`. Both
 per-row columns are gated on the same predicate their aggregate folds over — a job that never
 ran a microVM exports `0` billable seconds, `0` cost and an **empty** `costBasis`, because a
@@ -337,6 +338,14 @@ contributing 0 on screen, so the column summed higher than the figure it drills 
 seconds column there is no currency symbol to make the magnitude look wrong. The row's real span
 is still exported under `wallClockSeconds`/`createdAt`/`updatedAt`, and `status` says why it has
 no compute.
+
+The **run view** is gated identically, and it was the last surface that was not: it reported that
+same row's whole span as `billableSeconds` on a `wallClock` basis while the aggregate and the
+export both said 0, and Run detail's prose reads `costBasis` to explain the estimate — so it told
+the operator the job was “priced on total wall clock, an overstatement” about a job that was not
+priced at all. `costBasis` is therefore **absent**, not `wallClock`, when no microVM ran, and the
+page has a third sentence for that case. Right number, false explanation is the same defect class
+as the `runningAt` cost basis this section corrects above.
 
 An export is **additionally** capped independently of the read budget, because it is one
 synchronous Lambda response and those are limited to **6 MB**. The read budget allows 20 000 job

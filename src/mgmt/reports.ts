@@ -165,15 +165,17 @@ export const METRIC_CATALOG: readonly MetricDoc[] = [
     metric: 'billableMinutes',
     label: 'Billable compute minutes',
     unit: 'minutes',
+    // Deliberately short, like `spend`'s: a definition says what the metric MEASURES and the
+    // caveat carries the mechanics and the direction of the error. This one first restated the
+    // whole caveat, which printed the same claim twice on the Reports panel (the definition and
+    // the caveat render one after the other) and put every word of it into the assistant's
+    // system prompt, which is built from this catalog (`buildSystemPrompt`).
     definition:
       'Sum of per-job billable microVM time in minutes — the same billable window `spend` is ' +
-      'priced from (runningAt watermark to the last transition, or to now while in flight), so ' +
-      'this is that estimate with the flavor rate taken out. Measured from timestamps, so a job ' +
-      'whose flavor has no rate in the catalog still counts its minutes even though `spend` ' +
-      'cannot price it. Jobs that never launched a microVM contribute 0. ESTIMATE: rows without ' +
-      'a watermark fall back to queue-to-finish wall clock, which OVERSTATES consumption. This ' +
-      'is an ABSOLUTE figure, not a percentage of any capacity ceiling — the microVM concurrency ' +
-      'quota is not read anywhere yet.',
+      'priced from, with the flavor rate taken out, so a job whose flavor has no rate in the ' +
+      'catalog still counts its minutes. An ABSOLUTE figure, not a percentage of any capacity ' +
+      'ceiling — the microVM concurrency quota is not read anywhere yet. ESTIMATE — see the ' +
+      'caveat for which rows overstate.',
     estimate: true,
   },
   {

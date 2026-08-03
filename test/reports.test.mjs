@@ -34,7 +34,7 @@ import {
   toExportRows,
   validateReportSpec,
 } from '../dist/src/mgmt/reports.js';
-import { flavorRatePerMinute } from '../dist/src/mgmt/views.js';
+import { flavorRatePerMinute, toRunView } from '../dist/src/mgmt/views.js';
 
 const NOW = new Date('2026-07-15T12:00:00.000Z');
 
@@ -412,6 +412,33 @@ test('a spend report and its export agree with Run detail on the same row', () =
   assert.equal(res.total, 0, 'the aggregate must not bill a VM that never existed');
   const [row] = toExportRows([launchFailure], NOW);
   assert.equal(row.estimatedCostUsd, 0, 'the export must not contradict the aggregate');
+
+  // This test named Run detail and never asked it, so the surface it claimed to pin was the one
+  // surface left ungated: `toRunView` reported this row's whole queue-to-finish wall clock as
+  // `billableSeconds` on a `wallClock` basis while the aggregate and the export both said 0, and
+  // the detail page's prose then explained a price the row never had. All three now agree.
+  const view = toRunView(launchFailure, NOW);
+  assert.equal(view.costUsd, undefined, 'Run detail must not price a VM that never existed');
+  assert.equal(view.billableSeconds, 0, 'Run detail billed a window the report did not');
+  assert.equal(
+    view.costBasis,
+    undefined,
+    'Run detail claimed a billable clock for a row with no billable window',
+  );
+  assert.equal(view.billableSeconds, row.billableSeconds);
+  assert.equal(view.costBasis ?? '', row.costBasis, 'the export and Run detail disagree on basis');
+
+  // And the row that DID run reconciles across all three, so the gate is not just zeroing.
+  const ran = job({ jobId: 1, microvmId: 'mv-1' });
+  const ranView = toRunView(ran, NOW);
+  const [ranRow] = toExportRows([ran], NOW);
+  assert.equal(ranView.billableSeconds, ranRow.billableSeconds);
+  assert.equal(ranView.costBasis, 'measured');
+  assert.equal(
+    round6(ranView.billableSeconds / 60),
+    computeReport([ran], SPEC({ metric: 'billableMinutes', dimension: 'none' }), { now: NOW }).total,
+    'Run detail and the utilisation aggregate disagree about one row',
+  );
 });
 
 test('summing an export column reproduces the aggregate it was downloaded from', () => {

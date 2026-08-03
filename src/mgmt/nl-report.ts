@@ -54,6 +54,22 @@ const ENABLED = (process.env.REPORTS_NL_ENABLED ?? 'true') !== 'false';
 /** Max characters of operator question forwarded to the model. */
 export const MAX_QUESTION_CHARS = 400;
 
+/**
+ * Ceiling on the generated system prompt, in characters. **Not a runtime limit** — the prompt is
+ * built from repo constants, so there is nothing to reject at request time. It is a budget the
+ * test suite enforces (`test/nl-report.test.mjs`), because the prompt is the fixed input cost of
+ * every single question and it is assembled from `METRIC_CATALOG`: adding a metric, or widening
+ * one metric's prose, silently raises the per-invocation bill on a route whose ADR justifies the
+ * model choice partly on that bill being small. ADR-044 quotes this number, and the same test
+ * asserts the quoted figure matches this constant so the ADR cannot drift from the code.
+ *
+ * Sized with headroom over the current prompt for a couple more metrics; if a change needs more
+ * than this, the honest move is to shorten a definition (the catalog doubles as operator-facing
+ * text on the Reports panel, where a long definition is also a wall of prose) rather than to
+ * raise the ceiling by reflex.
+ */
+export const MAX_SYSTEM_PROMPT_CHARS = 3600;
+
 /** Per-session invocations per rolling window (see `rateLimit`). */
 export const RATE_LIMIT_PER_WINDOW = 10;
 export const RATE_WINDOW_MS = 60_000;

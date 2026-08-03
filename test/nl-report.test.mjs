@@ -12,6 +12,7 @@ import {
   DEFAULT_MODEL_ID,
   MAX_INVOCATIONS_PER_CONTAINER,
   MAX_QUESTION_CHARS,
+  MAX_SYSTEM_PROMPT_CHARS,
   RATE_LIMIT_PER_WINDOW,
   RATE_WINDOW_MS,
   buildSystemPrompt,
@@ -22,7 +23,8 @@ import {
   resetRateLimits,
   specFromCompletion,
 } from '../dist/src/mgmt/nl-report.js';
-import { CHART_TYPES, DIMENSIONS, METRICS } from '../dist/src/mgmt/reports.js';
+import { CHART_TYPES, DIMENSIONS, METRICS, METRIC_CATALOG } from '../dist/src/mgmt/reports.js';
+import fs from 'node:fs';
 
 const NOW = new Date('2026-07-15T12:00:00.000Z');
 
@@ -150,6 +152,42 @@ test('the prompt forbids code output and repository identifiers', () => {
   const prompt = buildSystemPrompt();
   assert.match(prompt, /do NOT write code/);
   assert.match(prompt, /Never include repository ids or names/);
+});
+
+test('the generated prompt stays inside its budget, and ADR-044 quotes the real figure', () => {
+  // The prompt is the FIXED input cost of every question and it is generated from
+  // `METRIC_CATALOG`, so a new metric or a widened definition raises the per-invocation bill on
+  // a route whose model choice ADR-044 justifies partly by that bill being small. Nothing at
+  // runtime can notice — there is no request-time input to reject — so the budget has to be a
+  // test.
+  const prompt = buildSystemPrompt();
+  assert.ok(
+    prompt.length <= MAX_SYSTEM_PROMPT_CHARS,
+    `system prompt is ${prompt.length} chars, over the ${MAX_SYSTEM_PROMPT_CHARS} budget — shorten a ` +
+      `metric definition (it is also operator-facing prose on the Reports panel) rather than raising the ceiling`,
+  );
+
+  // The catalog is the part that grows, so name it in the failure: this is where the chars are.
+  const catalogChars = METRIC_CATALOG.reduce(
+    (n, m) => n + m.metric.length + m.label.length + m.unit.length + m.definition.length,
+    0,
+  );
+  assert.ok(
+    catalogChars < prompt.length,
+    'the catalog is meant to be the bulk of the prompt; this assertion has lost its subject',
+  );
+
+  // ADR-044 quotes the ceiling as part of its cost argument. A quoted number nobody checks is
+  // how the previous "~400-token prompt" claim survived the prompt growing past 600 — the same
+  // drift `test/mgmt-stack.test.mjs` prevents between the stack's model id and the handler's.
+  const adr = fs.readFileSync(new URL('../docs/DECISIONS.md', import.meta.url), 'utf8');
+  const quoted = adr.match(/system prompt\s*\ncapped at \*\*([\d\u202f\u00a0 ]+) characters/);
+  assert.ok(quoted, 'ADR-044 no longer states the system-prompt budget');
+  assert.equal(
+    Number(quoted[1].replace(/[^\d]/g, '')),
+    MAX_SYSTEM_PROMPT_CHARS,
+    'ADR-044 quotes a prompt budget the code does not enforce',
+  );
 });
 
 // ---- question validation ---------------------------------------------------
