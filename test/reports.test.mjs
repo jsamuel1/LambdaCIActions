@@ -1434,7 +1434,13 @@ test('the default report window comes from real retention, not a compile-time co
   // 2. A window named in the URL is passed through untouched: rewriting a shared link would
   //    answer a different question than the link names, which is why the validator rejects
   //    rather than clamps. The picker's `(beyond retention)` option depends on this.
-  assert.match(fn, /windowFromUrl/, 'a URL-named window is not exempt from substitution');
+  //    Asserted on the GUARD, not on the identifier: `windowFromUrl` stays in the signature
+  //    when it is dropped from the condition, so a name check passes the exact inversion.
+  assert.match(
+    fn,
+    /if \(windowFromUrl \|\|/,
+    'a URL-named window is not exempt from substitution — a shared link would be silently rewritten',
+  );
   // 3. A servable preset is left exactly as it is.
   assert.match(fn, /presets\.includes\(query\.preset\)/, 'a servable preset is not passed through');
 
@@ -1457,11 +1463,21 @@ test('the default report window comes from real retention, not a compile-time co
     /presets\?\.length \? api\.report/,
     'the report is fetched before retention is known, so the refused default goes out anyway',
   );
-  // The permalink, the picker and the assistant all see the same substituted query — a picker
-  // showing `7d` while the chart reports `24h` is the drift this substitution would otherwise
-  // introduce.
-  for (const usage of ['query={active}', 'catalog={catalog.data} query={active}']) {
-    assert.ok(component.includes(usage), `the screen renders a control from the unsubstituted query (${usage})`);
+  // The permalink, the picker, the assistant and the result all read the SAME substituted
+  // query. Each is asserted through its own component, because a shared substring (both the
+  // Picker and the Assistant are passed `catalog={catalog.data} query=…`) lets one of them keep
+  // the unsubstituted state while a loose match still passes. A picker reading `7d` while the
+  // chart reports `24h` is precisely the drift this substitution would otherwise introduce.
+  for (const [tag, attr] of [
+    ['Assistant', 'query={active}'],
+    ['Picker', 'query={active}'],
+    ['ReportView', 'query={active}'],
+  ]) {
+    const el = component.slice(component.indexOf(`<${tag} `));
+    assert.ok(
+      el.slice(0, el.indexOf('/>') + 2).includes(attr),
+      `<${tag}> is rendered from the unsubstituted query, so it can disagree with the report`,
+    );
   }
   assert.match(component, /reportQueryString\(active\)/, 'the permalink is built from the unsubstituted query');
 });
