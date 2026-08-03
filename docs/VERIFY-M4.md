@@ -121,10 +121,15 @@ Root cause, established by reading the deployed vintage rather than guessing:
 The remedy in this card's brief — *"force with suspend/unsuspend or add/remove a repo"* — **does
 not work**, and this walkthrough proved it: an App suspend → unsuspend cycle was executed
 (both `204`), the row's `updatedAt` advanced to `2026-08-03T06:15:22.233Z`, and `gsi1pk`
-was **still absent**. Reason: only `action: created` routes to `upsertInstallation()` (the
-only writer that sets `gsi1pk`); `suspend`, `unsuspend`, `added` and `removed` route to
-`setInstallationFlags()`, which never touches the index keys
-(`src/ingest/install-filter.ts` @ `63069ff`). `docs/DEPLOY-M4.md` on `main` already states
+was **still absent**. Reason: only `action: created` routes to `upsertInstallation()`, the
+only writer that sets `gsi1pk` (`src/shared/install-store.ts:68` @ `63069ff`). None of the
+other lifecycle actions can stamp it: `suspend`/`unsuspend` route to
+`setInstallationFlags()`, which `SET`s `suspended`/`deleted`/`updatedAt` on the `INSTALL#`
+row and never the index keys; `added`/`removed` route to `enableRepo()`/`disableRepo()`,
+which write a **`REPO#` row** and do not touch the installation row at all
+(`src/ingest/install-filter.ts` + `src/shared/install-store.ts` @ `63069ff`). That also
+explains the observation above — `updatedAt` moving while `gsi1pk` stayed absent is exactly
+`setInstallationFlags()`'s write. `docs/DEPLOY-M4.md` on `main` already states
 this correctly ("**The installation case does NOT self-heal**") and prescribes the backfill —
 the card's note is stale, not the runbook.
 
