@@ -74,9 +74,13 @@ export const DEFAULT_MAX_RANGE_DAYS = 90;
  * reads a partially aged-out window and still says `complete: true`, which is the silent-floor
  * failure every other budget path in this feature reports honestly. The same number is also the
  * AGE limit: `validateReportSpec` refuses an explicit window starting before `now − this`, since
- * a narrow window behind the horizon is aged out just as completely as a too-wide one. Read per
- * call (not captured at module load) and validated the same way run-store validates it, so a
- * missing or malformed value falls back instead of poisoning the container.
+ * a narrow window behind the horizon is aged out just as completely as a too-wide one. The
+ * horizon is inclusive, so a window exactly retention-wide resolves at the moment it is built —
+ * not forever after, because an absolute `from` necessarily crosses a moving horizon (that is
+ * what the age check is for). Preset windows are immune: a preset is stored as a preset and
+ * recomputed against `now` on every read. Read per call (not captured at module load) and
+ * validated the same way run-store validates it, so a missing or malformed value falls back
+ * instead of poisoning the container.
  */
 export function maxRangeDays(): number {
   const raw = process.env.RUN_RETENTION_DAYS;

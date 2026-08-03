@@ -249,8 +249,12 @@ the assistant's prompt lists only servable presets so a fair question is not ans
 refusal. An explicit window whose `from` predates the horizon (`now − RUN_RETENTION_DAYS`) is
 rejected the same way even when it is narrow — a pinned report keeps its absolute `from`/`to`, so
 a bookmarked custom window ages out on its own and must refuse rather than answer zero jobs as
-though none had run. The horizon is inclusive, so the widest servable preset's own window still
-resolves when pinned. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
+though none had run. The horizon is inclusive, so a window exactly retention-wide resolves at the
+moment it is built; it does not stay resolvable forever, because an absolute `from` necessarily
+crosses a moving horizon — which is the whole point of the age check. A **preset** window is
+immune: it is stored as a preset and recomputed against `now` on every read, so the widest preset
+keeps working indefinitely.
+Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
 p90 invents a value between two real jobs. A row whose span cannot be measured (unparseable or
 inverted timestamps — `createdAt` and `runningAt` are written by different λ invocations) is
 **excluded from the sample and counted as uncovered**, never folded in as a 0-second job, which

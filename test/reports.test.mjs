@@ -1386,6 +1386,84 @@ test('rows in the window with nothing measurable are not reported as "no jobs"',
     /rowCount === 0/.test(view),
     'the empty panel must tell an empty window apart from an unmeasurable one',
   );
+
+  // ...and the COVERAGE sentence has the same three states as the empty-series line, not two.
+  // An empty denominator has two causes and only one of them is "jobs that could not
+  // contribute": on an empty window there were no jobs to contribute at all, so the two-branch
+  // form told the operator that none of 0 jobs could be measured while the line below it said
+  // "No jobs in this window" and the header said `0 jobs`. That is the default view of any
+  // environment with no run history, under the default metric — the first coverage sentence a
+  // new operator ever reads — and it is the same conflation this test's subject corrected for
+  // the series.
+  const coverageLine = sliceBetween(view, '{report.caveat && (', '{report.caveat}', 2000);
+  assert.ok(
+    /rowCount === 0/.test(coverageLine),
+    'the coverage sentence claims an empty window\u2019s jobs could not contribute; there were none',
+  );
+  assert.ok(
+    /coverageSampleSize === 0/.test(coverageLine),
+    'the coverage sentence lost its vacuous-ratio branch',
+  );
+  assert.ok(
+    coverageLine.indexOf('rowCount === 0') < coverageLine.indexOf('coverageSampleSize === 0'),
+    'the empty-window branch must be tested FIRST — an empty window also has an empty sample, so the sample branch would swallow it',
+  );
+});
+
+test('the default report window comes from real retention, not a compile-time constant', () => {
+  // `DEFAULT_QUERY.preset` in the SPA is a constant; the servable preset list is a per-
+  // environment fact (RUN_RETENTION_DAYS, ADR-033) only the catalog knows. Where they disagree
+  // the screen opened on a spec the server refuses — a 400 on first paint, before the operator
+  // touched anything, on the one screen whose design rule is never to offer a window retention
+  // cannot fill. The server already degrades its own default; this pins the client half.
+  //
+  // Source-level, per this file's convention for SPA logic (no DOM harness). It pins the three
+  // properties that make the substitution correct, since each inversion is a different defect.
+  const screen = fs.readFileSync(
+    new URL('../web/src/screens/Reports.tsx', import.meta.url),
+    'utf8',
+  );
+  const fn = sliceBetween(screen, 'function effectiveQuery(', '\n}\n', 900);
+
+  // 1. It substitutes the widest SERVABLE preset, not a second hardcoded one.
+  assert.match(
+    fn,
+    /presets\[presets\.length - 1\]/,
+    'the substituted default is not derived from the catalog\u2019s own list',
+  );
+  // 2. A window named in the URL is passed through untouched: rewriting a shared link would
+  //    answer a different question than the link names, which is why the validator rejects
+  //    rather than clamps. The picker's `(beyond retention)` option depends on this.
+  assert.match(fn, /windowFromUrl/, 'a URL-named window is not exempt from substitution');
+  // 3. A servable preset is left exactly as it is.
+  assert.match(fn, /presets\.includes\(query\.preset\)/, 'a servable preset is not passed through');
+
+  // And it is a PURE derivation, not a normalising effect: an effect would fetch the refused
+  // default first and correct it on the next render, so the operator sees a 400 that vanishes
+  // and the fan-out is spent on it.
+  assert.ok(
+    !/setQuery/.test(fn),
+    'the substitution mutates state, so the unservable default is still what the first fetch uses',
+  );
+  const component = sliceBetween(screen, 'export function Reports()', '\n}\n', 3000);
+  assert.match(
+    component,
+    /effectiveQuery\(query, presets, windowFromUrl\)/,
+    'the screen does not report on the substituted query',
+  );
+  // The report must not be fetched before the catalog says which windows are servable.
+  assert.match(
+    component,
+    /presets\?\.length \? api\.report/,
+    'the report is fetched before retention is known, so the refused default goes out anyway',
+  );
+  // The permalink, the picker and the assistant all see the same substituted query — a picker
+  // showing `7d` while the chart reports `24h` is the drift this substitution would otherwise
+  // introduce.
+  for (const usage of ['query={active}', 'catalog={catalog.data} query={active}']) {
+    assert.ok(component.includes(usage), `the screen renders a control from the unsubstituted query (${usage})`);
+  }
+  assert.match(component, /reportQueryString\(active\)/, 'the permalink is built from the unsubstituted query');
 });
 
 test('USD is rendered by exactly one formatter in the console', () => {

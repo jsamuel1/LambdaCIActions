@@ -1908,8 +1908,10 @@ narrow it is. A 10-day window 200 days ago is inside every width limit and behin
 entirely, and a report pinned by URL carries `from`/`to` verbatim — so any bookmarked or shared
 custom-window report becomes an aged-out one by the passage of time alone, and answering it
 `complete: true` over rows the TTL deleted prints "No jobs in this window" about jobs that ran.
-The horizon is inclusive, so the widest legal preset's own window still resolves through the
-explicit branch. An operator with hundreds of active repos and a 90-day window
+The horizon is inclusive, so a window exactly retention-wide resolves at the moment it is built;
+it does not stay resolvable forever, since an absolute `from` necessarily crosses a moving
+horizon — preset windows are recomputed against `now` on every read and so are immune.
+An operator with hundreds of active repos and a 90-day window
 is the case this
 design serves worst; if that becomes real, rollups keyed *per installation* are the next step.
 `test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the
