@@ -27,6 +27,7 @@ import { ALL_STATUSES, billableSeconds, isCostEligible, flavorRatePerMinute, fla
 /** Metrics a report can compute. Adding one here is the only way to add a report. */
 export const METRICS = [
   'spend',
+  'billableMinutes',
   'runCount',
   'duration',
   'failureRate',
@@ -99,6 +100,10 @@ export function availablePresets(max: number = maxRangeDays()): RangePreset[] {
 /** Which chart types make sense for a metric+dimension pair (the UI and the model share this). */
 export const DEFAULT_CHART: Record<ReportMetric, ChartType> = {
   spend: 'bar',
+  // Same shape as `spend` for the same reason: an additive total per group, biggest first. It is
+  // deliberately NOT `stackedBar` — a stack implies the bars compose into a meaningful whole per
+  // category, which consumption per repo/flavor does not (the whole is the total, already printed).
+  billableMinutes: 'bar',
   runCount: 'stackedBar',
   duration: 'bar',
   failureRate: 'bar',
@@ -154,6 +159,19 @@ export const METRIC_CATALOG: readonly MetricDoc[] = [
       'Sum of per-job estimated microVM cost: billable minutes × the flavor rate derived ' +
       'from its vCPU/GB footprint. Jobs with no flavor (never launched) contribute 0. ' +
       'ESTIMATE — not billing truth.',
+    estimate: true,
+  },
+  {
+    metric: 'billableMinutes',
+    label: 'Billable compute minutes',
+    unit: 'minutes',
+    definition:
+      'Sum of per-job billable microVM time in minutes — the same billable window `spend` is ' +
+      'priced from (runningAt watermark to the last transition, or to now while in flight), so ' +
+      'this is that estimate with the flavor rate taken out. Jobs that never launched a microVM ' +
+      'contribute 0. ESTIMATE: rows without a watermark fall back to queue-to-finish wall clock, ' +
+      'which OVERSTATES consumption. This is an ABSOLUTE figure, not a percentage of any ' +
+      'capacity ceiling — the microVM concurrency quota is not read anywhere yet.',
     estimate: true,
   },
   {
@@ -530,6 +548,21 @@ function bucketKey(iso: string, bucket: 'hour' | 'day'): string {
   return bucket === 'hour' ? `${iso.slice(0, 13)}:00` : iso.slice(0, 10);
 }
 
+/**
+ * The bucket a row falls into for a dimension, as a `{ key, label }` pair.
+ *
+ * `key` and `label` are NOT interchangeable for `workflow`. `workflowName` is copied verbatim
+ * off the `workflow_job` webhook, so it is tenant-controlled and a repo may legitimately contain
+ * a workflow literally named `(not recorded)`. Keying the absent case by its own display string
+ * would merge those rows into one bar and attribute real workflow activity to a data gap (and
+ * vice versa), which is unfalsifiable from the chart. So the absent case gets a key that no
+ * webhook value can produce, and every present name is namespaced under `name:`.
+ *
+ * `flavor` needs no such namespacing: every resolution path in `src/provision/flavor.ts` gates
+ * the chosen name through `byName()`, so `run.flavor` is always a catalog entry — a tenant's
+ * `runs-on:` label can select a flavor but can never become one. `(not launched)` is therefore
+ * not a reachable value.
+ */
 function groupKey(run: RunRecord, spec: ReportSpec): { key: string; label: string } {
   switch (spec.dimension) {
     case 'repo':
@@ -537,7 +570,14 @@ function groupKey(run: RunRecord, spec: ReportSpec): { key: string; label: strin
     case 'flavor':
       return { key: run.flavor ?? '(not launched)', label: run.flavor ?? '(not launched)' };
     case 'workflow':
-      return { key: run.workflowName ?? '(unknown)', label: run.workflowName ?? '(unknown)' };
+      // Labelled "not recorded", not "unknown": the name is absent because the row was written
+      // before ingest persisted `workflowName` (M5) — the workflow itself is perfectly well
+      // known, it just was not stored. "(unknown)" reads like a real workflow whose name could
+      // not be determined, which invites an operator to treat the bucket as one workflow's
+      // activity. Any row written after that deploy carries a name.
+      return run.workflowName === undefined || run.workflowName === ''
+        ? { key: 'workflow:unrecorded', label: '(not recorded — pre-M5 row)' }
+        : { key: `name:${run.workflowName}`, label: run.workflowName };
     case 'status':
       return { key: run.status, label: run.status };
     case 'time': {
@@ -588,21 +628,27 @@ export function computeReport(
 
   for (const [key, g] of groups) {
     switch (spec.metric) {
-      case 'spend': {
-        let usd = 0;
+      case 'spend':
+      case 'billableMinutes': {
+        // One arm for both, deliberately. They read the SAME billable window off the SAME
+        // eligibility gate and differ only in whether the flavor rate is applied, so splitting
+        // them into two folds is how a report could start claiming spend over a window it did
+        // not charge minutes for. `billableMinutes` is `spend` with the rate taken out.
+        let value = 0;
         for (const r of g.runs) {
-          usd += jobCostUsd(r, now);
           // Coverage is over the rows that were actually PRICED, not every row in the group.
-          // A queued / launch-failure row contributes 0 to spend (`isCostEligible`), so
-          // counting it in the denominator understated coverage on exactly the metric whose
-          // caveat then claimed the uncovered share was priced on overstating wall clock —
-          // it was not priced at all. An unpriced row is silent in both, so the ratio means
-          // what the caveat says it means.
+          // A queued / launch-failure row contributes 0 (`isCostEligible`), so counting it in
+          // the denominator understated coverage on exactly the metric whose caveat then
+          // claimed the uncovered share was measured on overstating wall clock — it was not
+          // measured at all. An ineligible row is silent in both, so the ratio means what the
+          // caveat says it means.
           if (!isCostEligible(r)) continue;
+          value +=
+            spec.metric === 'spend' ? jobCostUsd(r, now) : billableSeconds(r, now).seconds / 60;
           coverageDen += 1;
           if (billableSeconds(r, now).basis === 'measured') coverageNum += 1;
         }
-        points.push({ key, label: g.label, value: round(usd, 6), sampleSize: g.runs.length });
+        points.push({ key, label: g.label, value: round(value, 6), sampleSize: g.runs.length });
         break;
       }
       case 'runCount':
@@ -670,7 +716,8 @@ export function computeReport(
     spec.dimension === 'time' ? a.key.localeCompare(b.key) : b.value - a.value || a.label.localeCompare(b.label),
   );
 
-  const additive = spec.metric === 'spend' || spec.metric === 'runCount';
+  const additive =
+    spec.metric === 'spend' || spec.metric === 'billableMinutes' || spec.metric === 'runCount';
   const doc = metricDoc(spec.metric);
   return {
     spec,
@@ -691,6 +738,8 @@ function caveatFor(metric: ReportMetric): string | undefined {
   switch (metric) {
     case 'spend':
       return 'Estimate. Coverage is the share of PRICED jobs whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES cost. Jobs that never launched a microVM are priced at 0 and counted in neither share.';
+    case 'billableMinutes':
+      return 'Estimate, and an ABSOLUTE figure — not a share of any capacity ceiling. Coverage is the share of MEASURED jobs whose billable window came from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES consumption by the queue and provisioning time it wrongly includes. Jobs that never launched a microVM contribute 0 and are counted in neither share.';
     case 'duration':
       return 'Coverage is the share of jobs that reached a terminal status AND whose span was measurable; in-flight jobs are excluded.';
     case 'failureRate':

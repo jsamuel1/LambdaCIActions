@@ -1976,7 +1976,8 @@ that the frontend evaluates, or SQL that the backend runs. Report data here is
 from GitHub. Any of it reaching a prompt is untrusted input, and anything the model emits that
 gets executed or rendered is an injection sink with a straight path to another tenant's data.
 **Decision**: the model **selects from a closed vocabulary and nothing else**. It emits a JSON
-report spec — one of 5 metrics, one of 6 dimensions, one of 4 chart types, a preset window, and
+report spec — one metric, one dimension and one chart type drawn from the enumerated catalog in
+`src/mgmt/reports.ts`, a preset window, and
 optional flavor/status filters — which is parsed as data and passed through
 `validateReportSpec`, the *same* validator the manual picker's query params go through. The
 backend then executes the deterministic report **through the one report route**

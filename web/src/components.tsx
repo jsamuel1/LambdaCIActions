@@ -127,9 +127,22 @@ export function formatDuration(seconds: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
+/**
+ * Render a USD figure. **The single USD formatter in the console** — Run detail, the Dashboard
+ * and Reports all print money through this, so the same number cannot appear with two different
+ * precisions on two screens.
+ *
+ * Precision is by MAGNITUDE, not by caller. A single job's estimate is fractions of a cent
+ * (a ≈2 vCPU/4 GB flavor is ~$0.0044/min), so 2dp would render most per-job costs as `$0.00`
+ * and 4dp is the only useful precision there. An aggregate total of $1 234.5678 does not need
+ * sub-cent digits to be read, and printing them makes a column of totals harder to compare.
+ * So: below $1 → 4dp, at or above → 2dp. Reports previously carried its own copy of this rule
+ * in `ReportChart.formatValue`; it delegates here instead (ADR-042 has one definition of
+ * billable time, and one rendering of what it costs is the same argument).
+ */
 export function formatCost(usd?: number): string {
   if (usd === undefined) return '—';
-  return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(Math.abs(usd) < 1 ? 4 : 2)}`;
 }
 
 export function formatTime(iso: string): string {

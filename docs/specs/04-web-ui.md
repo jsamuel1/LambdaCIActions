@@ -213,13 +213,23 @@ assistant's prompt is generated from it so the two cannot drift):
 | Metric | Unit | Definition |
 |---|---|---|
 | `spend` | USD | Σ per-job billable minutes × flavor rate. **Estimate** — see below. |
+| `billableMinutes` | minutes | Σ per-job billable microVM time — `spend`'s window with the flavor rate taken out. **Estimate**; an **absolute** figure, not a share of any ceiling. |
 | `runCount` | jobs | Job rows created in the window, by queued timestamp. |
 | `duration` | seconds | p50 / p90 of queued→last-transition wall clock, **terminal jobs only**, and only where that span is measurable. |
 | `failureRate` | ratio | (failed + timed_out) ÷ terminal jobs. In-flight jobs excluded from **both** sides. |
 | `queueLatency` | seconds | p50 / p90 of queued→`runningAt`, over jobs carrying a **measurable** watermark. |
 
 Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days, else daily),
-`none`. Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
+`none`. Grouping by `workflow` buckets rows written before ingest persisted `workflowName` (M5)
+under **“(not recorded — pre-M5 row)”** rather than *“(unknown)”*, which reads like a real
+workflow whose name could not be determined and invites an operator to treat a data gap as one
+workflow's activity. That bucket's group key is namespaced so it cannot collide with a workflow
+literally named the same thing: `workflowName` is copied verbatim off the `workflow_job` webhook,
+so it is tenant-controlled, and merging the two would attribute real activity to the gap
+unfalsifiably from the chart. `flavor` needs no such namespacing — every resolution path gates the
+chosen name through the flavor catalog (`byName`), so a tenant's `runs-on:` label can select a
+flavor but never become one, and its `(not launched)` bucket is not a reachable value.
+Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
 a wish list, so a spec can never resolve to a chart type that silently falls through to a
 different one. Windows: the `24h`/`7d`/`30d`/`90d` presets **that this environment's run
 retention can actually fill**, or an explicit `from`/`to` that is both no wider than that number
@@ -254,6 +264,29 @@ then rejects `running`, so the row never gains one) — both are priced on wall 
 are the fast ones. Reconciliation against a real
 microVM bill is still outstanding
 (OQ-7): the direction of the error is known and stated, the magnitude is not.
+
+**Utilisation.** `billableMinutes` answers *how much microVM compute did we consume*, and it is
+the same fold as `spend` with the rate divided out — one arm in `computeReport`, sharing ADR-042's
+billable window and the `isCostEligible` gate, so consumption and cost can never be measured over
+different windows. It inherits the estimate caveat for the same reason `spend` has one: a row on a
+`wallClock` basis counts queue and provisioning time as compute and therefore **overstates**
+consumption, and `coverage` is the measured share exactly as it is for spend.
+
+It is deliberately an **absolute** figure and not a percentage. A utilisation *ratio* needs a
+capacity ceiling as its denominator — the microVM service's concurrency quota (spec 05 § Quotas &
+limits) — which nothing in this system reads yet, and which belongs to the Settings/quotas
+surface. Inventing a denominator would produce a percentage that looks authoritative and is not,
+which is worse than a number the operator has to interpret. Once the quota is readable, a ratio
+can be layered on this metric without changing what it measures.
+
+**One USD renderer.** Money is printed by `formatCost` in `web/src/components.tsx` and nowhere
+else — Run detail, the Dashboard, the flavor rate table and every Reports axis/tooltip/cell go
+through it. Precision is by **magnitude, not by caller**: below \$1 → 4dp, at or above → 2dp. A
+single job's estimate is fractions of a cent, so 2dp there would render most jobs as `$0.00`;
+sub-cent digits on a four-figure aggregate total are noise. Reports previously carried a private
+copy of that rule in `ReportChart.formatValue`, which meant the same job's cost could print with
+different precision on two screens — the same argument ADR-042 makes for one definition of
+billable time applies to one rendering of what it cost.
 
 **Every report reports its own completeness.** `complete: false` means the read budget was spent
 before the window was exhausted, and the UI renders the numbers as a floor with advice to narrow

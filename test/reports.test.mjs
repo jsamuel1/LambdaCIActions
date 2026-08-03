@@ -12,6 +12,7 @@ import {
   METRICS,
   DIMENSIONS,
   CHART_TYPES,
+  DEFAULT_CHART,
   METRIC_CATALOG,
   DEFAULT_MAX_RANGE_DAYS,
   MAX_EXPORT_BYTES,
@@ -99,9 +100,111 @@ test('every metric has a catalog entry with a stated unit and definition', () =>
   assert.equal(METRIC_CATALOG.length, METRICS.length, 'catalog and metric list disagree');
 });
 
-test('spend is flagged an estimate and every other metric is not', () => {
+test('spend and billableMinutes are flagged estimates and every other metric is not', () => {
   const estimates = METRIC_CATALOG.filter((m) => m.estimate).map((m) => m.metric);
-  assert.deepEqual(estimates, ['spend']);
+  assert.deepEqual(estimates, ['spend', 'billableMinutes']);
+});
+
+test('every metric has a default chart the renderer can draw', () => {
+  for (const m of METRICS) {
+    assert.ok(CHART_TYPES.includes(DEFAULT_CHART[m]), `${m} defaults to a chart outside the vocabulary`);
+  }
+});
+
+// ---- utilisation (billableMinutes) ----------------------------------------
+
+test('billableMinutes is spend with the flavor rate taken out', () => {
+  // The card's utilisation question is "how much microVM compute did we consume", and the only
+  // honest answer shares ADR-042's billable window with the cost estimate. Pinning the two
+  // together is what stops a future edit from measuring consumption over one window and
+  // charging for another.
+  const rows = [job(), job({ jobId: 2, runningAt: '2026-07-15T11:02:00.000Z' })];
+  const minutes = computeReport(rows, SPEC({ metric: 'billableMinutes', dimension: 'none' }), { now: NOW });
+  const usd = computeReport(rows, SPEC({ metric: 'spend', dimension: 'none' }), { now: NOW });
+
+  const expected = rows.reduce((s, r) => s + billableSeconds(r, NOW).seconds / 60, 0);
+  assert.equal(minutes.total, expected, 'billable minutes must fold billableSeconds/60');
+  assert.equal(minutes.metric.unit, 'minutes');
+
+  // Same flavor for both rows, so spend is exactly minutes x that flavor's rate.
+  const rate = jobCostUsd(rows[0], NOW) / (billableSeconds(rows[0], NOW).seconds / 60);
+  assert.ok(Math.abs(usd.total - minutes.total * rate) < 1e-6, 'spend and minutes disagree about the window');
+});
+
+test('billableMinutes charts on every dimension', () => {
+  // A metric that only works on `none` is a metric the picker offers and cannot draw. Every
+  // dimension must produce a point per group, with the group totals summing to the whole.
+  const rows = [
+    job({ jobId: 1 }),
+    job({ jobId: 2, repoId: 9, repoFullName: 'acme/other', flavor: 'large', workflowName: 'Release', status: 'failed' }),
+    job({ jobId: 3, createdAt: '2026-07-14T11:00:00.000Z', runningAt: '2026-07-14T11:01:00.000Z', updatedAt: '2026-07-14T11:09:00.000Z' }),
+  ];
+  const whole = computeReport(rows, SPEC({ metric: 'billableMinutes', dimension: 'none' }), { now: NOW });
+  assert.ok(whole.total > 0);
+
+  for (const dimension of DIMENSIONS) {
+    const res = computeReport(rows, SPEC({ metric: 'billableMinutes', dimension, preset: '30d' }), { now: NOW });
+    assert.ok(res.points.length >= 1, `no points for dimension ${dimension}`);
+    const summed = res.points.reduce((s, p) => s + p.value, 0);
+    assert.ok(
+      Math.abs(summed - whole.total) < 1e-6,
+      `dimension ${dimension} groups sum to ${summed}, whole-window total is ${whole.total}`,
+    );
+    assert.equal(res.total, res.points.reduce((s, p) => s + p.value, 0), `${dimension} total must be additive`);
+  }
+});
+
+test('a wallClock-basis row lowers billableMinutes coverage and the caveat says which way it errs', () => {
+  const spec = SPEC({ metric: 'billableMinutes', dimension: 'none' });
+  const measured = job();
+  // No watermark -> the window starts at `createdAt`, so queue + provisioning time is counted
+  // as compute. That OVERSTATES consumption, and the caveat must say so rather than presenting
+  // the figure as measured.
+  const wallClock = job({ jobId: 2, runningAt: undefined });
+  assert.equal(billableSeconds(wallClock, NOW).basis, 'wallClock');
+
+  const res = computeReport([measured, wallClock], spec, { now: NOW });
+  assert.equal(res.coverage, 0.5, 'a wallClock-basis row must not count as measured');
+  assert.equal(res.coverageSampleSize, 2);
+  assert.ok(res.metric.estimate, 'billableMinutes is an estimate, not measured truth');
+  assert.match(res.caveat, /OVERSTATES/);
+
+  // The overstatement is real, not just documented: the same job priced without a watermark
+  // reports MORE minutes than one that has it.
+  const measuredOnly = computeReport([measured], spec, { now: NOW }).total;
+  const wallClockOnly = computeReport([job({ runningAt: undefined })], spec, { now: NOW }).total;
+  assert.ok(wallClockOnly > measuredOnly, 'wall-clock basis should include the queue time it wrongly bills');
+
+  // All-measured is 100%, so the caveat cannot become permanent.
+  assert.equal(computeReport([measured], spec, { now: NOW }).coverage, 1);
+});
+
+test('billableMinutes does not credit compute to a job that never ran a microVM', () => {
+  const spec = SPEC({ metric: 'billableMinutes', dimension: 'none' });
+  // A mint/launch failure carries the intended flavor for support but never had a VM
+  // (`isCostEligible`). Counting its wall clock as consumed compute would report utilisation
+  // that physically did not happen — worst, exactly when provisioning is broken.
+  const launchFailure = job({ jobId: 2, status: 'failed', microvmId: undefined });
+  const queued = job({ jobId: 3, status: 'queued', microvmId: undefined, runningAt: undefined });
+  const real = job();
+
+  const res = computeReport([real, launchFailure, queued], spec, { now: NOW });
+  assert.equal(res.total, computeReport([real], spec, { now: NOW }).total, 'an ineligible row added minutes');
+  assert.equal(res.coverage, 1, 'an ineligible row must not understate coverage');
+  assert.equal(res.coverageSampleSize, 1, 'only the row that ran is measurable');
+  assert.equal(res.points[0].sampleSize, 3, 'sampleSize still reports every row in the group');
+});
+
+test('billableMinutes is an absolute figure, never a share of a capacity ceiling', () => {
+  // Utilisation-as-a-ratio needs the microVM concurrency quota as a denominator, which nothing
+  // reads yet (Settings/quotas work). A ratio invented from a guessed ceiling is worse than an
+  // absolute number, so the catalog text and the caveat must both refuse to imply one.
+  const doc = metricDoc('billableMinutes');
+  assert.match(doc.definition, /ABSOLUTE figure/);
+  assert.match(doc.definition, /concurrency quota is not read/);
+  assert.equal(doc.unit, 'minutes', 'a ratio unit would be a capacity claim');
+  const res = computeReport([job()], SPEC({ metric: 'billableMinutes', dimension: 'none' }), { now: NOW });
+  assert.ok(res.total > 1, 'a 5-minute job must report ~5, not a 0-1 fraction');
 });
 
 // ---- spec validation (the security boundary) -------------------------------
@@ -413,10 +516,29 @@ test('spend coverage ignores rows that were never priced at all', () => {
   assert.equal(mixed.coverage, 0, 'an unpriced row was counted as a measured price');
 });
 
-test('grouping by workflow labels rows with no workflow name rather than dropping them', () => {
+test('grouping by workflow labels rows with no workflow name honestly and without collision', () => {
   const spec = SPEC({ dimension: 'workflow' });
   const res = computeReport([job({ workflowName: undefined })], spec, { now: NOW });
-  assert.equal(res.points[0].label, '(unknown)');
+  // "(unknown)" read like a real workflow whose name could not be determined. The name is
+  // absent because the row predates ingest persisting it (M5), so the label says that.
+  assert.match(res.points[0].label, /not recorded/);
+  assert.doesNotMatch(res.points[0].label, /unknown/i);
+
+  // `workflowName` is copied verbatim off the webhook, so a repo may contain a workflow
+  // literally named like the empty bucket's label. Keying the absent case by its display
+  // string merged the two into one bar — real activity attributed to a data gap, unfalsifiable
+  // from the chart.
+  const collide = computeReport(
+    [job({ jobId: 1, workflowName: undefined }), job({ jobId: 2, workflowName: '(not recorded — pre-M5 row)' })],
+    SPEC({ metric: 'runCount', dimension: 'workflow' }),
+    { now: NOW },
+  );
+  assert.equal(collide.points.length, 2, 'a tenant-named workflow was merged into the unrecorded bucket');
+  assert.deepEqual(collide.points.map((p) => p.value), [1, 1]);
+
+  // An empty-string name is a gap too, not a workflow with a blank name.
+  const blank = computeReport([job({ workflowName: '' })], spec, { now: NOW });
+  assert.match(blank.points[0].label, /not recorded/);
 });
 
 test('a time-dimension report sorts chronologically, others by magnitude', () => {
@@ -1098,4 +1220,39 @@ test('rows in the window with nothing measurable are not reported as "no jobs"',
     /rowCount === 0/.test(view),
     'the empty panel must tell an empty window apart from an unmeasurable one',
   );
+});
+
+test('USD is rendered by exactly one formatter in the console', () => {
+  // The card's requirement, and a real divergence before it: ReportChart carried a private
+  // `formatValue` USD branch while Run detail used `formatCost`, so the SAME job's estimated
+  // cost could print with different precision on two screens. Documenting a precision rule in
+  // two places does not keep them equal — one of them being the only implementation does.
+  //
+  // Source-level assertion because this repo has no DOM harness for the SPA (same convention as
+  // the chart-host guard above). It pins BOTH halves: the rule lives in formatCost, and every
+  // other money renderer delegates to it.
+  const components = fs.readFileSync(new URL('../web/src/components.tsx', import.meta.url), 'utf8');
+  const formatter = sliceBetween(components, 'export function formatCost', '\n}', 300);
+  assert.match(formatter, /toFixed\(/, 'formatCost no longer owns the precision rule');
+  assert.match(formatter, /< 1 \? 4 : 2/, 'the magnitude rule (4dp under $1, else 2dp) is not stated in code');
+
+  for (const file of ['screens/ReportChart.tsx', 'screens/RunDetail.tsx', 'screens/Dashboard.tsx', 'screens/Platform.tsx']) {
+    const src = fs.readFileSync(new URL(`../web/src/${file}`, import.meta.url), 'utf8');
+    assert.match(src, /formatCost/, `${file} renders money without the shared formatter`);
+    // A second `$${…toFixed}` anywhere in the console is a second precision rule by definition.
+    assert.doesNotMatch(
+      src,
+      /\$\$\{[^}]*toFixed/,
+      `${file} formats a USD figure inline instead of delegating to formatCost`,
+    );
+  }
+
+  // And the chart's USD branch is the delegation, not a copy.
+  const renderer = fs.readFileSync(
+    new URL('../web/src/screens/ReportChart.tsx', import.meta.url),
+    'utf8',
+  );
+  const fmt = sliceBetween(renderer, 'function formatValue', '\n}', 600);
+  assert.match(fmt, /'USD'\)\s*return formatCost\(/, 'the chart re-implements USD formatting');
+  assert.match(fmt, /'minutes'/, 'the minutes unit has no renderer, so billableMinutes axes print raw numbers');
 });
