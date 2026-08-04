@@ -106,6 +106,10 @@ export function RunDetail({
   // The API's `pending` flag is authoritative: an empty first page with a live stream is
   // "caught up", not "waiting for the microVM".
   const pending = events.length === 0 && pendingFlag;
+  // The stream name the API resolved (ADR-048). Shown because it is the operator's jump-off
+  // point to the same events in the CloudWatch console, and the fastest way to see that
+  // resolution — not the run — is what failed when the pane is empty.
+  const logStream = pages.find((p) => p.logStream)?.logStream ?? null;
 
   return (
     <div className="stack">
@@ -159,6 +163,11 @@ export function RunDetail({
         <div className="row">
           <h3 className="tight">Logs</h3>
           <span className="muted">{events.length} events</span>
+          {logStream && (
+            <span className="muted" title={`CloudWatch log stream: ${logStream}`}>
+              {logStream}
+            </span>
+          )}
           <button onClick={() => setTailing((t) => !t)}>{tailing ? 'Pause tail' : 'Resume tail'}</button>
         </div>
         {logErr && <p className="error">{logErr}</p>}

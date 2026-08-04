@@ -2224,10 +2224,25 @@ inside an unrelated stream's name, so containment is equally exact and does not 
 service moves the date/version decoration.
 
 Resolved names are cached per Lambda container (`microvmId` → stream name, FIFO-bounded), so
-the 3 s poll costs one `FilterLogEvents` in steady state, not a rescan. **Only positive**
-results are cached — "no stream yet" becomes "stream" seconds later while the VM boots, so a
-miss must stay retryable. Every scan is page-capped (4 × 50 streams) to bound the worst case
-on a busy group.
+the 3 s poll costs one `FilterLogEvents` in steady state, not a rescan. Misses are cached too,
+but only for **5 s**: "no stream yet" becomes "stream" seconds later while the VM boots, so a
+miss has to stay retryable — while an *uncached* miss meant every poll of a queued run
+re-scanned the group. Measured on a 300-stream day that was 9 `DescribeLogStreams` per poll ≈
+**3 TPS from a single viewer**, against an account-wide 5 TPS quota that a second operator
+would push past — and a `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
+With the TTL it is 0.7 per poll (0.23 TPS).
+
+The two tiers share **one** describe budget (12 calls × 50 streams), rather than each getting
+its own page cap that multiplies across them. The fallback also runs only when a date scan
+could not rule the stream out — no usable date, or a scan truncated by the budget. A date
+prefix listed to its end is proof the stream does not exist, so the ordinary "VM has not
+written yet" poll costs two describes and never re-scans the whole group.
+
+**Residual limit**: ~600 streams per date is the resolution horizon. Beyond that a *finished*
+run whose stream sits past the budget is unresolvable — the recency fallback cannot help,
+because an old stream is by definition not among the most recently written. A live run is
+unaffected (recency finds it), and dev is orders of magnitude below the horizon, but this is the
+limit that makes the row stamp below the real scaling answer rather than just a cheaper one.
 
 **Why not stamp the stream name on the run row at launch?** Cheaper (zero describes), but it
 needs a Provision-side write plus a resolver fallback for every row written before it lands —
@@ -2239,13 +2254,16 @@ stays available as a later optimisation.
 - `pending` is now exactly "there is no stream to read" — no VM, or no stream yet — rather
   than "the first page came back empty". A resumed tail that returns nothing is still
   *caught up*, so the UI cannot flash "no log stream yet" over rendered output.
-- `GET /api/runs/…/logs` returns the resolved `logStream`, so an operator can jump to the
-  same events in the CloudWatch console and can see at a glance when resolution failed.
+- `GET /api/runs/…/logs` returns the resolved `logStream`, and the Run detail log pane shows
+  it, so an operator can jump to the same events in the CloudWatch console and can see at a
+  glance when resolution failed.
 - A cold container pays 1–3 `DescribeLogStreams` per run before its first read. IAM already
   allowed both calls (ADR-025), so there is no permission change.
+- A stream that appears during a cached miss shows up to 5 s late in the pane. That is under
+  two poll intervals and invisible next to microVM boot time.
 - The stream layout is now a load-bearing assumption in two places (date prefix, id
   containment). Both degrade to the recency scan rather than to an empty pane if the service
-  changes the format.
+  changes the format — for live runs, which is when an operator is watching.
 - **The test stub is part of the fix.** `test/mgmt-logs.test.mjs` previously replied from a
   scripted response queue that ignored `logStreamNamePrefix` entirely, and its fixture names
   (`vm-1/x` for `vm-1`) were id-prefixed — so no test in the file could observe a wrong

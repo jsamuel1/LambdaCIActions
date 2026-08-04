@@ -68,20 +68,47 @@ const DEFAULT_LIMIT = 200;
 /** Streams per `DescribeLogStreams` page (CloudWatch's own maximum). */
 const STREAM_PAGE_SIZE = 50;
 
-/** Pages walked per scan attempt. Bounds the worst case on a busy group. */
-const MAX_STREAM_PAGES = 4;
+/**
+ * `DescribeLogStreams` calls one whole resolution attempt may spend, across every tier.
+ *
+ * A per-tier page cap is the wrong budget: it multiplies (two date prefixes plus a fallback
+ * scan), so the miss path — a queued/booting VM, polled every 3 s — cost 9 describes/poll
+ * ≈ 3 TPS from a single viewer against an account-wide 5 TPS quota. One shared budget makes
+ * the worst case flat, and `STREAM_SCAN_BUDGET × STREAM_PAGE_SIZE` streams per day the
+ * resolution horizon (see ADR-048 for what happens beyond it).
+ */
+const STREAM_SCAN_BUDGET = 12;
 
 /**
  * Resolved `microvmId` → exact stream name, per Lambda container.
  *
  * The Run detail pane polls every 3 s, so without this every poll would re-scan the group.
- * Entries are immutable (a stream is never renamed) and only ever positive — a miss must
- * stay retryable, because "no stream yet" becomes "stream" seconds later while the VM boots.
+ * Entries are immutable (a stream is never renamed), so positive results never expire.
  */
 const streamNameCache = new Map<string, string>();
 
-/** Keeps a long-lived container from growing the cache without bound. */
+/**
+ * microVMs whose stream did not exist yet, with the time the answer stops being trusted.
+ *
+ * A miss must stay retryable — "no stream yet" becomes "stream" seconds later while the VM
+ * boots — but it must not be re-derived on every 3 s poll, or watching a queued run costs a
+ * full group scan per poll. A TTL just over the poll interval collapses that to roughly one
+ * scan per two polls while keeping the pane's worst-case lag to a few seconds.
+ */
+const streamMissCache = new Map<string, number>();
+
+/** How long a "no stream yet" answer is reused before it is re-derived. */
+const STREAM_MISS_TTL_MS = 5_000;
+
+/** Keeps a long-lived container from growing either cache without bound. */
 const STREAM_CACHE_MAX = 500;
+
+/** Insertion-ordered FIFO eviction: the oldest entry is the least likely to still be polled. */
+function evictOldest(cache: Map<string, unknown>): void {
+  if (cache.size < STREAM_CACHE_MAX) return;
+  const oldest = cache.keys().next();
+  if (!oldest.done) cache.delete(oldest.value);
+}
 
 let cached: CloudWatchLogsClient | undefined;
 function client(): CloudWatchLogsClient {
@@ -94,6 +121,7 @@ export function _setClient(stub: Pick<CloudWatchLogsClient, 'send'> | undefined)
   cached = stub as CloudWatchLogsClient | undefined;
   // A different client is a different world: resolved names from the previous one are void.
   streamNameCache.clear();
+  streamMissCache.clear();
 }
 
 /**
@@ -125,13 +153,31 @@ function datePrefixes(runCreatedAt: string | undefined): string[] {
   return [utcDatePrefix(at), utcDatePrefix(next)];
 }
 
-/** Walk up to `MAX_STREAM_PAGES` pages of one scan, returning the first matching stream. */
+/** Outcome of one scan tier: what it found, and whether it ran out of budget doing so. */
+interface ScanResult {
+  found?: string;
+  /** True when the scan reached the end of its listing — a miss here is authoritative. */
+  exhausted: boolean;
+  /** Describe calls spent, so the caller can debit one shared budget across tiers. */
+  spent: number;
+}
+
+/**
+ * Walk one scan until it matches, runs out of streams, or runs out of `budget` calls.
+ *
+ * `exhausted` is the load-bearing part: a scan that listed every stream under its prefix and
+ * found nothing proves the stream does not exist, which lets the caller skip the fallback
+ * tier entirely. That is what keeps the ordinary "VM has not written yet" poll at two
+ * describes instead of a whole-group scan.
+ */
 async function scanForStream(
   input: { logGroupName: string; logStreamNamePrefix?: string; orderByLastEventTime?: boolean },
   microvmId: string,
-): Promise<string | undefined> {
+  budget: number,
+): Promise<ScanResult> {
   let nextToken: string | undefined;
-  for (let page = 0; page < MAX_STREAM_PAGES; page++) {
+  let spent = 0;
+  while (spent < budget) {
     const res = await client().send(
       new DescribeLogStreamsCommand({
         logGroupName: input.logGroupName,
@@ -144,22 +190,28 @@ async function scanForStream(
         ...(nextToken ? { nextToken } : {}),
       }),
     );
+    spent++;
     const hit = (res.logStreams ?? []).find(
       (s: LogStream) => s.logStreamName && streamBelongsTo(s.logStreamName, microvmId),
     );
-    if (hit?.logStreamName) return hit.logStreamName;
+    if (hit?.logStreamName) return { found: hit.logStreamName, exhausted: false, spent };
     nextToken = res.nextToken;
-    if (!nextToken) return undefined;
+    if (!nextToken) return { exhausted: true, spent };
   }
-  return undefined;
+  // Budget spent with pages still unread: the miss is inconclusive, not authoritative.
+  return { exhausted: false, spent };
 }
 
 /**
  * Resolve a microVM's exact log stream name, or `undefined` when it has none yet.
  *
- * Two tiers: date-bounded prefix scans (cheap, exact for any run whose queue date is
- * known), then a recency-ordered scan of the group as a self-healing fallback for rows with
- * no/garbled `createdAt` or a stream stamped with an unexpected date.
+ * Two tiers, sharing one describe budget: date-bounded prefix scans (cheap, exact for any
+ * run whose queue date is known), then a recency-ordered scan of the group as a self-healing
+ * fallback for rows with no/garbled `createdAt` or a stream stamped with an unexpected date.
+ *
+ * The fallback runs only when a date scan could not rule the stream out — no usable date, or
+ * a scan truncated by the budget. Once a date prefix has been listed to its end, its miss is
+ * final, and scanning the whole group again would just re-answer the same question at cost.
  */
 export async function resolveLogStreamName(
   logGroupName: string,
@@ -169,20 +221,44 @@ export async function resolveLogStreamName(
   const key = `${logGroupName}\u0000${microvmId}`;
   const hit = streamNameCache.get(key);
   if (hit) return hit;
+  const missUntil = streamMissCache.get(key);
+  if (missUntil !== undefined && Date.now() < missUntil) return undefined;
+  streamMissCache.delete(key);
 
+  let budget = STREAM_SCAN_BUDGET;
   let found: string | undefined;
-  for (const prefix of datePrefixes(runCreatedAt)) {
-    found = await scanForStream({ logGroupName, logStreamNamePrefix: prefix }, microvmId);
-    if (found) break;
+  // Optimistic until every date prefix has been listed to its end: with no date prefix, or
+  // with one the budget truncated, nothing has ruled the stream out and the fallback must run.
+  let ruledOut = false;
+  const prefixes = datePrefixes(runCreatedAt);
+  for (const [i, prefix] of prefixes.entries()) {
+    // Reserve one call for each prefix still to come, so a busy queue date cannot starve the
+    // next-day scan — that is the only tier that can find a VM launched across midnight UTC.
+    const reserve = prefixes.length - 1 - i;
+    const scan = await scanForStream(
+      { logGroupName, logStreamNamePrefix: prefix },
+      microvmId,
+      Math.max(1, budget - reserve),
+    );
+    budget -= scan.spent;
+    ruledOut = scan.exhausted;
+    if (scan.found) {
+      found = scan.found;
+      break;
+    }
   }
-  found ??= await scanForStream({ logGroupName, orderByLastEventTime: true }, microvmId);
-  if (!found) return undefined;
+  if (!found && !ruledOut && budget > 0) {
+    const scan = await scanForStream({ logGroupName, orderByLastEventTime: true }, microvmId, budget);
+    found = scan.found;
+  }
 
-  if (streamNameCache.size >= STREAM_CACHE_MAX) {
-    // FIFO: the oldest resolution is the least likely to still be polled.
-    const oldest = streamNameCache.keys().next();
-    if (!oldest.done) streamNameCache.delete(oldest.value);
+  if (!found) {
+    evictOldest(streamMissCache);
+    streamMissCache.set(key, Date.now() + STREAM_MISS_TTL_MS);
+    return undefined;
   }
+
+  evictOldest(streamNameCache);
   streamNameCache.set(key, found);
   return found;
 }

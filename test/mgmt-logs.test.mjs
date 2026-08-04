@@ -241,6 +241,13 @@ test('a VM with no stream yet is pending and reads nothing', async () => {
   });
   assert.deepEqual(page, { events: [], pending: true });
   assert.equal(s.names().includes('FilterLogEvents'), false, 'nothing to read → no read');
+  // A date prefix listed to its end RULES the stream out, so the whole-group recency
+  // fallback is not spent re-answering the same question.
+  assert.deepEqual(
+    s.sent.map((c) => c.input.logStreamNamePrefix),
+    ['2026/08/03', '2026/08/04'],
+    'no unbounded fallback scan once the run’s own dates are exhausted',
+  );
   // A miss must stay retryable: the stream appears seconds later while the VM boots.
   s.sent.length = 0;
   const streams = [{ name: REAL_STREAM, events: [{ timestamp: 1, message: 'booted' }] }];
@@ -253,6 +260,87 @@ test('a VM with no stream yet is pending and reads nothing', async () => {
   });
   assert.equal(later.pending, false);
   assert.equal(later.logStream, REAL_STREAM);
+  _setClient(undefined);
+});
+
+// The pane polls every 3 s. A queued/booting VM resolves to nothing on every one of those
+// polls, so an uncached miss re-scans the group each time: 9 describes/poll on a busy group
+// ≈ 3 TPS from ONE viewer, against an account-wide 5 TPS DescribeLogStreams quota that a
+// second viewer would push past — and a ThrottlingException is a 500, not a pending pane.
+test('polling a booting VM does not re-scan the group on every poll', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 0 });
+  // A busy day: 300 streams under the run's date, none of them this run's.
+  const busy = Array.from({ length: 300 }, (_, i) => ({
+    name: `2026/08/03[10.0]microvm-other-${String(i).padStart(4, '0')}`,
+    events: [{ timestamp: i, message: 'noise' }],
+  }));
+  const s = fakeCloudWatch(busy);
+  _setClient(s.client);
+  const args = { logGroupName: '/g', microvmId: VM, runCreatedAt: '2026-08-03T10:00:00.000Z' };
+
+  const first = await fetchRunLogs(args);
+  assert.equal(first.pending, true);
+  const perAttempt = s.sent.length;
+  assert.ok(perAttempt <= 12, `one attempt must stay inside the shared budget, got ${perAttempt}`);
+
+  // Three more polls inside the miss TTL cost nothing at all.
+  s.sent.length = 0;
+  t.mock.timers.tick(3_000);
+  assert.equal((await fetchRunLogs(args)).pending, true);
+  t.mock.timers.tick(1_000);
+  assert.equal((await fetchRunLogs(args)).pending, true);
+  assert.equal(s.sent.length, 0, 'a cached miss is reused, not re-derived');
+
+  // Once the TTL lapses the miss is re-derived — so a stream that appeared is picked up.
+  t.mock.timers.tick(2_000);
+  const s2 = fakeCloudWatch([...busy, { name: REAL_STREAM, events: [{ timestamp: 9, message: 'booted' }] }]);
+  // Swap the backing data without _setClient (which clears the caches) to prove the TTL,
+  // not the reset, is what makes the retry happen.
+  s.client.send = s2.client.send;
+  const later = await fetchRunLogs(args);
+  assert.equal(later.pending, false, 'the TTL lapsed, so the stream is found');
+  assert.equal(later.logStream, REAL_STREAM);
+  t.mock.timers.reset();
+  _setClient(undefined);
+});
+
+test('a busy queue date cannot starve the next-day scan out of budget', async () => {
+  // 5 000 streams on the queue date exhaust the budget without matching; the VM actually
+  // launched just after midnight, so only the next-day prefix can find it.
+  const busy = Array.from({ length: 5_000 }, (_, i) => ({
+    name: `2026/08/03[10.0]microvm-other-${String(i).padStart(5, '0')}`,
+    events: [{ timestamp: i, message: 'noise' }],
+  }));
+  const s = fakeCloudWatch([...busy, { name: `2026/08/04[10.0]${VM}`, events: [{ timestamp: 1, message: 'mine' }] }]);
+  _setClient(s.client);
+  const page = await fetchRunLogs({
+    logGroupName: '/g',
+    microvmId: VM,
+    runCreatedAt: '2026-08-03T23:59:30.000Z',
+  });
+  assert.equal(page.logStream, `2026/08/04[10.0]${VM}`);
+  assert.deepEqual(
+    page.events.map((e) => e.message),
+    ['mine'],
+  );
+  const describes = s.sent.filter((c) => c.name === 'DescribeLogStreams').length;
+  assert.ok(describes <= 12, `still inside the shared budget, got ${describes} describes`);
+  _setClient(undefined);
+});
+
+test('the scan budget is shared across tiers, not multiplied by them', async () => {
+  // No usable date → the recency fallback is the only tier, over a group far larger than
+  // the budget can walk. It must stop at the budget instead of paging the whole group.
+  const huge = Array.from({ length: 5_000 }, (_, i) => ({
+    name: `2026/08/03[10.0]microvm-other-${String(i).padStart(5, '0')}`,
+    events: [{ timestamp: i, message: 'noise' }],
+  }));
+  const s = fakeCloudWatch(huge);
+  _setClient(s.client);
+  const page = await fetchRunLogs({ logGroupName: '/g', microvmId: VM, runCreatedAt: 'not-a-date' });
+  assert.equal(page.pending, true);
+  assert.ok(s.sent.length <= 12, `budget must bound the scan, got ${s.sent.length} calls`);
+  assert.ok(s.sent.length >= 2, 'but it must actually page, not give up after one');
   _setClient(undefined);
 });
 
