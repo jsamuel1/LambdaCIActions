@@ -2227,13 +2227,14 @@ inside an unrelated stream's name, so containment is equally exact and does not 
 service moves the date/version decoration.
 
 Resolved names are cached per Lambda container (`microvmId` → stream name, FIFO-bounded), so
-the 3 s poll costs one `FilterLogEvents` in steady state, not a rescan. Misses are cached too,
-but only for **5 s**: "no stream yet" becomes "stream" seconds later while the VM boots, so a
-miss has to stay retryable — while an *uncached* miss meant every poll of a queued run
-re-scanned the group. Measured on the miss path: an attempt costs 2 `DescribeLogStreams` on a
-50-stream day and 7 on a 300-stream day. Uncached that is 0.7–2.3 TPS from a **single** viewer
-against an account-wide 5 TPS quota; with the TTL (a miss is re-derived every second poll) it
-is 0.3–1.2 TPS. A `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
+the pane's log poll costs one `FilterLogEvents` in steady state, not a rescan. Misses are
+cached too, but only for **5 s**: "no stream yet" becomes "stream" seconds later while the VM
+boots, so a miss has to stay retryable — while an *uncached* miss meant every poll of a queued
+run re-scanned the group. Measured on the miss path: an attempt costs 2 `DescribeLogStreams` on
+a 50-stream day and 7 on a 300-stream day. The log pane polls every **4 s** (the run row
+itself polls every 3 s — ADR-026), so uncached that is 0.5–1.8 TPS from a **single** viewer
+against an account-wide 5 TPS quota; with the TTL a miss is re-derived every second poll, i.e.
+0.25–0.9 TPS. A `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
 
 The two tiers share **one** describe budget (12 calls × 50 streams), rather than each getting
 its own page cap that multiplies across them. Two of those calls are *reserved* for the
@@ -2261,7 +2262,9 @@ stays available as a later optimisation.
   *caught up*, so the UI cannot flash "no log stream yet" over rendered output.
 - `GET /api/runs/…/logs` returns the resolved `logStream`, and the Run detail log pane shows
   it, so an operator can jump to the same events in the CloudWatch console and can see at a
-  glance when resolution failed.
+  glance when resolution failed. The pane tracks it **per poll**, not from the pages it
+  rendered: it only buffers pages that carried events, so deriving the name from them would
+  hide it in precisely the empty-pane case it exists to explain.
 - A cold container pays 1–3 `DescribeLogStreams` per run before its first read. IAM already
   allowed both calls (ADR-025), so there is no permission change.
 - A stream that appears during a cached miss shows up to 5 s late in the pane. That is under
@@ -2278,4 +2281,8 @@ stays available as a later optimisation.
   CloudWatch model that honours `logStreamNamePrefix` / `logStreamNames` / `startTime` /
   `limit` / `nextToken` / `orderBy` (including rejecting the prefix + `LastEventTime`
   combination the API forbids), with realistic `2026/08/03[10.0]microvm-…` fixtures. A test
-  asserts the model itself cannot see an id-prefix scan, so the guard cannot rot back.
+  asserts the model itself cannot see an id-prefix scan, so the guard cannot rot back. The
+  handler's own wiring is pinned separately (`test/mgmt-logs.test.mjs`, source-level): the
+  resolver is only date-bounded because the route passes the run's `createdAt`, and dropping
+  that argument would leave every logs test green while silently degrading resolution to the
+  recency fallback — which cannot find a finished run's stream.

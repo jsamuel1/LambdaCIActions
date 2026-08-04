@@ -358,12 +358,14 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 ## Live run updates
 
 - Runner bootstrap emits lifecycle heartbeats → `Run` rows update ([02](02-microvm-runners.md)).
-- v1 is **polling** (ADR-026): 3 s on Run detail, 5 s on Dashboard/Runs, **paused while the
-  tab is hidden**. No WebSocket/SSE — Phase 3.
+- v1 is **polling** (ADR-026): 3 s on the Run detail row, 4 s on its log tail, 5 s on
+  Dashboard/Runs, **paused while the tab is hidden**. No WebSocket/SSE — Phase 3.
 - Log viewer tails the per-env run log group (`/aws/lambda/microvms/runs/lca-<env>`,
-  ADR-016) filtered to the run's `microvmId` (ADR-019), following CloudWatch's `nextToken`
-  while one is issued and its own `since` watermark afterwards (see the API notes above —
-  re-sending a spent token would replay the same page forever).
+  ADR-016). The run's `microvmId` (ADR-019) is a stream-name **suffix**, so the stream is
+  resolved to its exact name and read with `logStreamNames` — never matched by prefix
+  (ADR-048) — following CloudWatch's `nextToken` while one is issued and its own `since`
+  watermark afterwards (see the API notes above — re-sending a spent token would replay the
+  same page forever).
 
 ## Tech choices
 

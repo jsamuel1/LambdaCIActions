@@ -74,9 +74,10 @@ const STREAM_PAGE_SIZE = 50;
  * A per-tier page cap is the wrong budget: it multiplies (two date prefixes plus a fallback
  * scan). One shared budget makes the worst case flat. Measured on the miss path — a
  * queued/booting VM whose stream does not exist yet — an attempt costs 2 describes on a
- * 50-stream day and 7 on a 300-stream day; with the miss TTL below that is ~3.5 per 3 s poll,
- * ~1.2 TPS from one viewer against an account-wide 5 TPS quota. Uncached it would be ~2.3 TPS,
- * and a `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
+ * 50-stream day and 7 on a 300-stream day. With the miss TTL below, one attempt is amortised
+ * over two of the pane's 4 s log polls, so the busy case is 7 calls per 8 s ≈ 0.9 TPS from one
+ * viewer against an account-wide 5 TPS quota. Uncached it would be ~1.8 TPS, and a
+ * `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
  */
 const STREAM_SCAN_BUDGET = 12;
 
@@ -93,8 +94,8 @@ const STREAM_FALLBACK_RESERVE = 2;
 /**
  * Resolved `microvmId` → exact stream name, per Lambda container.
  *
- * The Run detail pane polls every 3 s, so without this every poll would re-scan the group.
- * Entries are immutable (a stream is never renamed), so positive results never expire.
+ * The Run detail pane polls logs every 4 s, so without this every poll would re-scan the
+ * group. Entries are immutable (a stream is never renamed), so positive results never expire.
  */
 const streamNameCache = new Map<string, string>();
 
@@ -102,7 +103,7 @@ const streamNameCache = new Map<string, string>();
  * microVMs whose stream did not exist yet, with the time the answer stops being trusted.
  *
  * A miss must stay retryable — "no stream yet" becomes "stream" seconds later while the VM
- * boots — but it must not be re-derived on every 3 s poll, or watching a queued run costs a
+ * boots — but it must not be re-derived on every 4 s poll, or watching a queued run costs a
  * full group scan per poll. A TTL just over the poll interval collapses that to roughly one
  * scan per two polls while keeping the pane's worst-case lag to a few seconds.
  */

@@ -19,6 +19,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fetchRunLogs, resolveLogStreamName, streamBelongsTo, _setClient } from '../dist/src/mgmt/logs.js';
 import { parseEpochMs } from '../dist/src/mgmt/validate.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const VM = 'microvm-98c2f28c-2463-3526-a201-ef44bd494d15';
 /** A real stream name from dev (us-west-2, /aws/lambda/microvms/runs/lca-dev). */
@@ -283,7 +286,7 @@ test('the scan pages past the first page of a busy group', async () => {
   _setClient(undefined);
 });
 
-test('the resolved name is cached, so a 3 s poll does not re-scan the group', async () => {
+test('the resolved name is cached, so a 4 s log poll does not re-scan the group', async () => {
   const s = fakeCloudWatch([{ name: REAL_STREAM, events: [{ timestamp: 10, message: 'a' }] }]);
   _setClient(s.client);
   const args = { logGroupName: '/g', microvmId: VM, runCreatedAt: '2026-08-03T10:00:00.000Z' };
@@ -327,10 +330,10 @@ test('a VM with no stream yet is pending and reads nothing', async () => {
   _setClient(undefined);
 });
 
-// The pane polls every 3 s. A queued/booting VM resolves to nothing on every one of those
-// polls, so an uncached miss re-scans the group each time: 9 describes/poll on a busy group
-// ≈ 3 TPS from ONE viewer, against an account-wide 5 TPS DescribeLogStreams quota that a
-// second viewer would push past — and a ThrottlingException is a 500, not a pending pane.
+// The pane polls logs every 4 s. A queued/booting VM resolves to nothing on every one of
+// those polls, so an uncached miss re-scans the group each time: 7 describes/poll on a busy
+// group ≈ 1.8 TPS from ONE viewer, against an account-wide 5 TPS DescribeLogStreams quota that
+// a second viewer would push past — and a ThrottlingException is a 500, not a pending pane.
 test('polling a booting VM does not re-scan the group on every poll', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: 0 });
   // A busy day: 300 streams under the run's date, none of them this run's.
@@ -349,9 +352,7 @@ test('polling a booting VM does not re-scan the group on every poll', async (t) 
 
   // Three more polls inside the miss TTL cost nothing at all.
   s.sent.length = 0;
-  t.mock.timers.tick(3_000);
-  assert.equal((await fetchRunLogs(args)).pending, true);
-  t.mock.timers.tick(1_000);
+  t.mock.timers.tick(4_000);
   assert.equal((await fetchRunLogs(args)).pending, true);
   assert.equal(s.sent.length, 0, 'a cached miss is reused, not re-derived');
 
@@ -531,4 +532,46 @@ test('the since watermark is validated, so junk never reaches CloudWatch', () =>
   assert.equal(parseEpochMs('12.5'), undefined);
   assert.equal(parseEpochMs('now'), undefined);
   assert.equal(parseEpochMs('9'.repeat(20)), undefined);
+});
+
+// ---------------------------------------------------------------------------------------
+// Wiring pins (source-level, the repo's existing pattern — see test/image-content.test.mjs).
+//
+// Everything above tests `fetchRunLogs` with arguments the TEST supplies. That is exactly the
+// blind spot that let the original defect ship: a locator can be perfect in the module and
+// wrong at the call site, and no test in this file would notice.
+// ---------------------------------------------------------------------------------------
+
+const REPO_ROOT = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '..');
+const src = (p) => fs.readFileSync(path.join(REPO_ROOT, p), 'utf8');
+
+test('the logs route bounds resolution with the run’s own createdAt', () => {
+  const handler = src('src/mgmt/handler.ts');
+  const route = handler.slice(
+    handler.indexOf("case 'getRunLogs':"),
+    handler.indexOf("case 'listFlavors':"),
+  );
+  assert.ok(route.length > 0, 'getRunLogs case not found — update this test');
+  // Without this the resolver has no date tier at all and degrades to the recency fallback,
+  // which by construction cannot find a FINISHED run's stream (ADR-048 residual limit) —
+  // i.e. the original "0 events forever" symptom, with every test above still green.
+  assert.match(route, /runCreatedAt:\s*run\.record\.createdAt/);
+  // And the resolved name has to reach the client, or the pane cannot report it.
+  assert.match(route, /logStream:\s*page\.logStream\s*\?\?\s*null/);
+});
+
+test('the log pane reports the resolved stream per poll, not from buffered pages', () => {
+  const pane = src('web/src/screens/RunDetail.tsx');
+  // `pages` only holds pages that CARRIED events, so a stream resolved for a run that has
+  // written nothing (or whose events aged out) would never be shown — the one case where the
+  // name is the difference between "nothing written yet" and "resolution failed".
+  assert.match(pane, /if \(page\.logStream\) setLogStream\(page\.logStream\)/);
+  assert.doesNotMatch(
+    pane,
+    /pages\.find\(\(p\) => p\.logStream\)/,
+    'deriving the stream name from buffered pages hides it on an empty pane',
+  );
+  // Run identity change must clear it, or a new run inherits the previous run's stream.
+  const reset = pane.slice(pane.indexOf('setPages([]);'), pane.indexOf('}, [repoId, runId, jobId]);'));
+  assert.match(reset, /setLogStream\(null\)/);
 });
