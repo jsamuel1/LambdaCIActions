@@ -2181,10 +2181,10 @@ non-CD path has to stay first-class and correct for exactly the case where the p
   line or a repo variable).
 - The `cfn-exec-role` admin ceiling is accepted and recorded, not fixed.
 
-> **ADR numbering note.** This block takes **048**: 034/035 are claimed by
-> `kermes/task-nervous-mountain` and 042..046 by `kermes/task-jolly-dove`, and 047 is on
-> `main`. ADR numbers are a shared mutable namespace across branches; a gap is cheaper than a
-> duplicate.
+> **ADR numbering note.** This block takes **048**: 042..047 are already on `main` (the
+> highest landed number is 047), and the only outstanding gap, 034/035, is claimed by the
+> unmerged `kermes/task-nervous-mountain`. ADR numbers are a shared mutable namespace across
+> branches, so a gap is cheaper than a duplicate — do not backfill 034/035 here.
 
 ## ADR-048 — A run's log stream is resolved by name, not matched by prefix (M4 fix)
 **Status**: Accepted (v1) · amends [ADR-016](#adr-016) (log destination) · fixes the log half
@@ -2250,6 +2250,16 @@ run is unaffected, because its stream *is* the most recent; that is what the res
 pages buy. Dev is orders of magnitude below the horizon, but this is the limit that makes the
 row stamp below the real scaling answer rather than just a cheaper one.
 
+Second residual, from the authoritative-miss rule itself: a stream stamped with a date
+**outside** `[D, D+1]` — a clock-skewed VM, or one launched more than a day after it was
+queued — is unresolvable whenever the queue date is a *populated* namespace, because those
+prefixes then list themselves out over real streams and rule the stream out before the
+fallback can run. This is the deliberate price of keeping the ordinary "VM has not written
+yet" poll at two describes: the alternative is a whole-group recency scan on every poll of
+every queued run. It is not the same case as a changed name *format*, which empties the date
+namespace for every stream at once and therefore does reach the fallback. Pinned by
+`test/mgmt-logs.test.mjs` so it stays a known cost rather than a surprise.
+
 **Why not stamp the stream name on the run row at launch?** Cheaper (zero describes), but it
 needs a Provision-side write plus a resolver fallback for every row written before it lands —
 and the resolver is the thing that has to be correct either way. Resolution is self-healing
@@ -2270,10 +2280,12 @@ stays available as a later optimisation.
 - A stream that appears during a cached miss shows up to 5 s late in the pane. That is under
   two poll intervals and invisible next to microVM boot time.
 - The stream layout is now a load-bearing assumption in two places (date prefix, id
-  containment). Both degrade to the recency scan rather than to an empty pane if the service
-  changes the format — for live runs, which is when an operator is watching. A date prefix
-  that lists nothing is treated as "cannot rule it out", not as "not there", which is what
-  makes that degradation real rather than aspirational.
+  containment). A wholesale **format** change degrades to the recency scan rather than to an
+  empty pane — for live runs, which is when an operator is watching — because it empties the
+  date namespace for every stream at once, and a date prefix that lists nothing is treated as
+  "cannot rule it out" rather than "not there". That is what makes the degradation real rather
+  than aspirational. It does **not** cover a single stream stamped outside `[D, D+1]` on a
+  populated date; see the second residual limit above.
 - **The test stub is part of the fix.** `test/mgmt-logs.test.mjs` previously replied from a
   scripted response queue that ignored `logStreamNamePrefix` entirely, and its fixture names
   (`vm-1/x` for `vm-1`) were id-prefixed — so no test in the file could observe a wrong

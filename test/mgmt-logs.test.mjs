@@ -201,9 +201,14 @@ test('a run with no usable createdAt falls back to a recency-ordered scan', asyn
 // The fallback's whole point is surviving a stream name the date tiers cannot predict. It is
 // only load-bearing if it runs for a run row with a PERFECTLY GOOD createdAt — which is every
 // production row — and not merely for the garbled-date case above.
-test('a stream stamped with an unexpected date is still found, valid createdAt or not', async () => {
+//
+// Scope: this covers a changed name FORMAT, which empties the date namespace for every stream
+// at once. A single stream stamped off-window while the queue date holds other streams is a
+// different case, and is deliberately NOT found — pinned by the test below it.
+test('a stream stamped with an unexpected date is still found when the date tiers list nothing', async () => {
   const s = fakeCloudWatch([
-    // Neither the queue date nor the day after: a clock-skewed VM, or a changed name format.
+    // Neither the queue date nor the day after, and nothing else under either: this is what a
+    // changed date/version decoration looks like from the resolver's side.
     { name: `2026/08/06[10.0]${VM}`, events: [{ timestamp: 5, message: 'runner output' }] },
   ]);
   _setClient(s.client);
@@ -222,6 +227,37 @@ test('a stream stamped with an unexpected date is still found, valid createdAt o
     s.sent.some((c) => c.name === 'DescribeLogStreams' && c.input.orderBy === 'LastEventTime'),
     true,
     'the date prefixes listed nothing, so nothing ruled the stream out',
+  );
+  _setClient(undefined);
+});
+
+// The other side of the authoritative-miss rule, and the reason the test above is scoped to an
+// EMPTY date namespace: once the queue date holds real streams, an exhausted date scan rules
+// the stream out and the fallback never runs. A VM stamped outside [D, D+1] — clock skew, or a
+// launch more than a day after the queue — is then unresolvable. That is the deliberate price
+// of keeping the ordinary "not written yet" poll at two describes instead of a group scan
+// (ADR-048, second residual limit); pinned so it stays a known cost, not a surprise.
+test('an off-window stream is NOT found once the queue date is populated (documented residual)', async () => {
+  const s = fakeCloudWatch([
+    { name: '2026/08/03[10.0]microvm-someone-else', events: [{ timestamp: 1, message: 'other' }] },
+    { name: `2026/08/06[10.0]${VM}`, events: [{ timestamp: 5, message: 'mine' }] },
+  ]);
+  _setClient(s.client);
+  const page = await fetchRunLogs({
+    logGroupName: '/g',
+    microvmId: VM,
+    runCreatedAt: '2026-08-03T10:00:00.000Z',
+  });
+  assert.deepEqual(page, { events: [], pending: true });
+  assert.deepEqual(
+    s.sent.map((c) => c.input.logStreamNamePrefix),
+    ['2026/08/03', '2026/08/04'],
+    'a populated, exhausted date namespace is an authoritative miss — no whole-group scan',
+  );
+  assert.equal(
+    s.sent.some((c) => c.input.orderBy === 'LastEventTime'),
+    false,
+    'if this starts running the fallback, the cost claims in ADR-048 need re-measuring',
   );
   _setClient(undefined);
 });
