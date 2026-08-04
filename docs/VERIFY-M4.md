@@ -442,6 +442,11 @@ this walkthrough and a marked 🎯. Landing it clears the criterion's *"reads it
 the *"installs the App"* clause still needs the interactive GitHub half of steps 1–2 walked by
 a human. Both are preconditions for marking.
 
+> **Fixed** ([ADR-048](DECISIONS.md#adr-048)): the stream is resolved to its exact name before
+> it is read. Everything above is the walkthrough as observed on 2026-08-03 and is left
+> unedited as the evidence for the defect — the pane still needs re-walking against a deployed
+> console before the 🎯's *"reads its logs"* clause is observed rather than inferred.
+
 ### Non-defects encountered (recorded so the next walkthrough doesn't re-litigate them)
 
 | Observation | Disposition |
