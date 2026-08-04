@@ -195,6 +195,70 @@ test('a run with no usable createdAt falls back to a recency-ordered scan', asyn
   _setClient(undefined);
 });
 
+// The fallback's whole point is surviving a stream name the date tiers cannot predict. It is
+// only load-bearing if it runs for a run row with a PERFECTLY GOOD createdAt — which is every
+// production row — and not merely for the garbled-date case above.
+test('a stream stamped with an unexpected date is still found, valid createdAt or not', async () => {
+  const s = fakeCloudWatch([
+    // Neither the queue date nor the day after: a clock-skewed VM, or a changed name format.
+    { name: `2026/08/06[10.0]${VM}`, events: [{ timestamp: 5, message: 'runner output' }] },
+  ]);
+  _setClient(s.client);
+  const page = await fetchRunLogs({
+    logGroupName: '/g',
+    microvmId: VM,
+    runCreatedAt: '2026-08-03T10:00:00.000Z',
+  });
+  assert.equal(page.pending, false, 'an unpredicted date must degrade to recency, not to empty');
+  assert.equal(page.logStream, `2026/08/06[10.0]${VM}`);
+  assert.deepEqual(
+    page.events.map((e) => e.message),
+    ['runner output'],
+  );
+  assert.equal(
+    s.sent.some((c) => c.name === 'DescribeLogStreams' && c.input.orderBy === 'LastEventTime'),
+    true,
+    'the date prefixes listed nothing, so nothing ruled the stream out',
+  );
+  _setClient(undefined);
+});
+
+// Budget arithmetic, not policy: the date tiers must not be able to spend the calls the
+// fallback needs. A live run's stream is the newest in the group, so recency finds it on its
+// first page — but only if there is a page left to spend.
+test('a date scan truncated by the budget still reaches the recency fallback', async () => {
+  // 5 000 streams on the run's own date, all sorting BEFORE the run's stream by name (so a
+  // name-ordered date scan is truncated before reaching it) and all older by event time (so
+  // recency ordering reaches it first).
+  const busy = Array.from({ length: 5_000 }, (_, i) => ({
+    name: `2026/08/03[10.0]microvm-0other-${String(i).padStart(5, '0')}`,
+    events: [{ timestamp: i, message: 'noise' }],
+  }));
+  const s = fakeCloudWatch([
+    ...busy,
+    { name: REAL_STREAM, events: [{ timestamp: 99_999_999, message: 'mine' }] },
+  ]);
+  _setClient(s.client);
+  const page = await fetchRunLogs({
+    logGroupName: '/g',
+    microvmId: VM,
+    runCreatedAt: '2026-08-03T10:00:00.000Z',
+  });
+  assert.equal(page.logStream, REAL_STREAM);
+  assert.deepEqual(
+    page.events.map((e) => e.message),
+    ['mine'],
+  );
+  const describes = s.sent.filter((c) => c.name === 'DescribeLogStreams');
+  assert.equal(
+    describes.some((c) => c.input.orderBy === 'LastEventTime'),
+    true,
+    'a truncated date scan rules nothing out, so the fallback must still run',
+  );
+  assert.ok(describes.length <= 12, `still inside the shared budget, got ${describes.length}`);
+  _setClient(undefined);
+});
+
 test('the scan pages past the first page of a busy group', async () => {
   const filler = Array.from({ length: 60 }, (_, i) => ({
     name: `2026/08/03[10.0]microvm-0filler-${String(i).padStart(3, '0')}`,
@@ -241,8 +305,8 @@ test('a VM with no stream yet is pending and reads nothing', async () => {
   });
   assert.deepEqual(page, { events: [], pending: true });
   assert.equal(s.names().includes('FilterLogEvents'), false, 'nothing to read → no read');
-  // A date prefix listed to its end RULES the stream out, so the whole-group recency
-  // fallback is not spent re-answering the same question.
+  // Both of the run's own dates were listed to their end AND held real streams, so the miss
+  // is authoritative: the whole-group recency fallback is not spent re-answering it.
   assert.deepEqual(
     s.sent.map((c) => c.input.logStreamNamePrefix),
     ['2026/08/03', '2026/08/04'],

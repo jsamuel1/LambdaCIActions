@@ -72,12 +72,23 @@ const STREAM_PAGE_SIZE = 50;
  * `DescribeLogStreams` calls one whole resolution attempt may spend, across every tier.
  *
  * A per-tier page cap is the wrong budget: it multiplies (two date prefixes plus a fallback
- * scan), so the miss path — a queued/booting VM, polled every 3 s — cost 9 describes/poll
- * ≈ 3 TPS from a single viewer against an account-wide 5 TPS quota. One shared budget makes
- * the worst case flat, and `STREAM_SCAN_BUDGET × STREAM_PAGE_SIZE` streams per day the
- * resolution horizon (see ADR-048 for what happens beyond it).
+ * scan). One shared budget makes the worst case flat. Measured on the miss path — a
+ * queued/booting VM whose stream does not exist yet — an attempt costs 2 describes on a
+ * 50-stream day and 7 on a 300-stream day; with the miss TTL below that is ~3.5 per 3 s poll,
+ * ~1.2 TPS from one viewer against an account-wide 5 TPS quota. Uncached it would be ~2.3 TPS,
+ * and a `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
  */
 const STREAM_SCAN_BUDGET = 12;
+
+/**
+ * Describe calls held back from the date tiers so the recency fallback can always run.
+ *
+ * Without a reserve the date tiers can spend the whole budget, and then the fallback — the
+ * only tier that can find a stream the date scans could not rule out — is skipped for lack
+ * of calls, which is exactly the case it exists for. Two pages is 100 streams: enough for a
+ * *live* run, whose stream is by definition among the most recently written.
+ */
+const STREAM_FALLBACK_RESERVE = 2;
 
 /**
  * Resolved `microvmId` → exact stream name, per Lambda container.
@@ -158,6 +169,15 @@ interface ScanResult {
   found?: string;
   /** True when the scan reached the end of its listing — a miss here is authoritative. */
   exhausted: boolean;
+  /**
+   * Whether the scan saw ANY stream at all.
+   *
+   * An exhausted date-prefix scan only proves the stream does not exist if that date
+   * namespace is real. A prefix that lists nothing is equally consistent with "no VM wrote
+   * on this date" and "the service no longer stamps the date the way we assume", and the
+   * second is the case the recency fallback exists to survive.
+   */
+  sawStreams: boolean;
   /** Describe calls spent, so the caller can debit one shared budget across tiers. */
   spent: number;
 }
@@ -177,6 +197,7 @@ async function scanForStream(
 ): Promise<ScanResult> {
   let nextToken: string | undefined;
   let spent = 0;
+  let sawStreams = false;
   while (spent < budget) {
     const res = await client().send(
       new DescribeLogStreamsCommand({
@@ -191,15 +212,18 @@ async function scanForStream(
       }),
     );
     spent++;
-    const hit = (res.logStreams ?? []).find(
+    const streams = res.logStreams ?? [];
+    if (streams.length > 0) sawStreams = true;
+    const hit = streams.find(
       (s: LogStream) => s.logStreamName && streamBelongsTo(s.logStreamName, microvmId),
     );
-    if (hit?.logStreamName) return { found: hit.logStreamName, exhausted: false, spent };
+    if (hit?.logStreamName)
+      return { found: hit.logStreamName, exhausted: false, sawStreams, spent };
     nextToken = res.nextToken;
-    if (!nextToken) return { exhausted: true, spent };
+    if (!nextToken) return { exhausted: true, sawStreams, spent };
   }
   // Budget spent with pages still unread: the miss is inconclusive, not authoritative.
-  return { exhausted: false, spent };
+  return { exhausted: false, sawStreams, spent };
 }
 
 /**
@@ -209,9 +233,11 @@ async function scanForStream(
  * run whose queue date is known), then a recency-ordered scan of the group as a self-healing
  * fallback for rows with no/garbled `createdAt` or a stream stamped with an unexpected date.
  *
- * The fallback runs only when a date scan could not rule the stream out — no usable date, or
- * a scan truncated by the budget. Once a date prefix has been listed to its end, its miss is
- * final, and scanning the whole group again would just re-answer the same question at cost.
+ * The fallback runs only when the date tiers could not rule the stream out: no usable date, a
+ * scan truncated by the budget, or a date namespace that listed no streams at all (which is
+ * what a changed name format looks like from here). Once EVERY date prefix has been listed to
+ * its end and at least one of them was a real, populated namespace, the miss is final —
+ * scanning the whole group would only re-answer the same question at cost.
  */
 export async function resolveLogStreamName(
   logGroupName: string,
@@ -227,10 +253,16 @@ export async function resolveLogStreamName(
 
   let budget = STREAM_SCAN_BUDGET;
   let found: string | undefined;
-  // Optimistic until every date prefix has been listed to its end: with no date prefix, or
-  // with one the budget truncated, nothing has ruled the stream out and the fallback must run.
-  let ruledOut = false;
   const prefixes = datePrefixes(runCreatedAt);
+  // A miss is authoritative only if EVERY date tier listed itself out (`exhausted`) and at
+  // least one of them was a populated namespace. Conjunction, not last-wins: a truncated
+  // early prefix is not un-truncated by a later empty one.
+  let allExhausted = prefixes.length > 0;
+  let sawStreams = false;
+  // Hold the fallback's pages back from the date tiers, or a busy queue date spends the whole
+  // budget and the fallback is skipped for lack of calls in precisely the case it is for.
+  const dateBudget = prefixes.length > 0 ? STREAM_SCAN_BUDGET - STREAM_FALLBACK_RESERVE : 0;
+  let dateSpent = 0;
   for (const [i, prefix] of prefixes.entries()) {
     // Reserve one call for each prefix still to come, so a busy queue date cannot starve the
     // next-day scan — that is the only tier that can find a VM launched across midnight UTC.
@@ -238,17 +270,24 @@ export async function resolveLogStreamName(
     const scan = await scanForStream(
       { logGroupName, logStreamNamePrefix: prefix },
       microvmId,
-      Math.max(1, budget - reserve),
+      Math.max(1, dateBudget - dateSpent - reserve),
     );
     budget -= scan.spent;
-    ruledOut = scan.exhausted;
+    dateSpent += scan.spent;
+    allExhausted &&= scan.exhausted;
+    sawStreams ||= scan.sawStreams;
     if (scan.found) {
       found = scan.found;
       break;
     }
   }
+  const ruledOut = allExhausted && sawStreams;
   if (!found && !ruledOut && budget > 0) {
-    const scan = await scanForStream({ logGroupName, orderByLastEventTime: true }, microvmId, budget);
+    const scan = await scanForStream(
+      { logGroupName, orderByLastEventTime: true },
+      microvmId,
+      budget,
+    );
     found = scan.found;
   }
 

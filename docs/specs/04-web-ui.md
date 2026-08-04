@@ -187,10 +187,12 @@ The run's stream is **resolved to its exact name** before it is read (ADR-048). 
 group holds one stream per microVM, named `<YYYY/MM/DD>[<imageVersion>]<microvmId>` — the id
 is a **suffix**, so `logStreamNamePrefix: microvmId` matches nothing. The reader scans
 `DescribeLogStreams` bounded by the run's date (and the next day, for a launch across midnight
-UTC), falls back to a recency-ordered scan, then reads with `logStreamNames: [exactName]`. The
-resolved name is cached per Lambda container (misses too, for 5 s, so polling a booting VM
-does not re-scan the group) and returned as `logStream`, which the pane shows so an operator
-can open the same stream in the CloudWatch console.
+UTC), then falls back to a recency-ordered scan whenever those date scans could not rule the
+stream out — no usable date, a scan the call budget truncated, or a date prefix that listed no
+streams at all — and reads with `logStreamNames: [exactName]`. The resolved name is cached per
+Lambda container (misses too, for 5 s, so polling a booting VM does not re-scan the group) and
+returned as `logStream`, which the pane shows so an operator can open the same stream in the
+CloudWatch console.
 
 Run-list pagination uses an opaque cursor (base64url of the DynamoDB `LastEvaluatedKey`);
 the unfiltered multi-status view returns `nextCursor: null` — narrow by repo or status to

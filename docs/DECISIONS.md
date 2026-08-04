@@ -2213,10 +2213,13 @@ the id and the right one for the *date*:
 1. Scan `DescribeLogStreams` with `logStreamNamePrefix` = the run's `createdAt` date
    (`YYYY/MM/DD`) and the day after it — a VM queued near midnight UTC launches on the next
    date — and take the stream whose name **contains** the `microvmId`.
-2. If that finds nothing (no/garbled `createdAt`, or a stream stamped with an unexpected
-   date), fall back to one `orderBy: LastEventTime, descending` scan of the group: a live
-   run's stream is the most recently written. CloudWatch forbids combining that ordering with
-   a name prefix, which is why it is the fallback and not the primary.
+2. If that finds nothing, fall back to one `orderBy: LastEventTime, descending` scan of the
+   group: a live run's stream is the most recently written. CloudWatch forbids combining that
+   ordering with a name prefix, which is why it is the fallback and not the primary. It runs
+   whenever the date tiers could not *rule the stream out* — no usable date, a scan the budget
+   truncated, or a date prefix that listed **no streams at all**, which is what a changed name
+   format looks like from here. Only an exhausted scan over a populated date namespace is an
+   authoritative miss.
 3. Read with `logStreamNames: [exactName]`; **never** a prefix.
 
 Matching is containment, not `endsWith`: the id is a UUID-shaped token that cannot occur
@@ -2227,22 +2230,24 @@ Resolved names are cached per Lambda container (`microvmId` → stream name, FIF
 the 3 s poll costs one `FilterLogEvents` in steady state, not a rescan. Misses are cached too,
 but only for **5 s**: "no stream yet" becomes "stream" seconds later while the VM boots, so a
 miss has to stay retryable — while an *uncached* miss meant every poll of a queued run
-re-scanned the group. Measured on a 300-stream day that was 9 `DescribeLogStreams` per poll ≈
-**3 TPS from a single viewer**, against an account-wide 5 TPS quota that a second operator
-would push past — and a `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
-With the TTL it is 0.7 per poll (0.23 TPS).
+re-scanned the group. Measured on the miss path: an attempt costs 2 `DescribeLogStreams` on a
+50-stream day and 7 on a 300-stream day. Uncached that is 0.7–2.3 TPS from a **single** viewer
+against an account-wide 5 TPS quota; with the TTL (a miss is re-derived every second poll) it
+is 0.3–1.2 TPS. A `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
 
 The two tiers share **one** describe budget (12 calls × 50 streams), rather than each getting
-its own page cap that multiplies across them. The fallback also runs only when a date scan
-could not rule the stream out — no usable date, or a scan truncated by the budget. A date
-prefix listed to its end is proof the stream does not exist, so the ordinary "VM has not
-written yet" poll costs two describes and never re-scans the whole group.
+its own page cap that multiplies across them. Two of those calls are *reserved* for the
+fallback: without a reserve a busy queue date can spend the whole budget and the fallback is
+then skipped for want of calls, in precisely the case it exists for. A date prefix listed to
+its end **and** holding real streams is proof the stream is not there, so the ordinary "VM has
+not written yet" poll costs two describes and never re-scans the whole group.
 
-**Residual limit**: ~600 streams per date is the resolution horizon. Beyond that a *finished*
-run whose stream sits past the budget is unresolvable — the recency fallback cannot help,
-because an old stream is by definition not among the most recently written. A live run is
-unaffected (recency finds it), and dev is orders of magnitude below the horizon, but this is the
-limit that makes the row stamp below the real scaling answer rather than just a cheaper one.
+**Residual limit**: the date tier reaches ~450 streams under the run's own date, and the
+fallback the 100 most recently written streams in the group. Beyond both, a **finished** run
+is unresolvable — an old stream is by definition not among the most recently written. A live
+run is unaffected, because its stream *is* the most recent; that is what the reserved fallback
+pages buy. Dev is orders of magnitude below the horizon, but this is the limit that makes the
+row stamp below the real scaling answer rather than just a cheaper one.
 
 **Why not stamp the stream name on the run row at launch?** Cheaper (zero describes), but it
 needs a Provision-side write plus a resolver fallback for every row written before it lands —
@@ -2263,7 +2268,9 @@ stays available as a later optimisation.
   two poll intervals and invisible next to microVM boot time.
 - The stream layout is now a load-bearing assumption in two places (date prefix, id
   containment). Both degrade to the recency scan rather than to an empty pane if the service
-  changes the format — for live runs, which is when an operator is watching.
+  changes the format — for live runs, which is when an operator is watching. A date prefix
+  that lists nothing is treated as "cannot rule it out", not as "not there", which is what
+  makes that degradation real rather than aspirational.
 - **The test stub is part of the fix.** `test/mgmt-logs.test.mjs` previously replied from a
   scripted response queue that ignored `logStreamNamePrefix` entirely, and its fixture names
   (`vm-1/x` for `vm-1`) were id-prefixed — so no test in the file could observe a wrong
