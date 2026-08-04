@@ -11,11 +11,14 @@ Walked as an operator against the live `dev` console on **2026-08-03**. Repo ena
 workflow routing preview, live run tracking, presence-only Settings and the ADR-027 opt-out
 gate all work from the UI. (Step 6's pass carries one scoped caveat: `provisioning`, `running`
 and `completed` are screenshotted, `queued` is an untimed DOM reading — see step 6.) The final
-clause — **"and reads its logs"** — does not: the run-detail log pane renders `0 events` for
+clause — **"and reads its logs"** — did not: the run-detail log pane rendered `0 events` for
 every run, including runs whose CloudWatch stream demonstrably holds the runner output. Root
 cause found and filed as
-[`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it is
-a two-line locator bug, **live on `main`**, not a deployment artifact.
+[`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it was
+a two-line locator bug live on `main` at the time of this walkthrough, not a deployment
+artifact. **It is now fixed** ([ADR-048](DECISIONS.md#adr-048)) — but the 🎯 stays unmarked
+until the pane is re-walked against a deployed console, so this document's verdict stands as
+written.
 
 Two steps sit outside what this walkthrough could reach at all: the GitHub App's registered
 Callback URL (owner-only, and not inferable from an unauthenticated probe — see step 1) and
@@ -354,9 +357,11 @@ describe-log-streams --log-stream-name-prefix microvm-98c2f28c-…  ->  0
 filter-log-events  --log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'  ->  5
 ```
 
-`src/mgmt/logs.ts` has **zero diff between `63069ff` and `main` @ `d3dd0de`** (current tip,
-and likewise at `d8d23f1`), so this is live on `main` — deploying newer code will not fix it.
-Filed as **`task-1785738322-0bb6`** (P2) with a fix sketch.
+`src/mgmt/logs.ts` had **zero diff between `63069ff` and `main` @ `d3dd0de`** (the tip at the
+time of this walkthrough, and likewise at `d8d23f1`), so this was live on `main` — deploying
+newer code would not have fixed it. Filed as **`task-1785738322-0bb6`** (P2) with a fix sketch,
+and **since fixed** ([ADR-048](DECISIONS.md#adr-048)): the stream is resolved to its exact name
+before it is read. The measurements below are the walkthrough as observed on 2026-08-03.
 
 Why the existing unit tests never caught it: `test/mgmt-logs.test.mjs` stubs the CloudWatch
 client with a **scripted response queue that ignores `logStreamNamePrefix` entirely** — it
