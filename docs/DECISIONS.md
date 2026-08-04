@@ -2275,8 +2275,12 @@ stays available as a later optimisation.
   glance when resolution failed. The pane tracks it **per poll**, not from the pages it
   rendered: it only buffers pages that carried events, so deriving the name from them would
   hide it in precisely the empty-pane case it exists to explain.
-- A cold container pays 1–3 `DescribeLogStreams` per run before its first read. IAM already
-  allowed both calls (ADR-025), so there is no permission change.
+- A cold container pays one `DescribeLogStreams` per run before its first read in the common
+  case — the stream is on the first page of the run's own date — and up to the 12-call budget
+  on a busy day, since each tier pages before the next one starts: the measured figures above
+  are 2 on a 50-stream day and 7 on a 300-stream day. Only the FIRST read of a run pays this;
+  the container cache makes every later poll one `FilterLogEvents`. IAM already allowed both
+  calls (ADR-025), so there is no permission change.
 - A stream that appears during a cached miss shows up to 5 s late in the pane. That is under
   two poll intervals and invisible next to microVM boot time.
 - The stream layout is now a load-bearing assumption in two places (date prefix, id
