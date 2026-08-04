@@ -347,9 +347,9 @@ $ aws logs get-log-events --log-stream-name '2026/08/03[10.0]microvm-98c2f28c-�
 ```
 
 Root cause: the stream is named `<date>[<imageVersion>]<microvmId>`, so the microVM id is a
-**suffix** — but `fetchRunLogs()` and `hasLogStream()` both pass
-`logStreamNamePrefix: microvmId` (`src/mgmt/logs.ts:77`, `:118`). Measured, same group, same
-microVM id:
+**suffix** — but at `d3dd0de` both readers passed `logStreamNamePrefix: microvmId`
+(`d3dd0de:src/mgmt/logs.ts:77` in `fetchRunLogs()`, `:118` in the `hasLogStream()` probe that
+ADR-048 has since replaced with name resolution). Measured, same group, same microVM id:
 
 ```
 filter-log-events  --log-stream-name-prefix microvm-98c2f28c-…  ->  {"events": 0, "searched": []}
