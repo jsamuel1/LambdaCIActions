@@ -363,15 +363,17 @@ newer code would not have fixed it. Filed as **`task-1785738322-0bb6`** (P2) wit
 and **since fixed** ([ADR-048](DECISIONS.md#adr-048)): the stream is resolved to its exact name
 before it is read. The measurements below are the walkthrough as observed on 2026-08-03.
 
-Why the existing unit tests never caught it: `test/mgmt-logs.test.mjs` stubs the CloudWatch
-client with a **scripted response queue that ignores `logStreamNamePrefix` entirely** — it
-replies with the next canned page whatever prefix is sent, so no test in the file can observe
-a wrong locator direction. Worse, line 51 *asserts* the buggy direction as correct
+Why the unit tests never caught it — describing the file **as it stood at the 2026-08-03 tip
+`d3dd0de`**, not as it stands now: `test/mgmt-logs.test.mjs` stubbed the CloudWatch client with
+a **scripted response queue that ignored `logStreamNamePrefix` entirely** — it replied with the
+next canned page whatever prefix was sent, so no test in the file could observe a wrong locator
+direction. Worse, `d3dd0de:test/mgmt-logs.test.mjs:51` *asserted* the buggy direction as correct
 (`assert.equal(input.logStreamNamePrefix, 'vm-1')`), and the fixture stream names (`vm-1/x`,
-with `microvmId: 'vm-1'`) happen to be id-prefixed, so even a prefix-aware stub would match.
-A regression test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only bites if
-the stub is first taught to filter by prefix the way CloudWatch does **and** that assertion is
-inverted.
+with `microvmId: 'vm-1'`) happened to be id-prefixed, so even a prefix-aware stub would have
+matched. A regression test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only
+bites once the stub filters by prefix the way CloudWatch does **and** that assertion is
+inverted — both of which [ADR-048](DECISIONS.md#adr-048) did: the stub is now a CloudWatch model
+that honours the prefix, and a test asserts the model itself cannot see an id-prefix scan.
 
 ![run detail, log pane empty](evidence/m4/07-rundetail-final-completed.png)
 
