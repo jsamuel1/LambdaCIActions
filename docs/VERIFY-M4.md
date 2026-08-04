@@ -441,16 +441,18 @@ path — it does **not** establish strictness under a read fault.
 
 **`task-1785738322-0bb6`.** `logStreamNamePrefix: microvmId` in `src/mgmt/logs.ts:77`/`:118`,
 but the microVM id is a stream-name **suffix**. Evidence and fix sketch in step 7 and on the
-card. **Live on `main`** — zero diff since `63069ff`. This is the only *product defect* found,
-and the only blocker that is a defect at all — but it is **not** the only thing standing between
-this walkthrough and a marked 🎯. Landing it clears the criterion's *"reads its logs"* clause;
-the *"installs the App"* clause still needs the interactive GitHub half of steps 1–2 walked by
-a human. Both are preconditions for marking.
+card. It was **live on `main`** at this walkthrough — zero diff between `63069ff` and the
+2026-08-03 tip `d3dd0de`. This was the only *product defect* found, and the only blocker that
+was a defect at all — but it was **not** the only thing standing between this walkthrough and a
+marked 🎯: clearing the criterion's *"reads its logs"* clause is one precondition, and the
+*"installs the App"* clause still needs the interactive GitHub half of steps 1–2 walked by a
+human.
 
 > **Fixed** ([ADR-048](DECISIONS.md#adr-048)): the stream is resolved to its exact name before
-> it is read. Everything above is the walkthrough as observed on 2026-08-03 and is left
-> unedited as the evidence for the defect — the pane still needs re-walking against a deployed
-> console before the 🎯's *"reads its logs"* clause is observed rather than inferred.
+> it is read, so the line/SHA references above describe the pre-fix code, not current `main`.
+> Everything above is the walkthrough as observed on 2026-08-03 and is left unedited as the
+> evidence for the defect — the pane still needs re-walking against a deployed console before
+> the 🎯's *"reads its logs"* clause is observed rather than inferred.
 
 ### Non-defects encountered (recorded so the next walkthrough doesn't re-litigate them)
 
@@ -489,10 +491,11 @@ npm run backfill:installs -- --table lca-dev --apply
 #    #/ and run detail. Dispatch also works on that branch:
 gh workflow run m4-verify-docker.yml --repo <owner>/lca-m3-verify --ref m4-verify-01
 
-# 5. the log-pane defect, without a browser
+# 5. the log-pane defect as it stood on 2026-08-03, without a browser (pre-ADR-048; the API
+#    now resolves the exact stream name instead of prefix-matching the id)
 MV=<microvmId from the run row>
 aws logs filter-log-events --log-group-name /aws/lambda/microvms/runs/lca-dev \
-  --log-stream-name-prefix "$MV"                                  # 0 events  <- what the API does
+  --log-stream-name-prefix "$MV"                                  # 0 events  <- what the API did
 aws logs describe-log-streams --log-group-name /aws/lambda/microvms/runs/lca-dev \
   --order-by LastEventTime --descending --max-items 3              # find the real stream name
 aws logs filter-log-events --log-group-name /aws/lambda/microvms/runs/lca-dev \
