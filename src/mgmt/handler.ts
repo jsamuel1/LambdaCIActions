@@ -531,6 +531,8 @@ async function route_(
       const page = await fetchRunLogs({
         logGroupName: RUN_LOG_GROUP,
         microvmId: run.record.microvmId,
+        // Bounds the stream-name resolution scan to the run's own date (src/mgmt/logs.ts).
+        runCreatedAt: run.record.createdAt,
         limit: parseLimit(q.limit, 200, 1000),
         nextToken: q.nextToken,
         // `since` is the client's tail watermark: the newest event timestamp it already
@@ -541,6 +543,9 @@ async function route_(
       return json(200, {
         logGroup: RUN_LOG_GROUP,
         microvmId: run.record.microvmId ?? null,
+        // The resolved stream name: what an operator needs to go read the same events in the
+        // CloudWatch console / CLI, and the fastest way to see a resolution has failed.
+        logStream: page.logStream ?? null,
         pending: page.pending,
         events: page.events,
         nextToken: page.nextToken ?? null,

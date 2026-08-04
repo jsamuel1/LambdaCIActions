@@ -196,6 +196,8 @@ export interface Settings {
 export interface LogPage {
   logGroup: string;
   microvmId: string | null;
+  /** Exact CloudWatch stream name once resolved (ADR-048); null before the VM writes. */
+  logStream: string | null;
   pending: boolean;
   events: { timestamp: number; message: string; stream: string }[];
   nextToken: string | null;

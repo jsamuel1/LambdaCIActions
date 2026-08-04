@@ -740,6 +740,11 @@ the first implementation did, replays the same page indefinitely; `test/mgmt-log
 pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
 WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
 
+**Fixed by [ADR-048](#adr-048)**: the tail was correct about *paging* and wrong about *which
+stream* — it located the run's stream with `logStreamNamePrefix: microvmId`, but the id is a
+stream-name suffix, so the pane read nothing for any run. The stream is now resolved to its
+exact name before it is read.
+
 ## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
 **Status**: Accepted (v1) · follows [ADR-023](#adr-023)
 **Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
@@ -2175,3 +2180,77 @@ non-CD path has to stay first-class and correct for exactly the case where the p
   and the role ARN is hardcoded in the workflow (derived from `envName`, so prod needs its own
   line or a repo variable).
 - The `cfn-exec-role` admin ceiling is accepted and recorded, not fixed.
+
+> **ADR numbering note.** This block takes **048**: 034/035 are claimed by
+> `kermes/task-nervous-mountain` and 042..046 by `kermes/task-jolly-dove`, and 047 is on
+> `main`. ADR numbers are a shared mutable namespace across branches; a gap is cheaper than a
+> duplicate.
+
+## ADR-048 — A run's log stream is resolved by name, not matched by prefix (M4 fix)
+**Status**: Accepted (v1) · amends [ADR-016](#adr-016) (log destination) · fixes the log half
+of [ADR-026](#adr-026)
+
+**Context**: Every microVM's runner + run-hook output lands in one per-env log group
+(`/aws/lambda/microvms/runs/lca-<env>`, ADR-016) with one stream per VM, and the run row
+carries the `microvmId` (ADR-019). The first log reader therefore located a run's stream with
+`logStreamNamePrefix: microvmId` on both `FilterLogEvents` and `DescribeLogStreams`.
+
+That locator is **backwards**. The service names the stream
+`<YYYY/MM/DD>[<imageVersion>]<microvmId>` — for example
+`2026/08/03[10.0]microvm-98c2f28c-2463-3526-a201-ef44bd494d15` — so the microVM id is a
+**suffix**. A prefix filter never matched: the pane rendered `Logs / 0 events` for the whole
+life of every run, and because the `pending` probe used the same bad prefix it first claimed
+"No log stream yet — the microVM has not started writing" for a VM that had already written.
+Verified in dev on run `30789972919`: prefix-filtering the id returned 0 events and 0 streams,
+while `--log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'` returned the job's output.
+This blocked the M4 exit criterion — an operator must be able to read a run's logs **from the
+UI** — with the AWS console as the only workaround.
+
+**Decision**: **resolve the exact stream name first, then read that stream by name.**
+`DescribeLogStreams` cannot suffix-match, so the prefix argument is the wrong instrument for
+the id and the right one for the *date*:
+
+1. Scan `DescribeLogStreams` with `logStreamNamePrefix` = the run's `createdAt` date
+   (`YYYY/MM/DD`) and the day after it — a VM queued near midnight UTC launches on the next
+   date — and take the stream whose name **contains** the `microvmId`.
+2. If that finds nothing (no/garbled `createdAt`, or a stream stamped with an unexpected
+   date), fall back to one `orderBy: LastEventTime, descending` scan of the group: a live
+   run's stream is the most recently written. CloudWatch forbids combining that ordering with
+   a name prefix, which is why it is the fallback and not the primary.
+3. Read with `logStreamNames: [exactName]`; **never** a prefix.
+
+Matching is containment, not `endsWith`: the id is a UUID-shaped token that cannot occur
+inside an unrelated stream's name, so containment is equally exact and does not break if the
+service moves the date/version decoration.
+
+Resolved names are cached per Lambda container (`microvmId` → stream name, FIFO-bounded), so
+the 3 s poll costs one `FilterLogEvents` in steady state, not a rescan. **Only positive**
+results are cached — "no stream yet" becomes "stream" seconds later while the VM boots, so a
+miss must stay retryable. Every scan is page-capped (4 × 50 streams) to bound the worst case
+on a busy group.
+
+**Why not stamp the stream name on the run row at launch?** Cheaper (zero describes), but it
+needs a Provision-side write plus a resolver fallback for every row written before it lands —
+and the resolver is the thing that has to be correct either way. Resolution is self-healing
+for existing runs, and the container cache already removes the per-poll cost. The row stamp
+stays available as a later optimisation.
+
+**Consequences**:
+- `pending` is now exactly "there is no stream to read" — no VM, or no stream yet — rather
+  than "the first page came back empty". A resumed tail that returns nothing is still
+  *caught up*, so the UI cannot flash "no log stream yet" over rendered output.
+- `GET /api/runs/…/logs` returns the resolved `logStream`, so an operator can jump to the
+  same events in the CloudWatch console and can see at a glance when resolution failed.
+- A cold container pays 1–3 `DescribeLogStreams` per run before its first read. IAM already
+  allowed both calls (ADR-025), so there is no permission change.
+- The stream layout is now a load-bearing assumption in two places (date prefix, id
+  containment). Both degrade to the recency scan rather than to an empty pane if the service
+  changes the format.
+- **The test stub is part of the fix.** `test/mgmt-logs.test.mjs` previously replied from a
+  scripted response queue that ignored `logStreamNamePrefix` entirely, and its fixture names
+  (`vm-1/x` for `vm-1`) were id-prefixed — so no test in the file could observe a wrong
+  locator direction, which is precisely why this shipped green. The stub is now a small
+  CloudWatch model that honours `logStreamNamePrefix` / `logStreamNames` / `startTime` /
+  `limit` / `nextToken` / `orderBy` (including rejecting the prefix + `LastEventTime`
+  combination the API forbids), with realistic `2026/08/03[10.0]microvm-…` fixtures. A test
+  asserts the model itself cannot see an id-prefix scan, so the guard cannot rot back.

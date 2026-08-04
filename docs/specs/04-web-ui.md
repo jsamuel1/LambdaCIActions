@@ -180,8 +180,16 @@ Responses are JSON; log endpoints paginate via CloudWatch tokens (no log bodies 
 CloudWatch stops issuing `nextToken` once a filter is caught up, so the log endpoint also
 accepts `since=<epoch-ms>` — the client's tail watermark (newest event it holds, +1 ms).
 `nextToken` wins when both are sent; a resumed tail that returns nothing is *caught up*, not
-`pending`. `pending: true` means the run has no `microvmId`, the log group does not exist, or
-a cold first page found no stream (confirmed with one `DescribeLogStreams`).
+`pending`. `pending: true` means there is nothing to read: the run has no `microvmId`, the log
+group does not exist, or the microVM has no log stream yet.
+
+The run's stream is **resolved to its exact name** before it is read (ADR-048). One per-env
+group holds one stream per microVM, named `<YYYY/MM/DD>[<imageVersion>]<microvmId>` — the id
+is a **suffix**, so `logStreamNamePrefix: microvmId` matches nothing. The reader scans
+`DescribeLogStreams` bounded by the run's date (and the next day, for a launch across midnight
+UTC), falls back to a recency-ordered scan, then reads with `logStreamNames: [exactName]`. The
+resolved name is cached per Lambda container and returned as `logStream` so an operator can
+open the same stream in the CloudWatch console.
 
 Run-list pagination uses an opaque cursor (base64url of the DynamoDB `LastEvaluatedKey`);
 the unfiltered multi-status view returns `nextCursor: null` — narrow by repo or status to
