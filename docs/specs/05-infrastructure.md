@@ -192,7 +192,10 @@ template, so re-widening the role fails the build.
 
 - **Logs**: each runner → its own CloudWatch log stream inside the per-env run log group
   (`/aws/lambda/microvms/runs/lca-<env>`, ADR-016); Lambdas → standard log groups. The
-  console's log viewer reads that group filtered by the run's `microvmId` (ADR-019) — log
+  console's log viewer reads that group by resolving the run's stream to its **exact name**
+  first — the stream is `<YYYY/MM/DD>[<imageVersion>]<microvmId>`, so the `microvmId`
+  (ADR-019) is a *suffix* and cannot be prefix-matched: a date-bounded `DescribeLogStreams`
+  scan (with a recency-ordered fallback) then a read by `logStreamNames` (ADR-048) — log
   bodies never land in DynamoDB.
 - **Metrics** (M5, ADR-032): emitted as **CloudWatch EMF log lines**, not `PutMetricData` — no
   extra hot-path API call and no `cloudwatch:PutMetricData` grant on any Lambda. Namespace
