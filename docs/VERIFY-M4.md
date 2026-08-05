@@ -11,11 +11,14 @@ Walked as an operator against the live `dev` console on **2026-08-03**. Repo ena
 workflow routing preview, live run tracking, presence-only Settings and the ADR-027 opt-out
 gate all work from the UI. (Step 6's pass carries one scoped caveat: `provisioning`, `running`
 and `completed` are screenshotted, `queued` is an untimed DOM reading — see step 6.) The final
-clause — **"and reads its logs"** — does not: the run-detail log pane renders `0 events` for
+clause — **"and reads its logs"** — did not: the run-detail log pane rendered `0 events` for
 every run, including runs whose CloudWatch stream demonstrably holds the runner output. Root
 cause found and filed as
-[`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it is
-a two-line locator bug, **live on `main`**, not a deployment artifact.
+[`task-1785738322-0bb6`](#defect-1--run-detail-log-pane-can-never-show-runner-output-p2); it was
+a two-line locator bug live on `main` at the time of this walkthrough, not a deployment
+artifact. **It is now fixed** ([ADR-048](DECISIONS.md#adr-048)) — but the 🎯 stays unmarked
+until the pane is re-walked against a deployed console, so this document's verdict stands as
+written.
 
 Two steps sit outside what this walkthrough could reach at all: the GitHub App's registered
 Callback URL (owner-only, and not inferable from an unauthenticated probe — see step 1) and
@@ -344,9 +347,9 @@ $ aws logs get-log-events --log-stream-name '2026/08/03[10.0]microvm-98c2f28c-�
 ```
 
 Root cause: the stream is named `<date>[<imageVersion>]<microvmId>`, so the microVM id is a
-**suffix** — but `fetchRunLogs()` and `hasLogStream()` both pass
-`logStreamNamePrefix: microvmId` (`src/mgmt/logs.ts:77`, `:118`). Measured, same group, same
-microVM id:
+**suffix** — but at `d3dd0de` both readers passed `logStreamNamePrefix: microvmId`
+(`d3dd0de:src/mgmt/logs.ts:77` in `fetchRunLogs()`, `:118` in the `hasLogStream()` probe that
+ADR-048 has since replaced with name resolution). Measured, same group, same microVM id:
 
 ```
 filter-log-events  --log-stream-name-prefix microvm-98c2f28c-…  ->  {"events": 0, "searched": []}
@@ -354,19 +357,23 @@ describe-log-streams --log-stream-name-prefix microvm-98c2f28c-…  ->  0
 filter-log-events  --log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'  ->  5
 ```
 
-`src/mgmt/logs.ts` has **zero diff between `63069ff` and `main` @ `d3dd0de`** (current tip,
-and likewise at `d8d23f1`), so this is live on `main` — deploying newer code will not fix it.
-Filed as **`task-1785738322-0bb6`** (P2) with a fix sketch.
+`src/mgmt/logs.ts` had **zero diff between `63069ff` and `main` @ `d3dd0de`** (the tip at the
+time of this walkthrough, and likewise at `d8d23f1`), so this was live on `main` — deploying
+newer code would not have fixed it. Filed as **`task-1785738322-0bb6`** (P2) with a fix sketch,
+and **since fixed** ([ADR-048](DECISIONS.md#adr-048)): the stream is resolved to its exact name
+before it is read. The measurements below are the walkthrough as observed on 2026-08-03.
 
-Why the existing unit tests never caught it: `test/mgmt-logs.test.mjs` stubs the CloudWatch
-client with a **scripted response queue that ignores `logStreamNamePrefix` entirely** — it
-replies with the next canned page whatever prefix is sent, so no test in the file can observe
-a wrong locator direction. Worse, line 51 *asserts* the buggy direction as correct
+Why the unit tests never caught it — describing the file **as it stood at the 2026-08-03 tip
+`d3dd0de`**, not as it stands now: `test/mgmt-logs.test.mjs` stubbed the CloudWatch client with
+a **scripted response queue that ignored `logStreamNamePrefix` entirely** — it replied with the
+next canned page whatever prefix was sent, so no test in the file could observe a wrong locator
+direction. Worse, `d3dd0de:test/mgmt-logs.test.mjs:51` *asserted* the buggy direction as correct
 (`assert.equal(input.logStreamNamePrefix, 'vm-1')`), and the fixture stream names (`vm-1/x`,
-with `microvmId: 'vm-1'`) happen to be id-prefixed, so even a prefix-aware stub would match.
-A regression test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only bites if
-the stub is first taught to filter by prefix the way CloudWatch does **and** that assertion is
-inverted.
+with `microvmId: 'vm-1'`) happened to be id-prefixed, so even a prefix-aware stub would have
+matched. A regression test with a realistic name (`2026/08/03[10.0]microvm-…`) therefore only
+bites once the stub filters by prefix the way CloudWatch does **and** that assertion is
+inverted — both of which [ADR-048](DECISIONS.md#adr-048) did: the stub is now a CloudWatch model
+that honours the prefix, and a test asserts the model itself cannot see an id-prefix scan.
 
 ![run detail, log pane empty](evidence/m4/07-rundetail-final-completed.png)
 
@@ -436,11 +443,18 @@ path — it does **not** establish strictness under a read fault.
 
 **`task-1785738322-0bb6`.** `logStreamNamePrefix: microvmId` in `src/mgmt/logs.ts:77`/`:118`,
 but the microVM id is a stream-name **suffix**. Evidence and fix sketch in step 7 and on the
-card. **Live on `main`** — zero diff since `63069ff`. This is the only *product defect* found,
-and the only blocker that is a defect at all — but it is **not** the only thing standing between
-this walkthrough and a marked 🎯. Landing it clears the criterion's *"reads its logs"* clause;
-the *"installs the App"* clause still needs the interactive GitHub half of steps 1–2 walked by
-a human. Both are preconditions for marking.
+card. It was **live on `main`** at this walkthrough — zero diff between `63069ff` and the
+2026-08-03 tip `d3dd0de`. This was the only *product defect* found, and the only blocker that
+was a defect at all — but it was **not** the only thing standing between this walkthrough and a
+marked 🎯: clearing the criterion's *"reads its logs"* clause is one precondition, and the
+*"installs the App"* clause still needs the interactive GitHub half of steps 1–2 walked by a
+human.
+
+> **Fixed** ([ADR-048](DECISIONS.md#adr-048)): the stream is resolved to its exact name before
+> it is read, so the line/SHA references above describe the pre-fix code, not current `main`.
+> Everything above is the walkthrough as observed on 2026-08-03 and is left unedited as the
+> evidence for the defect — the pane still needs re-walking against a deployed console before
+> the 🎯's *"reads its logs"* clause is observed rather than inferred.
 
 ### Non-defects encountered (recorded so the next walkthrough doesn't re-litigate them)
 
@@ -479,10 +493,11 @@ npm run backfill:installs -- --table lca-dev --apply
 #    #/ and run detail. Dispatch also works on that branch:
 gh workflow run m4-verify-docker.yml --repo <owner>/lca-m3-verify --ref m4-verify-01
 
-# 5. the log-pane defect, without a browser
+# 5. the log-pane defect as it stood on 2026-08-03, without a browser (pre-ADR-048; the API
+#    now resolves the exact stream name instead of prefix-matching the id)
 MV=<microvmId from the run row>
 aws logs filter-log-events --log-group-name /aws/lambda/microvms/runs/lca-dev \
-  --log-stream-name-prefix "$MV"                                  # 0 events  <- what the API does
+  --log-stream-name-prefix "$MV"                                  # 0 events  <- what the API did
 aws logs describe-log-streams --log-group-name /aws/lambda/microvms/runs/lca-dev \
   --order-by LastEventTime --descending --max-items 3              # find the real stream name
 aws logs filter-log-events --log-group-name /aws/lambda/microvms/runs/lca-dev \

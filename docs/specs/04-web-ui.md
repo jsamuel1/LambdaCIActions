@@ -180,8 +180,19 @@ Responses are JSON; log endpoints paginate via CloudWatch tokens (no log bodies 
 CloudWatch stops issuing `nextToken` once a filter is caught up, so the log endpoint also
 accepts `since=<epoch-ms>` — the client's tail watermark (newest event it holds, +1 ms).
 `nextToken` wins when both are sent; a resumed tail that returns nothing is *caught up*, not
-`pending`. `pending: true` means the run has no `microvmId`, the log group does not exist, or
-a cold first page found no stream (confirmed with one `DescribeLogStreams`).
+`pending`. `pending: true` means there is nothing to read: the run has no `microvmId`, the log
+group does not exist, or the microVM has no log stream yet.
+
+The run's stream is **resolved to its exact name** before it is read (ADR-048). One per-env
+group holds one stream per microVM, named `<YYYY/MM/DD>[<imageVersion>]<microvmId>` — the id
+is a **suffix**, so `logStreamNamePrefix: microvmId` matches nothing. The reader scans
+`DescribeLogStreams` bounded by the run's date (and the next day, for a launch across midnight
+UTC), then falls back to a recency-ordered scan whenever those date scans could not rule the
+stream out — no usable date, a scan the call budget truncated, or a date prefix that listed no
+streams at all — and reads with `logStreamNames: [exactName]`. The resolved name is cached per
+Lambda container (misses too, for 5 s, so polling a booting VM does not re-scan the group) and
+returned as `logStream`, which the pane shows so an operator can open the same stream in the
+CloudWatch console.
 
 Run-list pagination uses an opaque cursor (base64url of the DynamoDB `LastEvaluatedKey`);
 the unfiltered multi-status view returns `nextCursor: null` — narrow by repo or status to
@@ -347,12 +358,14 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 ## Live run updates
 
 - Runner bootstrap emits lifecycle heartbeats → `Run` rows update ([02](02-microvm-runners.md)).
-- v1 is **polling** (ADR-026): 3 s on Run detail, 5 s on Dashboard/Runs, **paused while the
-  tab is hidden**. No WebSocket/SSE — Phase 3.
+- v1 is **polling** (ADR-026): 3 s on the Run detail row, 4 s on its log tail, 5 s on
+  Dashboard/Runs, **paused while the tab is hidden**. No WebSocket/SSE — Phase 3.
 - Log viewer tails the per-env run log group (`/aws/lambda/microvms/runs/lca-<env>`,
-  ADR-016) filtered to the run's `microvmId` (ADR-019), following CloudWatch's `nextToken`
-  while one is issued and its own `since` watermark afterwards (see the API notes above —
-  re-sending a spent token would replay the same page forever).
+  ADR-016). The run's `microvmId` (ADR-019) is a stream-name **suffix**, so the stream is
+  resolved to its exact name and read with `logStreamNames` — never matched by prefix
+  (ADR-048) — following CloudWatch's `nextToken` while one is issued and its own `since`
+  watermark afterwards (see the API notes above — re-sending a spent token would replay the
+  same page forever).
 
 ## Tech choices
 

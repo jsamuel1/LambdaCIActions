@@ -7,8 +7,8 @@ const TERMINAL = new Set(['completed', 'failed', 'timed_out']);
 
 /**
  * Run detail — state timeline, microVM identity, cost estimate, and the CloudWatch log
- * viewer. The run row polls every 3 s while non-terminal; logs tail by following
- * CloudWatch's `nextToken` (no log bodies in DynamoDB — spec 04).
+ * viewer. The run row polls every 3 s while non-terminal; the log tail polls every 4 s,
+ * following CloudWatch's `nextToken` (no log bodies in DynamoDB — spec 04).
  */
 export function RunDetail({
   repoId,
@@ -27,6 +27,15 @@ export function RunDetail({
   const [caughtUp, setCaughtUp] = useState(false);
   /** The newest poll's `pending` flag — the API's "no stream yet" signal. */
   const [pendingFlag, setPendingFlag] = useState(true);
+  /**
+   * The resolved CloudWatch stream name (ADR-048).
+   *
+   * Tracked per POLL, not derived from `pages`: `pages` only holds pages that carried
+   * events, so deriving it from them would hide the name in exactly the case it is for — an
+   * empty pane, where it is the difference between "resolved, nothing written" and
+   * "resolution failed". Sticky once set: a later caught-up page reports the same stream.
+   */
+  const [logStream, setLogStream] = useState<string | null>(null);
   const tokenRef = useRef<string | undefined>(undefined);
   /** Newest event timestamp already rendered — the tail watermark when tokens run out. */
   const sinceRef = useRef<number | undefined>(undefined);
@@ -46,6 +55,7 @@ export function RunDetail({
     setPages([]);
     setCaughtUp(false);
     setPendingFlag(true);
+    setLogStream(null);
     setTailing(true);
     tokenRef.current = undefined;
     sinceRef.current = undefined;
@@ -65,6 +75,7 @@ export function RunDetail({
         setLogErr(undefined);
         setCaughtUp(page.events.length === 0);
         setPendingFlag(page.pending);
+        if (page.logStream) setLogStream(page.logStream);
         if (page.events.length) {
           setPages((prev) => [...prev, page]);
           const newest = page.events.reduce((max, e) => (e.timestamp > max ? e.timestamp : max), 0);
@@ -159,6 +170,11 @@ export function RunDetail({
         <div className="row">
           <h3 className="tight">Logs</h3>
           <span className="muted">{events.length} events</span>
+          {logStream && (
+            <span className="muted" title={`CloudWatch log stream: ${logStream}`}>
+              {logStream}
+            </span>
+          )}
           <button onClick={() => setTailing((t) => !t)}>{tailing ? 'Pause tail' : 'Resume tail'}</button>
         </div>
         {logErr && <p className="error">{logErr}</p>}

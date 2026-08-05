@@ -740,6 +740,11 @@ the first implementation did, replays the same page indefinitely; `test/mgmt-log
 pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
 WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
 
+**Fixed by [ADR-048](#adr-048)**: the tail was correct about *paging* and wrong about *which
+stream* — it located the run's stream with `logStreamNamePrefix: microvmId`, but the id is a
+stream-name suffix, so the pane read nothing for any run. The stream is now resolved to its
+exact name before it is read.
+
 ## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
 **Status**: Accepted (v1) · follows [ADR-023](#adr-023)
 **Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
@@ -2175,3 +2180,125 @@ non-CD path has to stay first-class and correct for exactly the case where the p
   and the role ARN is hardcoded in the workflow (derived from `envName`, so prod needs its own
   line or a repo variable).
 - The `cfn-exec-role` admin ceiling is accepted and recorded, not fixed.
+
+> **ADR numbering note.** This block takes **048**: 042..047 are already on `main` (the
+> highest landed number is 047), and the only outstanding gap, 034/035, is claimed by the
+> unmerged `kermes/task-nervous-mountain`. ADR numbers are a shared mutable namespace across
+> branches, so a gap is cheaper than a duplicate — do not backfill 034/035 here.
+
+## ADR-048 — A run's log stream is resolved by name, not matched by prefix (M4 fix)
+**Status**: Accepted (v1) · amends [ADR-016](#adr-016) (log destination) · fixes the log half
+of [ADR-026](#adr-026)
+
+**Context**: Every microVM's runner + run-hook output lands in one per-env log group
+(`/aws/lambda/microvms/runs/lca-<env>`, ADR-016) with one stream per VM, and the run row
+carries the `microvmId` (ADR-019). The first log reader therefore located a run's stream with
+`logStreamNamePrefix: microvmId` on both `FilterLogEvents` and `DescribeLogStreams`.
+
+That locator is **backwards**. The service names the stream
+`<YYYY/MM/DD>[<imageVersion>]<microvmId>` — for example
+`2026/08/03[10.0]microvm-98c2f28c-2463-3526-a201-ef44bd494d15` — so the microVM id is a
+**suffix**. A prefix filter never matched: the pane rendered `Logs / 0 events` for the whole
+life of every run, and because the `pending` probe used the same bad prefix it first claimed
+"No log stream yet — the microVM has not started writing" for a VM that had already written.
+Verified in dev on run `30789972919`: prefix-filtering the id returned 0 events and 0 streams,
+while `--log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'` returned the job's output.
+This blocked the M4 exit criterion — an operator must be able to read a run's logs **from the
+UI** — with the AWS console as the only workaround.
+
+**Decision**: **resolve the exact stream name first, then read that stream by name.**
+`DescribeLogStreams` cannot suffix-match, so the prefix argument is the wrong instrument for
+the id and the right one for the *date*:
+
+1. Scan `DescribeLogStreams` with `logStreamNamePrefix` = the run's `createdAt` date
+   (`YYYY/MM/DD`) and the day after it — a VM queued near midnight UTC launches on the next
+   date — and take the stream whose name **contains** the `microvmId`.
+2. If that finds nothing, fall back to one `orderBy: LastEventTime, descending` scan of the
+   group: a live run's stream is the most recently written. CloudWatch forbids combining that
+   ordering with a name prefix, which is why it is the fallback and not the primary. It runs
+   whenever the date tiers could not *rule the stream out* — no usable date, a scan the budget
+   truncated, or a date prefix that listed **no streams at all**, which is what a changed name
+   format looks like from here. Only an exhausted scan over a populated date namespace is an
+   authoritative miss.
+3. Read with `logStreamNames: [exactName]`; **never** a prefix.
+
+Matching is containment, not `endsWith`: the id is a UUID-shaped token that cannot occur
+inside an unrelated stream's name, so containment is equally exact and does not break if the
+service moves the date/version decoration.
+
+Resolved names are cached per Lambda container (`microvmId` → stream name, FIFO-bounded), so
+the pane's log poll costs one `FilterLogEvents` in steady state, not a rescan. Misses are
+cached too, but only for **5 s**: "no stream yet" becomes "stream" seconds later while the VM
+boots, so a miss has to stay retryable — while an *uncached* miss meant every poll of a queued
+run re-scanned the group. Measured on the miss path: an attempt costs 2 `DescribeLogStreams` on
+a 50-stream day and 7 on a 300-stream day. The log pane polls every **4 s** (the run row
+itself polls every 3 s — ADR-026), so uncached that is 0.5–1.8 TPS from a **single** viewer
+against an account-wide 5 TPS quota; with the TTL a miss is re-derived every second poll, i.e.
+0.25–0.9 TPS. A `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
+
+The two tiers share **one** describe budget (12 calls × 50 streams), rather than each getting
+its own page cap that multiplies across them. Two of those calls are *reserved* for the
+fallback: without a reserve a busy queue date can spend the whole budget and the fallback is
+then skipped for want of calls, in precisely the case it exists for. A date prefix listed to
+its end **and** holding real streams is proof the stream is not there, so the ordinary "VM has
+not written yet" poll costs two describes and never re-scans the whole group.
+
+**Residual limit**: the date tier reaches ~450 streams under the run's own date, and the
+fallback the 100 most recently written streams in the group. Beyond both, a **finished** run
+is unresolvable — an old stream is by definition not among the most recently written. A live
+run is unaffected, because its stream *is* the most recent; that is what the reserved fallback
+pages buy. Dev is orders of magnitude below the horizon, but this is the limit that makes the
+row stamp below the real scaling answer rather than just a cheaper one.
+
+Second residual, from the authoritative-miss rule itself: a stream stamped with a date
+**outside** `[D, D+1]` — a clock-skewed VM, or one launched more than a day after it was
+queued — is unresolvable whenever the queue date is a *populated* namespace, because those
+prefixes then list themselves out over real streams and rule the stream out before the
+fallback can run. This is the deliberate price of keeping the ordinary "VM has not written
+yet" poll at two describes: the alternative is a whole-group recency scan on every poll of
+every queued run. It is not the same case as a changed name *format*, which empties the date
+namespace for every stream at once and therefore does reach the fallback. Pinned by
+`test/mgmt-logs.test.mjs` so it stays a known cost rather than a surprise.
+
+**Why not stamp the stream name on the run row at launch?** Cheaper (zero describes), but it
+needs a Provision-side write plus a resolver fallback for every row written before it lands —
+and the resolver is the thing that has to be correct either way. Resolution is self-healing
+for existing runs, and the container cache already removes the per-poll cost. The row stamp
+stays available as a later optimisation.
+
+**Consequences**:
+- `pending` is now exactly "there is no stream to read" — no VM, or no stream yet — rather
+  than "the first page came back empty". A resumed tail that returns nothing is still
+  *caught up*, so the UI cannot flash "no log stream yet" over rendered output.
+- `GET /api/runs/…/logs` returns the resolved `logStream`, and the Run detail log pane shows
+  it, so an operator can jump to the same events in the CloudWatch console and can see at a
+  glance when resolution failed. The pane tracks it **per poll**, not from the pages it
+  rendered: it only buffers pages that carried events, so deriving the name from them would
+  hide it in precisely the empty-pane case it exists to explain.
+- A cold container pays one `DescribeLogStreams` per run before its first read in the common
+  case — the stream is on the first page of the run's own date — and up to the 12-call budget
+  on a busy day, since each tier pages before the next one starts: the measured figures above
+  are 2 on a 50-stream day and 7 on a 300-stream day. Only the FIRST read of a run pays this;
+  the container cache makes every later poll one `FilterLogEvents`. IAM already allowed both
+  calls (ADR-025), so there is no permission change.
+- A stream that appears during a cached miss shows up to 5 s late in the pane. That is under
+  two poll intervals and invisible next to microVM boot time.
+- The stream layout is now a load-bearing assumption in two places (date prefix, id
+  containment). A wholesale **format** change degrades to the recency scan rather than to an
+  empty pane — for live runs, which is when an operator is watching — because it empties the
+  date namespace for every stream at once, and a date prefix that lists nothing is treated as
+  "cannot rule it out" rather than "not there". That is what makes the degradation real rather
+  than aspirational. It does **not** cover a single stream stamped outside `[D, D+1]` on a
+  populated date; see the second residual limit above.
+- **The test stub is part of the fix.** `test/mgmt-logs.test.mjs` previously replied from a
+  scripted response queue that ignored `logStreamNamePrefix` entirely, and its fixture names
+  (`vm-1/x` for `vm-1`) were id-prefixed — so no test in the file could observe a wrong
+  locator direction, which is precisely why this shipped green. The stub is now a small
+  CloudWatch model that honours `logStreamNamePrefix` / `logStreamNames` / `startTime` /
+  `limit` / `nextToken` / `orderBy` (including rejecting the prefix + `LastEventTime`
+  combination the API forbids), with realistic `2026/08/03[10.0]microvm-…` fixtures. A test
+  asserts the model itself cannot see an id-prefix scan, so the guard cannot rot back. The
+  handler's own wiring is pinned separately (`test/mgmt-logs.test.mjs`, source-level): the
+  resolver is only date-bounded because the route passes the run's `createdAt`, and dropping
+  that argument would leave every logs test green while silently degrading resolution to the
+  recency fallback — which cannot find a finished run's stream.
