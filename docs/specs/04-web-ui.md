@@ -19,6 +19,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 - [Screens](#screens)
 - [Management API](#management-api)
 - [Settings](#settings)
+- [Reports](#reports)
 - [Auth](#auth)
 - [Live run updates](#live-run-updates)
 - [Tech choices](#tech-choices)
@@ -45,6 +46,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
 | **Runs** | Filterable, run-primary history | run + folded status, flavor rollup, duration, job count, expandable jobs | `#/runs` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
+| **Reports** | Spend + utilisation + run analytics over a window, and an NL report assistant | spend/billable compute minutes/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
 | **Settings** | GitHub App linkage, runner labels, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
 
@@ -71,7 +73,8 @@ expander. The fold is a pure module (`src/mgmt/run-rollup.ts`, re-exported to th
   which answers "how long did the run take". The **sum of job durations** appears on expand as
   **job time**, not "compute": a job's `durationSeconds` is queue → last transition, so queued
   time is in it and the sum is an upper bound on billed microVM runtime rather than a cost
-  basis (see OQ-5). It exceeds wall clock for parallel matrices, which is its point. On a
+  basis (billable time is `runningAt → last transition` — ADR-042, § Reports). It exceeds wall
+  clock for parallel matrices, which is its point. On a
   partial window a duration renders as `≥ 4m 10s` (`durationLabel`); a run with no elapsed span
   yet keeps the plain em dash, since `≥ —` would read as "at least unknown".
 - **Started** — the earliest job queue time. On a **partial** window it is an *upper* bound and
@@ -166,6 +169,10 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `POST /api/settings/github-app/relink` | Write-only credential intake: verify against GitHub, then store | ✅ |
 | `POST /api/settings/github-app/rollback` | Undo a relink: restore replaced parameter versions and/or `remove` ones it created | ✅ |
 | `POST /api/settings/webhook/test` | Ask GitHub to re-deliver a delivery (real signed round-trip) | ✅ |
+| `GET /api/reports/catalog` | Metric catalog + vocabulary + the operator's reportable repos + assistant availability | ✅ |
+| `GET /api/reports/run` | Execute a report spec from query params | ✅ |
+| `GET /api/reports/export` | CSV/JSON download of the underlying job rows (`format=csv\|json`) | ✅ |
+| `POST /api/reports/ask` | NL question → validated spec (the console then renders it via `/api/reports/run` — ADR-044/045) | ✅ |
 | `GET /api/repos/{repoId}/rewrite-pr` | Auto-rewrite **dry run** — always available, writes nothing | ✅ M5 |
 | `POST /api/repos/{repoId}/rewrite-pr` | Opt-in auto-rewrite PR ([03](03-workflow-ingestion.md)); 409 unless the deployment flag **and** the repo opt-in are both on | ✅ M5 |
 
@@ -178,8 +185,19 @@ Responses are JSON; log endpoints paginate via CloudWatch tokens (no log bodies 
 CloudWatch stops issuing `nextToken` once a filter is caught up, so the log endpoint also
 accepts `since=<epoch-ms>` — the client's tail watermark (newest event it holds, +1 ms).
 `nextToken` wins when both are sent; a resumed tail that returns nothing is *caught up*, not
-`pending`. `pending: true` means the run has no `microvmId`, the log group does not exist, or
-a cold first page found no stream (confirmed with one `DescribeLogStreams`).
+`pending`. `pending: true` means there is nothing to read: the run has no `microvmId`, the log
+group does not exist, or the microVM has no log stream yet.
+
+The run's stream is **resolved to its exact name** before it is read (ADR-048). One per-env
+group holds one stream per microVM, named `<YYYY/MM/DD>[<imageVersion>]<microvmId>` — the id
+is a **suffix**, so `logStreamNamePrefix: microvmId` matches nothing. The reader scans
+`DescribeLogStreams` bounded by the run's date (and the next day, for a launch across midnight
+UTC), then falls back to a recency-ordered scan whenever those date scans could not rule the
+stream out — no usable date, a scan the call budget truncated, or a date prefix that listed no
+streams at all — and reads with `logStreamNames: [exactName]`. The resolved name is cached per
+Lambda container (misses too, for 5 s, so polling a booting VM does not re-scan the group) and
+returned as `logStream`, which the pane shows so an operator can open the same stream in the
+CloudWatch console.
 
 Run-list pagination uses an opaque cursor (base64url of the DynamoDB `LastEvaluatedKey`);
 the unfiltered multi-status view returns `nextCursor: null` — narrow by repo or status to
@@ -458,6 +476,203 @@ the new one: restoring SSM alone would leave GitHub signing with the relinked Ap
 Ingest verifies against the restored one, and every delivery would 401. A rollback whose hook
 re-sync fails reports `hookSynced: false` with a UI warning.
 
+## Reports
+
+The Reports screen owns cost/spend and run analytics. It is the home for the cost estimate
+that the Runs table only summarises.
+
+**Counting unit.** Every stored row is one workflow **job**, not one workflow run — the run
+store is keyed by `(repoId, runId, jobId)` because a job is what occupies a microVM. A
+`workflow_run` with five jobs is five rows, so "job count" is the unit and the UI says *jobs*.
+
+**Report catalog** (the closed vocabulary; `src/mgmt/reports.ts` is the single source, and the
+assistant's prompt is generated from it so the two cannot drift):
+
+| Metric | Unit | Definition |
+|---|---|---|
+| `spend` | USD | Σ per-job billable minutes × flavor rate. **Estimate** — see below. |
+| `billableMinutes` | minutes | Σ per-job billable microVM time — `spend`'s window with the flavor rate taken out, so a job whose flavor has no rate still counts its minutes. **Estimate**; an **absolute** figure, not a share of any ceiling. |
+| `runCount` | jobs | Job rows created in the window, by queued timestamp. |
+| `duration` | seconds | p50 / p90 of queued→last-transition wall clock, **terminal jobs only**, and only where that span is measurable. |
+| `failureRate` | ratio | (failed + timed_out) ÷ terminal jobs. In-flight jobs excluded from **both** sides. |
+| `queueLatency` | seconds | p50 / p90 of queued→`runningAt`, over jobs carrying a **measurable** watermark. |
+
+Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days, else daily),
+`none`. Grouping by `workflow` buckets rows carrying no `workflowName` under
+**“(no workflow name recorded)”** rather than *“(unknown)”*, which reads like a real workflow
+whose name could not be determined and invites an operator to treat a data gap as one workflow's
+activity. The label names the gap and deliberately **not** a cause, because there are two and
+only one is about age: the row predates ingest persisting the field (M5), **or**
+`workflow_job.workflow_name` was absent on the event itself — it is optional and nullable on the
+wire, Ingest's single run-row write coalesces a null to absent, and the run store omits a falsy
+value, so a brand-new row lands in the same bucket. Naming it a pre-M5 row would repeat the
+`runningAt` error corrected above: right number, false explanation for a reachable current row.
+That bucket's group key is namespaced so it cannot collide with a workflow
+literally named the same thing: `workflowName` is copied verbatim off the `workflow_job` webhook,
+so it is tenant-controlled, and merging the two would attribute real activity to the gap
+unfalsifiably from the chart. `flavor` needs no such namespacing — every resolution path gates the
+chosen name through the flavor catalog (`byName`), so a tenant's `runs-on:` label can select a
+flavor but never become one, and its `(not launched)` bucket is not a reachable value.
+Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
+a wish list, so a spec can never resolve to a chart type that silently falls through to a
+different one. Windows: the `24h`/`7d`/`30d`/`90d` presets **that this environment's run
+retention can actually fill**, or an explicit `from`/`to` that is both no wider than that number
+and no older than it. That cap is
+`RUN_RETENTION_DAYS` (ADR-033: dev 30, prod 90), not a fixed 90 — terminal rows age out at
+exactly that TTL, so a wider window reads a partly deleted span and would report itself
+`complete`. A preset beyond retention (a `90d` link shared into a 30-day deployment) is rejected
+with an error naming the presets that are available; the picker still shows the requested value
+labelled `(beyond retention)` so the refusal is legible against the control that caused it, and
+the assistant's prompt lists only servable presets so a fair question is not answered with a
+refusal. An explicit window whose `from` predates the horizon (`now − RUN_RETENTION_DAYS`) is
+rejected the same way even when it is narrow — a pinned report keeps its absolute `from`/`to`, so
+a bookmarked custom window ages out on its own and must refuse rather than answer zero jobs as
+though none had run. The horizon is inclusive, so a window exactly retention-wide resolves at the
+moment it is built; it does not stay resolvable forever, because an absolute `from` necessarily
+crosses a moving horizon — which is the whole point of the age check. A **preset** window is
+immune: it is stored as a preset and recomputed against `now` on every read, so the widest preset
+keeps working indefinitely.
+Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
+p90 invents a value between two real jobs. A row whose span cannot be measured (unparseable or
+inverted timestamps — `createdAt` and `runningAt` are written by different λ invocations) is
+**excluded from the sample and counted as uncovered**, never folded in as a 0-second job, which
+would be indistinguishable from a genuinely instant one and would drag both percentiles down.
+
+**Cost honesty.** `spend` is an estimate and is labelled as one everywhere. The rate comes from
+the flavor's vCPU/GB footprint (OQ-3), and billable time comes from the `runningAt` watermark
+(ADR-042) so queue and provisioning time are not charged. Rows carrying no watermark fall back
+to total wall clock, which **overstates** cost; each export row carries `costBasis`
+(`measured` \| `wallClock`) and every report reports `coverage` — the share of contributing rows
+measured rather than inferred. For `spend` that share is over the **priced** rows only: a job that
+never launched a microVM is priced at 0 and counted in neither side of the ratio, so coverage is
+not dragged down by rows the wall-clock caveat does not describe. A watermark is absent on pre-M5
+rows **and** on a job whose terminal webhook beat the `running` transition (the forward-only guard
+then rejects `running`, so the row never gains one) — both are priced on wall clock, and
+`queueLatency` excludes both, which biases its percentiles slightly high because the excluded jobs
+are the fast ones. Reconciliation against a real
+microVM bill is still outstanding
+(OQ-7): the direction of the error is known and stated, the magnitude is not.
+
+**Utilisation.** `billableMinutes` answers *how much microVM compute did we consume*, and it is
+the same fold as `spend` with the rate divided out — one arm in `computeReport`, sharing ADR-042's
+billable window, so consumption and cost can never be measured over different windows. It
+inherits the estimate caveat for the same reason `spend` has one: a row on a
+`wallClock` basis counts queue and provisioning time as compute and therefore **overstates**
+consumption, and `coverage` is the measured share exactly as it is for spend.
+
+The two metrics deliberately do **not** share an eligibility gate, because they differ by exactly
+the rate: money needs a price list, compute does not. Spend counts a job only if a microVM ran
+*and* its flavor has a rate (`isCostEligible`); minutes count a job if a microVM ran
+(`hasRunMicrovm`), whether or not it can be priced. Gating minutes on the pricing predicate would
+drop real compute out of the total **and** out of its own coverage denominator, so the screen
+would report 100% coverage over a number missing whole rows. That is reachable with no new
+feature: rates resolve against the static `microvm/flavors.json`, so renaming or removing an entry
+orphans every historical run row still inside the retention window that stored the old name, and
+custom flavors (ADR-040/041) would make it routine. A job whose flavor has no rate therefore
+contributes its minutes and is priced at 0.
+
+It is deliberately an **absolute** figure and not a percentage. A utilisation *ratio* needs a
+capacity ceiling as its denominator — the microVM service's concurrency quota (spec 05 § Quotas &
+limits) — which nothing in this system reads yet, and which belongs to the Settings/quotas
+surface. Inventing a denominator would produce a percentage that looks authoritative and is not,
+which is worse than a number the operator has to interpret. Once the quota is readable, a ratio
+can be layered on this metric without changing what it measures.
+
+**One USD renderer.** Money is printed by `formatCost` in `web/src/components.tsx` and nowhere
+else — Run detail, the Dashboard, the flavor rate table and every Reports axis/tooltip/cell go
+through it. Precision is by **magnitude, not by caller**: below \$1 → 4dp, at or above → 2dp. A
+single job's estimate is fractions of a cent, so 2dp there would render most jobs as `$0.00`;
+sub-cent digits on a four-figure aggregate total are noise. Reports previously carried a private
+copy of that rule in `ReportChart.formatValue`, which meant the same job's cost could print with
+different precision on two screens — the same argument ADR-042 makes for one definition of
+billable time applies to one rendering of what it cost.
+
+**Every report reports its own completeness.** `complete: false` means the read budget was spent
+before the window was exhausted, and the UI renders the numbers as a floor with advice to narrow
+the window — it never silently truncates. `coverage` and the metric's `caveat` are shown
+alongside every chart, and `coverageSampleSize` reports that ratio's **denominator** so a vacuous
+one is never dressed up as a good result: a spend report over jobs that never launched, or a
+duration report over jobs still queued, has a 0/0 coverage that would print as *“100%”* — i.e.
+the screen claiming it measured everything about a metric that measured nothing. Where the sample
+is empty the UI says so instead of printing a ratio. The same number separates two states that
+both produce an empty series and must not share one sentence: an empty window (*“No jobs in this
+window”*) and a window whose jobs the chosen metric cannot measure (*“N jobs in this window, but
+none of them can be measured by …”*), the second of which otherwise contradicts the job count
+printed directly above it. The transparency block separates the two repo counts that a partial read
+makes different: `repoCount` is the operator's authorization scope, `repoCountRead` is the repos a
+query was actually issued for. They diverge only when the row budget stopped the fan-out, and the
+UI then reads *“M of N repos read”* rather than implying the numbers cover the whole scope.
+
+**Export.** `GET /api/reports/export` returns the underlying job rows, not the aggregate. CSV
+fields are RFC-4180 quoted **and** formula-defanged: repo/workflow/job names are
+tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Excel/Sheets. An
+export is truncated by the same budget as its report: the JSON form carries `complete`, and the
+CSV form — which has nowhere in the body to put it — carries `X-Report-Complete`.
+
+An export **reconciles with the report it was downloaded from**, and both reconcile with Run
+detail: summing `billableSeconds` ÷ 60
+yields the `billableMinutes` total, and summing `estimatedCostUsd` yields `spend` — over the rows
+the export actually carries. A file the row/byte cap truncated sums *lower* than the figure beside
+it, which is what `complete: false` and `X-Report-Complete` are for; the reconciliation is a
+statement about the per-row definitions agreeing, not a promise that a capped download totals the
+headline. Both
+per-row columns are gated on the same predicate their aggregate folds over — a job that never
+ran a microVM exports `0` billable seconds, `0` cost and an **empty** `costBasis`, because a
+basis names which clock measured a billable window and such a row has none. Ungated, a
+launch-failure or queued row exported its whole queue-to-finish wall clock as billable while
+contributing 0 on screen, so the column summed higher than the figure it drills into — and in a
+seconds column there is no currency symbol to make the magnitude look wrong. The row's real span
+is still exported under `wallClockSeconds`/`createdAt`/`updatedAt`, and `status` says why it has
+no compute.
+
+The **run view** is gated identically, and it was the last surface that was not: it reported that
+same row's whole span as `billableSeconds` on a `wallClock` basis while the aggregate and the
+export both said 0, and Run detail's prose reads `costBasis` to explain the estimate — so it told
+the operator the job was “priced on total wall clock, an overstatement” about a job that was not
+priced at all. `costBasis` is therefore **absent**, not `wallClock`, when no microVM ran, and the
+page has a third sentence for that case. Right number, false explanation is the same defect class
+as the `runningAt` cost basis this section corrects above.
+
+An export is **additionally** capped independently of the read budget, because it is one
+synchronous Lambda response and those are limited to **6 MB**. The read budget allows 20 000 job
+rows, which measures 3.8 MiB of CSV with short tenant names, 6.5 MiB with realistic long
+repo/workflow/job names, and 7.2–9.8 MiB as JSON — so the unbounded form fails the platform limit
+before it fails the row budget, and over the limit is not a short file but an invocation error the
+operator sees as a 502. So `MAX_EXPORT_ROWS` (10 000) caps the row count and `MAX_EXPORT_BYTES`
+(4.5 MB) is a byte backstop for the case the row cap cannot cover — names are unbounded, so a row
+has no fixed width. When the backstop binds, the bound **bisects** for the largest prefix that
+fits rather than halving: halving never comes back up, so a body 8% over the backstop shipped
+half the rows it could have (measured: 5 000 JSON rows where 8 460 fit). Both cost O(log n)
+measurements. Both truncation sources are folded into the SAME `complete` /
+`X-Report-Complete` channel, and the row limit is published in the report result
+(`exportRowLimit`) so the console warns that a download will be capped *before* the operator
+clicks, rather than handing back a file quietly shorter than the row count beside it. That limit
+is stated as a **ceiling**, not a promise — with long tenant names the byte backstop binds first
+and the file is shorter still, which is why the download carries the completeness verdict too.
+
+**Tenant isolation (ADR-043).** Unlike run lists, reporting does **not** post-filter. It resolves
+the operator's visible repos first and queries only those GSI2 partitions, so a foreign row is
+never fetched. `filters.repoIds` can only narrow that set. A zero-grant session gets 403, as on
+`/api/health`. `test/report-isolation.test.mjs` asserts the platform-wide total is strictly
+larger than the tenant total, so the test is provably isolating something.
+
+**Assistant (ADR-044 / ADR-045).** `POST /api/reports/ask` sends the operator's question to
+Bedrock, which replies with a JSON spec — never code, never a query, never markup. The spec goes
+through the *same* validator as the picker's query params; anything outside the vocabulary is
+rejected, not repaired, and an ill-typed field (an explicit `dimension: null`, say) is an error
+rather than a silent default. The route returns **the spec, not a result**: the console adopts it
+as picker state and renders through `GET /api/reports/run`, so there is exactly one executor and
+one fan-out per question — executing in both places doubled the DynamoDB read cost and threw the
+first result away. The resolved spec is written into the URL, so a generated report is a
+plain shareable link that re-runs deterministically without the model. The assistant's
+*“resolved to …”* provenance line is dropped as soon as a picker change moves the screen off that
+spec, so it can never describe a report that is no longer rendered. Refusals (disabled,
+unsupported, invalid spec, unavailable, rate-limited) leave the manual picker fully usable and
+show why. No tenant data enters the prompt; authorization is never a spec field. Limits: 400-char
+question, 10 invocations/minute per actor, 500 per container. The assistant is an EnvConfig knob
+(ADR-033): `-c reportsNl=false` disables it and drops the Bedrock grant from the template,
+`-c reportsModel=…` moves both the λ env and the IAM grant to another model.
+
 ## Auth
 
 GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
@@ -493,12 +708,14 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 ## Live run updates
 
 - Runner bootstrap emits lifecycle heartbeats → `Run` rows update ([02](02-microvm-runners.md)).
-- v1 is **polling** (ADR-026): 3 s on Run detail, 5 s on Dashboard/Runs, **paused while the
-  tab is hidden**. No WebSocket/SSE — Phase 3.
+- v1 is **polling** (ADR-026): 3 s on the Run detail row, 4 s on its log tail, 5 s on
+  Dashboard/Runs, **paused while the tab is hidden**. No WebSocket/SSE — Phase 3.
 - Log viewer tails the per-env run log group (`/aws/lambda/microvms/runs/lca-<env>`,
-  ADR-016) filtered to the run's `microvmId` (ADR-019), following CloudWatch's `nextToken`
-  while one is issued and its own `since` watermark afterwards (see the API notes above —
-  re-sending a spent token would replay the same page forever).
+  ADR-016). The run's `microvmId` (ADR-019) is a stream-name **suffix**, so the stream is
+  resolved to its exact name and read with `logStreamNames` — never matched by prefix
+  (ADR-048) — following CloudWatch's `nextToken` while one is issued and its own `since`
+  watermark afterwards (see the API notes above — re-sending a spent token would replay the
+  same page forever).
 
 ## Tech choices
 
@@ -564,13 +781,32 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
 - **OQ-3** (cost rate card) → derived from the **flavor catalog footprint**
   (`vcpu × $/vCPU-min + GB × $/GB-min`, calibrated to the README's 2 vCPU/4 GB ≈
   $0.0044/min reference) rather than a hand-maintained rate table, so a new flavor cannot
-  ship without a price. Surfaced as an explicit *estimate*: it uses wall-clock duration,
-  which is an upper bound on billed microVM runtime (v1 stores no per-phase timestamps).
+  ship without a price. Surfaced as an explicit *estimate*.
   **Amended by ADR-038**: the catalog's `vcpu` is *descriptive* — the microVM API accepts a
   memory request (`--resources minimumMemoryInMiB`) and exposes no vCPU knob — so the vCPU
   term is a proxy for the shape a flavor is intended for, not for provisioned capacity. The
   two-term formula stays (memory is real and drives quota), but every surface must label the
   figure an estimate; the Flavors screen footnotes the `vcpu` column for this reason.
+  **Amended by ADR-042**: the *duration* term is no longer wall clock. v1 had no per-phase
+  timestamps, so it billed queue + provisioning time too; the watermarks below narrow it to
+  `runningAt → updatedAt`. The figure stays an estimate — the rate is still derived, not billed.
+- **OQ-5** (per-phase run timestamps) → **added**, ADR-042. `provisioningAt` + `runningAt` are
+  stamped write-once inside the guarded status transition, which makes billable time
+  `runningAt → updatedAt` instead of total wall clock and makes queue-to-start latency a real
+  metric. Pre-M5 rows have no watermark and are reported as coverage, never as zero.
+- **OQ-6** (**Reports screen**: windowed cost/utilisation grouped by repo, flavor or workflow)
+  → **shipped**, see § Reports. The open part was how to aggregate without a scan; the answer is
+  authorization-first repo fan-out over GSI2 with a read budget (ADR-043), not a new index or an
+  aggregation job. The Dashboard's rolling total stays what it was — a fixed bounded sample of
+  recent terminal **job** rows with no window and no grouping (ADR-032) — and is deliberately
+  *not* this report; the two now share one billable-time definition so they cannot disagree.
+- **Chart library** → **ECharts (Apache-2.0), pinned exact**, ADR-046. Highcharts was requested
+  but is commercially licensed; the project owner declined to license it, so it is rejected
+  outright rather than pending a check. Future charting extends the ECharts wrapper.
+- **Generative UI shape** → **constrained spec emission**, ADR-045. The model selects from a
+  closed catalog; no model-authored JS/JSX/HTML/query is ever evaluated or rendered.
+- **Report model** → **Claude 3.5 Sonnet on Bedrock**, from the existing Mgmt λ, with
+  `bedrock:InvokeModel` scoped to that one model id, ADR-044.
 
   The Dashboard's rolling total (M5) folds the same per-run estimate over a bounded sample of
   recent terminal runs, and counts **only runs that actually launched a microVM** (`microvmId`
@@ -596,21 +832,18 @@ GitHub-OAuth-only with a stateless signed session — **ADR-022**. Summary:
     understating active spend. A non-terminal row is now measured `createdAt → now` (terminal
     rows stay pinned to `updatedAt`, since their billing window is closed), with `now` injected
     so it is deterministic in tests and one instant per API response. It remains an upper bound
-    — OQ-5 is what would make it exact.
+    — the ADR-042 watermarks narrow it (`runningAt → now` once the job is running), but a live
+    row is still measured to the current instant rather than to a closed billing window.
 
 ## Open questions
 
 - **OQ-4**: ~~custom domain + ACM cert for the console~~ — **resolved** by
   [ADR-036](../DECISIONS.md#adr-036) (M5): config-derived vanity origin + a us-east-1 cert
   stack, with the raw-CloudFront path kept for accounts owning no domain.
-- **OQ-5**: per-phase run timestamps (`provisioningAt`/`runningAt`) would make the cost
-  estimate exact and enable boot-latency charts. Worth a run-row schema addition in M5?
-- **OQ-6**: **Reports screen** — cost/utilisation over a time window, grouped by repo, flavor
-  or workflow, using `formatCost` / `flavorRatePerMinute` (removed from Runs per ADR-029).
-  Whether that needs a run-keyed index or an aggregation job is the open part — a per-run cost
-  total over an arbitrary window cannot be served by the current per-job indexes without a
-  scan. Tracked as its own M5 card, not part of the Runs work. **Still open after M5's
-  observability slice**: the Dashboard's rolling total is a fixed bounded sample of recent
-  terminal **job** rows (no window, no grouping, and a per-job denominator — see ADR-032),
-  which is what a health screen can serve from the existing per-status indexes — it is not the
-  windowed report this OQ asks for.
+- **OQ-7**: reconcile the `spend` estimate against a real microVM bill for one month so the
+  error bar is a measured number rather than a stated direction. The estimate is deliberately
+  labelled and its bias (overstates, for rows without a `runningAt` watermark) is known;
+  the magnitude is not.
+- **OQ-8**: a durable, cross-container spend budget for the Reports assistant. The current cap
+  is per-λ-container (ADR-044) — adequate for a single-λ console, wrong the moment reporting
+  moves to its own function or the console scales out.

@@ -58,6 +58,30 @@ import {
 import { planPreviewFromAnalyses } from './rewrite.js';
 import { collectVisible } from './paging.js';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
+import {
+  METRIC_CATALOG,
+  CHART_TYPES,
+  DIMENSIONS,
+  MAX_EXPORT_ROWS,
+  applyFilters,
+  availablePresets,
+  boundExportRows,
+  computeReport,
+  maxRangeDays,
+  specFromQuery,
+  specToQuery,
+  toCsv,
+  toExportRows,
+  type ReportSpec,
+} from './reports.js';
+import { fetchReportRuns, resolveVisibleRepos } from './report-store.js';
+import {
+  checkQuestion,
+  modelId,
+  nlEnabled,
+  proposeSpec,
+  rateLimit,
+} from './nl-report.js';
 import { fetchRunLogs } from './logs.js';
 import {
   countRunsByStatus,
@@ -563,6 +587,8 @@ async function route_(
       const page = await fetchRunLogs({
         logGroupName: RUN_LOG_GROUP,
         microvmId: run.record.microvmId,
+        // Bounds the stream-name resolution scan to the run's own date (src/mgmt/logs.ts).
+        runCreatedAt: run.record.createdAt,
         limit: parseLimit(q.limit, 200, 1000),
         nextToken: q.nextToken,
         // `since` is the client's tail watermark: the newest event timestamp it already
@@ -573,6 +599,9 @@ async function route_(
       return json(200, {
         logGroup: RUN_LOG_GROUP,
         microvmId: run.record.microvmId ?? null,
+        // The resolved stream name: what an operator needs to go read the same events in the
+        // CloudWatch console / CLI, and the fastest way to see a resolution has failed.
+        logStream: page.logStream ?? null,
         pending: page.pending,
         events: page.events,
         nextToken: page.nextToken ?? null,
@@ -599,6 +628,36 @@ async function route_(
 
     case 'testWebhook':
       return testWebhookRoute(session, event);
+
+    case 'reportCatalog':
+      return json(200, {
+        metrics: METRIC_CATALOG,
+        dimensions: DIMENSIONS,
+        charts: CHART_TYPES,
+        // Only the presets this environment's run retention can actually fill. Offering `90d`
+        // where terminal rows age out at 30 days hands the operator a window the store cannot
+        // serve, and the report would read a partly aged-out span while reporting itself
+        // complete (ADR-043).
+        presets: availablePresets(),
+        maxRangeDays: maxRangeDays(),
+        // The UI needs the operator's repo list to offer a repo filter; it is the SAME
+        // authorization-resolved set the executor reads from, so the picker cannot offer a
+        // repo the report would refuse.
+        repos: (await resolveReportRepos(session)).map((r) => ({
+          repoId: r.repoId,
+          repoFullName: r.repoFullName,
+        })),
+        nl: { enabled: nlEnabled(), modelId: nlEnabled() ? modelId() : null },
+      });
+
+    case 'runReport':
+      return runReportRoute(session, q);
+
+    case 'exportReport':
+      return exportReportRoute(session, q);
+
+    case 'askReport':
+      return askReportRoute(session, event);
 
     default:
       return problem(404, 'not found');
@@ -784,6 +843,193 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
     .flatMap((p) => p.runs)
     .filter((r) => canAdminInstallation(session, r.installationId));
   return json(200, { ...buildHealth(counts, active, new Date(), costRuns), countsExact: exact });
+}
+
+// ---- reports (spec 04 § Reports) -------------------------------------------
+
+/**
+ * Repos this session may report on. Delegates to the report store so the catalog route and
+ * the executor cannot disagree about the authorization scope.
+ */
+async function resolveReportRepos(
+  session: SessionPayload,
+): Promise<{ repoId: number; repoFullName: string }[]> {
+  return resolveVisibleRepos(session);
+}
+
+/**
+ * Resolve a spec from query params and execute it.
+ *
+ * A ZERO-grant session is refused outright: it administers nothing, so every aggregate it
+ * could ask for is either empty or (if a filter were ever forgotten) platform-wide. Same
+ * reasoning as `/api/health`.
+ */
+async function runReportRoute(
+  session: SessionPayload,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  if (session.installations.length === 0) return problem(403, 'no installations');
+  const parsed = specFromQuery(q);
+  if (!parsed.ok) return problem(400, 'invalid report spec', parsed.errors);
+  return json(200, await executeReport(session, parsed.value));
+}
+
+/**
+ * Execute a validated spec. The ONLY place a report is computed — the manual picker, a
+ * shared URL and the model-proposed path all land here, so the authorization scope and the
+ * completeness reporting are identical for all three.
+ */
+async function executeReport(
+  session: SessionPayload,
+  spec: ReportSpec,
+): Promise<Record<string, unknown>> {
+  const fetched = await fetchReportRuns(session, spec);
+  const rows = applyFilters(fetched.runs, spec);
+  const result = computeReport(rows, spec, { complete: fetched.complete });
+  return {
+    ...result,
+    // Transparency block (ADR-045): what was actually resolved and read, so a generated view
+    // can show its provenance and be pinned as a plain URL without re-invoking the model.
+    resolved: {
+      query: specToQuery(spec),
+      /** Repos in the operator's authorization scope for this spec. */
+      repoCount: fetched.repoIds.length,
+      /**
+       * Repos actually queried. Lower than `repoCount` only when the row budget cut the
+       * fan-out short, which is also when `complete` is false. Reported separately because
+       * presenting the scope as the read set overstates what the numbers cover.
+       */
+      repoCountRead: fetched.repoIdsRead.length,
+      /** Restates that scope came from the session, never from the request or a model. */
+      scope: 'operator installations',
+    },
+  };
+}
+
+/** CSV/JSON export of the underlying job rows for a spec (not the aggregate). */
+async function exportReportRoute(
+  session: SessionPayload,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  if (session.installations.length === 0) return problem(403, 'no installations');
+  const parsed = specFromQuery(q);
+  if (!parsed.ok) return problem(400, 'invalid report spec', parsed.errors);
+  const spec = parsed.value;
+  const fetched = await fetchReportRuns(session, spec);
+  // One instant for the whole response, so an in-flight row's billable window is consistent
+  // across every exported row and with the filename stamp.
+  const now = new Date();
+  const all = toExportRows(applyFilters(fetched.runs, spec), now);
+  const stamp = now.toISOString().slice(0, 10);
+  const filename = `lca-${spec.metric}-${stamp}`;
+  if ((q.format ?? 'csv') === 'json') {
+    // Bounded before serialization: the fan-out budget allows 20 000 rows, which is 7-10 MiB of
+    // JSON and therefore OVER Lambda's 6 MB synchronous response cap. Exceeding it is not a
+    // short file, it is an invocation error the operator sees as a 502.
+    const bounded = boundExportRows(all, (rows) => Buffer.byteLength(JSON.stringify(rows)));
+    return json(
+      200,
+      // `complete` is the conjunction: the read may have been truncated by the fan-out budget,
+      // the response by the export cap, and either one means these rows are not the whole story.
+      { rows: bounded.rows, complete: fetched.complete && bounded.complete, rowLimit: MAX_EXPORT_ROWS },
+      { headers: { 'Content-Disposition': `attachment; filename="${filename}.json"` } },
+    );
+  }
+  const bounded = boundExportRows(all, (rows) => Buffer.byteLength(toCsv(rows)));
+  return {
+    statusCode: 200,
+    raw: toCsv(bounded.rows),
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}.csv"`,
+      // A CSV body has nowhere to put the `complete` flag the JSON export carries, so a
+      // truncated fan-out would hand the operator a silently short file. State it in a header
+      // (and in the UI beside the download link) rather than letting the row count imply a
+      // total it is not. Covers BOTH truncation sources: the read budget and the export cap.
+      'X-Report-Complete': String(fetched.complete && bounded.complete),
+      // Tenant-controlled strings ride in this body; never let a browser sniff it as HTML.
+      'X-Content-Type-Options': 'nosniff',
+    },
+  };
+}
+
+/**
+ * Natural-language report (Part C). The pipeline is deliberately one-directional:
+ *
+ *   operator question → model → JSON spec → validateReportSpec → executeReport
+ *
+ * The model's output is data. It is parsed, validated against the closed catalog, and either
+ * handed back as a spec the SAME deterministic route then executes, or refused. Nothing it
+ * returns is evaluated or rendered, and it cannot influence which repos are read.
+ *
+ * This route deliberately does NOT execute the report. The console adopts the returned spec as
+ * picker state, which makes it fetch `GET /api/reports/run` for that spec — so executing here
+ * too would run the authorization fan-out TWICE per question (up to 2 x MAX_TOTAL_ROWS row
+ * reads) and throw the first result away. `/api/reports/run` stays the single executor, which
+ * also means a shared URL and an assistant answer are byte-identical by construction.
+ */
+async function askReportRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+): Promise<Reply> {
+  if (session.installations.length === 0) return problem(403, 'no installations');
+  if (!nlEnabled()) return problem(503, 'natural-language reports are not enabled');
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const body = (raw ?? {}) as { question?: unknown };
+  const question = checkQuestion(body.question);
+  if (!question.ok) return problem(400, question.message);
+
+  const decision = rateLimit(session.login);
+  if (!decision.allowed) {
+    return json(
+      429,
+      {
+        error:
+          decision.reason === 'container-budget'
+            ? 'report assistant budget exhausted — use the manual report picker'
+            : 'too many report questions — slow down',
+        reason: decision.reason,
+      },
+      decision.retryAfterSeconds
+        ? { headers: { 'Retry-After': String(decision.retryAfterSeconds) } }
+        : {},
+    );
+  }
+
+  const proposal = await proposeSpec(question.question);
+  // Audit every invocation with the actor (ADR-044). The question is operator-authored text,
+  // so only its length is logged — not its content.
+  console.log(
+    JSON.stringify({
+      msg: 'report question',
+      actor: session.login,
+      modelId: modelId(),
+      questionChars: question.question.length,
+      outcome: proposal.ok ? 'spec' : proposal.reason,
+      ...(proposal.ok ? { metric: proposal.spec.metric, dimension: proposal.spec.dimension } : {}),
+    }),
+  );
+  if (!proposal.ok) {
+    // 422, not 500: the request was fine, the assistant could not serve it. The UI shows the
+    // manual picker rather than an error page.
+    return json(proposal.reason === 'unavailable' ? 503 : 422, {
+      error: proposal.message,
+      reason: proposal.reason,
+      ...(proposal.errors ? { details: proposal.errors } : {}),
+      fallback: 'manual',
+    });
+  }
+  // Spec + provenance only. The client renders from the deterministic route.
+  return json(200, {
+    spec: proposal.spec,
+    source: { kind: 'model', modelId: proposal.modelId },
+    resolved: {
+      query: specToQuery(proposal.spec),
+      /** Restates that scope came from the session, never from the request or the model. */
+      scope: 'operator installations',
+    },
+  });
 }
 
 /**

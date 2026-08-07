@@ -1,6 +1,6 @@
 import { api } from '../api.js';
 import { useApi } from '../hooks.js';
-import { ErrorBox, Loading } from '../components.js';
+import { ErrorBox, Loading, formatCost } from '../components.js';
 
 /** Flavors — global catalog + whether an image ARN is published for each (spec 04). */
 export function Flavors(): JSX.Element {
@@ -34,7 +34,7 @@ export function Flavors(): JSX.Element {
                 {f.vcpu} vCPU&dagger; / {Math.round(f.memoryMb / 1024)} GB
               </td>
               <td>{f.capabilities.join(', ') || '—'}</td>
-              <td>~${f.usdPerMinute.toFixed(4)}</td>
+              <td>~{formatCost(f.usdPerMinute)}</td>
               <td>
                 {f.imageAvailable ? (
                   <span className="badge ok">built</span>

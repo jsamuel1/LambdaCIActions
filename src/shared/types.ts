@@ -206,10 +206,36 @@ export interface RunRecord {
    * (AGENTS.md — no secret values in the UI/API).
    */
   hookTokenHash?: string;
+  /**
+   * Workflow display name from the `workflow_job` event (reports group by workflow).
+   *
+   * Absent for two independent reasons, only one of which is about age: the row predates M5
+   * persisting it, **or** the event carried no `workflow_name` — it is optional and nullable on
+   * the wire (see `WorkflowJobEvent` above), Ingest's `putQueuedRun` call coalesces a null to
+   * absent, and `buildQueuedItem` omits a falsy value. That call is the only writer of this
+   * field, so Reports must label the gap, not date it.
+   */
+  workflowName?: string;
+  /** Job display name from the `workflow_job` event. */
+  jobName?: string;
   labels: string[];
   /** Reason string for failed / timed_out. */
   reason?: string;
   createdAt: string; // ISO8601
+  /**
+   * Phase watermarks, stamped once on first entry to each phase (ADR-042 / spec 04 OQ-5).
+   * Write-once (`if_not_exists`) so a duplicate/late webhook can't move them, and ABSENT on
+   * rows created before M5 — every report that consumes them reports coverage rather than
+   * silently treating a missing watermark as zero.
+   *
+   * Also absent on a job whose TERMINAL webhook beat the `running` transition: `provisioning
+   * → completed` is a legal forward move, after which `completed → running` is rejected, so
+   * that row never gains a `runningAt` at all. Such rows are the FAST ones, so consumers must
+   * not describe a missing watermark as merely "old data".
+   */
+  provisioningAt?: string; // ISO8601
+  /** First entry into `running`: the queue-to-start boundary and the billing start. */
+  runningAt?: string; // ISO8601
   updatedAt: string; // ISO8601
   /** Epoch seconds — DynamoDB TTL to age out terminal rows per retention policy. */
   ttl?: number;

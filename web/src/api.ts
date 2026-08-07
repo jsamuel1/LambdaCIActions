@@ -24,14 +24,13 @@ export class ApiError extends Error {
    * `{ applied: false, hookSynced: false, rolledBack, replacedVersions, createdParams }`, and
    * both the only legitimate way forward (the explicit `allowHookDesync` retry) and the rollback
    * handle live in that body. Discarding it at the throw makes those controls unreachable.
+   *
+   * Report refusals use the same channel: they carry a machine-readable `reason` alongside
+   * `error`, and the Reports screen branches on it to decide between "ask differently" and
+   * "the assistant is down" — both of which fall back to the manual picker.
    */
   readonly body?: Record<string, unknown>;
-  constructor(
-    status: number,
-    message: string,
-    details?: unknown,
-    body?: Record<string, unknown>,
-  ) {
+  constructor(status: number, message: string, details?: unknown, body?: Record<string, unknown>) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
@@ -158,6 +157,9 @@ export interface Run {
   updatedAt: string;
   durationSeconds: number;
   costUsd?: number;
+  /** `measured` = priced from the runningAt watermark; `wallClock` = pre-watermark, overstates. */
+  costBasis?: 'measured' | 'wallClock';
+  billableSeconds?: number;
 }
 
 export interface CostSummary {
@@ -440,9 +442,142 @@ export function installationListState(
 export interface LogPage {
   logGroup: string;
   microvmId: string | null;
+  /** Exact CloudWatch stream name once resolved (ADR-048); null before the VM writes. */
+  logStream: string | null;
   pending: boolean;
   events: { timestamp: number; message: string; stream: string }[];
   nextToken: string | null;
+}
+
+// ---- reports (mirror src/mgmt/reports.ts) ----------------------------------
+
+export type ReportMetric =
+  | 'spend'
+  | 'billableMinutes'
+  | 'runCount'
+  | 'duration'
+  | 'failureRate'
+  | 'queueLatency';
+export type ReportDimension = 'repo' | 'flavor' | 'workflow' | 'status' | 'time' | 'none';
+export type ChartType = 'bar' | 'stackedBar' | 'line' | 'table';
+export type RangePreset = '24h' | '7d' | '30d' | '90d';
+
+export interface MetricDoc {
+  metric: ReportMetric;
+  label: string;
+  unit: string;
+  definition: string;
+  estimate: boolean;
+}
+
+export interface ReportCatalog {
+  metrics: MetricDoc[];
+  dimensions: ReportDimension[];
+  charts: ChartType[];
+  presets: RangePreset[];
+  maxRangeDays: number;
+  repos: { repoId: number; repoFullName: string }[];
+  nl: { enabled: boolean; modelId: string | null };
+}
+
+export interface ReportSpec {
+  metric: ReportMetric;
+  dimension: ReportDimension;
+  chart: ChartType;
+  filters: { repoIds?: number[]; flavors?: string[]; statuses?: RunStatus[] };
+  from: string;
+  to: string;
+  preset?: RangePreset;
+}
+
+export interface SeriesPoint {
+  key: string;
+  label: string;
+  value: number;
+  secondary?: number;
+  sampleSize: number;
+}
+
+export interface Report {
+  spec: ReportSpec;
+  metric: MetricDoc;
+  points: SeriesPoint[];
+  total?: number;
+  rowCount: number;
+  /** False when the fan-out spent its page budget — the numbers are a floor. */
+  complete: boolean;
+  coverage: number;
+  /**
+   * Rows in `coverage`'s denominator. Zero means the ratio is vacuous (0/0, reported as 1), so
+   * the UI must not print "100%" — nothing was measured. It also separates "no rows in the
+   * window" from "rows, but none this metric can measure", which look identical in `points`.
+   */
+  coverageSampleSize: number;
+  caveat?: string;
+  /**
+   * Rows an export of this report will carry at most. A CSV/JSON download is one synchronous
+   * Lambda response (6 MB cap), so it is capped independently of the read budget — surfaced so
+   * the UI can say the download will be short BEFORE the operator clicks.
+   */
+  exportRowLimit: number;
+  generatedAt: string;
+  /** What the server actually resolved + read (ADR-045 transparency). */
+  resolved: {
+    query: string;
+    /** Repos in the operator's authorization scope. */
+    repoCount: number;
+    /** Repos actually queried — below `repoCount` only when the read budget cut the fan-out. */
+    repoCountRead: number;
+    scope: string;
+  };
+}
+
+/**
+ * A model-proposed report: the validated spec and its provenance, WITHOUT a result.
+ *
+ * `/api/reports/ask` deliberately does not execute the report. The screen adopts this spec as
+ * picker state, which fetches `/api/reports/run` — so returning a result here too would run the
+ * authorization fan-out twice per question and discard the first one. One executor also means an
+ * assistant answer and a shared URL cannot differ.
+ */
+export interface AskResult {
+  spec: ReportSpec;
+  source: { kind: 'model'; modelId: string };
+  resolved: { query: string; scope: string };
+}
+
+/** A refused NL question — the UI degrades to the manual picker on any of these. */
+export interface AskRefusal {
+  error: string;
+  reason: 'disabled' | 'unsupported' | 'invalid-spec' | 'unavailable' | 'bad-question';
+  details?: unknown;
+}
+
+/** Query-param bag for a report; mirrors `specToQuery` on the server. */
+export interface ReportQuery {
+  metric: ReportMetric;
+  dimension: ReportDimension;
+  chart: ChartType;
+  preset?: RangePreset;
+  from?: string;
+  to?: string;
+  repos?: number[];
+  flavors?: string[];
+  statuses?: RunStatus[];
+}
+
+export function reportQueryString(q: ReportQuery): string {
+  const p = new URLSearchParams();
+  p.set('metric', q.metric);
+  p.set('dimension', q.dimension);
+  p.set('chart', q.chart);
+  if (q.preset) p.set('preset', q.preset);
+  if (q.from) p.set('from', q.from);
+  if (q.to) p.set('to', q.to);
+  if (q.repos?.length) p.set('repos', q.repos.join(','));
+  if (q.flavors?.length) p.set('flavors', q.flavors.join(','));
+  if (q.statuses?.length) p.set('statuses', q.statuses.join(','));
+  return p.toString();
 }
 
 // ---- endpoints -------------------------------------------------------------
@@ -572,5 +707,18 @@ export const api = {
       '/api/settings/webhook/test',
       { method: 'POST', body: JSON.stringify(deliveryId ? { deliveryId } : {}) },
     ),
+  reportCatalog: () => request<ReportCatalog>('/api/reports/catalog'),
+  report: (q: ReportQuery) => request<Report>(`/api/reports/run?${reportQueryString(q)}`),
+  /** Export URL (a plain link, so the browser downloads instead of buffering in JS). */
+  reportExportUrl: (q: ReportQuery, format: 'csv' | 'json' = 'csv') =>
+    `/api/reports/export?${reportQueryString(q)}&format=${format}`,
+  /**
+   * Ask for a report in natural language. Returns the validated SPEC (not a result) — the
+   * caller renders it through `report()`, so the model never becomes a second executor. A
+   * refusal is an `ApiError` whose `body` carries the machine-readable `reason`, so the caller
+   * can fall back to the picker rather than surfacing a stack of validation noise.
+   */
+  askReport: (question: string) =>
+    request<AskResult>('/api/reports/ask', { method: 'POST', body: JSON.stringify({ question }) }),
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 };

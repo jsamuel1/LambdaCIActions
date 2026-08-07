@@ -62,12 +62,37 @@ export interface EnvConfig {
    * and it requires the elevated `contents:write` App permission (AGENTS.md hard rule).
    */
   rewriteEnabled: boolean;
+  /**
+   * Reports natural-language assistant (ADR-044). **ON by default** — unlike
+   * `rewriteEnabled` it writes nothing and cannot touch a customer repo; its cost is one
+   * bounded Bedrock call per operator question, and every failure path degrades to the manual
+   * picker. Switch it off with `-c reportsNl=false` where Bedrock is unavailable in the
+   * deploy region, the account has no model access, or the marginal spend is unwanted: that
+   * also drops `bedrock:InvokeModel` from the template entirely (see MgmtStack).
+   */
+  reportsNlEnabled: boolean;
+  /**
+   * Bedrock model id backing that assistant. Flows to the λ as `REPORTS_MODEL_ID` **and**
+   * into the IAM resource ARN from the same value, so the policy and the runtime cannot
+   * disagree (a drift there is a runtime 403). Override with `-c reportsModel=…`.
+   */
+  reportsModelId: string;
 }
 
 export interface EnvConfigOverrides {
   alarmEmail?: string;
   rewriteEnabled?: boolean;
+  reportsNlEnabled?: boolean;
+  reportsModelId?: string;
 }
+
+/**
+ * Default Reports assistant model (ADR-044). Lives here, with the other per-env knobs, so the
+ * CDK side and `src/mgmt/nl-report.ts` have exactly one place each to state it and
+ * `test/mgmt-stack.test.mjs` can assert they agree — the λ cannot import this module (CDK
+ * types would follow it into the bundle), so the constant is mirrored, not shared.
+ */
+export const DEFAULT_REPORTS_MODEL_ID = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
 
 /**
  * Resolve the config for an environment name. Unknown names (personal sandboxes like
@@ -89,6 +114,8 @@ export function envConfig(name: EnvName, overrides: EnvConfigOverrides = {}): En
         provisionFailureThreshold: 1,
         stuckRunMinutes: 15,
         rewriteEnabled: false,
+        reportsNlEnabled: true,
+        reportsModelId: DEFAULT_REPORTS_MODEL_ID,
       }
     : {
         name,
@@ -103,12 +130,18 @@ export function envConfig(name: EnvName, overrides: EnvConfigOverrides = {}): En
         provisionFailureThreshold: 5,
         stuckRunMinutes: 15,
         rewriteEnabled: false,
+        reportsNlEnabled: true,
+        reportsModelId: DEFAULT_REPORTS_MODEL_ID,
       };
 
   return {
     ...base,
     ...(overrides.alarmEmail ? { alarmEmail: overrides.alarmEmail } : {}),
     ...(overrides.rewriteEnabled !== undefined ? { rewriteEnabled: overrides.rewriteEnabled } : {}),
+    ...(overrides.reportsNlEnabled !== undefined
+      ? { reportsNlEnabled: overrides.reportsNlEnabled }
+      : {}),
+    ...(overrides.reportsModelId ? { reportsModelId: overrides.reportsModelId } : {}),
   };
 }
 

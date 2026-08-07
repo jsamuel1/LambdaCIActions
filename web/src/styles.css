@@ -93,6 +93,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
  */
 .tight { margin: 0; }
 .spacer { flex: 1; }
+.grow { flex: 1; min-width: 220px; }
 .clickable { cursor: pointer; }
 .gap-top { margin-top: 10px; }
 
@@ -158,6 +159,13 @@ td.jobs-head { color: var(--muted); font-size: 11px; text-transform: uppercase; 
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
+
+/*
+ * Chart host (Reports). ECharts measures its container on init, so the height MUST come from
+ * CSS — a React inline style prop is dropped by the console's CSP (style-src 'self') and the
+ * chart would silently render 0px tall in production.
+ */
+.chart { width: 100%; height: 320px; }
 
 pre.logs {
   background: #0b0d12;

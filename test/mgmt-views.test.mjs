@@ -125,10 +125,12 @@ test("a running job's estimate advances with now; terminal rows stay pinned to u
 });
 
 test('run view exposes only run fields (no jit config, no secrets)', () => {
-  const view = toRunView(run({ ttl: 123, someInternal: 'x' }));
+  const view = toRunView(run({ ttl: 123, someInternal: 'x', hookTokenHash: 'a'.repeat(64) }));
   assert.deepEqual(
     Object.keys(view).sort(),
     [
+      'billableSeconds',
+      'costBasis',
       'costUsd',
       'createdAt',
       'durationSeconds',
@@ -145,6 +147,121 @@ test('run view exposes only run fields (no jit config, no secrets)', () => {
       'updatedAt',
     ],
   );
+  // ADR-021: the hook capability token hash is a bearer-secret verifier and must never leave
+  // the control plane, even though it now rides the same row the Reports fan-out reads.
+  assert.ok(!('hookTokenHash' in view));
+});
+
+// ADR-042: Run detail and Reports must never disagree about what one run cost, so both derive
+// from `billableSeconds`. These pin the shared basis and the fallback's direction of error.
+test('cost is priced from the runningAt watermark when the row has one', () => {
+  const view = toRunView(
+    run({
+      createdAt: '2026-07-01T00:00:00.000Z',
+      runningAt: '2026-07-01T00:05:00.000Z',
+      updatedAt: '2026-07-01T00:06:00.000Z',
+    }),
+  );
+  assert.equal(view.costBasis, 'measured');
+  assert.equal(view.billableSeconds, 60, 'queue time was billed');
+  assert.equal(view.durationSeconds, 360, 'duration is still total wall clock');
+});
+
+test('a pre-watermark row falls back to wall clock and is labelled as such', () => {
+  const view = toRunView(
+    run({ createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:06:00.000Z' }),
+  );
+  assert.equal(view.costBasis, 'wallClock');
+  assert.equal(view.billableSeconds, 360);
+});
+
+test('the watermark can only reduce the estimate, never inflate it', () => {
+  const base = { createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:06:00.000Z' };
+  const measured = toRunView(run({ ...base, runningAt: '2026-07-01T00:05:00.000Z' }));
+  const fallback = toRunView(run(base));
+  assert.ok(measured.costUsd < fallback.costUsd);
+});
+
+// The merge of #23 and this branch put TWO independent clocks on the cost window: the
+// watermark decides where it STARTS, terminality decides where it ENDS. Each side tested only
+// its own axis (a terminal row with a watermark; a live row without one), so the combination
+// below — the one a real running job actually hits — was covered by neither.
+test('a LIVE row with a watermark is measured runningAt -> now, and advances', () => {
+  const live = run({
+    status: 'running',
+    microvmId: 'mv-1',
+    createdAt: '2026-07-01T00:00:00.000Z',
+    runningAt: '2026-07-01T00:05:00.000Z',
+    // Written when it reached `running`; measuring to this froze the estimate at 60s.
+    updatedAt: '2026-07-01T00:06:00.000Z',
+  });
+  const view = toRunView(live, new Date('2026-07-01T00:35:00.000Z'));
+  assert.equal(view.costBasis, 'measured', 'a live row still has a real start clock');
+  assert.equal(view.billableSeconds, 1800, 'runningAt -> now, not runningAt -> updatedAt');
+
+  // …and it keeps advancing rather than pinning to the last transition.
+  const later = toRunView(live, new Date('2026-07-01T01:05:00.000Z'));
+  assert.ok(later.billableSeconds > view.billableSeconds);
+  assert.ok(later.costUsd > view.costUsd);
+
+  // Queue time is still excluded: wall clock from createdAt would be 2100s at the same instant.
+  assert.ok(view.billableSeconds < view.durationSeconds + 1800);
+});
+
+test('a window that cannot be measured reports wallClock rather than a false measured basis', () => {
+  // Clock skew: `now` precedes the watermark. Claiming `measured` here would label a fallback
+  // number as tight, which is the one thing `costBasis` exists to prevent.
+  const skewed = toRunView(
+    run({
+      status: 'running',
+      microvmId: 'mv-1',
+      createdAt: '2026-07-01T00:00:00.000Z',
+      runningAt: '2026-07-01T00:05:00.000Z',
+      updatedAt: '2026-07-01T00:06:00.000Z',
+    }),
+    new Date('2026-06-30T00:00:00.000Z'),
+  );
+  assert.equal(skewed.costBasis, 'wallClock');
+  assert.ok(skewed.billableSeconds >= 0, 'never negative spend');
+
+  // An unparseable watermark is not a measurement either.
+  const garbage = toRunView(run({ runningAt: 'not-a-date' }));
+  assert.equal(garbage.costBasis, 'wallClock');
+});
+
+test('a row that never ran a microVM reports no billable window at all', () => {
+  // `costUsd` was gated from the start (`isCostEligible`), but the basis and the seconds beside
+  // it were not: a mint/launch failure carries the intended flavor and no VM, so it reported its
+  // whole queue-to-finish span as `billableSeconds` on a `wallClock` basis while Reports and the
+  // CSV export both reported 0 for the same row. The detail page's prose reads `costBasis` to
+  // explain the estimate, so it told the operator the run was "priced on total wall clock, an
+  // overstatement" — about a run that was not priced at all. A basis names which clock produced
+  // a billable window; a row with no window has no basis to report.
+  for (const status of ['failed', 'timed_out', 'queued', 'provisioning']) {
+    const view = toRunView(
+      run({
+        status,
+        microvmId: undefined,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        updatedAt: '2026-07-01T00:09:00.000Z',
+      }),
+    );
+    assert.equal(view.costUsd, undefined, `${status} without a VM must not be priced`);
+    assert.equal(view.costBasis, undefined, `${status} claimed a billable clock it never started`);
+    assert.equal(view.billableSeconds, 0, `${status} reported compute it never used`);
+    // Nothing is hidden: the row's real elapsed span is still on the view, under the field that
+    // means elapsed time, and `microvmId` is what the page renders as "(not launched)".
+    assert.equal(view.durationSeconds, 540, 'the real span must survive the gate');
+  }
+
+  // Either evidence of a launch restores both figures — the gate must not flatten real compute.
+  // `microvmId` is stamped best-effort (ADR-019), so a post-launch status has to count alone.
+  const stamped = toRunView(run({ status: 'failed', microvmId: 'mv-1' }));
+  assert.equal(stamped.costBasis, 'wallClock', 'a real VM with no watermark still has a basis');
+  assert.ok(stamped.billableSeconds > 0);
+  const byStatus = toRunView(run({ status: 'running', microvmId: undefined }));
+  assert.ok(byStatus.billableSeconds > 0, 'a post-launch status is evidence on its own');
+  assert.ok(byStatus.costBasis);
 });
 
 test('health folds counts, error rate, and stuck runs', () => {

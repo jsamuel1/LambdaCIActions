@@ -56,6 +56,15 @@ export interface MgmtStackProps extends StackProps {
 }
 
 /**
+ * Default Reports assistant model. Re-exported from `env-config` (where it is the default for
+ * the `reportsModelId` knob) so importers of this stack keep a single name for it, and mirrored
+ * by `DEFAULT_MODEL_ID` in src/mgmt/nl-report.ts — the λ cannot import a CDK module, so
+ * `test/mgmt-stack.test.mjs` asserts the two agree instead. A drift is a runtime 403: IAM would
+ * authorize one model while the handler invoked another.
+ */
+export { DEFAULT_REPORTS_MODEL_ID } from './env-config.js';
+
+/**
  * MgmtStack — the management plane (spec 04, M4).
  *
  *   CloudFront → HTTP API (`/api/*`, `/auth/*`) → Mgmt API λ → DynamoDB / CloudWatch Logs
@@ -69,6 +78,8 @@ export interface MgmtStackProps extends StackProps {
  *     is checked for presence via `DescribeParameters` (a metadata action that returns no
  *     values) — so no code path can leak a SecureString (spec 04 hard rule).
  *   - CloudWatch Logs: read-only on the per-env run log group.
+ *   - Bedrock: `InvokeModel` on exactly ONE model id (the Reports assistant, ADR-044) — no
+ *     wildcard, no streaming, no other Bedrock action.
  *   - NO `lambda:RunMicrovm` / `TerminateMicrovm`, NO GitHub App PEM. It cannot launch
  *     compute or mint installation tokens; the only GitHub calls it makes are OAuth
  *     (its own client creds) and `/user/*` with the operator's token.
@@ -119,6 +130,11 @@ export class MgmtStack extends Stack {
         OAUTH_CLIENT_SECRET_PARAM: `${ssmPrefix}/github/client-secret`,
         RUN_LOG_GROUP: runLogGroupName,
         TABLE_NAME: table.tableName,
+        // Terminal-row retention (ADR-033). The control plane's writers already get this to
+        // set the TTL; Reports needs the SAME number to cap a report window, or the console
+        // offers a 90-day report in an environment that ages rows out at 30 and the result
+        // reads a partly aged-out window while reporting itself complete (ADR-043).
+        RUN_RETENTION_DAYS: String(config.runRetentionDays),
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
         REWRITE_QUEUE_URL: props.rewriteQueueUrl ?? '',
         REWRITE_ENABLED: config.rewriteEnabled ? 'true' : 'false',
@@ -127,6 +143,12 @@ export class MgmtStack extends Stack {
         PLATFORM_ADMINS_PARAM: `${ssmPrefix}/config/platform-admins`,
         APPCFG_BROKER_NAME: props.appcfgBrokerName ?? '',
         WEBHOOK_URL: props.webhookUrl ?? '',
+        // Reports assistant (ADR-044). Enabled by default; `-c reportsNl=false` turns the NL
+        // path off (and drops the Bedrock grant below), and the console degrades to the manual
+        // report picker rather than erroring. Both values come from EnvConfig so the knob is
+        // reachable without a code edit — ADR-033's wiring note.
+        REPORTS_NL_ENABLED: String(config.reportsNlEnabled),
+        REPORTS_MODEL_ID: config.reportsModelId,
       },
     });
 
@@ -205,6 +227,26 @@ export class MgmtStack extends Stack {
           sid: 'InvokeAppConfigBroker',
           actions: ['lambda:InvokeFunction'],
           resources: [props.appcfgBrokerArn],
+        }),
+      );
+    }
+
+    // Reports assistant (ADR-044): InvokeModel on EXACTLY the configured model, in this
+    // region only. `InvokeModelWithResponseStream` is deliberately NOT granted — the NL path
+    // wants one small JSON spec, not a stream. Foundation-model ARNs are account-less.
+    // Same `config` value the λ receives as env, so the policy and the runtime cannot disagree.
+    if (config.reportsNlEnabled) {
+      const reportsModel = config.reportsModelId;
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeReportsModel',
+          actions: ['bedrock:InvokeModel'],
+          resources: [
+            `arn:${this.partition}:bedrock:${this.region}::foundation-model/${reportsModel}`,
+            // Cross-region inference profiles resolve to a regional profile ARN in the
+            // caller's account; needed if the model id is switched to an `xx.` profile.
+            `arn:${this.partition}:bedrock:${this.region}:${this.account}:inference-profile/${reportsModel}`,
+          ],
         }),
       );
     }

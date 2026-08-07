@@ -47,10 +47,12 @@ Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md)
   Evidence: [`docs/VERIFY-M4.md`](VERIFY-M4.md) — 6 of 9 walkthrough steps pass as observed
   against the deployed `dev` console (repo enable, routing preview, live `provisioning →
   running → completed` with no reload, presence-only Settings, ADR-027 opt-out
-  gate). **Blocked on "and reads its logs"**: the run-detail log pane renders `0 events` for
-  every run — `src/mgmt/logs.ts` passes the microVM id as `logStreamNamePrefix` while it is a
-  stream-name *suffix*. Live on `main`; filed as `task-1785738322-0bb6`. Marking needs **both**
-  that fix landed + the pane re-walked, **and** the interactive GitHub half of steps 1–2
+  gate). Step 7 — **"and reads its logs"** — failed at that walkthrough: the run-detail log
+  pane rendered `0 events` for every run, because `src/mgmt/logs.ts` passed the microVM id as
+  `logStreamNamePrefix` while it is a stream-name *suffix*. That locator defect
+  (`task-1785738322-0bb6`) is **fixed** — the stream is now resolved to its exact name before
+  it is read ([ADR-048](DECISIONS.md#adr-048)) — but the 🎯 stays unmarked: it needs the pane
+  **re-walked against the deployed console**, **and** the interactive GitHub half of steps 1–2
   (registered Callback URL is owner-only, authorize screen is interactive) walked by a human —
   the 🎯's "installs the App" clause.
 
@@ -67,10 +69,18 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
   level so it doesn't mask real problems.
 - Metrics as EMF + per-env alarms + X-Ray (ADR-032); cost estimate in Run detail **and** a
   rolling per-flavor estimate on the Dashboard.
-- **Reports screen** — cost/utilisation over a time window, grouped by repo/flavor/workflow
-  (cost left Runs per ADR-029; see spec 04 OQ-6). **Still open**: the Dashboard estimate is a
-  fixed bounded sample of recent finished runs, deliberately not the windowed, groupable
-  report ADR-029 defers to this screen.
+- **Reports screen** (spec 04 § Reports): spend / **billable compute minutes** / job counts /
+  duration p50-p90 / failure rate /
+  queue-to-start latency over a window, charted + CSV/JSON export, plus a natural-language
+  report assistant. Cost left Runs per ADR-029 and lands here. Aggregates are
+  authorization-first (ADR-043); phase watermarks make the cost basis honest (ADR-042); the
+  assistant emits a **validated spec**, never code (ADR-045). `billableMinutes` is the
+  utilisation half: the same billable window as `spend` with the rate divided out, reported as an
+  **absolute** figure — a utilisation *ratio* needs the microVM concurrency quota as a
+  denominator, which is Settings/quotas work and is deliberately not invented here. This is the
+  windowed, groupable
+  report ADR-029 deferred; the Dashboard's rolling estimate remains a deliberately separate
+  fixed bounded sample of recent finished runs, not a substitute for it.
 - Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.
 - `dev`/`prod` config separation (ADR-033); runbook + quotas docs.
 - 🎯 **Exit criterion not yet verified**: a brand-new repo running unchanged in `adopt` mode

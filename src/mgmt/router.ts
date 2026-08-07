@@ -40,7 +40,11 @@ export type RouteId =
   | 'putRunnerLabels'
   | 'relinkGithubApp'
   | 'rollbackGithubApp'
-  | 'testWebhook';
+  | 'testWebhook'
+  | 'reportCatalog'
+  | 'runReport'
+  | 'exportReport'
+  | 'askReport';
 
 export const ROUTES: readonly RouteDef[] = [
   // --- auth (unauthenticated by definition) ---
@@ -94,6 +98,12 @@ export const ROUTES: readonly RouteDef[] = [
     template: '/api/settings/webhook/test',
     authRequired: true,
   },
+  // --- reports (spec 04 § Reports) ---
+  { id: 'reportCatalog', method: 'GET', template: '/api/reports/catalog', authRequired: true },
+  { id: 'runReport', method: 'GET', template: '/api/reports/run', authRequired: true },
+  { id: 'exportReport', method: 'GET', template: '/api/reports/export', authRequired: true },
+  // POST because it spends money (a model invocation) — not a cacheable, prefetchable GET.
+  { id: 'askReport', method: 'POST', template: '/api/reports/ask', authRequired: true },
 ];
 
 export interface RouteMatch {

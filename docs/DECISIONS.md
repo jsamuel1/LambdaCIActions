@@ -740,6 +740,11 @@ the first implementation did, replays the same page indefinitely; `test/mgmt-log
 pins the token/watermark precedence and the `pending` semantics. Phase 3 already lists
 WebSocket live updates — this ADR is the explicit "not yet", not a rejection.
 
+**Fixed by [ADR-048](#adr-048)**: the tail was correct about *paging* and wrong about *which
+stream* — it located the run's stream with `logStreamNamePrefix: microvmId`, but the id is a
+stream-name suffix, so the pane read nothing for any run. The stream is now resolved to its
+exact name before it is read.
+
 ## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
 **Status**: Accepted (v1) · follows [ADR-023](#adr-023)
 **Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
@@ -929,8 +934,12 @@ every run row built from it is partial by construction.
   because it answers "how long did this run take". The **sum of job durations** is shown on
   expand as **job time** — deliberately not "compute": each job's `durationSeconds` is itself
   queue → last transition, so queued time is included and the sum is an upper bound on billed
-  microVM runtime, not a cost basis (v1 stores no per-phase timestamps — spec 04 OQ-5). It
+  microVM runtime, not a cost basis (v1 stored no per-phase timestamps — spec 04 OQ-5). It
   exceeds wall clock whenever jobs run in parallel, which is the question it answers.
+  **Amended by [ADR-042](#adr-042)**: the watermarks resolve OQ-5, so billable time is now
+  `runningAt → updatedAt` where a watermark exists. This figure is unchanged — it is still
+  queue-inclusive job time, deliberately not a cost basis; the cost basis lives in
+  `views.billableSeconds`.
 - **Completeness** is split into two halves, so neither side can lie on its own. The **server**
   returns `complete` on `GET /api/runs`, answering only *were any job rows dropped from this
   response?* — not *is the index exhausted?*. The **client** supplies exhaustion from the
@@ -1412,8 +1421,11 @@ CloudWatch alarm reads **one exact dimension set** — it does not aggregate acr
   the weaker artefact ADR-029 does not defer: a fixed, bounded sample of the most recent
   terminal runs, labelled as such, reachable with no new index and no new read pattern — it
   answers "is spend roughly what I expect" for the M5 exit criterion ("dashboard shows health
-  + cost"). The windowed, groupable report remains open on the Reports screen (spec 04 OQ-6);
-  when it lands, this sample is a candidate for removal rather than a second source of truth.
+  + cost"). The windowed, groupable report now ships on the Reports screen
+  ([ADR-043](#adr-043), spec 04 § Reports), which serves it by authorization-first repo fan-out
+  over GSI2 under a read budget; this sample stays as the health-screen figure rather than a
+  second source of truth, and both now share one billable-time definition so they cannot
+  disagree about what a job cost.
 - **The cost sample's unit is a JOB, not a workflow run** (review fix). The run store is keyed
   `(repoId, runId, jobId)` (ADR-009/ADR-029), so a 3-variant matrix workflow is three rows.
   `CostSummary` originally called its counter `runs`, and the Dashboard rendered it as
@@ -1423,8 +1435,10 @@ CloudWatch alarm reads **one exact dimension set** — it does not aggregate acr
   grouping by `(repoId, runId)` here would misrepresent the sample in the other direction: the
   sample is a bounded page of job rows, so a run whose jobs straddle the page boundary would be
   priced as a complete run when it is not — the same partial-window problem ADR-029 solved on
-  Runs with an explicit flag. Per-workflow-run cost belongs to the Reports screen (OQ-6), which
-  gets a read pattern that can see a whole run.
+  Runs with an explicit flag. Per-workflow-run cost is **still not delivered by either surface**:
+  the Reports screen ([ADR-043](#adr-043)) ships the windowed, groupable report but its counting
+  unit is also the job — its dimensions are repo/flavor/workflow/status/time, with no `run` — so a
+  true per-workflow-run figure remains future work.
 **Consequences**: metric emission cannot fail a provision (`emitMetrics` swallows everything —
 telemetry is best-effort by construction). Alarm thresholds and λ error tolerances differ per
 environment (ADR-033). Anyone adding a metric must keep the emitter's dimension set and the
@@ -2049,6 +2063,225 @@ so it consumes quota, costs money, and needs a repo to register against; it is t
 the static gates; the smoke run itself is verified against a live environment. Deferred to a
 follow-up card together with ADR-040.
 
+> **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
+> to **042..046** to vacate a collision, following the same convention as the 038..041 block
+> above. At the time of renumbering 030..033 were claimed by `kermes/task-tidal-hawk` (PR #23),
+> 034/035 by `kermes/task-nervous-mountain`, and 036..041 had landed, so 042 was the lowest free
+> number. The mapping is 030→042 (phase watermarks), 031→043 (authorization-first aggregation),
+> 032→044 (Bedrock model + scoped grant), 033→045 (validated spec emission), 034→046 (ECharts).
+> Renumbering unconditionally means neither branch has to renumber at merge time; a gap is
+> cheaper than a duplicate number.
+
+
+## ADR-042 — Phase watermarks on the run row (`provisioningAt` / `runningAt`) (M5)
+**Status**: Accepted (v1) · resolves spec 04 OQ-5 · precondition for [ADR-043](#adr-043)
+**Context**: M4 priced a run as `wall-clock(createdAt → updatedAt) × flavor rate`. The microVM
+service only bills while the VM *runs*, so that figure includes queue time and provisioning
+time and is an unbounded overstatement — a job that sat queued for ten minutes and ran for one
+was priced at eleven. It also made queue-to-start latency, the single most useful number for
+judging whether the platform is keeping up, uncomputable: nothing recorded when a job started.
+**Decision**: stamp two ISO timestamps on the run row, inside the SAME guarded `UpdateItem`
+that performs the status transition, using `if_not_exists` so each is **write-once**:
+`provisioningAt` on first entry to `provisioning`, `runningAt` on first entry to `running`.
+`createdAt` already marks `queued` and `updatedAt` the terminal transition, so no third
+attribute is needed. Billable time is `runningAt → updatedAt`; queue latency is
+`createdAt → runningAt`.
+**Why write-once, and why in the transition write**: a `workflow_job` webhook can be delivered
+more than once, and `transitionRun` treats a same-status re-write as an idempotent success. A
+plain `SET` would let a duplicate `running` delivery push `runningAt` forward — *shrinking*
+billable time and *inflating* queue latency, both in the flattering direction, silently.
+Riding the existing forward-only condition also means a watermark can never exist for a phase
+the run did not actually enter. Rejected: a separate phase-history item per run (doubles write
+volume on the hot path for data only reporting reads), and deriving phases from CloudWatch
+(the log group is per-env and the correlation is by microVM id, which is stamped later).
+**Consequences**: rows created before M5 have no watermarks. Reports must treat that as
+**absent, never zero** — `queueLatency` excludes such rows and reports coverage, and `spend`
+falls back to wall-clock and labels the row `costBasis: wallClock`. So the cost estimate
+improves monotonically as history turns over rather than changing retroactively.
+`test/run-store.test.mjs` pins the write-once expression and that terminal/queued transitions
+stamp nothing.
+
+## ADR-043 — Reporting aggregates via authorization-first repo fan-out (M5)
+**Status**: Accepted (v1) · builds on [ADR-023](#adr-023), [ADR-042](#adr-042)
+**Context**: the Reports screen needs spend / counts / duration / failure rate / queue latency
+over a time window. The table has no aggregate index: rows are per-job, keyed by
+`(repoId, runId, jobId)` and indexed by status/time (GSI1) and repo/time (GSI2). Three designs
+were considered: (a) rollup rows written on every run transition, (b) a new time-bucketed GSI,
+(c) a bounded query fan-out over GSI2.
+**Decision**: **(c) a bounded fan-out, ordered authorization-first.** The Reports code resolves
+the operator's visible repos *before* reading anything — from the installation partitions their
+session grants — and only queries those GSI2 partitions. `spec.filters.repoIds` can only
+*narrow* that set (set intersection); it can never widen it.
+**Why**: the deciding factor is authorization, not cost. Every other management read queries a
+status/repo index and filters by installation *afterwards* (`collectVisible`, spec 04
+§ Authorization). For a list, a missed filter leaks a row. For an **aggregate** it converts a
+per-tenant total into a platform-wide one — and unlike a leaked row, a leaked *number* looks
+entirely plausible and no one notices. Inverting the order removes the filter that could be
+forgotten: a foreign row is never fetched. Rollup rows (a) were rejected because they put a
+write on the control-plane hot path for a management-plane read, need a backfill for existing
+history, and would themselves have to be keyed per-installation to be safe. A time-bucketed
+index (b) was rejected because the bucket partition is shared across tenants, which reproduces
+exactly the post-filter hazard this ADR exists to eliminate.
+**Consequences**: reads scale with (visible repos × pages), bounded by `MAX_PAGES_PER_REPO`
+(20), `PAGE_SIZE` (200) and `MAX_TOTAL_ROWS` (20 000), with concurrency 8. GSI2 is
+newest-first, so paging stops at the first row older than the window — a 24 h report costs one
+page per repo. Spending a budget sets `complete: false`, which the API returns and the UI
+renders as "treat these numbers as a floor"; it never silently truncates. Report windows are
+capped at the environment's **actual** terminal-row retention (`RUN_RETENTION_DAYS`, ADR-033:
+dev 30, prod 90) rather than a fixed 90, and the Mgmt λ is given that same config value the
+control-plane writers stamp the TTL with. A fixed 90-day cap was wrong in a way that mattered:
+in a 30-day environment it accepted a window most of which had already aged out of the table,
+and the report answered over that partially deleted span while reporting `complete: true` — the
+exact silent floor every other budget path here discloses. A preset or explicit window wider
+than retention is **rejected with a readable error naming the available presets**, not clamped
+(clamping answers a different question than the shared link names), and both the picker's option
+list and the assistant's prompt menu are generated from the same number so neither offers a
+window the validator would refuse. Width is not the whole cap: an explicit window is **also**
+rejected when its `from` predates the retention horizon (`now − RUN_RETENTION_DAYS`), however
+narrow it is. A 10-day window 200 days ago is inside every width limit and behind the horizon
+entirely, and a report pinned by URL carries `from`/`to` verbatim — so any bookmarked or shared
+custom-window report becomes an aged-out one by the passage of time alone, and answering it
+`complete: true` over rows the TTL deleted prints "No jobs in this window" about jobs that ran.
+The horizon is inclusive, so a window exactly retention-wide resolves at the moment it is built;
+it does not stay resolvable forever, since an absolute `from` necessarily crosses a moving
+horizon — preset windows are recomputed against `now` on every read and so are immune.
+An operator with hundreds of active repos and a 90-day window
+is the case this
+design serves worst; if that becomes real, rollups keyed *per installation* are the next step.
+`test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the
+platform-wide total is strictly larger than the tenant total (so the test is actually
+isolating), and that a repo granted via two installations is not double-counted.
+One consequence of the row budget is not about reads at all: **an export cannot carry it.** A
+CSV/JSON download is a single synchronous Lambda response (6 MB cap), and 20 000 job rows measures
+3.8–6.5 MiB as CSV and 7.2–9.8 MiB as JSON depending on how long the tenant-controlled
+repo/workflow/job names are — so the read budget exceeds the platform's response limit, and the
+failure is an invocation error surfacing as a 502 rather than a short file. Exports are therefore
+capped separately (`MAX_EXPORT_ROWS` 10 000, with a `MAX_EXPORT_BYTES` 4.5 MB backstop because
+names are unbounded and a row has no fixed width), both truncation sources feed the same
+`complete` / `X-Report-Complete` disclosure, and the cap is published in the report result so the
+UI warns before the download rather than after.
+
+## ADR-044 — Reports assistant on Bedrock: Claude Sonnet, one pinned model, one scoped grant (M5)
+**Status**: Accepted (v1) · security boundary in [ADR-045](#adr-045)
+**Context**: the Reports screen accepts a natural-language question ("spend by repo last 30
+days") and must turn it into a report. The repo had no Bedrock dependency, no model choice, and
+no IAM for one.
+**Decision**: `@aws-sdk/client-bedrock-runtime` (pinned exact, per repo convention), invoked
+from the existing Mgmt λ — not a new function — with `bedrock:InvokeModel` granted on **exactly
+one model id** in the deploy region. Default model: `anthropic.claude-3-5-sonnet-20241022-v2:0`.
+The id is an **EnvConfig knob** (ADR-033) that flows to the λ as `REPORTS_MODEL_ID` *and* into
+the IAM resource ARN from the same value, so the policy and the runtime can never disagree;
+`test/mgmt-stack.test.mjs` asserts the stack default equals the handler default (a drift there is
+a runtime 403). The NL path is **enabled by default** and switched off per-env with
+`-c reportsNl=false`, which also drops the Bedrock grant from the template entirely; the model is
+overridden with `-c reportsModel=…`. Both live in EnvConfig rather than as stack props for the
+reason ADR-033's wiring note gives — the first cut made them props `bin/lca.ts` never passed, so
+this paragraph described a switch no operator could reach, and the only field workaround
+(hand-editing the λ's env) breaks the grant and 403s.
+**Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto the
+enumerated metric × dimension × chart catalog in `src/mgmt/reports.ts` plus a time window is a
+small *structured* problem where a wrong-but-valid answer is worse than a refusal: an invalid
+spec is rejected and the operator sees the picker, but a plausible-but-wrong spec renders a chart
+that silently answers a different question. Sonnet's stronger instruction-following buys accuracy
+on exactly that
+failure mode, and the cost is bounded by `max_tokens: 400`, `temperature: 0`, a system prompt
+capped at **3 600 characters (~900 tokens)** and the caps below. That prompt figure is a
+test-enforced budget (`MAX_SYSTEM_PROMPT_CHARS`), not an estimate: the prompt is generated from
+`METRIC_CATALOG`, so it is the fixed input cost of *every* question and adding a metric — or
+widening one metric's prose — raises that bill on a route whose model choice is justified partly
+by the bill being small. An earlier revision of this paragraph quoted "~400 tokens" while the
+generated prompt was already past 600, which is exactly the drift the test now prevents.
+`InvokeModelWithResponseStream` is deliberately NOT
+granted — one small JSON object needs no stream.
+**Why the existing λ**: a separate Reports λ would need its own DynamoDB read grant, its own
+session-secret read, and a second copy of the authorization logic that ADR-043 exists to keep
+in one place. The Mgmt λ's posture widens by exactly one action on one resource.
+**Cost / abuse controls**: `POST` (never a prefetchable `GET`); question capped at 400 chars and
+validated before any spend; per-actor sliding window of 10 invocations/minute keyed on the
+server-derived session login; a per-container ceiling of 500 invocations as a crude spend cap.
+**And the route does not execute the report.** `/api/reports/ask` returns the validated spec plus
+its provenance; the console adopts that spec as picker state, which fetches
+`GET /api/reports/run`. Executing in both places ran the authorization fan-out TWICE per question
+(up to 2 × `MAX_TOTAL_ROWS` = 40 000 row reads) and discarded the first result, since the console
+only ever rendered the deterministic fetch. One executor also means an assistant answer and the
+shared URL for it cannot drift apart. Every invocation is logged with the actor, the model id, the
+outcome and the question *length* — never its content, which is operator-authored text. A durable
+cross-container budget belongs in the run table and is deferred rather than faked.
+**Consequences**: the console now has a per-request marginal cost on one interaction it did not
+have before, and a Bedrock regional dependency. Throttling, an unconfigured model, or a
+malformed response degrade to the manual picker (ADR-045), never to an error page.
+
+## ADR-045 — Generative UI = validated spec emission, never model-authored code (M5)
+**Status**: Accepted (v1) · this is the security boundary of the Reports feature
+**Context**: "dynamic generative UI" is commonly implemented by having a model emit JSX/HTML/JS
+that the frontend evaluates, or SQL that the backend runs. Report data here is
+**tenant-controlled**: repo names, workflow names, job names and branch names all originate
+from GitHub. Any of it reaching a prompt is untrusted input, and anything the model emits that
+gets executed or rendered is an injection sink with a straight path to another tenant's data.
+**Decision**: the model **selects from a closed vocabulary and nothing else**. It emits a JSON
+report spec — one metric, one dimension and one chart type drawn from the enumerated catalog in
+`src/mgmt/reports.ts`, a preset window, and
+optional flavor/status filters — which is parsed as data and passed through
+`validateReportSpec`, the *same* validator the manual picker's query params go through. The
+backend then executes the deterministic report **through the one report route**
+(`GET /api/reports/run`); the frontend renders it with pre-built components.
+Specifically:
+- **No `eval`, no `new Function`, no `dangerouslySetInnerHTML`, no model-authored JS/JSX/HTML**,
+  and no model-authored DynamoDB expression. Unknown fields are rejected, not ignored, so a
+  spec carrying `html`, `component`, `query` or `KeyConditionExpression` fails closed. An
+  ill-typed field is rejected too, never coerced: an explicit `dimension: null` is an error, not
+  a silent default, because a repaired spec answers a question nobody asked.
+- **Authorization is not a spec field.** Scope comes from the session's installations
+  (ADR-043). A spec naming a foreign repo id contributes zero rows.
+- **No tenant data in the prompt.** Repo/workflow/job names are never sent, so a repo named
+  `ignore previous instructions…` cannot influence the model. The prompt is our catalog text
+  plus the operator's own question.
+- **Ambiguity fails closed.** An array of candidate specs is refused rather than silently
+  taking the first — rendering one of several proposals is rendering a report nobody chose.
+- **Transparency + fallback.** Every generated view states the report and filters it resolved
+  to, and the resolved spec is written into the URL, so a report is a plain shareable link that
+  re-runs deterministically and never re-invokes the model. Disabled, throttled, unsupported,
+  and invalid-spec outcomes all fall back to the manual picker with the reason shown.
+**Why**: this makes the blast radius of a fully-compromised model output equal to *picking the
+wrong report from a menu the operator could already pick from*. No prompt injection — from
+tenant data or from the question — can widen scope, execute code, or read another tenant's rows,
+because none of those are expressible in the spec grammar.
+**Consequences**: the assistant can only answer questions the deterministic catalog already
+covers; anything else is an explicit `unsupported` refusal rather than a bespoke answer. That is
+the intended trade. Adding a report means adding a catalog entry (which the prompt is generated
+from), not prompting differently. `test/nl-report.test.mjs` pins the refusals for hostile
+payloads: model-authored queries, render payloads, scope-widening fields, hallucinated metrics,
+truncated JSON, and candidate arrays.
+
+## ADR-046 — Charts: ECharts (Apache-2.0), not Highcharts (M5)
+**Status**: Accepted (v1) · **settled** — Highcharts is not being licensed for this project
+**Context**: the Reports screen needs bar / stacked-bar / line charts. Highcharts was the
+initial request. Highcharts is **commercially licensed** for non-personal use — unlike
+Chart.js, ECharts or Recharts it is not MIT/BSD. The call was put to the project owner
+explicitly and the answer was **no Highcharts license**, so the licensed option is off the
+table rather than merely unconfirmed. The SPA also had zero chart dependencies and a
+deliberately lean runtime dep set (react + react-dom only), and is served as a static
+S3/CloudFront bundle.
+**Decision**: **Apache ECharts, pinned exact (`echarts@5.5.1`)**, imported per chart type
+(`echarts/core` + `BarChart`/`LineChart` + only the components used) rather than via the barrel,
+and rendered with the **SVG** renderer. Highcharts is rejected on licensing; the decision is
+recorded here rather than quietly vendoring a licensed library. **This is not a
+revisit-if-convenient item**: adopting Highcharts later would require a license decision, not
+just a dependency swap, so any future charting work should extend the ECharts wrapper in
+`web/src/screens/ReportChart.tsx`.
+**Why SVG over canvas**: the console's CSP is `default-src 'none'` with `style-src 'self'`
+(ADR-022) and the SVG path touches far less inline styling, and SVG text stays legible when an
+operator screenshots a report into a ticket. Chart height lives in `styles.css`, not a React
+inline style — the CSP drops `style="…"` attributes, so an inline-sized chart would work in dev
+and collapse to zero height in production. (ECharts' own runtime styling is CSSOM property
+assignment and SVG presentation attributes, neither of which `style-src` restricts;
+`test/web-stack.test.mjs` still fails the build if a React inline style appears in `web/src`.)
+**Consequences**: the SPA bundle grows to ~692 KB raw / ~228 KB gzipped (measured from
+`npm run build:web`) — the first meaningful runtime dependency beyond React. Acceptable for an
+authenticated internal console behind CloudFront, and bounded by the per-chart-type import list:
+adding a chart type means editing that list, which is deliberate friction. If the bundle becomes
+a problem the next step is lazy-loading the Reports route, not swapping libraries.
+
 > **ADR numbering note.** This block takes **047** because 042..046 are claimed by the
 > concurrent branch `kermes/task-jolly-dove` (spend/run analytics) and 034/035 by
 > `kermes/task-nervous-mountain`. ADR numbers are a shared mutable namespace across branches;
@@ -2186,3 +2419,125 @@ non-CD path has to stay first-class and correct for exactly the case where the p
   and the role ARN is hardcoded in the workflow (derived from `envName`, so prod needs its own
   line or a repo variable).
 - The `cfn-exec-role` admin ceiling is accepted and recorded, not fixed.
+
+> **ADR numbering note.** This block takes **048**: 042..047 are already on `main` (the
+> highest landed number is 047), and the only outstanding gap, 034/035, is claimed by the
+> unmerged `kermes/task-nervous-mountain`. ADR numbers are a shared mutable namespace across
+> branches, so a gap is cheaper than a duplicate — do not backfill 034/035 here.
+
+## ADR-048 — A run's log stream is resolved by name, not matched by prefix (M4 fix)
+**Status**: Accepted (v1) · amends [ADR-016](#adr-016) (log destination) · fixes the log half
+of [ADR-026](#adr-026)
+
+**Context**: Every microVM's runner + run-hook output lands in one per-env log group
+(`/aws/lambda/microvms/runs/lca-<env>`, ADR-016) with one stream per VM, and the run row
+carries the `microvmId` (ADR-019). The first log reader therefore located a run's stream with
+`logStreamNamePrefix: microvmId` on both `FilterLogEvents` and `DescribeLogStreams`.
+
+That locator is **backwards**. The service names the stream
+`<YYYY/MM/DD>[<imageVersion>]<microvmId>` — for example
+`2026/08/03[10.0]microvm-98c2f28c-2463-3526-a201-ef44bd494d15` — so the microVM id is a
+**suffix**. A prefix filter never matched: the pane rendered `Logs / 0 events` for the whole
+life of every run, and because the `pending` probe used the same bad prefix it first claimed
+"No log stream yet — the microVM has not started writing" for a VM that had already written.
+Verified in dev on run `30789972919`: prefix-filtering the id returned 0 events and 0 streams,
+while `--log-stream-names '2026/08/03[10.0]microvm-98c2f28c-…'` returned the job's output.
+This blocked the M4 exit criterion — an operator must be able to read a run's logs **from the
+UI** — with the AWS console as the only workaround.
+
+**Decision**: **resolve the exact stream name first, then read that stream by name.**
+`DescribeLogStreams` cannot suffix-match, so the prefix argument is the wrong instrument for
+the id and the right one for the *date*:
+
+1. Scan `DescribeLogStreams` with `logStreamNamePrefix` = the run's `createdAt` date
+   (`YYYY/MM/DD`) and the day after it — a VM queued near midnight UTC launches on the next
+   date — and take the stream whose name **contains** the `microvmId`.
+2. If that finds nothing, fall back to one `orderBy: LastEventTime, descending` scan of the
+   group: a live run's stream is the most recently written. CloudWatch forbids combining that
+   ordering with a name prefix, which is why it is the fallback and not the primary. It runs
+   whenever the date tiers could not *rule the stream out* — no usable date, a scan the budget
+   truncated, or a date prefix that listed **no streams at all**, which is what a changed name
+   format looks like from here. Only an exhausted scan over a populated date namespace is an
+   authoritative miss.
+3. Read with `logStreamNames: [exactName]`; **never** a prefix.
+
+Matching is containment, not `endsWith`: the id is a UUID-shaped token that cannot occur
+inside an unrelated stream's name, so containment is equally exact and does not break if the
+service moves the date/version decoration.
+
+Resolved names are cached per Lambda container (`microvmId` → stream name, FIFO-bounded), so
+the pane's log poll costs one `FilterLogEvents` in steady state, not a rescan. Misses are
+cached too, but only for **5 s**: "no stream yet" becomes "stream" seconds later while the VM
+boots, so a miss has to stay retryable — while an *uncached* miss meant every poll of a queued
+run re-scanned the group. Measured on the miss path: an attempt costs 2 `DescribeLogStreams` on
+a 50-stream day and 7 on a 300-stream day. The log pane polls every **4 s** (the run row
+itself polls every 3 s — ADR-026), so uncached that is 0.5–1.8 TPS from a **single** viewer
+against an account-wide 5 TPS quota; with the TTL a miss is re-derived every second poll, i.e.
+0.25–0.9 TPS. A `ThrottlingException` surfaces as a 500, not a "waiting for logs" pane.
+
+The two tiers share **one** describe budget (12 calls × 50 streams), rather than each getting
+its own page cap that multiplies across them. Two of those calls are *reserved* for the
+fallback: without a reserve a busy queue date can spend the whole budget and the fallback is
+then skipped for want of calls, in precisely the case it exists for. A date prefix listed to
+its end **and** holding real streams is proof the stream is not there, so the ordinary "VM has
+not written yet" poll costs two describes and never re-scans the whole group.
+
+**Residual limit**: the date tier reaches ~450 streams under the run's own date, and the
+fallback the 100 most recently written streams in the group. Beyond both, a **finished** run
+is unresolvable — an old stream is by definition not among the most recently written. A live
+run is unaffected, because its stream *is* the most recent; that is what the reserved fallback
+pages buy. Dev is orders of magnitude below the horizon, but this is the limit that makes the
+row stamp below the real scaling answer rather than just a cheaper one.
+
+Second residual, from the authoritative-miss rule itself: a stream stamped with a date
+**outside** `[D, D+1]` — a clock-skewed VM, or one launched more than a day after it was
+queued — is unresolvable whenever the queue date is a *populated* namespace, because those
+prefixes then list themselves out over real streams and rule the stream out before the
+fallback can run. This is the deliberate price of keeping the ordinary "VM has not written
+yet" poll at two describes: the alternative is a whole-group recency scan on every poll of
+every queued run. It is not the same case as a changed name *format*, which empties the date
+namespace for every stream at once and therefore does reach the fallback. Pinned by
+`test/mgmt-logs.test.mjs` so it stays a known cost rather than a surprise.
+
+**Why not stamp the stream name on the run row at launch?** Cheaper (zero describes), but it
+needs a Provision-side write plus a resolver fallback for every row written before it lands —
+and the resolver is the thing that has to be correct either way. Resolution is self-healing
+for existing runs, and the container cache already removes the per-poll cost. The row stamp
+stays available as a later optimisation.
+
+**Consequences**:
+- `pending` is now exactly "there is no stream to read" — no VM, or no stream yet — rather
+  than "the first page came back empty". A resumed tail that returns nothing is still
+  *caught up*, so the UI cannot flash "no log stream yet" over rendered output.
+- `GET /api/runs/…/logs` returns the resolved `logStream`, and the Run detail log pane shows
+  it, so an operator can jump to the same events in the CloudWatch console and can see at a
+  glance when resolution failed. The pane tracks it **per poll**, not from the pages it
+  rendered: it only buffers pages that carried events, so deriving the name from them would
+  hide it in precisely the empty-pane case it exists to explain.
+- A cold container pays one `DescribeLogStreams` per run before its first read in the common
+  case — the stream is on the first page of the run's own date — and up to the 12-call budget
+  on a busy day, since each tier pages before the next one starts: the measured figures above
+  are 2 on a 50-stream day and 7 on a 300-stream day. Only the FIRST read of a run pays this;
+  the container cache makes every later poll one `FilterLogEvents`. IAM already allowed both
+  calls (ADR-025), so there is no permission change.
+- A stream that appears during a cached miss shows up to 5 s late in the pane. That is under
+  two poll intervals and invisible next to microVM boot time.
+- The stream layout is now a load-bearing assumption in two places (date prefix, id
+  containment). A wholesale **format** change degrades to the recency scan rather than to an
+  empty pane — for live runs, which is when an operator is watching — because it empties the
+  date namespace for every stream at once, and a date prefix that lists nothing is treated as
+  "cannot rule it out" rather than "not there". That is what makes the degradation real rather
+  than aspirational. It does **not** cover a single stream stamped outside `[D, D+1]` on a
+  populated date; see the second residual limit above.
+- **The test stub is part of the fix.** `test/mgmt-logs.test.mjs` previously replied from a
+  scripted response queue that ignored `logStreamNamePrefix` entirely, and its fixture names
+  (`vm-1/x` for `vm-1`) were id-prefixed — so no test in the file could observe a wrong
+  locator direction, which is precisely why this shipped green. The stub is now a small
+  CloudWatch model that honours `logStreamNamePrefix` / `logStreamNames` / `startTime` /
+  `limit` / `nextToken` / `orderBy` (including rejecting the prefix + `LastEventTime`
+  combination the API forbids), with realistic `2026/08/03[10.0]microvm-…` fixtures. A test
+  asserts the model itself cannot see an id-prefix scan, so the guard cannot rot back. The
+  handler's own wiring is pinned separately (`test/mgmt-logs.test.mjs`, source-level): the
+  resolver is only date-bounded because the route passes the run's `createdAt`, and dropping
+  that argument would leave every logs test green while silently degrading resolution to the
+  recency fallback — which cannot find a finished run's stream.

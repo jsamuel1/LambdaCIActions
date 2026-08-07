@@ -428,6 +428,11 @@ async function handleWorkflowJob(
       runId: msg.runId,
       jobId: msg.jobId,
       labels: msg.labels,
+      // Stored for reporting (group spend / failure rate by workflow) so the Reports
+      // screen never has to call GitHub to name a run. Tenant-controlled strings; GitHub
+      // sends `name: null` for an unnamed job, which must become absent, not null.
+      workflowName: wf.workflow_job.workflow_name ?? undefined,
+      jobName: wf.workflow_job.name ?? undefined,
     });
   } catch (err) {
     console.error(
