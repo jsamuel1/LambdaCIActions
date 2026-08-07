@@ -8,6 +8,7 @@ import {
   METRICS,
   METRIC_CATALOG,
   availablePresets,
+  defaultPreset,
   validateReportSpec,
   type ReportSpec,
 } from './reports.js';
@@ -39,11 +40,11 @@ import { flavorNames } from './views.js';
 
 /**
  * Model id. Sonnet (ADR-044): the task is small but genuinely structured — it maps loose
- * operator phrasing onto a 5-metric × 6-dimension × 4-chart menu plus a time window, and a
- * wrong-but-valid spec is worse than a refusal because it silently answers a different
- * question. Mirrors `DEFAULT_REPORTS_MODEL_ID` in `lib/env-config.ts` (a λ must not import a
- * CDK module); `test/mgmt-stack.test.mjs` asserts the two agree, because a drift means IAM
- * authorizes one model while this handler invokes another. Overridden per-env with
+ * operator phrasing onto the enumerated metric × dimension × chart catalog below plus a time
+ * window, and a wrong-but-valid spec is worse than a refusal because it silently answers a
+ * different question. Mirrors `DEFAULT_REPORTS_MODEL_ID` in `lib/env-config.ts` (a λ must not
+ * import a CDK module); `test/mgmt-stack.test.mjs` asserts the two agree, because a drift means
+ * IAM authorizes one model while this handler invokes another. Overridden per-env with
  * `-c reportsModel=…`, which moves the IAM grant with it.
  */
 export const DEFAULT_MODEL_ID = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
@@ -53,6 +54,22 @@ const ENABLED = (process.env.REPORTS_NL_ENABLED ?? 'true') !== 'false';
 
 /** Max characters of operator question forwarded to the model. */
 export const MAX_QUESTION_CHARS = 400;
+
+/**
+ * Ceiling on the generated system prompt, in characters. **Not a runtime limit** — the prompt is
+ * built from repo constants, so there is nothing to reject at request time. It is a budget the
+ * test suite enforces (`test/nl-report.test.mjs`), because the prompt is the fixed input cost of
+ * every single question and it is assembled from `METRIC_CATALOG`: adding a metric, or widening
+ * one metric's prose, silently raises the per-invocation bill on a route whose ADR justifies the
+ * model choice partly on that bill being small. ADR-044 quotes this number, and the same test
+ * asserts the quoted figure matches this constant so the ADR cannot drift from the code.
+ *
+ * Sized with headroom over the current prompt for a couple more metrics; if a change needs more
+ * than this, the honest move is to shorten a definition (the catalog doubles as operator-facing
+ * text on the Reports panel, where a long definition is also a wall of prose) rather than to
+ * raise the ceiling by reflex.
+ */
+export const MAX_SYSTEM_PROMPT_CHARS = 3600;
 
 /** Per-session invocations per rolling window (see `rateLimit`). */
 export const RATE_LIMIT_PER_WINDOW = 10;
@@ -132,6 +149,13 @@ export function buildSystemPrompt(): string {
   // the operator gets a refusal for a perfectly reasonable question.
   const presets = availablePresets();
   const widest = presets[presets.length - 1];
+  // The default the model is told to pick is the SAME one `validateReportSpec` fills in when a
+  // spec names no window (`defaultPreset`), not a hardcoded `7d`. Hardcoding it made the prompt
+  // contradict itself wherever retention is shorter than a week: `preset: 24h` on one line,
+  // "default to 7d" on the next, "never propose wider than 24h" on the one after. The model then
+  // emits a spec this module's own validator refuses — an operator gets a refusal for a fair
+  // question, which is the exact failure the servable-preset list is in this prompt to prevent.
+  const fallback = defaultPreset(presets);
   return [
     'You translate an operator question about CI job history into a report specification.',
     'You do NOT answer the question and you do NOT write code, queries, HTML or markup.',
@@ -155,7 +179,7 @@ export function buildSystemPrompt(): string {
     '- Use only the values listed. Never invent a metric, dimension, chart, flavor or field.',
     '- Never include repository ids or names; repository scope is applied by the server.',
     '- Omit "filters" entirely when the question implies no filter.',
-    '- Default to preset "7d" when the question names no time range.',
+    `- Default to preset "${fallback}" when the question names no time range.`,
     `- Never propose a wider window than "${widest}" — this deployment retains no run history beyond it.`,
     '- Choose "table" only when the question asks for a list rather than a comparison.',
     '- If the question cannot be answered by one of these metrics, reply exactly: {"unsupported": true}',

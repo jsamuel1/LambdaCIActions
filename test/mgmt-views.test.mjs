@@ -229,6 +229,41 @@ test('a window that cannot be measured reports wallClock rather than a false mea
   assert.equal(garbage.costBasis, 'wallClock');
 });
 
+test('a row that never ran a microVM reports no billable window at all', () => {
+  // `costUsd` was gated from the start (`isCostEligible`), but the basis and the seconds beside
+  // it were not: a mint/launch failure carries the intended flavor and no VM, so it reported its
+  // whole queue-to-finish span as `billableSeconds` on a `wallClock` basis while Reports and the
+  // CSV export both reported 0 for the same row. The detail page's prose reads `costBasis` to
+  // explain the estimate, so it told the operator the run was "priced on total wall clock, an
+  // overstatement" — about a run that was not priced at all. A basis names which clock produced
+  // a billable window; a row with no window has no basis to report.
+  for (const status of ['failed', 'timed_out', 'queued', 'provisioning']) {
+    const view = toRunView(
+      run({
+        status,
+        microvmId: undefined,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        updatedAt: '2026-07-01T00:09:00.000Z',
+      }),
+    );
+    assert.equal(view.costUsd, undefined, `${status} without a VM must not be priced`);
+    assert.equal(view.costBasis, undefined, `${status} claimed a billable clock it never started`);
+    assert.equal(view.billableSeconds, 0, `${status} reported compute it never used`);
+    // Nothing is hidden: the row's real elapsed span is still on the view, under the field that
+    // means elapsed time, and `microvmId` is what the page renders as "(not launched)".
+    assert.equal(view.durationSeconds, 540, 'the real span must survive the gate');
+  }
+
+  // Either evidence of a launch restores both figures — the gate must not flatten real compute.
+  // `microvmId` is stamped best-effort (ADR-019), so a post-launch status has to count alone.
+  const stamped = toRunView(run({ status: 'failed', microvmId: 'mv-1' }));
+  assert.equal(stamped.costBasis, 'wallClock', 'a real VM with no watermark still has a basis');
+  assert.ok(stamped.billableSeconds > 0);
+  const byStatus = toRunView(run({ status: 'running', microvmId: undefined }));
+  assert.ok(byStatus.billableSeconds > 0, 'a post-launch status is evidence on its own');
+  assert.ok(byStatus.costBasis);
+});
+
 test('health folds counts, error rate, and stuck runs', () => {
   const now = new Date('2026-07-01T01:00:00.000Z');
   const counts = { queued: 1, provisioning: 0, running: 2, completed: 6, failed: 3, timed_out: 1 };

@@ -205,7 +205,13 @@ export interface LogPage {
 
 // ---- reports (mirror src/mgmt/reports.ts) ----------------------------------
 
-export type ReportMetric = 'spend' | 'runCount' | 'duration' | 'failureRate' | 'queueLatency';
+export type ReportMetric =
+  | 'spend'
+  | 'billableMinutes'
+  | 'runCount'
+  | 'duration'
+  | 'failureRate'
+  | 'queueLatency';
 export type ReportDimension = 'repo' | 'flavor' | 'workflow' | 'status' | 'time' | 'none';
 export type ChartType = 'bar' | 'stackedBar' | 'line' | 'table';
 export type RangePreset = '24h' | '7d' | '30d' | '90d';

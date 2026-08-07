@@ -244,3 +244,64 @@ test('a complete read reports scope and read set as equal', async () => {
   assert.equal(res.complete, true);
   assert.deepEqual(res.repoIdsRead, res.repoIds, 'a complete read must not understate coverage');
 });
+
+test('billableMinutes carries no foreign tenant compute', async () => {
+  // Asserted independently of `spend` rather than trusting it. The two metrics share a fold and
+  // a window, but the leak this file exists to catch happens BEFORE the fold — and a metric
+  // added later inherits the isolation only if it is actually driven through the same read path.
+  // A consumption figure that silently included another tenant's microVM minutes is exactly as
+  // plausible-looking as a leaked spend total, and here there is no currency symbol to make an
+  // implausible magnitude obvious.
+  const idx = fakeIndex({ 1: [[job(1)]], 2: [[job(2), job(2, { jobId: 2001 })]] });
+  const s = spec({ metric: 'billableMinutes', dimension: 'none' });
+
+  const mine = await fetchReportRuns(MINE, s, {
+    listRepos: async () => [{ repoId: 1, repoFullName: 'mine/service' }],
+    listRunsByRepo: idx.listRunsByRepo,
+  });
+  assert.deepEqual(idx.queried, [1], 'a foreign partition was queried for a utilisation report');
+  const mineReport = computeReport(applyFilters(mine.runs, s), s, { complete: mine.complete, now: NOW });
+
+  const both = await fetchReportRuns(
+    session([
+      { installationId: 11, accountLogin: 'mine' },
+      { installationId: 22, accountLogin: 'theirs' },
+    ]),
+    s,
+    {
+      listRepos: async () => [
+        { repoId: 1, repoFullName: 'mine/service' },
+        { repoId: 2, repoFullName: 'theirs/service' },
+      ],
+      listRunsByRepo: idx.listRunsByRepo,
+    },
+  );
+  const bothReport = computeReport(applyFilters(both.runs, s), s, { complete: both.complete, now: NOW });
+
+  assert.equal(mineReport.rowCount, 1);
+  assert.equal(bothReport.rowCount, 3);
+  assert.ok(mineReport.total > 0, 'the tenant report must measure something to be worth isolating');
+  assert.ok(
+    bothReport.total > mineReport.total,
+    'the platform-wide compute total is not larger than the tenant one — this test is not isolating',
+  );
+  // Every minute in the tenant report belongs to a repo the tenant can see.
+  assert.deepEqual([...new Set(applyFilters(mine.runs, s).map((r) => r.repoId))], [1]);
+});
+
+test('a spec naming a foreign repo yields no utilisation, not a platform figure', async () => {
+  const idx = fakeIndex({ 1: [[job(1)]], 2: [[job(2)]] });
+  const s = spec({ metric: 'billableMinutes', dimension: 'repo', filters: { repoIds: [2] } });
+  const res = await fetchReportRuns(MINE, s, {
+    listRepos: (sess, sp) =>
+      resolveVisibleRepos(sess, sp, {
+        listRepos: async (installationId) =>
+          installationId === 11 ? [{ repoId: 1, repoFullName: 'mine/service' }] : [],
+      }),
+    listRunsByRepo: idx.listRunsByRepo,
+  });
+  assert.deepEqual(idx.queried, [], 'a foreign repo id in a utilisation spec caused a query');
+  const report = computeReport(applyFilters(res.runs, s), s, { complete: res.complete, now: NOW });
+  assert.equal(report.total, 0);
+  assert.equal(report.points.length, 0);
+});

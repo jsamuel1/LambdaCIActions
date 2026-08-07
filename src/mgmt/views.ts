@@ -40,9 +40,13 @@ export interface RunView {
    * Which clock the cost came from: `measured` (the `runningAt` watermark, ADR-042) or
    * `wallClock` (a pre-watermark row, which overstates). Exposed so the UI states the bias
    * instead of presenting both kinds of estimate as equally tight.
+   *
+   * **Absent** when no microVM ran (`hasRunMicrovm`): a basis names which clock produced a
+   * billable window, and such a row has none. Reporting `wallClock` there claimed the row was
+   * priced on an overstating clock when it was not priced at all — see `toRunView`.
    */
-  costBasis: CostBasis;
-  /** Seconds counted as billable for the cost figure. */
+  costBasis?: CostBasis;
+  /** Seconds counted as billable for the cost figure. `0` when no microVM ran. */
   billableSeconds: number;
 }
 
@@ -131,7 +135,19 @@ export function billableSeconds(
 }
 
 /**
- * Whether a run row is evidence that a microVM actually ran, and can therefore be priced.
+ * Whether a run row is evidence that a microVM actually **ran**.
+ *
+ * This is the physical question — did compute happen — and it is deliberately separate from
+ * `isCostEligible`, which is the *pricing* question and additionally needs a known flavor rate.
+ * A consumption metric (`billableMinutes`, spec 04 § Reports) must use THIS predicate: minutes
+ * are measured from timestamps and need no price list, so folding the rate requirement into a
+ * consumption figure would silently drop real compute out of the total and out of its own
+ * coverage denominator, reporting `100%` coverage over a number missing whole rows.
+ *
+ * That is reachable without any new feature: `flavorRatePerMinute` resolves against the static
+ * `microvm/flavors.json` catalog, so renaming or removing a flavor entry orphans every historical
+ * run row still inside the retention window (30d dev / 90d prod) that stored the old name. Custom
+ * flavors (ADR-040/041) would make it routine.
  *
  * Two independent signals, because neither alone is sufficient:
  *   - `microvmId` — the run↔VM mapping. Normally present, but Provision stamps it
@@ -148,11 +164,20 @@ export function billableSeconds(
  * inflated the estimate exactly when provisioning was broken — such a row is priced only if it
  * does carry a `microvmId`, which is real evidence.
  */
+export function hasRunMicrovm(run: Pick<RunRecord, 'microvmId' | 'status'>): boolean {
+  return Boolean(run.microvmId) || LAUNCHED_STATUSES.has(run.status);
+}
+
+/**
+ * Whether a run row can be **priced**: a microVM ran (`hasRunMicrovm`) *and* its flavor has a
+ * rate. The rate half belongs only to money — see `hasRunMicrovm` for why a consumption metric
+ * must not inherit it.
+ */
 export function isCostEligible(
   run: Pick<RunRecord, 'microvmId' | 'flavor' | 'status'>,
 ): boolean {
   if (flavorRatePerMinute(run.flavor) === undefined) return false;
-  return Boolean(run.microvmId) || LAUNCHED_STATUSES.has(run.status);
+  return hasRunMicrovm(run);
 }
 
 /** Statuses a run can only reach once a microVM has actually launched. */
@@ -177,8 +202,22 @@ export function estimateCostUsd(
   return Math.round(rate * minutes * 1e6) / 1e6;
 }
 
-/** Project a stored run row onto the API shape (adds derived duration + cost). */
+/**
+ * Project a stored run row onto the API shape (adds derived duration + cost).
+ *
+ * The billable pair is gated on `hasRunMicrovm`, the SAME predicate the `billableMinutes`
+ * aggregate folds over and its export column is gated on (`toExportRows`) — Run detail, the
+ * report and the download must agree about one row, which is the whole point of ADR-042 having
+ * one definition of billable time. Ungated, a launch-failure row reported its entire
+ * queue-to-finish wall clock as billable seconds on a `wallClock` basis while both aggregates
+ * and the export said 0, and the Run detail prose then explained the row as "priced on total
+ * wall clock, an overstatement" — a row that was never priced at all. Numbers right, explanation
+ * false, which is exactly the failure `costBasis` exists to prevent.
+ *
+ * `costUsd` was already gated (`estimateCostUsd`), so only these two were divergent.
+ */
 export function toRunView(run: RunRecord, now: Date = new Date()): RunView {
+  const ran = hasRunMicrovm(run);
   const billable = billableSeconds(run, now);
   return {
     repoId: run.repoId,
@@ -195,8 +234,8 @@ export function toRunView(run: RunRecord, now: Date = new Date()): RunView {
     updatedAt: run.updatedAt,
     durationSeconds: durationSeconds(run),
     costUsd: estimateCostUsd(run, now),
-    costBasis: billable.basis,
-    billableSeconds: billable.seconds,
+    costBasis: ran ? billable.basis : undefined,
+    billableSeconds: ran ? billable.seconds : 0,
   };
 }
 

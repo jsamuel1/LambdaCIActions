@@ -1913,8 +1913,10 @@ narrow it is. A 10-day window 200 days ago is inside every width limit and behin
 entirely, and a report pinned by URL carries `from`/`to` verbatim — so any bookmarked or shared
 custom-window report becomes an aged-out one by the passage of time alone, and answering it
 `complete: true` over rows the TTL deleted prints "No jobs in this window" about jobs that ran.
-The horizon is inclusive, so the widest legal preset's own window still resolves through the
-explicit branch. An operator with hundreds of active repos and a 90-day window
+The horizon is inclusive, so a window exactly retention-wide resolves at the moment it is built;
+it does not stay resolvable forever, since an absolute `from` necessarily crosses a moving
+horizon — preset windows are recomputed against `now` on every read and so are immune.
+An operator with hundreds of active repos and a 90-day window
 is the case this
 design serves worst; if that becomes real, rollups keyed *per installation* are the next step.
 `test/report-isolation.test.mjs` asserts a foreign partition is never queried, that the
@@ -1947,13 +1949,20 @@ overridden with `-c reportsModel=…`. Both live in EnvConfig rather than as sta
 reason ADR-033's wiring note gives — the first cut made them props `bin/lca.ts` never passed, so
 this paragraph described a switch no operator could reach, and the only field workaround
 (hand-editing the λ's env) breaks the grant and 403s.
-**Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto a
-5-metric × 6-dimension × 4-chart menu plus a time window is a small *structured* problem where
-a wrong-but-valid answer is worse than a refusal: an invalid spec is rejected and the operator
-sees the picker, but a plausible-but-wrong spec renders a chart that silently answers a
-different question. Sonnet's stronger instruction-following buys accuracy on exactly that
-failure mode, and the cost is bounded by a ~400-token prompt, `max_tokens: 400`,
-`temperature: 0` and the caps below. `InvokeModelWithResponseStream` is deliberately NOT
+**Why Sonnet over Haiku**: the task looks trivial and isn't. Mapping loose phrasing onto the
+enumerated metric × dimension × chart catalog in `src/mgmt/reports.ts` plus a time window is a
+small *structured* problem where a wrong-but-valid answer is worse than a refusal: an invalid
+spec is rejected and the operator sees the picker, but a plausible-but-wrong spec renders a chart
+that silently answers a different question. Sonnet's stronger instruction-following buys accuracy
+on exactly that
+failure mode, and the cost is bounded by `max_tokens: 400`, `temperature: 0`, a system prompt
+capped at **3 600 characters (~900 tokens)** and the caps below. That prompt figure is a
+test-enforced budget (`MAX_SYSTEM_PROMPT_CHARS`), not an estimate: the prompt is generated from
+`METRIC_CATALOG`, so it is the fixed input cost of *every* question and adding a metric — or
+widening one metric's prose — raises that bill on a route whose model choice is justified partly
+by the bill being small. An earlier revision of this paragraph quoted "~400 tokens" while the
+generated prompt was already past 600, which is exactly the drift the test now prevents.
+`InvokeModelWithResponseStream` is deliberately NOT
 granted — one small JSON object needs no stream.
 **Why the existing λ**: a separate Reports λ would need its own DynamoDB read grant, its own
 session-secret read, and a second copy of the authorization logic that ADR-043 exists to keep
@@ -1981,7 +1990,8 @@ that the frontend evaluates, or SQL that the backend runs. Report data here is
 from GitHub. Any of it reaching a prompt is untrusted input, and anything the model emits that
 gets executed or rendered is an injection sink with a straight path to another tenant's data.
 **Decision**: the model **selects from a closed vocabulary and nothing else**. It emits a JSON
-report spec — one of 5 metrics, one of 6 dimensions, one of 4 chart types, a preset window, and
+report spec — one metric, one dimension and one chart type drawn from the enumerated catalog in
+`src/mgmt/reports.ts`, a preset window, and
 optional flavor/status filters — which is parsed as data and passed through
 `validateReportSpec`, the *same* validator the manual picker's query params go through. The
 backend then executes the deterministic report **through the one report route**

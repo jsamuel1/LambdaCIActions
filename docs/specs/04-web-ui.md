@@ -45,7 +45,7 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Workflow detail** | Parsed view of a workflow | jobs, `runs_on`, resolved flavor + reason, compat warnings | inline on Repo detail |
 | **Runs** | Filterable, run-primary history | run + folded status, flavor rollup, duration, job count, expandable jobs | `#/runs` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
-| **Reports** | Spend + run analytics over a window, and an NL report assistant | spend/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
+| **Reports** | Spend + utilisation + run analytics over a window, and an NL report assistant | spend/billable compute minutes/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
 | **Settings** | Secret/config presence, env identity | SSM param presence (**not values**), env, region | `#/settings` |
 
@@ -224,13 +224,29 @@ assistant's prompt is generated from it so the two cannot drift):
 | Metric | Unit | Definition |
 |---|---|---|
 | `spend` | USD | Σ per-job billable minutes × flavor rate. **Estimate** — see below. |
+| `billableMinutes` | minutes | Σ per-job billable microVM time — `spend`'s window with the flavor rate taken out, so a job whose flavor has no rate still counts its minutes. **Estimate**; an **absolute** figure, not a share of any ceiling. |
 | `runCount` | jobs | Job rows created in the window, by queued timestamp. |
 | `duration` | seconds | p50 / p90 of queued→last-transition wall clock, **terminal jobs only**, and only where that span is measurable. |
 | `failureRate` | ratio | (failed + timed_out) ÷ terminal jobs. In-flight jobs excluded from **both** sides. |
 | `queueLatency` | seconds | p50 / p90 of queued→`runningAt`, over jobs carrying a **measurable** watermark. |
 
 Dimensions: `repo`, `flavor`, `workflow`, `status`, `time` (hourly under 3 days, else daily),
-`none`. Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
+`none`. Grouping by `workflow` buckets rows carrying no `workflowName` under
+**“(no workflow name recorded)”** rather than *“(unknown)”*, which reads like a real workflow
+whose name could not be determined and invites an operator to treat a data gap as one workflow's
+activity. The label names the gap and deliberately **not** a cause, because there are two and
+only one is about age: the row predates ingest persisting the field (M5), **or**
+`workflow_job.workflow_name` was absent on the event itself — it is optional and nullable on the
+wire, Ingest's single run-row write coalesces a null to absent, and the run store omits a falsy
+value, so a brand-new row lands in the same bucket. Naming it a pre-M5 row would repeat the
+`runningAt` error corrected above: right number, false explanation for a reachable current row.
+That bucket's group key is namespaced so it cannot collide with a workflow
+literally named the same thing: `workflowName` is copied verbatim off the `workflow_job` webhook,
+so it is tenant-controlled, and merging the two would attribute real activity to the gap
+unfalsifiably from the chart. `flavor` needs no such namespacing — every resolution path gates the
+chosen name through the flavor catalog (`byName`), so a tenant's `runs-on:` label can select a
+flavor but never become one, and its `(not launched)` bucket is not a reachable value.
+Charts: `bar`, `stackedBar`, `line`, `table` — the list is the renderer's capability, not
 a wish list, so a spec can never resolve to a chart type that silently falls through to a
 different one. Windows: the `24h`/`7d`/`30d`/`90d` presets **that this environment's run
 retention can actually fill**, or an explicit `from`/`to` that is both no wider than that number
@@ -244,8 +260,12 @@ the assistant's prompt lists only servable presets so a fair question is not ans
 refusal. An explicit window whose `from` predates the horizon (`now − RUN_RETENTION_DAYS`) is
 rejected the same way even when it is narrow — a pinned report keeps its absolute `from`/`to`, so
 a bookmarked custom window ages out on its own and must refuse rather than answer zero jobs as
-though none had run. The horizon is inclusive, so the widest servable preset's own window still
-resolves when pinned. Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
+though none had run. The horizon is inclusive, so a window exactly retention-wide resolves at the
+moment it is built; it does not stay resolvable forever, because an absolute `from` necessarily
+crosses a moving horizon — which is the whole point of the age check. A **preset** window is
+immune: it is stored as a preset and recomputed against `now` on every read, so the widest preset
+keeps working indefinitely.
+Percentiles are **nearest-rank, never interpolated** — with tens of samples an interpolated
 p90 invents a value between two real jobs. A row whose span cannot be measured (unparseable or
 inverted timestamps — `createdAt` and `runningAt` are written by different λ invocations) is
 **excluded from the sample and counted as uncovered**, never folded in as a 0-second job, which
@@ -265,6 +285,40 @@ then rejects `running`, so the row never gains one) — both are priced on wall 
 are the fast ones. Reconciliation against a real
 microVM bill is still outstanding
 (OQ-7): the direction of the error is known and stated, the magnitude is not.
+
+**Utilisation.** `billableMinutes` answers *how much microVM compute did we consume*, and it is
+the same fold as `spend` with the rate divided out — one arm in `computeReport`, sharing ADR-042's
+billable window, so consumption and cost can never be measured over different windows. It
+inherits the estimate caveat for the same reason `spend` has one: a row on a
+`wallClock` basis counts queue and provisioning time as compute and therefore **overstates**
+consumption, and `coverage` is the measured share exactly as it is for spend.
+
+The two metrics deliberately do **not** share an eligibility gate, because they differ by exactly
+the rate: money needs a price list, compute does not. Spend counts a job only if a microVM ran
+*and* its flavor has a rate (`isCostEligible`); minutes count a job if a microVM ran
+(`hasRunMicrovm`), whether or not it can be priced. Gating minutes on the pricing predicate would
+drop real compute out of the total **and** out of its own coverage denominator, so the screen
+would report 100% coverage over a number missing whole rows. That is reachable with no new
+feature: rates resolve against the static `microvm/flavors.json`, so renaming or removing an entry
+orphans every historical run row still inside the retention window that stored the old name, and
+custom flavors (ADR-040/041) would make it routine. A job whose flavor has no rate therefore
+contributes its minutes and is priced at 0.
+
+It is deliberately an **absolute** figure and not a percentage. A utilisation *ratio* needs a
+capacity ceiling as its denominator — the microVM service's concurrency quota (spec 05 § Quotas &
+limits) — which nothing in this system reads yet, and which belongs to the Settings/quotas
+surface. Inventing a denominator would produce a percentage that looks authoritative and is not,
+which is worse than a number the operator has to interpret. Once the quota is readable, a ratio
+can be layered on this metric without changing what it measures.
+
+**One USD renderer.** Money is printed by `formatCost` in `web/src/components.tsx` and nowhere
+else — Run detail, the Dashboard, the flavor rate table and every Reports axis/tooltip/cell go
+through it. Precision is by **magnitude, not by caller**: below \$1 → 4dp, at or above → 2dp. A
+single job's estimate is fractions of a cent, so 2dp there would render most jobs as `$0.00`;
+sub-cent digits on a four-figure aggregate total are noise. Reports previously carried a private
+copy of that rule in `ReportChart.formatValue`, which meant the same job's cost could print with
+different precision on two screens — the same argument ADR-042 makes for one definition of
+billable time applies to one rendering of what it cost.
 
 **Every report reports its own completeness.** `complete: false` means the read budget was spent
 before the window was exhausted, and the UI renders the numbers as a floor with advice to narrow
@@ -287,6 +341,30 @@ fields are RFC-4180 quoted **and** formula-defanged: repo/workflow/job names are
 tenant-controlled, and a name beginning `=`/`+`/`-`/`@` executes on open in Excel/Sheets. An
 export is truncated by the same budget as its report: the JSON form carries `complete`, and the
 CSV form — which has nowhere in the body to put it — carries `X-Report-Complete`.
+
+An export **reconciles with the report it was downloaded from**, and both reconcile with Run
+detail: summing `billableSeconds` ÷ 60
+yields the `billableMinutes` total, and summing `estimatedCostUsd` yields `spend` — over the rows
+the export actually carries. A file the row/byte cap truncated sums *lower* than the figure beside
+it, which is what `complete: false` and `X-Report-Complete` are for; the reconciliation is a
+statement about the per-row definitions agreeing, not a promise that a capped download totals the
+headline. Both
+per-row columns are gated on the same predicate their aggregate folds over — a job that never
+ran a microVM exports `0` billable seconds, `0` cost and an **empty** `costBasis`, because a
+basis names which clock measured a billable window and such a row has none. Ungated, a
+launch-failure or queued row exported its whole queue-to-finish wall clock as billable while
+contributing 0 on screen, so the column summed higher than the figure it drills into — and in a
+seconds column there is no currency symbol to make the magnitude look wrong. The row's real span
+is still exported under `wallClockSeconds`/`createdAt`/`updatedAt`, and `status` says why it has
+no compute.
+
+The **run view** is gated identically, and it was the last surface that was not: it reported that
+same row's whole span as `billableSeconds` on a `wallClock` basis while the aggregate and the
+export both said 0, and Run detail's prose reads `costBasis` to explain the estimate — so it told
+the operator the job was “priced on total wall clock, an overstatement” about a job that was not
+priced at all. `costBasis` is therefore **absent**, not `wallClock`, when no microVM ran, and the
+page has a third sentence for that case. Right number, false explanation is the same defect class
+as the `runningAt` cost basis this section corrects above.
 
 An export is **additionally** capped independently of the read budget, because it is one
 synchronous Lambda response and those are limited to **6 MB**. The read budget allows 20 000 job

@@ -80,35 +80,82 @@ function queryFromHash(): ReportQuery {
   };
 }
 
+/**
+ * The query actually reported on, once per-environment retention is known.
+ *
+ * `DEFAULT_QUERY.preset` is a compile-time constant; the servable preset list is a per-
+ * environment fact (`RUN_RETENTION_DAYS`, ADR-033) that only the catalog knows. If they
+ * disagree the screen opens on a spec the server refuses — a 400 on first paint, before the
+ * operator has touched anything, on the one screen whose design rule is never to offer a window
+ * retention cannot fill. `validateReportSpec` already degrades its own default to the widest
+ * servable preset; this is the client half of the same rule.
+ *
+ * A *pure derivation* rather than a normalising effect, so the unservable default is never the
+ * state anything fetches from: an effect would issue the refused request first and correct it on
+ * the next render, showing a 400 that then vanishes and spending a fan-out on it.
+ *
+ * Only the DEFAULT is substituted. A window NAMED in the URL is passed through untouched, so a
+ * shared link still shows `(beyond retention)` on the picker and the server's readable refusal —
+ * silently rewriting someone's link would answer a different question than the link names, which
+ * is exactly why the validator rejects rather than clamps.
+ */
+function effectiveQuery(
+  query: ReportQuery,
+  presets: readonly RangePreset[] | undefined,
+  windowFromUrl: boolean,
+): ReportQuery {
+  if (windowFromUrl || !presets?.length) return query;
+  if (!query.preset || presets.includes(query.preset)) return query;
+  return { ...query, preset: presets[presets.length - 1], from: undefined, to: undefined };
+}
+
 export function Reports(): JSX.Element {
   const [query, setQuery] = useState<ReportQuery>(queryFromHash);
   const catalog = useApi(() => api.reportCatalog(), []);
+
+  // Was a window NAMED in the URL, or is `query.preset` just the built-in default? Captured
+  // once at mount, because the hash-sync effect below immediately rewrites the address bar with
+  // the full resolved query — after that the hash can no longer tell the two apart.
+  const [windowFromUrl] = useState(() => {
+    const raw = new URLSearchParams(window.location.hash.split('?')[1] ?? '');
+    return raw.has('preset') || raw.has('from');
+  });
+
+  const presets = catalog.data?.presets;
+  const active = effectiveQuery(query, presets, windowFromUrl);
+  const activeString = reportQueryString(active);
 
   // Keep the hash in sync so the address bar IS the report's permalink. `replaceState` rather
   // than assigning `location.hash`: assigning fires `hashchange`, which the shell's router
   // listens to, remounting this screen and discarding in-flight state on every filter tweak.
   useEffect(() => {
-    const next = `#/reports?${reportQueryString(query)}`;
+    const next = `#/reports?${activeString}`;
     if (window.location.hash !== next) {
       window.history.replaceState(null, '', next);
     }
-  }, [query]);
+  }, [activeString]);
 
-  const report = useApi(() => api.report(query), [reportQueryString(query)]);
+  // Waits for the catalog: reporting on the pre-substitution default is the refused request
+  // `effectiveQuery` exists to avoid, and the screen renders the catalog loader until it lands
+  // anyway, so nothing that was previously visible is delayed.
+  const report = useApi(
+    () => (presets?.length ? api.report(active) : new Promise<never>(() => {})),
+    [activeString, Boolean(presets?.length)],
+  );
 
   if (catalog.error) return <ErrorBox message={catalog.error} />;
   if (!catalog.data) return <Loading what="report catalog" />;
 
   return (
     <div className="stack">
-      <Assistant catalog={catalog.data} query={query} onSpec={setQuery} />
-      <Picker catalog={catalog.data} query={query} onChange={setQuery} />
+      <Assistant catalog={catalog.data} query={active} onSpec={setQuery} />
+      <Picker catalog={catalog.data} query={active} onChange={setQuery} />
       {report.error ? (
         <ErrorBox message={report.error} />
       ) : !report.data ? (
         <Loading what="report" />
       ) : (
-        <ReportView report={report.data} query={query} />
+        <ReportView report={report.data} query={active} />
       )}
     </div>
   );
@@ -373,11 +420,24 @@ function ReportView({ report, query }: { report: Report; query: ReportQuery }): 
         </p>
         {report.caveat && (
           <p className="gap-top muted tight">
-            {report.coverageSampleSize === 0
-              ? // Coverage is 0/0 here. Printing the ratio would say "100%" about a metric that
-                // measured nothing — the one number on this screen that must never overstate.
-                'No jobs in this window could contribute to this metric. '
-              : `Coverage ${Math.round(report.coverage * 100)}%. `}
+            {/* THREE states, exactly as the empty-series line below has three. Coverage is 0/0
+                when the denominator is empty, and printing the ratio there would say "100%"
+                about a metric that measured nothing — the one number on this screen that must
+                never overstate. But an empty denominator has two causes, and saying "no jobs
+                could contribute" for the first of them contradicts the sentence directly below
+                it (and the `0 jobs` in the header): on an EMPTY window there were no jobs to
+                contribute in the first place. That is the default view of any environment with
+                no run history yet, under the default metric, so it is the first coverage
+                sentence a new operator reads. Same defect class this branch corrected for the
+                series and the table — split on `rowCount` too, not only on the sample.
+
+                Order matters: an empty window ALSO has an empty sample, so testing the sample
+                first would swallow it and reinstate the conflation. */}
+            {report.rowCount === 0
+              ? 'No jobs in this window, so there is nothing to measure. '
+              : report.coverageSampleSize === 0
+                ? `None of the ${report.rowCount} jobs in this window could contribute to this metric. `
+                : `Coverage ${Math.round(report.coverage * 100)}%. `}
             {report.caveat}
           </p>
         )}

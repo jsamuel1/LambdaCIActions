@@ -69,11 +69,16 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
   level so it doesn't mask real problems.
 - Metrics as EMF + per-env alarms + X-Ray (ADR-032); cost estimate in Run detail **and** a
   rolling per-flavor estimate on the Dashboard.
-- **Reports screen** (spec 04 § Reports): spend / job counts / duration p50-p90 / failure rate /
+- **Reports screen** (spec 04 § Reports): spend / **billable compute minutes** / job counts /
+  duration p50-p90 / failure rate /
   queue-to-start latency over a window, charted + CSV/JSON export, plus a natural-language
   report assistant. Cost left Runs per ADR-029 and lands here. Aggregates are
   authorization-first (ADR-043); phase watermarks make the cost basis honest (ADR-042); the
-  assistant emits a **validated spec**, never code (ADR-045). This is the windowed, groupable
+  assistant emits a **validated spec**, never code (ADR-045). `billableMinutes` is the
+  utilisation half: the same billable window as `spend` with the rate divided out, reported as an
+  **absolute** figure — a utilisation *ratio* needs the microVM concurrency quota as a
+  denominator, which is Settings/quotas work and is deliberately not invented here. This is the
+  windowed, groupable
   report ADR-029 deferred; the Dashboard's rolling estimate remains a deliberately separate
   fixed bounded sample of recent finished runs, not a substitute for it.
 - Vanity console domain + us-east-1 ACM cert (ADR-036) — **shipped**; resolves spec 04 OQ-4.

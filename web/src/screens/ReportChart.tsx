@@ -4,6 +4,7 @@ import { BarChart, LineChart } from 'echarts/charts';
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components';
 import { SVGRenderer } from 'echarts/renderers';
 import type { ChartType, Report, SeriesPoint } from '../api.js';
+import { formatCost } from '../components.js';
 
 /**
  * Report charts (spec 04 § Reports, ADR-046).
@@ -31,10 +32,24 @@ const SECONDARY = '#8b93a7';
 const AXIS = '#8b93a7';
 const LINE = '#2a3040';
 
+/**
+ * Render a metric value for an axis, tooltip or table cell, per the metric's declared unit.
+ *
+ * USD delegates to `formatCost` rather than reimplementing the precision rule: this component
+ * used to carry its own copy, which meant Run detail and Reports could print the SAME job's
+ * cost with different precision. One renderer, one rule (see `formatCost`).
+ *
+ * `minutes` is deliberately NOT reduced to `Nh Mm` the way `formatDuration` handles a single
+ * job's elapsed time. This unit carries an aggregate over many jobs, and it is the axis unit as
+ * well as the cell unit — an axis mixing `45m` and `2h` ticks cannot be read as one linear
+ * scale, and a total of 4 812 minutes is directly comparable to another group's only while both
+ * stay in minutes.
+ */
 function formatValue(value: number, unit: string): string {
-  if (unit === 'USD') return `$${value.toFixed(value < 1 ? 4 : 2)}`;
+  if (unit === 'USD') return formatCost(value);
   if (unit === 'ratio 0-1') return `${(value * 100).toFixed(1)}%`;
   if (unit === 'seconds') return value >= 60 ? `${Math.round(value / 60)}m` : `${Math.round(value)}s`;
+  if (unit === 'minutes') return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })}m`;
   return String(value);
 }
 

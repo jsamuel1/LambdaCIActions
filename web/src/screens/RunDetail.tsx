@@ -159,9 +159,19 @@ export function RunDetail({
         <p className="muted">
           Cost is an estimate: billable minutes × flavor rate (vCPU + GB), where the rate is
           derived from the flavor footprint rather than a bill.{' '}
-          {r.costBasis === 'wallClock'
-            ? 'This run carries no start watermark — it predates per-phase timestamps, or it finished before the running transition landed — so it is priced on total wall clock, an overstatement, since queue and provisioning time are not billed.'
-            : 'Billable time is measured from when the microVM started running, so queue and provisioning time are excluded.'}{' '}
+          {/*
+            Three cases, not two. `costBasis` is absent when no microVM ran (a mint/launch
+            failure carries the intended flavor but never had a VM), and this row is not priced
+            at all — the previous two-branch form fell through to the wallClock sentence and told
+            an operator the run was "priced on total wall clock", explaining a number that does
+            not exist. Reports and the CSV export report 0 billable seconds and no basis for the
+            same row, so this sentence is what keeps the three surfaces telling one story.
+          */}
+          {r.costBasis === undefined
+            ? 'No microVM ran for this job, so there is no billable time to price and no cost is estimated — the duration above is the time it spent queued or failing to launch, which is not billed.'
+            : r.costBasis === 'wallClock'
+              ? 'This run carries no start watermark — it predates per-phase timestamps, or it finished before the running transition landed — so it is priced on total wall clock, an overstatement, since queue and provisioning time are not billed.'
+              : 'Billable time is measured from when the microVM started running, so queue and provisioning time are excluded.'}{' '}
           See Reports for spend over a window.
         </p>
       </div>

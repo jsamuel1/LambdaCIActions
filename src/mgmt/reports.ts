@@ -1,5 +1,5 @@
 import type { RunRecord, RunStatus } from '../shared/types.js';
-import { ALL_STATUSES, billableSeconds, isCostEligible, flavorRatePerMinute, flavorNames } from './views.js';
+import { ALL_STATUSES, billableSeconds, hasRunMicrovm, isCostEligible, flavorRatePerMinute, flavorNames } from './views.js';
 
 /**
  * Reporting read model (spec 04 § Reports, ADR-043/044/045).
@@ -27,6 +27,7 @@ import { ALL_STATUSES, billableSeconds, isCostEligible, flavorRatePerMinute, fla
 /** Metrics a report can compute. Adding one here is the only way to add a report. */
 export const METRICS = [
   'spend',
+  'billableMinutes',
   'runCount',
   'duration',
   'failureRate',
@@ -73,9 +74,13 @@ export const DEFAULT_MAX_RANGE_DAYS = 90;
  * reads a partially aged-out window and still says `complete: true`, which is the silent-floor
  * failure every other budget path in this feature reports honestly. The same number is also the
  * AGE limit: `validateReportSpec` refuses an explicit window starting before `now − this`, since
- * a narrow window behind the horizon is aged out just as completely as a too-wide one. Read per
- * call (not captured at module load) and validated the same way run-store validates it, so a
- * missing or malformed value falls back instead of poisoning the container.
+ * a narrow window behind the horizon is aged out just as completely as a too-wide one. The
+ * horizon is inclusive, so a window exactly retention-wide resolves at the moment it is built —
+ * not forever after, because an absolute `from` necessarily crosses a moving horizon (that is
+ * what the age check is for). Preset windows are immune: a preset is stored as a preset and
+ * recomputed against `now` on every read. Read per call (not captured at module load) and
+ * validated the same way run-store validates it, so a missing or malformed value falls back
+ * instead of poisoning the container.
  */
 export function maxRangeDays(): number {
   const raw = process.env.RUN_RETENTION_DAYS;
@@ -96,9 +101,34 @@ export function availablePresets(max: number = maxRangeDays()): RangePreset[] {
   return allowed.length ? allowed : [RANGE_PRESETS[0]];
 }
 
+/**
+ * The window to report on when nothing named one: `7d` where retention serves it, otherwise the
+ * widest preset it does.
+ *
+ * Exported and shared rather than restated, because there are three places that need this answer
+ * and each restatement is a place it can drift out of the servable list: `validateReportSpec`
+ * (which fills the window when a spec names none), the assistant's system prompt (which tells the
+ * model what to default to), and the SPA's own default query. A hardcoded `7d` in any of them is
+ * a value the validator refuses whenever retention is shorter than a week — and in the prompt it
+ * is worse than a refusal, because the model is told to default to `7d` in the same breath as
+ * being told the only servable preset is `24h` and never to exceed it. It then emits either a
+ * spec the validator rejects (an operator gets a refusal for a fair question, the exact failure
+ * `availablePresets` exists in the prompt to prevent) or an arbitrary guess.
+ *
+ * Not reachable with the shipped dev 30 / prod 90 retention (ADR-033); it is reachable the moment
+ * an environment sets `RUN_RETENTION_DAYS` below 7, which is a one-variable change.
+ */
+export function defaultPreset(presets: readonly RangePreset[] = availablePresets()): RangePreset {
+  return presets.includes('7d') ? '7d' : presets[presets.length - 1];
+}
+
 /** Which chart types make sense for a metric+dimension pair (the UI and the model share this). */
 export const DEFAULT_CHART: Record<ReportMetric, ChartType> = {
   spend: 'bar',
+  // Same shape as `spend` for the same reason: an additive total per group, biggest first. It is
+  // deliberately NOT `stackedBar` — a stack implies the bars compose into a meaningful whole per
+  // category, which consumption per repo/flavor does not (the whole is the total, already printed).
+  billableMinutes: 'bar',
   runCount: 'stackedBar',
   duration: 'bar',
   failureRate: 'bar',
@@ -154,6 +184,23 @@ export const METRIC_CATALOG: readonly MetricDoc[] = [
       'Sum of per-job estimated microVM cost: billable minutes × the flavor rate derived ' +
       'from its vCPU/GB footprint. Jobs with no flavor (never launched) contribute 0. ' +
       'ESTIMATE — not billing truth.',
+    estimate: true,
+  },
+  {
+    metric: 'billableMinutes',
+    label: 'Billable compute minutes',
+    unit: 'minutes',
+    // Deliberately short, like `spend`'s: a definition says what the metric MEASURES and the
+    // caveat carries the mechanics and the direction of the error. This one first restated the
+    // whole caveat, which printed the same claim twice on the Reports panel (the definition and
+    // the caveat render one after the other) and put every word of it into the assistant's
+    // system prompt, which is built from this catalog (`buildSystemPrompt`).
+    definition:
+      'Sum of per-job billable microVM time in minutes — the same billable window `spend` is ' +
+      'priced from, with the flavor rate taken out, so a job whose flavor has no rate in the ' +
+      'catalog still counts its minutes. An ABSOLUTE figure, not a percentage of any capacity ' +
+      'ceiling — the microVM concurrency quota is not read anywhere yet. ESTIMATE — see the ' +
+      'caveat for which rows overstate.',
     estimate: true,
   },
   {
@@ -320,9 +367,10 @@ export function validateReportSpec(input: unknown, now: Date = new Date()): Spec
       }
     }
   } else {
-    // Default window: 7d where retention allows it, otherwise the widest preset it does.
-    const fallback = presets.includes('7d') ? '7d' : presets[presets.length - 1];
-    const chosen = preset ?? fallback;
+    // Default window: `defaultPreset` — 7d where retention allows it, otherwise the widest
+    // preset it does. Shared with the assistant's prompt so the two cannot name different
+    // defaults, which would make the model's default a spec this validator refuses.
+    const chosen = preset ?? defaultPreset(presets);
     const win = presetWindow(chosen, now);
     from = win.from;
     to = win.to;
@@ -477,7 +525,12 @@ export interface ReportResult {
   spec: ReportSpec;
   metric: MetricDoc;
   points: SeriesPoint[];
-  /** Total across every point, when the metric is additive (spend, runCount). */
+  /**
+   * Total across every point, when the metric is additive — `spend`, `billableMinutes`,
+   * `runCount`. Absent otherwise: summing p50 durations, failure ratios or queue latencies
+   * across groups produces a number with no meaning, so the field is omitted rather than
+   * computed and ignored. The predicate is in `computeReport`; keep this list with it.
+   */
   total?: number;
   /** Rows read after filtering. */
   rowCount: number;
@@ -530,6 +583,21 @@ function bucketKey(iso: string, bucket: 'hour' | 'day'): string {
   return bucket === 'hour' ? `${iso.slice(0, 13)}:00` : iso.slice(0, 10);
 }
 
+/**
+ * The bucket a row falls into for a dimension, as a `{ key, label }` pair.
+ *
+ * `key` and `label` are NOT interchangeable for `workflow`. `workflowName` is copied verbatim
+ * off the `workflow_job` webhook, so it is tenant-controlled and a repo may legitimately contain
+ * a workflow literally named like the absent bucket's label. Keying the absent case by its own
+ * display string would merge those rows into one bar and attribute real workflow activity to a
+ * data gap (and vice versa), which is unfalsifiable from the chart. So the absent case gets a
+ * key that no webhook value can produce, and every present name is namespaced under `name:`.
+ *
+ * `flavor` needs no such namespacing: every resolution path in `src/provision/flavor.ts` gates
+ * the chosen name through `byName()`, so `run.flavor` is always a catalog entry — a tenant's
+ * `runs-on:` label can select a flavor but can never become one. `(not launched)` is therefore
+ * not a reachable value.
+ */
 function groupKey(run: RunRecord, spec: ReportSpec): { key: string; label: string } {
   switch (spec.dimension) {
     case 'repo':
@@ -537,7 +605,21 @@ function groupKey(run: RunRecord, spec: ReportSpec): { key: string; label: strin
     case 'flavor':
       return { key: run.flavor ?? '(not launched)', label: run.flavor ?? '(not launched)' };
     case 'workflow':
-      return { key: run.workflowName ?? '(unknown)', label: run.workflowName ?? '(unknown)' };
+      // Labelled "no workflow name recorded", not "unknown": "(unknown)" reads like a real
+      // workflow whose name could not be determined, which invites an operator to treat the
+      // bucket as one workflow's activity. The label names the GAP and deliberately does NOT
+      // name a cause, because there are two and only one of them is about age:
+      //   - the row predates ingest persisting `workflowName` (M5), or
+      //   - `workflow_job.workflow_name` was absent on the event itself — it is optional and
+      //     nullable on the wire (`src/shared/types.ts`), Ingest's `putQueuedRun` call coalesces
+      //     a null to absent, and `buildQueuedItem` omits a falsy value rather than writing
+      //     `undefined` (a DynamoDB validation error), so a BRAND-NEW row lands here too. That
+      //     one write is the only place a run row's `workflowName` comes from.
+      // Calling this bucket a pre-M5 row would repeat the `runningAt` mistake: numbers right,
+      // explanation false for a reachable current row.
+      return run.workflowName === undefined || run.workflowName === ''
+        ? { key: 'workflow:unrecorded', label: '(no workflow name recorded)' }
+        : { key: `name:${run.workflowName}`, label: run.workflowName };
     case 'status':
       return { key: run.status, label: run.status };
     case 'time': {
@@ -588,21 +670,34 @@ export function computeReport(
 
   for (const [key, g] of groups) {
     switch (spec.metric) {
-      case 'spend': {
-        let usd = 0;
+      case 'spend':
+      case 'billableMinutes': {
+        // One arm for both, deliberately. They read the SAME billable window (ADR-042) and differ
+        // only in whether the flavor rate is applied, so splitting them into two folds is how a
+        // report could start claiming spend over a window it did not charge minutes for.
+        //
+        // They do NOT share the eligibility gate, because the two questions differ by exactly
+        // the rate: money needs a price list, compute does not. `isCostEligible` = a microVM ran
+        // AND its flavor has a rate; `hasRunMicrovm` is the launch evidence alone. Gating minutes
+        // on the pricing predicate silently drops real compute (a flavor renamed or removed from
+        // `microvm/flavors.json` orphans every historical row inside the retention window, and
+        // custom flavors would make it routine) and then reports 100% coverage over a total
+        // missing whole rows — the one number on this screen that must never overstate.
+        const eligible = spec.metric === 'spend' ? isCostEligible : hasRunMicrovm;
+        let value = 0;
         for (const r of g.runs) {
-          usd += jobCostUsd(r, now);
-          // Coverage is over the rows that were actually PRICED, not every row in the group.
-          // A queued / launch-failure row contributes 0 to spend (`isCostEligible`), so
-          // counting it in the denominator understated coverage on exactly the metric whose
-          // caveat then claimed the uncovered share was priced on overstating wall clock —
-          // it was not priced at all. An unpriced row is silent in both, so the ratio means
-          // what the caveat says it means.
-          if (!isCostEligible(r)) continue;
+          // Coverage is over the rows the metric could actually MEASURE, not every row in the
+          // group. A queued / launch-failure row contributes 0, so counting it in the denominator
+          // understated coverage on exactly the metric whose caveat then claimed the uncovered
+          // share was measured on overstating wall clock — it was not measured at all. An
+          // ineligible row is silent in both, so the ratio means what the caveat says it means.
+          if (!eligible(r)) continue;
+          value +=
+            spec.metric === 'spend' ? jobCostUsd(r, now) : billableSeconds(r, now).seconds / 60;
           coverageDen += 1;
           if (billableSeconds(r, now).basis === 'measured') coverageNum += 1;
         }
-        points.push({ key, label: g.label, value: round(usd, 6), sampleSize: g.runs.length });
+        points.push({ key, label: g.label, value: round(value, 6), sampleSize: g.runs.length });
         break;
       }
       case 'runCount':
@@ -670,7 +765,8 @@ export function computeReport(
     spec.dimension === 'time' ? a.key.localeCompare(b.key) : b.value - a.value || a.label.localeCompare(b.label),
   );
 
-  const additive = spec.metric === 'spend' || spec.metric === 'runCount';
+  const additive =
+    spec.metric === 'spend' || spec.metric === 'billableMinutes' || spec.metric === 'runCount';
   const doc = metricDoc(spec.metric);
   return {
     spec,
@@ -691,6 +787,8 @@ function caveatFor(metric: ReportMetric): string | undefined {
   switch (metric) {
     case 'spend':
       return 'Estimate. Coverage is the share of PRICED jobs whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES cost. Jobs that never launched a microVM are priced at 0 and counted in neither share.';
+    case 'billableMinutes':
+      return 'Estimate, and an ABSOLUTE figure — not a share of any capacity ceiling. Coverage is the share of jobs that RAN a microVM whose billable window was measured from the runningAt watermark; the remainder use queue-to-finish wall clock, which OVERSTATES consumption by the queue and provisioning time it wrongly includes. Jobs that never launched a microVM contribute 0 and are counted in neither share.';
     case 'duration':
       return 'Coverage is the share of jobs that reached a terminal status AND whose span was measurable; in-flight jobs are excluded.';
     case 'failureRate':
@@ -822,8 +920,25 @@ export interface ExportRow {
   [k: string]: string | number;
 }
 
+/**
+ * Project run rows onto export rows.
+ *
+ * `billableSeconds` / `costBasis` are gated on `hasRunMicrovm`, the SAME predicate the
+ * `billableMinutes` aggregate folds over — an export must reconcile with the report it was
+ * downloaded from. Ungated, a launch-failure or queued row exported its whole queue-to-finish
+ * wall clock as billable while contributing 0 to the on-screen total, so summing the column
+ * overstated consumption (a 4-minute report exported as 9 minutes on two rows). That is the
+ * same contradiction the priced column already avoids by going through `jobCostUsd`, and it is
+ * worse in this column because there is no currency symbol to make the magnitude look wrong.
+ *
+ * A row that never ran a VM therefore exports `0` and an EMPTY basis, not `wallClock`: a basis
+ * names which clock produced a billable window, and this row has no billable window to have
+ * measured. Nothing is lost — `createdAt`/`updatedAt`/`wallClockSeconds` still carry the row's
+ * real span, and `status` says why it has no compute.
+ */
 export function toExportRows(runs: RunRecord[], now: Date = new Date()): ExportRow[] {
   return runs.map((r) => {
+    const ran = hasRunMicrovm(r);
     const billable = billableSeconds(r, now);
     return {
       repoId: r.repoId,
@@ -838,8 +953,8 @@ export function toExportRows(runs: RunRecord[], now: Date = new Date()): ExportR
       runningAt: r.runningAt ?? '',
       updatedAt: r.updatedAt,
       wallClockSeconds: wallClockSeconds(r),
-      billableSeconds: billable.seconds,
-      costBasis: billable.basis,
+      billableSeconds: ran ? billable.seconds : 0,
+      costBasis: ran ? billable.basis : '',
       estimatedCostUsd: round(jobCostUsd(r, now), 6),
     };
   });
