@@ -52,6 +52,15 @@ export class ControlStack extends Stack {
   /** Discovery queue coordinates, consumed by MgmtStack's manual re-scan endpoint (M4). */
   public readonly discoveryQueueUrl: string;
   public readonly discoveryQueueArn: string;
+  /**
+   * App-config broker coordinates (ADR-034). The Mgmt λ invokes this to verify/relink the
+   * GitHub App and write platform config — the console λ itself holds neither the App PEM nor
+   * any `ssm:PutParameter` grant.
+   */
+  public readonly appcfgBrokerName: string;
+  public readonly appcfgBrokerArn: string;
+  /** The deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
+  public readonly webhookUrl: string;
   /** Rewrite queue coordinates, consumed by MgmtStack's rewrite-PR endpoint (M5). */
   public readonly rewriteQueueUrl: string;
   public readonly rewriteQueueArn: string;
@@ -666,9 +675,115 @@ export class ControlStack extends Stack {
       methods: [apigw.HttpMethod.POST],
       integration: new HttpLambdaIntegration('IngestIntegration', ingest),
     });
+    this.webhookUrl = `${httpApi.apiEndpoint}/webhook`;
+
+    // ---- App-config broker λ (ADR-034) ----
+    // The management plane needs to prove the GitHub App linkage (App JWT → GET /app,
+    // /app/hook/deliveries) and to re-link the environment to a rotated App. Both need the
+    // App PEM, and the relink needs PutParameter on SecureString credential paths — authority
+    // the console λ deliberately does NOT have (ADR-025). It lives here instead, invoked by
+    // the Mgmt λ and nothing else, so secret-read + secret-write stay in the control plane.
+    const appcfgLogGroup = new logs.LogGroup(this, 'AppConfigLogGroup', {
+      logGroupName: `/aws/lambda/lca-${envName}-appcfg`,
+      // Deliberately NOT `logDefaults.retention`: this group is the audit trail for credential
+      // changes, so it outlives the env's ordinary Lambda retention (dev's two weeks would
+      // discard a relink history the operator may need to reconstruct). It floors at three
+      // months and follows the env when the env keeps logs longer.
+      retention: logs.RetentionDays.THREE_MONTHS,
+      // Removal DOES follow the env (ADR-033). Hardcoding DESTROY here would delete the
+      // credential-change history in `prod` on stack removal — exactly what the long
+      // retention above exists to prevent.
+      removalPolicy: config.logRemovalPolicy,
+    });
+    const appcfg = new NodejsFunction(this, 'AppConfigFn', {
+      functionName: `lca-${envName}-appcfg`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(SRC, 'appcfg', 'handler.ts'),
+      handler: 'handler',
+      // Several sequential GitHub calls plus up to 6 SSM writes; the console waits on it, and
+      // the console's own integration is capped at API Gateway's 29 s. A broker that outlived
+      // that would finish a relink whose `replacedVersions` rollback handle the operator never
+      // received — so it must fail FIRST, leaving its own verify→rollback path to clean up.
+      timeout: Duration.seconds(25),
+      memorySize: 256,
+      // One credential change at a time is enforced by a conditional DynamoDB lock around the
+      // MUTATING actions (`acquireConfigLock`), not by a concurrency cap: capping the function
+      // would also serialize `status`, which the Settings screen polls every 15 s — two
+      // operators with the screen open would throttle each other into a blank view. `status`
+      // instead caches its GitHub answers per container (STATUS_CACHE_MS) so polling cannot
+      // drain the App's shared 5,000/h JWT budget that Provision needs for job tokens.
+      logGroup: appcfgLogGroup,
+      tracing,
+      bundling,
+      environment: {
+        LCA_ENV: envName,
+        SSM_PREFIX: ssmPrefix,
+        TABLE_NAME: table.tableName,
+        WEBHOOK_URL: this.webhookUrl,
+      },
+    });
+    this.appcfgBrokerName = appcfg.functionName;
+    this.appcfgBrokerArn = appcfg.functionArn;
+
+    // Reads the App credentials (incl. historical versions, for rollback) + config.
+    appcfg.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadAppCredentials',
+        actions: ['ssm:GetParameter'],
+        resources: [
+          paramArn(`${ssmPrefix}/github/app-id`),
+          paramArn(`${ssmPrefix}/github/app-pem`),
+          paramArn(`${ssmPrefix}/github/webhook-secret`),
+          paramArn(`${ssmPrefix}/github/client-id`),
+          paramArn(`${ssmPrefix}/github/client-secret`),
+          paramArn(`${ssmPrefix}/github/app-slug`),
+          paramArn(`${ssmPrefix}/config/runner-labels`),
+        ],
+      }),
+    );
+    // The ONLY PutParameter grant in the platform, scoped to the exact credential + config
+    // paths a relink/label change replaces (ADR-034 blast radius). Note what is absent:
+    // `/mgmt/session-secret` (forging it would forge operator sessions), the image ARNs, and
+    // any wildcard over the prefix.
+    //
+    // DeleteParameter is scoped to the SAME set and exists only for the undo path: a relink
+    // that creates a parameter and then fails has no prior version to restore, so the created
+    // parameter must be removed rather than left as a partial credential set.
+    const credentialParams = [
+      paramArn(`${ssmPrefix}/github/app-id`),
+      paramArn(`${ssmPrefix}/github/app-pem`),
+      paramArn(`${ssmPrefix}/github/webhook-secret`),
+      paramArn(`${ssmPrefix}/github/client-id`),
+      paramArn(`${ssmPrefix}/github/client-secret`),
+      paramArn(`${ssmPrefix}/github/app-slug`),
+      paramArn(`${ssmPrefix}/config/runner-labels`),
+    ];
+    appcfg.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'WriteAppCredentials',
+        actions: ['ssm:PutParameter', 'ssm:DeleteParameter'],
+        resources: credentialParams,
+      }),
+    );
+    // Audit rows + the config lock + the shared status-cache row (`CONFIG#AUDIT`,
+    // `CONFIG#LOCK`, `CONFIG#STATUS`) only — scoped by leading key so the broker cannot touch
+    // run rows or installation config. UpdateItem (not Put/Delete): it cannot destroy history
+    // either. GetItem is needed to READ the shared status cache, which is what keeps a polled
+    // Settings screen from draining the App's shared GitHub JWT budget.
+    appcfg.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'WriteConfigAudit',
+        actions: ['dynamodb:UpdateItem', 'dynamodb:GetItem'],
+        resources: [table.tableArn],
+        conditions: {
+          'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['CONFIG#*'] },
+        },
+      }),
+    );
 
     new CfnOutput(this, 'WebhookUrl', {
-      value: `${httpApi.apiEndpoint}/webhook`,
+      value: this.webhookUrl,
       description: 'Set this as the GitHub App hook_attributes.url (scripts/create-github-app.mjs --webhook-url)',
     });
     new CfnOutput(this, 'ProvisionQueueUrl', { value: queue.queueUrl });
@@ -681,6 +796,7 @@ export class ControlStack extends Stack {
     });
     new CfnOutput(this, 'ReaperFunctionName', { value: reaper.functionName });
     new CfnOutput(this, 'HookBrokerFunctionName', { value: hookBroker.functionName });
+    new CfnOutput(this, 'AppConfigBrokerName', { value: appcfg.functionName });
     new CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn });
   }
 }

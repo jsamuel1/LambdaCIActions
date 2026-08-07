@@ -246,14 +246,19 @@ every image available, and a test push completes green.
 ## Break-glass
 
 **Stop all claiming immediately** (platform-wide, no deploy): point the runner-labels config
-at a label nothing uses. Ingest re-reads it from SSM on a 5-minute per-container cache
-(`src/shared/ssm.ts`), so it takes effect within **~5 minutes** — warm containers keep using
-the old value until their cache entry expires. If you need it to be instant, also zero
-Provision's concurrency (below) so nothing launches while the change propagates.
+at a label nothing uses. Ingest re-reads it from SSM on a **30-second** per-container cache
+(`RUNNER_LABELS_TTL_MS` in `src/ingest/handler.ts` — deliberately far below `getParam`'s
+5-minute default, because the Settings screen presents a label change as taking effect on the
+next delivery), so it takes effect within **~30 s** — warm containers keep using the old value
+until their cache entry expires. If you need it to be instant, also zero Provision's
+concurrency (below) so nothing launches while the change propagates.
 ```bash
 aws ssm put-parameter --name /lca/<env>/config/runner-labels \
   --value 'lambda-ci-DISABLED' --type String --overwrite
 ```
+If the console is reachable and you are in `config/platform-admins`, the same change is a
+**Settings → Runner labels** edit (mandatory impact preview, audited actor + timestamp,
+ADR-034). The SSM write above is the break-glass path for when the console is not available.
 Adopt-mode repos are **not** covered by that (they claim by hosted label, not by our label) —
 set those repos to `mode=off`. If you need to stop the platform launching anything at all
 without touching per-repo config, zero Provision's concurrency. Note this does **not** stop

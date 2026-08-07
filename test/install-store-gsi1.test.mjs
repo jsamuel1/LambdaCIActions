@@ -366,6 +366,37 @@ test('the installations route passes the session grants, not an empty candidate 
   assert.match(src, /grantedInstallationIds,?\n/, 'the helper must be imported, not shadowed');
 });
 
+test('EVERY listInstallations caller supplies a real candidate set, not an empty one', () => {
+  // The pin above resolves only the FIRST call site. Settings added two more (the settings
+  // screen's store read and the label-change impact preview), and a source pin that stops at
+  // the first match silently stops protecting the ones added after it. Enumerate all of them.
+  //
+  // Both new sites matter for a different reason than the installations route: the settings
+  // screen decides `known` per installation, and the label impact preview is the operator's
+  // only warning about jobs a label change will stop claiming. An empty candidate set makes
+  // the first render a false "unknown installation" and the second under-report the blast
+  // radius of a platform-wide change — both silent, both index blindness wearing a new hat.
+  const src = readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  const calls = [...src.matchAll(/listInstallations\(([^;]*?)\)\s*(?:\.catch|[,;)])/g)].map((m) =>
+    m[1].trim(),
+  );
+  assert.ok(calls.length >= 3, `expected at least 3 call sites, found ${calls.length}`);
+  for (const arg of calls) {
+    assert.notEqual(arg, '', 'a zero-arg listInstallations call restores index blindness');
+    assert.ok(
+      !/^\[\s*\]$/.test(arg),
+      'passing [] is the pre-ADR-037 index-only read with the type error silenced',
+    );
+  }
+  // Positive control: the regex must actually be capable of catching the prohibited spellings,
+  // otherwise every assertion above is a no-op that passes on any source.
+  const synthetic = 'await listInstallations();\nawait listInstallations([]).catch(() => []);';
+  const bad = [...synthetic.matchAll(/listInstallations\(([^;]*?)\)\s*(?:\.catch|[,;)])/g)].map(
+    (m) => m[1].trim(),
+  );
+  assert.deepEqual(bad, ['', '[]'], 'the call-site matcher must detect both prohibited forms');
+});
+
 test('an operator with a grant sees a legacy row through the route composition', async () => {
   // End-to-end over the pure seam the route uses: grants → reconcile → visibility filter.
   // This is the acceptance criterion in prose: installation 146431062 is served by the

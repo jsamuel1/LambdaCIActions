@@ -988,12 +988,15 @@ test('the assistant route returns a spec and never executes the report itself', 
   // the spec and fetches /api/reports/run) is up to 2 x MAX_TOTAL_ROWS of DynamoDB reads for one
   // answer, with the first result discarded. Source-level, matching the other handler/SPA
   // assertions in this file — this repo drives pure helpers and has no handler harness.
+  // The span ends at `settingsRoute`'s declaration, so ADR-034's doc block for that function
+  // sits inside this slice — hence a bound above the ~3.0 kB the route itself measures. It is
+  // still a plausibility bound: a missing terminator would yield tens of thousands of chars.
   const handler = fs.readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
   const body = sliceBetween(
     handler,
     'async function askReportRoute',
     'async function settingsRoute',
-    3000,
+    3400,
   );
   assert.ok(
     !/executeReport/.test(body),

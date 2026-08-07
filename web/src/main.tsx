@@ -8,7 +8,8 @@ import { RepoDetail } from './screens/RepoDetail.js';
 import { Runs } from './screens/Runs.js';
 import { RunDetail } from './screens/RunDetail.js';
 import { Reports } from './screens/Reports.js';
-import { Flavors, Settings } from './screens/Platform.js';
+import { Flavors } from './screens/Platform.js';
+import { Settings } from './screens/Settings.js';
 import { Setup } from './screens/Setup.js';
 import './styles.css';
 

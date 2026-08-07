@@ -37,6 +37,10 @@ export type RouteId =
   | 'listFlavors'
   | 'health'
   | 'settings'
+  | 'putRunnerLabels'
+  | 'relinkGithubApp'
+  | 'rollbackGithubApp'
+  | 'testWebhook'
   | 'reportCatalog'
   | 'runReport'
   | 'exportReport'
@@ -69,6 +73,31 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'listFlavors', method: 'GET', template: '/api/flavors', authRequired: true },
   { id: 'health', method: 'GET', template: '/api/health', authRequired: true },
   { id: 'settings', method: 'GET', template: '/api/settings', authRequired: true },
+  // --- settings mutations (spec 04 § Settings, ADR-034) ---
+  {
+    id: 'putRunnerLabels',
+    method: 'PUT',
+    template: '/api/settings/runner-labels',
+    authRequired: true,
+  },
+  {
+    id: 'relinkGithubApp',
+    method: 'POST',
+    template: '/api/settings/github-app/relink',
+    authRequired: true,
+  },
+  {
+    id: 'rollbackGithubApp',
+    method: 'POST',
+    template: '/api/settings/github-app/rollback',
+    authRequired: true,
+  },
+  {
+    id: 'testWebhook',
+    method: 'POST',
+    template: '/api/settings/webhook/test',
+    authRequired: true,
+  },
   // --- reports (spec 04 § Reports) ---
   { id: 'reportCatalog', method: 'GET', template: '/api/reports/catalog', authRequired: true },
   { id: 'runReport', method: 'GET', template: '/api/reports/run', authRequired: true },

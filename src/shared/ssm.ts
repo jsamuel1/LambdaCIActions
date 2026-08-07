@@ -1,4 +1,10 @@
-import { SSMClient, GetParameterCommand, DescribeParametersCommand } from '@aws-sdk/client-ssm';
+import {
+  SSMClient,
+  GetParameterCommand,
+  DescribeParametersCommand,
+  DeleteParameterCommand,
+  PutParameterCommand,
+} from '@aws-sdk/client-ssm';
 
 /**
  * Thin SSM Parameter Store reader with a per-container cache. Lambdas get path-scoped
@@ -9,13 +15,31 @@ const cache = new Map<string, { value: string; expires: number }>();
 const TTL_MS = 5 * 60 * 1000; // re-read secrets every 5 min at most
 
 /**
+ * Whether a cache entry may serve THIS read. Split out so the semantics are testable without
+ * an SSM stub, because one of them is load-bearing and counter-intuitive:
+ *
+ * A forced read (`ttlMs=0`) stores `expires: now + 0`, i.e. an entry that is already expired the
+ * moment it is written. So a forced read does NOT warm the cache for later callers — the next
+ * read of that name pays a fresh `GetParameter`. Ingest's webhook-secret rotation recovery depends
+ * on that being true (see `verifyWithRotation`): its uncached re-read is what makes the following
+ * delivery observe the rotated secret, and it does so by re-reading, not by leaving a warm entry.
+ */
+export function cacheEntryUsable(
+  entry: { value: string; expires: number } | undefined,
+  ttlMs: number,
+  now: number,
+): boolean {
+  return entry !== undefined && entry.expires > now && ttlMs > 0;
+}
+
+/**
  * Read a parameter (decrypting SecureStrings). Cached briefly to cut API calls on the hot
  * path. `ttlMs=0` forces a fresh read.
  */
 export async function getParam(name: string, ttlMs = TTL_MS): Promise<string> {
   const now = Date.now();
   const hit = cache.get(name);
-  if (hit && hit.expires > now && ttlMs > 0) return hit.value;
+  if (hit !== undefined && cacheEntryUsable(hit, ttlMs, now)) return hit.value;
 
   const res = await client.send(
     new GetParameterCommand({ Name: name, WithDecryption: true }),
@@ -46,4 +70,74 @@ export async function paramExists(name: string): Promise<boolean> {
     }),
   );
   return (res.Parameters ?? []).length > 0;
+}
+
+/**
+ * Current version number of a parameter, or undefined when it doesn't exist. Version
+ * numbers are metadata, not secrets — they are the rollback handle for a credential relink
+ * (ADR-034): SSM's parameter history holds the previous VALUES, so we never copy one.
+ */
+export async function paramVersion(name: string): Promise<number | undefined> {
+  try {
+    const res = await client.send(new GetParameterCommand({ Name: name, WithDecryption: false }));
+    return res.Parameter?.Version;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ParameterNotFound') return undefined;
+    throw err;
+  }
+}
+
+/**
+ * Read a specific historical version of a parameter (`Name:version`). Only the App-config
+ * broker holds the IAM grant for this on secret paths (ADR-034) — it is how rollback
+ * restores the pre-relink credentials without the platform ever storing a second copy.
+ */
+export async function getParamVersion(name: string, version: number): Promise<string> {
+  const res = await client.send(
+    new GetParameterCommand({ Name: `${name}:${version}`, WithDecryption: true }),
+  );
+  const value = res.Parameter?.Value;
+  if (value === undefined) throw new Error(`SSM parameter ${name}:${version} has no value`);
+  return value;
+}
+
+/**
+ * Write a parameter, returning the new version. Reserved for the App-config broker; the
+ * management λ has NO `ssm:PutParameter` grant of any kind (ADR-025 + ADR-034).
+ *
+ * The per-container read cache is invalidated for the name so a subsequent verification read
+ * in the same container can't observe the pre-write value.
+ */
+export async function putParam(
+  name: string,
+  value: string,
+  opts: { secure: boolean; description?: string },
+): Promise<number> {
+  const res = await client.send(
+    new PutParameterCommand({
+      Name: name,
+      Value: value,
+      Type: opts.secure ? 'SecureString' : 'String',
+      Overwrite: true,
+      ...(opts.description ? { Description: opts.description } : {}),
+    }),
+  );
+  cache.delete(name);
+  const version = res.Version;
+  if (version === undefined) throw new Error(`SSM put for ${name} returned no version`);
+  return version;
+}
+
+/**
+ * Delete a parameter. Used ONLY to undo a failed first-link: a parameter this attempt created
+ * has no prior version to restore, so leaving it behind would strand a partial credential set
+ * (ADR-034). A missing parameter is treated as already-undone.
+ */
+export async function deleteParam(name: string): Promise<void> {
+  try {
+    await client.send(new DeleteParameterCommand({ Name: name }));
+  } catch (err) {
+    if ((err as { name?: string }).name !== 'ParameterNotFound') throw err;
+  }
+  cache.delete(name);
 }

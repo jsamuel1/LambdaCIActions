@@ -99,9 +99,11 @@ only *referenced* by CDK.
 | `/lca/<env>/github/client-secret` | SecureString | OAuth client secret (console login) |
 | `/lca/<env>/mgmt/session-secret` | SecureString | Console session cookie signing key (ADR-022) |
 | `/lca/<env>/github/app-id` | String | App ID |
+| `/lca/<env>/github/app-slug` | String | App slug, for install URLs. Written by `create-github-app.mjs` and re-written by the App-config broker on relink/rollback (ADR-034) |
 | `/lca/<env>/config/image-arn-<flavor>` | String | Published by build script |
 | `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Must list every flavor label in `microvm/flavors.json` (plus any mapped label); a missing one means those jobs are never claimed. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
 | `/lca/<env>/config/table-name` | String | Published by `DataStack` |
+| `/lca/<env>/config/platform-admins` | String | Comma-separated GitHub logins allowed to make **platform-wide** settings changes (relink the App, change runner labels, test webhook delivery). **Fails closed** — unset authorizes nobody (ADR-035). Created manually, see [DEPLOY-M4](../DEPLOY-M4.md) |
 
 `scripts/create-github-app.mjs` writes the GitHub App credentials (app id, PEM, webhook
 secret, OAuth client id/secret) after the App Manifest flow; the console session secret is
@@ -165,7 +167,8 @@ Least privilege per Lambda:
 | Reaper | list live microVMs + terminate orphans (by run-store `microvmId`); update run rows |
 | Hook broker | `dynamodb:GetItem` on the run table (no Query/Scan, no index); `lambda:TerminateMicrovm` (region-scoped). Called ONLY by microVMs, token-gated to the caller's own run; 20 reserved concurrent executions (ADR-021) |
 | microVM exec role | its own log group; `lambda:InvokeFunction` on the hook broker ARN. **Nothing else** — no DynamoDB, no microVM control (ADR-021) |
-| Mgmt API | read the shared table + run log group; `dynamodb:UpdateItem` (config only — no Put/Delete); `sqs:SendMessage` on the discovery queue; read ONLY its own OAuth/session secrets; `ssm:DescribeParameters` for presence checks. **No** token minting, **no** microVM launch/terminate, **no** `iam:PassRole`, **no** access to the App PEM (ADR-025, asserted in `test/mgmt-stack.test.mjs`) |
+| Mgmt API | read the shared table + run log group; `dynamodb:UpdateItem` (config only — no Put/Delete); `sqs:SendMessage` on the discovery queue; read ONLY its own OAuth/session secrets plus the two **non-secret** config params it reports as effective values (`config/runner-labels`, `config/platform-admins`); `ssm:DescribeParameters` for presence checks; `lambda:InvokeFunction` on the App-config broker ARN and nothing else. **No** token minting, **no** microVM launch/terminate, **no** `iam:PassRole`, **no** access to the App PEM, **no** `ssm:PutParameter` of any kind (ADR-025 + ADR-034, asserted in `test/mgmt-stack.test.mjs`) |
+| App-config broker | read the App credentials incl. historical versions (`ssm:GetParameter` on the exact `github/*` + `config/runner-labels` paths); the platform's **only** `ssm:PutParameter`/`DeleteParameter` grant, scoped to that same exact path set — **not** `mgmt/session-secret`, not the image ARNs, no prefix wildcard; `dynamodb:UpdateItem`/`GetItem` restricted to `CONFIG#*` leading keys (audit, lock, status cache). Invoked ONLY by the Mgmt λ; makes App-JWT GitHub calls (`GET /app`, installations, hook config + deliveries). No compute, no run rows (ADR-034) |
 | Image build | `s3:*` on code bucket; microVM image build APIs |
 
 microVM launch/terminate IAM is scoped to account/region (`aws:RequestedRegion`), NOT by

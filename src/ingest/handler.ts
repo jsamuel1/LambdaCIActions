@@ -20,6 +20,7 @@ import {
   disableRepo,
   getRepo,
 } from '../shared/install-store.js';
+import { recordWebhookDelivery, recordWebhookRejection } from '../shared/config-store.js';
 import type {
   WorkflowJobEvent,
   InstallationEvent,
@@ -49,6 +50,41 @@ const sqs = new SQSClient({});
 
 const WEBHOOK_SECRET_PARAM = process.env.WEBHOOK_SECRET_PARAM!;
 const RUNNER_LABELS_PARAM = process.env.RUNNER_LABELS_PARAM!;
+
+/**
+ * Cache TTL for the claimed-label config, deliberately much shorter than `getParam`'s 5-minute
+ * default (ADR-034).
+ *
+ * A label change from the Settings screen is presented as taking effect on the very NEXT
+ * `workflow_job` delivery — that is what the mandatory impact preview describes, and the whole
+ * point of previewing which jobs move. With the default TTL a warm container would keep claiming
+ * against the PREVIOUS label set for up to 5 minutes: jobs the operator just stopped claiming
+ * would still be provisioned here, and jobs they just adopted would still go to GitHub-hosted,
+ * with nothing on the screen saying so. There is no recovery signal to trigger a re-read from (an
+ * unclaimed job simply runs elsewhere), so the bound has to be the TTL itself. Labels are a
+ * non-secret String, so the cost is one extra `GetParameter` per container per 30 s on the
+ * webhook path.
+ */
+export const RUNNER_LABELS_TTL_MS = 30_000;
+
+/**
+ * Cache TTL for the webhook secret, likewise far below `getParam`'s 5-minute default (ADR-034).
+ *
+ * `verifyWithRotation` below recovers from a rotation faster than any TTL by re-reading when a
+ * signature fails to verify — but that trigger must NOT be the only bound, because the thing
+ * that trips it is a request on a PUBLIC endpoint. The re-read is rate-limited per container
+ * (`SECRET_RECHECK_MS`) so an anonymous flood cannot drive an SSM call per delivery, and that
+ * rate limit is exactly what an attacker can consume: posting junk with a well-formed
+ * `sha256=` prefix every 30 s keeps the window spent, so GitHub's real delivery arrives, fails
+ * against the stale cached secret, finds the re-read throttled, and is rejected 401. GitHub does
+ * not retry a delivery that failed verification, so those `workflow_job` events are lost, not
+ * delayed — for as long as the cache holds.
+ *
+ * Making the TTL itself the bound removes that dependency: worst-case staleness is 30 s whether
+ * or not the recovery signal ever fires. Same cost as the label read it sits beside — one
+ * `GetParameter` per container per 30 s — since both are read on the same path.
+ */
+export const WEBHOOK_SECRET_TTL_MS = 30_000;
 const QUEUE_URL = process.env.QUEUE_URL!;
 const DISCOVERY_QUEUE_URL = process.env.DISCOVERY_QUEUE_URL;
 
@@ -68,11 +104,145 @@ export async function handler(
   const signature = headers['x-hub-signature-256'] ?? headers['X-Hub-Signature-256'];
   const ghEvent = headers['x-github-event'] ?? headers['X-GitHub-Event'];
 
-  const secret = await getParam(WEBHOOK_SECRET_PARAM);
-  if (!verifySignature(rawBody, signature, secret)) {
+  const secret = await getParam(WEBHOOK_SECRET_PARAM, WEBHOOK_SECRET_TTL_MS);
+  const verified = await verifyWithRotation(rawBody, signature, secret, () =>
+    getParam(WEBHOOK_SECRET_PARAM, 0),
+  );
+  if (!verified) {
+    // Record the rejection (best-effort): GitHub reaching us with a signature we can't
+    // verify is the signature of a half-finished secret rotation, and the Settings screen
+    // must be able to distinguish it from silence (spec 04 § webhook health).
+    //
+    // ONLY for a request that plausibly IS a GitHub delivery. `/webhook` is public and
+    // unauthenticated, so recording every rejection would let any stranger (or an ordinary
+    // internet scanner) drive the Settings badge to `degraded` and publish "the webhook secret
+    // at GitHub does not match the stored one" — a specific, actionable, and false diagnosis on
+    // the one screen whose whole purpose is that a badge means something. Unsigned junk is
+    // still refused 401; it just isn't evidence about our credentials.
+    if (looksLikeGithubDelivery(signature, ghEvent)) {
+      await recordWebhookRejection().catch((err) =>
+        console.error(JSON.stringify({ msg: 'webhook rejection heartbeat failed', error: errMsg(err) })),
+      );
+    }
     return json(401, { error: 'invalid signature' });
   }
 
+  // Delivery heartbeat (spec 04 § webhook health): real evidence that GitHub is delivering
+  // to THIS environment, recorded for every verified delivery regardless of event type.
+  // One fixed-key UpdateItem, and best-effort — a failed heartbeat must never drop a webhook.
+  //
+  // NOT awaited before the claim decision: Ingest must ack GitHub fast (a slow ack means
+  // redelivery), and this write is diagnostics. It is awaited at the END of the request via
+  // `heartbeat`, so the Lambda is not frozen mid-write, but it never sits in front of the
+  // enqueue latency.
+  const heartbeat = recordWebhookDelivery({
+    event: ghEvent ?? 'unknown',
+    deliveryId: headers['x-github-delivery'] ?? headers['X-GitHub-Delivery'],
+  }).catch((err) =>
+    console.error(JSON.stringify({ msg: 'webhook heartbeat failed', error: errMsg(err) })),
+  );
+
+  try {
+    return await dispatch(rawBody, ghEvent);
+  } finally {
+    await heartbeat;
+  }
+}
+
+/**
+ * At most one uncached secret re-read per container per window. `/webhook` is public and the
+ * signature check is what rejects an anonymous caller, so an unthrottled re-read would let
+ * anyone drive an SSM `GetParameter` per request.
+ *
+ * Because it is rate-limited, it is a FAST PATH and not the staleness bound: an anonymous
+ * caller can spend the window on junk (see `WEBHOOK_SECRET_TTL_MS`, which is the real bound).
+ */
+const SECRET_RECHECK_MS = 30_000;
+let lastSecretRecheck = 0;
+
+/**
+ * Verify a delivery, tolerating an in-flight webhook-secret rotation (ADR-034).
+ *
+ * `getParam` caches the secret for `WEBHOOK_SECRET_TTL_MS`, so a WARM container can keep verifying
+ * against the PREVIOUS secret for up to that long after a relink rotated it — while GitHub already
+ * signs with the new one. GitHub does NOT retry a delivery that failed verification, so every
+ * `workflow_job` in that window would be silently lost. One bounded uncached re-read collapses the
+ * window to the FIRST failing delivery instead of waiting out the TTL.
+ *
+ * Note what the re-read does NOT do: it goes through `getParam(name, 0)`, which stores its result
+ * with `expires: now + 0` — an already-expired entry — so it leaves no warm cache behind. The next
+ * delivery therefore pays one fresh `GetParameter` and verifies against the rotated secret on its
+ * first attempt; it is that fresh read, not a warmed cache, that makes the recovery stick. Cost is
+ * one extra uncached read per rotation recovery, on a path where read cost is the reason the
+ * re-read is throttled at all. Pinned by `test/ingest-secret-rotation.test.mjs`.
+ *
+ * This is an optimization on top of the TTL, not the guarantee: the re-read is rate-bounded, and
+ * an anonymous caller posting junk with a well-formed `sha256=` prefix can hold that window spent.
+ * The TTL is what makes recovery unconditional.
+ *
+ * Guards, in order: an absent/malformed signature never triggers a re-read (nothing to rotate
+ * toward), the re-read is rate-bounded per container, a read fault degrades to rejection rather
+ * than a 5xx, and an unchanged value short-circuits. Exported for tests — `readFresh` is the
+ * uncached-read seam.
+ */
+export async function verifyWithRotation(
+  rawBody: string,
+  signature: string | undefined,
+  cachedSecret: string,
+  readFresh: () => Promise<string>,
+  now = Date.now(),
+): Promise<boolean> {
+  if (verifySignature(rawBody, signature, cachedSecret)) return true;
+  // Only a well-formed signature is worth a re-read; `verifySignature` requires the `sha256=`
+  // prefix, so mirror that check rather than spending a read on arbitrary junk.
+  if (!signature || !signature.startsWith('sha256=')) return false;
+  if (now - lastSecretRecheck < SECRET_RECHECK_MS) return false;
+  lastSecretRecheck = now;
+  let fresh: string;
+  try {
+    fresh = await readFresh();
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'webhook secret re-read failed', error: errMsg(err) }));
+    return false;
+  }
+  if (fresh === cachedSecret) return false;
+  return verifySignature(rawBody, signature, fresh);
+}
+
+/** Test hook: reset the re-read throttle. */
+export function _resetSecretRecheck(): void {
+  lastSecretRecheck = 0;
+}
+
+/**
+ * Whether a refused request is plausibly a real GitHub delivery, and therefore evidence worth
+ * recording on the Settings screen (spec 04 § webhook health).
+ *
+ * The rejection heartbeat exists to make ONE symptom visible: GitHub is reaching us but its
+ * signature no longer verifies — a half-finished webhook-secret rotation. That symptom requires
+ * a delivery that carries both of GitHub's markers: a well-formed `sha256=` signature and an
+ * event name. Anything else (an empty probe, a scanner, a hand-rolled POST) proves nothing about
+ * our credentials, and counting it would let an anonymous caller publish a false credential
+ * diagnosis — the same public-endpoint reasoning that rate-bounds the write itself
+ * (`recordWebhookRejection`) and the secret re-read (`SECRET_RECHECK_MS`).
+ *
+ * Deliberately NOT a stronger check: nothing available here can prove the sender is GitHub (that
+ * is what the HMAC does, and it just failed). This only filters out traffic that never even
+ * claimed to be a delivery.
+ */
+export function looksLikeGithubDelivery(
+  signature: string | undefined,
+  ghEvent: string | undefined,
+): boolean {
+  if (!signature || !signature.startsWith('sha256=')) return false;
+  return Boolean(ghEvent && ghEvent.trim().length > 0);
+}
+
+/** Route a signature-verified delivery to its handler. */
+async function dispatch(
+  rawBody: string,
+  ghEvent: string | undefined,
+): Promise<APIGatewayProxyResultV2> {
   let payload: unknown;
   try {
     payload = JSON.parse(rawBody);
@@ -138,7 +308,7 @@ async function handleWorkflowJob(
     return json(202, { ok: true, claimed: false, ignored: wf.action });
   }
 
-  const claimedLabels = (await getParam(RUNNER_LABELS_PARAM))
+  const claimedLabels = (await getParam(RUNNER_LABELS_PARAM, RUNNER_LABELS_TTL_MS))
     .split(',')
     .map((l) => l.trim())
     .filter(Boolean);

@@ -520,12 +520,130 @@ export interface SecretStatus {
   present: boolean;
 }
 
+// ---- settings: GitHub App linkage, runner labels, webhook health ------------
+
+/** Live-verified App identity (from `GET /app` with the stored credentials). */
+export interface AppLinkageAppView {
+  appId: number;
+  name: string;
+  slug: string;
+  htmlUrl: string;
+  ownerLogin: string;
+  events: string[];
+  permissions: Record<string, string>;
+}
+
+export interface AppInstallationView {
+  installationId: number;
+  accountLogin: string;
+  /** GitHub's own view (from the App JWT listing). */
+  suspended: boolean;
+  /** True when our install store also has a row for it. */
+  known: boolean;
+}
+
+export interface WebhookDeliveryView {
+  id: number;
+  event: string;
+  action: string | null;
+  status: string;
+  statusCode: number;
+  deliveredAt: string;
+  durationMs: number;
+  redelivery: boolean;
+}
+
+/**
+ * Webhook health. Deliberately evidence-based (spec 04 § webhook health): a green state
+ * requires either a delivery we actually accepted (`lastReceivedAt`, from the Ingest
+ * heartbeat) or a successful delivery in GitHub's own log — never merely "the webhook-secret
+ * parameter exists".
+ */
+export interface WebhookHealthView {
+  /** URL GitHub is configured to POST to, as reported by GitHub. */
+  configuredUrl?: string;
+  /** The receiver URL this deployment actually exposes. */
+  deployedUrl?: string;
+  /** True when both are known and differ — the post-redeploy failure mode. */
+  urlMismatch: boolean;
+  secretConfigured?: boolean;
+  insecureSsl?: boolean;
+  /** Heartbeat: when we last accepted a signature-verified delivery. */
+  lastReceivedAt?: string;
+  lastReceivedEvent?: string;
+  lastDeliveryId?: string;
+  deliveries?: number;
+  /** Heartbeat: last delivery that FAILED signature verification (secret mismatch). */
+  lastRejectedAt?: string;
+  rejections?: number;
+  /** GitHub's delivery log (most recent first). */
+  recentDeliveries: WebhookDeliveryView[];
+  /** Deliveries in that window GitHub could not deliver successfully. */
+  recentFailures: number;
+  /** Why webhook data is missing/partial (e.g. the App JWT lacks hook scope). */
+  error?: string;
+  /** Folded state for the badge. */
+  state: 'healthy' | 'degraded' | 'unknown';
+}
+
+export interface RunnerLabelsView {
+  /** The effective claim list, as Ingest reads it. */
+  labels: string[];
+  /** True when the parameter is missing entirely (nothing is claimed). */
+  unset: boolean;
+  /** Labels in the list that name GitHub-hosted images (adopt-mode takeover). */
+  hostedLabels: string[];
+}
+
+export interface AuditEntryView {
+  at: string;
+  actor: string;
+  action: string;
+  detail?: string;
+}
+
 export interface SettingsView {
   envName: string;
   region: string;
-  /** Presence/health ONLY — spec 04: never return SecureString values. */
-  secrets: SecretStatus[];
+  /** Live GitHub App linkage — verified, not parroted from SSM. */
+  app: AppLinkageAppView | null;
+  /** Present when live verification failed; the UI shows it instead of a green badge. */
+  appVerifyError?: string;
+  /** App id recorded in config, so a mismatch with `app.appId` is visible. */
+  configuredAppId?: string;
+  installations: AppInstallationView[];
+  /**
+   * How many installations were withheld from `installations` because this session does not
+   * administer them (ADR-035 scoping).
+   *
+   * Without it the client cannot tell "the App is installed nowhere" from "the App is installed,
+   * but not on an account you administer" — and a zero-grant session (minted on purpose so Setup
+   * is reachable) would be shown the first claim while the second is true.
+   */
+  installationsHidden: number;
+  /**
+   * Whether `installations` is GitHub's COMPLETE answer for this environment.
+   *
+   * False means the enumeration failed (`appVerifyError` says how) and the list below is a
+   * fallback from our own store, so its emptiness proves nothing. The client needs this as a
+   * separate fact because the failure is invisible in the rest of the payload: an App whose
+   * identity verified while `/app/installations` failed still renders `app` — a green "verified"
+   * badge — and `appVerifyError` is only shown where `app` is null. Without this flag an empty
+   * fallback list is reported as "the App is not installed anywhere yet", which is a claim the
+   * platform has no evidence for and sends the operator to install an App that may already be
+   * installed everywhere it needs to be.
+   */
+  installationsEnumerated: boolean;
+  runnerLabels: RunnerLabelsView;
+  webhook: WebhookHealthView;
   flavors: FlavorView[];
+  recentChanges: AuditEntryView[];
+  /**
+   * Diagnostics: SSM parameter presence/health ONLY — spec 04 hard rule, never values. Kept
+   * out of the primary view (collapsed "advanced" section) because SSM paths are an
+   * implementation detail an operator should not have to reason about.
+   */
+  diagnostics: { secrets: SecretStatus[] };
 }
 
 /**
@@ -535,4 +653,235 @@ export interface SettingsView {
  */
 export function toSecretStatus(param: string, label: string, present: boolean): SecretStatus {
   return { param, label, present };
+}
+
+/**
+ * Fold webhook evidence into a state for the badge.
+ *
+ * `healthy` needs POSITIVE evidence and NO contradiction: no URL mismatch, no `insecure_ssl`,
+ * no signature rejection newer than the last accepted delivery, no failed delivery in GitHub's
+ * log newer than the last accepted delivery, and either an accepted delivery or a 2xx in
+ * GitHub's log. Everything ambiguous is `unknown` rather than green — the whole point of this
+ * screen is that a checkmark must mean something.
+ */
+export function foldWebhookState(
+  h: Omit<WebhookHealthView, 'state' | 'urlMismatch' | 'recentFailures'> & {
+    urlMismatch: boolean;
+    recentFailures: number;
+  },
+): WebhookHealthView['state'] {
+  if (h.urlMismatch) return 'degraded';
+  if (h.insecureSsl) return 'degraded';
+  const accepted = h.lastReceivedAt ? Date.parse(h.lastReceivedAt) : 0;
+  const acceptedAt = Number.isFinite(accepted) ? accepted : 0;
+  // A rejection newer than the newest accepted delivery ⇒ the secret no longer matches.
+  if (h.lastRejectedAt) {
+    const rejected = Date.parse(h.lastRejectedAt);
+    if (Number.isFinite(rejected) && rejected >= acceptedAt) return 'degraded';
+  }
+  // A FAILED delivery in GitHub's log that is at least as recent as our newest accepted one is
+  // current external evidence against health — a stale success must not mask it. (Older
+  // failures are history: they were superseded by a delivery we accepted.)
+  const failedRecently = h.recentDeliveries.some((d) => {
+    if (d.statusCode >= 200 && d.statusCode < 300) return false;
+    const at = Date.parse(d.deliveredAt);
+    // An unparseable timestamp is treated as current: fail toward `degraded`, not green.
+    return !Number.isFinite(at) || at >= acceptedAt;
+  });
+  if (failedRecently) return 'degraded';
+  if (h.recentFailures > 0 && !h.lastReceivedAt) return 'degraded';
+  const deliveredOk = h.recentDeliveries.some((d) => d.statusCode >= 200 && d.statusCode < 300);
+  if (h.lastReceivedAt || deliveredOk) return 'healthy';
+  return 'unknown';
+}
+
+/** Build the webhook health block from the heartbeat row + GitHub's delivery log. */
+export function buildWebhookHealth(input: {
+  configuredUrl?: string;
+  deployedUrl?: string;
+  secretConfigured?: boolean;
+  insecureSsl?: boolean;
+  heartbeat?: {
+    lastEvent?: string;
+    lastAt?: string;
+    lastDeliveryId?: string;
+    deliveries?: number;
+    lastRejectedAt?: string;
+    rejections?: number;
+  };
+  recentDeliveries?: WebhookDeliveryView[];
+  error?: string;
+}): WebhookHealthView {
+  const recentDeliveries = input.recentDeliveries ?? [];
+  const recentFailures = recentDeliveries.filter(
+    (d) => !(d.statusCode >= 200 && d.statusCode < 300),
+  ).length;
+  const urlMismatch = Boolean(
+    input.configuredUrl && input.deployedUrl && normalizeUrl(input.configuredUrl) !== normalizeUrl(input.deployedUrl),
+  );
+  const base = {
+    configuredUrl: input.configuredUrl,
+    deployedUrl: input.deployedUrl,
+    urlMismatch,
+    secretConfigured: input.secretConfigured,
+    insecureSsl: input.insecureSsl,
+    lastReceivedAt: input.heartbeat?.lastAt || undefined,
+    lastReceivedEvent: input.heartbeat?.lastEvent || undefined,
+    lastDeliveryId: input.heartbeat?.lastDeliveryId || undefined,
+    deliveries: input.heartbeat?.deliveries,
+    lastRejectedAt: input.heartbeat?.lastRejectedAt || undefined,
+    rejections: input.heartbeat?.rejections,
+    recentDeliveries,
+    recentFailures,
+    error: input.error,
+  };
+  return { ...base, state: foldWebhookState(base) };
+}
+
+function normalizeUrl(url: string): string {
+  return url.trim().replace(/\/+$/, '').toLowerCase();
+}
+
+/**
+ * Which repos/workflows reference labels that are about to stop (or start) being claimed.
+ *
+ * Shown BEFORE a label change is committed (spec 04 § Settings): changing the claim list
+ * takes effect on the very next `workflow_job` webhook, so an operator needs to see whose
+ * jobs move before they press the button, not after.
+ */
+export interface LabelImpactView {
+  current: string[];
+  proposed: string[];
+  added: string[];
+  removed: string[];
+  /** Jobs that are claimed today but would NOT be after the change. */
+  losing: LabelImpactJob[];
+  /** Jobs that are not claimed today but WOULD be after the change. */
+  gaining: LabelImpactJob[];
+  /** True when the analysis is based on fewer workflows than exist (bounded scan). */
+  truncated: boolean;
+  /**
+   * WHY the analysis is partial — the two causes are not interchangeable and the operator has to
+   * be told them apart, because this preview is their only warning before a change that takes
+   * effect for every tenant on the next webhook:
+   *
+   *  - `repoCap`: the scan stopped at the repo bound, so jobs in the repos past it are unlisted.
+   *  - `unverifiedInstallations`: the App linkage could not be verified, so the installation
+   *    enumeration fell back to the index plus this session's grants. Whole INSTALLATIONS may be
+   *    missing, not merely repos past a cap — a materially larger blind spot.
+   *
+   * `truncated` stays as the single "do not read this as complete" flag; this says which caveat
+   * to show.
+   */
+  partial: { repoCap: boolean; unverifiedInstallations: boolean };
+}
+
+export interface LabelImpactJob {
+  repoId: number;
+  repoFullName: string;
+  workflowPath: string;
+  jobId: string;
+  runsOn: string[];
+}
+
+/**
+ * Compute the claim-set delta over stored workflow analyses. Matching mirrors
+ * `shouldClaim` exactly (case-insensitive membership of any `runs-on` label) — if these two
+ * ever disagree, the preview lies, so the comparison logic is deliberately identical. Jobs the
+ * control plane would refuse regardless of labels are excluded for the same reason: the caller
+ * drops opted-out repos (`isRepoOptedOut`) and this drops compat-blocked jobs, matching Ingest's
+ * two gates downstream of `shouldClaim`.
+ */
+export function buildLabelImpact(
+  current: string[],
+  proposed: string[],
+  analyses: { repoId: number; repoFullName: string; analyses: WorkflowAnalysisRecord[] }[],
+  partial: { repoCap: boolean; unverifiedInstallations: boolean } = {
+    repoCap: false,
+    unverifiedInstallations: false,
+  },
+): LabelImpactView {
+  const cur = new Set(current.map((l) => l.toLowerCase()));
+  const next = new Set(proposed.map((l) => l.toLowerCase()));
+  const losing: LabelImpactJob[] = [];
+  const gaining: LabelImpactJob[] = [];
+
+  for (const repo of analyses) {
+    for (const a of repo.analyses) {
+      for (const job of a.parsed?.jobs ?? []) {
+        // Ingest's compat gate refuses a job whose stored analysis says `block`, whatever its
+        // labels (`matchJobAnalysis` → `compat.eligible`). Counting such a job as "newly
+        // claimed" would promise a takeover that never happens; counting it as "no longer
+        // claimed" would blame this change for a job that was already running on
+        // GitHub-hosted. A job with NO stored compat result is claimable (Ingest fails open).
+        const compat = a.compat?.jobs[job.id];
+        if (compat && compat.eligible === false) continue;
+        const labels = (job.runs_on ?? []).map((l) => l.toLowerCase());
+        const claimedNow = labels.some((l) => cur.has(l));
+        const claimedNext = labels.some((l) => next.has(l));
+        if (claimedNow === claimedNext) continue;
+        const entry: LabelImpactJob = {
+          repoId: repo.repoId,
+          repoFullName: repo.repoFullName,
+          workflowPath: a.path,
+          jobId: job.id,
+          runsOn: job.runs_on ?? [],
+        };
+        (claimedNow ? losing : gaining).push(entry);
+      }
+    }
+  }
+
+  const lower = (xs: string[]) => xs.map((x) => x.toLowerCase());
+  return {
+    current,
+    proposed,
+    added: lower(proposed).filter((l) => !cur.has(l)),
+    removed: lower(current).filter((l) => !next.has(l)),
+    losing,
+    gaining,
+    truncated: partial.repoCap || partial.unverifiedInstallations,
+    partial,
+  };
+}
+
+/** Labels in an effective claim list that name GitHub-hosted runner images. */
+export function hostedLabelsIn(labels: string[], hosted: readonly string[]): string[] {
+  const set = new Set(hosted.map((l) => l.toLowerCase()));
+  return labels.filter((l) => set.has(l.toLowerCase()));
+}
+
+/**
+ * Narrow a settings view to what THIS session may see (ADR-035).
+ *
+ * Everything else on the screen is environment-level (which App this deployment authenticates
+ * as, what it claims, whether GitHub reaches it) and stays readable — spec 04 requires a fresh
+ * environment to be able to show its own state. Two blocks are NOT environment-level and are
+ * scoped here instead:
+ *
+ *  - **installations** name other tenants (account login + installation id). Any GitHub user
+ *    can complete the OAuth dance — a zero-grant session is minted on purpose so Setup is
+ *    reachable — so returning the full list would let any authenticated stranger enumerate
+ *    every org/user that installed the App. Filtered to the session's own grants, exactly like
+ *    `GET /api/installations`; platform admins see all of them (they already hold
+ *    platform-wide authority, and reviewing a relink needs the full picture).
+ *  - **recentChanges** is the operator audit trail (who changed what). Platform admins only.
+ *
+ * Pure so the decision is unit-testable without AWS.
+ */
+export function scopeSettingsView<T extends SettingsView>(
+  view: T,
+  opts: { isPlatformAdmin: boolean; canSeeInstallation: (installationId: number) => boolean },
+): T {
+  if (opts.isPlatformAdmin) return { ...view, installationsHidden: 0 };
+  const visible = view.installations.filter((i) => opts.canSeeInstallation(i.installationId));
+  return {
+    ...view,
+    installations: visible,
+    // The COUNT is not itself cross-tenant data (it names no account and no id), and withholding
+    // it is what makes the screen lie: an operator whose grants cover none of this environment's
+    // installations would otherwise be told the App is installed nowhere.
+    installationsHidden: view.installations.length - visible.length,
+    recentChanges: [],
+  };
 }

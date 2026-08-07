@@ -1488,6 +1488,235 @@ intentional, and the same trade DataStack already made for the table. Auto-rewri
 in the base config for **every** environment including prod (ADR-031), so enabling it is always
 an explicit deploy-time act.
 
+## ADR-034 — Settings shows verified evidence, and platform config writes go through a control-plane broker (M4)
+**Status**: Accepted (v1) · extends [ADR-025](#adr-025), honors [ADR-027](#adr-027)
+**Context**: the M4 Settings screen listed SSM parameter paths with a present/absent flag.
+That is the wrong abstraction twice over. It leaks an implementation detail an operator should
+never have to reason about (`/lca/dev/github/app-pem`), and — worse — **presence is not
+evidence**. `webhook-secret: set ✓` is green when the secret at GitHub was rotated and every
+delivery is now failing its HMAC check; `app-pem: set ✓` is green when the stored key is
+corrupt or belongs to a deleted App. The screen also had no mutating actions, so rotating an
+App or changing the claimed runner labels meant hand-running `npm run app:create` or an `aws
+ssm put-parameter` against production.
+
+Making it evidence-based needs the App private key (App JWT → `GET /app`, `/app/installations`,
+`/app/hook/config`, `/app/hook/deliveries`), and making it mutable needs `ssm:PutParameter` on
+SecureString paths. ADR-025 deliberately denies the Mgmt λ **both**: it is the internet-facing,
+cookie-authenticated surface, and it holds no grant for the PEM precisely so no console bug can
+leak it. ADR-027 separately rejected "have the Mgmt λ mutate the runner-label config" as
+widening its IAM and coupling planes.
+
+**Decision**: keep the console λ read-mostly and move the authority into a new single-purpose
+control-plane function, `src/appcfg/` (`lca-<env>-appcfg`), reachable ONLY via
+`lambda:InvokeFunction` on its exact ARN — the same containment shape ADR-021 uses for
+microVMs. The console λ gains **no** PEM read and **no** `ssm:PutParameter` of any kind.
+
+The broker owns four actions: `status` (live linkage + webhook evidence), `relink`,
+`rollback`, `setRunnerLabels`, `redeliver`. Settings then reports:
+- **App linkage** verified live via `GET /app` — a green badge proves the *stored* credentials
+  authenticate, and a stored `app-id` disagreeing with the key's App is flagged;
+- **installations** from GitHub's own listing, cross-referenced with our install store so a
+  missed `installation` webhook surfaces instead of silently diverging;
+- **runner labels** as the effective list, not a parameter path;
+- **webhook health** from both directions: a `CONFIG#WEBHOOK / LAST` heartbeat row Ingest
+  writes per verified delivery (plus a separate signature-rejection counter) AND GitHub's
+  delivery log. `healthy` requires positive evidence and no contradiction; everything ambiguous
+  is `unknown`.
+SSM paths survive only in a collapsed diagnostics section.
+
+**Relink is verify → snapshot → write → re-verify → sync-hook → auto-undo.** Credentials are
+validated against GitHub *before* any write, so a typo cannot take the environment offline. The
+rollback handle is a set of SSM parameter **version numbers** plus the list of parameters the
+relink **created**: the previous values stay in SSM's own parameter history and are never copied
+into a Lambda, a log, or a DynamoDB row. Three edge cases are handled explicitly, because each
+would otherwise leave a broken environment that reads as healthy:
+
+- **A parameter this attempt created has no version to restore.** Undo therefore *deletes* such
+  a parameter rather than trying to re-put a version that never existed. Without this, a
+  first-link that fails part-way strands a partial credential set in SSM and reports rollback
+  failure — the verify→write→undo contract has to hold on a fresh environment too.
+- **A *successful* first link must be undoable too.** Its `replacedVersions` is empty, because
+  nothing existed to replace, so the result also carries `createdParams` and `rollback` accepts a
+  `remove` list constrained to the same credential allow-list. A rollback handle made only of
+  versions would leave the operator's rollback button a silent no-op on exactly the environment
+  most likely to need it.
+- **The webhook secret has two homes.** Storing a rotated `webhook-secret` in SSM alone leaves
+  GitHub signing with the previous value, so Ingest's HMAC check rejects every subsequent
+  delivery with 401 and the environment goes silent while every credential badge reads green. The
+  relink therefore also pushes the secret (and this deployment's receiver URL) to GitHub via
+  `PATCH /app/hook/config`. When the secret **changed** and that push fails, the relink **fails
+  closed**: it is rolled back and refused. GitHub does not retry a delivery that failed
+  verification, so the jobs lost in a desync window are lost, not delayed — a `hookSynced: false`
+  warning on a green-looking relink is not a proportionate answer to a total claim outage. An
+  Enterprise/org-hook App that genuinely does not own its hook config is still supported, but the
+  operator must set the secret at GitHub and confirm explicitly (`allowHookDesync: true`), which
+  the console offers directly from the refusal. When the submitted secret is **unchanged**, GitHub
+  and Ingest still agree whatever the hook call did, so the failure stays advisory.
+
+An explicit rollback reads **every** historical value before writing any of them. A sequential
+read-then-write loop that faulted midway would leave a mixed credential set — some parameters
+restored, the rest still on the replacement values — and, unlike the relink path, there is no
+snapshot left to compensate from.
+
+Intake is **write-only** — the response carries presence + verification outcome, never a value,
+and validation errors never quote a submitted credential.
+
+**Why**: concentrating secret-read + secret-write in one control-plane function with a
+single caller keeps the blast radius auditable in IAM rather than in prose, and preserves both
+ADR-025's boundary and ADR-027's rejection of console-side config mutation. Alternatives
+rejected: (a) granting the Mgmt λ the PEM + `PutParameter` — puts write authority over every
+platform secret behind an internet-facing surface, exactly what ADR-025 exists to prevent;
+(b) orchestrating the manifest flow only (console hands off to `npm run app:create`) — leaves
+the operator hand-running a script against production and gives no verification or rollback;
+(c) storing a copy of the previous credentials to enable rollback — a second at-rest copy of
+every secret, strictly worse than reading SSM's own version history.
+
+**Consequences**: `ssm:PutParameter` now exists in the platform where it did not before. Its
+scope is pinned in the synthesized template (`test/mgmt-stack.test.mjs`) to exactly the five
+credential parameters plus `app-slug` and `config/runner-labels` — specifically **not**
+`mgmt/session-secret` (writing it would let the broker forge operator sessions) and **not** the
+image ARNs. `ssm:DeleteParameter` is scoped to the same set (needed for the create-then-fail undo
+above). The broker's mutating actions are serialized by a conditional-write lock row
+(`CONFIG#LOCK`, `acquireConfigLock`), because concurrent relinks could interleave writes into a
+credential set no rollback snapshot describes. A `reservedConcurrentExecutions: 1` cap was
+considered and **rejected**: it would also serialize the read path (`status`), which the Settings
+screen polls every 15 s, so two operators with the screen open would throttle each other into a
+blank view. The lock carries a TTL above the broker's timeout so a crashed holder cannot wedge
+config changes, and the broker's `dynamodb:UpdateItem` grant is condition-scoped to `CONFIG#*`
+leading keys so it can reach only audit + lock rows. The broker's timeout (25 s) is deliberately
+below the Mgmt λ's 29 s API Gateway cap: a broker that outlived the caller would complete a
+relink whose `replacedVersions` rollback handle the operator never received. Its log group keeps
+3 months (credential changes are audit-relevant). A `assertNoSecrets` shape guard
+(`src/shared/redact.ts`) scans every broker/settings payload for PEM blocks and GitHub token
+shapes and **throws** rather than serving them, so a future field addition cannot quietly
+become a leak. Because the shape guard cannot recognize an *opaque* secret (a webhook secret or
+OAuth client secret is just a high-entropy string), the relink path additionally redacts the
+submitted plaintexts by **literal value** from every response string and log line
+(`redactLiterals`), and `githubJson` no longer echoes GitHub response bodies into error text —
+only the HTTP status, GitHub's request id, and GitHub's own `message` field, itself
+literal-redacted. Ingest takes one extra fixed-key `UpdateItem` per delivery for the heartbeat,
+best-effort and off the enqueue critical path — a failed heartbeat degrades the screen, never a
+webhook. The *rejection* counter is the one heartbeat write reachable before authentication (the
+webhook endpoint is public and the signature check is what rejects an anonymous caller), so it is
+rate-bounded to one write per minute by a condition on the row — enough to make a secret mismatch
+visible without giving an anonymous caller a write amplifier. `/app/hook/config` and
+`/app/hook/deliveries` require the App to own its hook config; where it does not (some
+Enterprise/org-hook setups) the screen degrades to heartbeat-only evidence and says why.
+
+Three further consequences of that design, each pinned by a test:
+
+- **The App's JWT rate budget is shared with job provisioning.** `status` costs four
+  App-JWT calls and the Settings screen polls it, while the same 5,000 requests/hour budget is
+  what Provision spends minting an installation token per job. `status` is therefore cached at
+  **two** levels for 30 s (poll interval is 15 s): in-memory per broker container, and — because
+  `GET /api/settings` is readable by ANY authenticated session (ADR-035) and concurrent reads
+  scale the broker out to containers whose in-memory caches are all cold — in a shared
+  `CONFIG#STATUS / LINKAGE` row, so the bound is platform-wide rather than per-container. The row
+  holds the already-redacted linkage payload (`assertNoSecrets` runs before the write and again
+  on read-back, since the row is treated as untrusted platform state). Any mutation clears both
+  levels and **bumps an invalidation generation** on that row; a `status` computation captures the
+  generation before it starts and publishes conditionally on it. Clearing alone is not enough: the
+  four GitHub round-trips take long enough for a relink to land midway, and an unconditional
+  publish would then overwrite that relink's invalidation with a pre-change snapshot and serve it
+  to every container for the full TTL. A timestamp cannot express this, because the stale write is
+  genuinely the newer one. A DynamoDB fault on either cache path degrades to
+  a live GitHub read rather than failing the screen. This is why the broker's `CONFIG#*`-scoped
+  DynamoDB grant includes `GetItem` alongside `UpdateItem`.
+- **Rotating the webhook secret has an Ingest cache window.** A warm Ingest container keeps
+  verifying against the PREVIOUS webhook secret until its cached copy expires — while GitHub
+  already signs with the new one. GitHub does **not** retry a delivery that failed verification,
+  so every `workflow_job` in that window would be lost silently, and Settings would report
+  `degraded` for a rotation that actually succeeded. Two bounds, and the second is the guarantee:
+  Ingest re-reads the secret **uncached once** before rejecting a signed-but-unverified delivery
+  (`verifyWithRotation`), which recovers on the FIRST failing delivery; and the secret's own read
+  carries a 30 s TTL (`WEBHOOK_SECRET_TTL_MS`) rather than `getParam`'s 5-minute default. The
+  re-read alone is not sufficient, because it is the one SSM call reachable before authentication
+  and is therefore rate-bounded per container (30 s) — an anonymous caller posting junk with a
+  well-formed `sha256=` prefix once per window can keep that window spent, so GitHub's real
+  delivery would find it throttled and be rejected. The TTL removes that dependency: worst-case
+  staleness is 30 s whether or not the re-read gets to fire. The re-read is additionally skipped
+  entirely for an absent/malformed `sha256=` signature, short-circuited when the stored value is
+  unchanged, and degrades to rejection (never a 5xx) if the read faults. Both bounds are pinned by
+  `test/ingest-secret-rotation.test.mjs`.
+- **Losing the config lock is retryable, not a rejection.** The broker returns `busy` and the
+  management API answers **503 with `Retry-After`**, rather than the 422/502 a real credential or
+  upstream failure gets. The lock holder is `actor:uuid`, not `actor:timestamp`: a
+  double-submitted form by one operator inside a millisecond would otherwise share a holder
+  string and the first completion would release the second's lock.
+- **Rollback must restore GitHub's hook config too.** Restoring the SSM credential versions
+  alone leaves GitHub signing with the *relinked* App's webhook secret while Ingest verifies
+  against the restored one — every delivery 401s, which is exactly the silent outage the relink
+  path's hook sync exists to prevent. Rollback re-pushes the restored secret and reports
+  `hookSynced`. Relatedly, the non-atomic `app-slug` write happens only AFTER post-write
+  verification passes, so a rolled-back environment does not keep advertising the slug of an App
+  whose credentials are no longer stored — and rollback re-points `app-slug` at the App the
+  *restored* credentials authenticate as, since the slug is not a credential and therefore carries
+  no version in the operator's rollback snapshot. That re-point is best-effort and skipped when
+  the restored credentials do not verify (`verified: false` is already the signal that the
+  rollback is incomplete; there is no authoritative slug to write).
+- **The label-impact preview must mirror ALL of Ingest's claim gates, not just `shouldClaim`.**
+  Ingest applies two further refusals downstream of the label match: the repo opt-out
+  (`isRepoOptedOut` — `enabled === false` **or** `mode === 'off'`) and the compat gate (a job
+  whose stored analysis is `eligible: false` is left to GitHub-hosted whatever its labels). A
+  preview that ignores them over-reports movement — promising a takeover of jobs the control
+  plane will keep refusing — which defeats the whole point of requiring a preview before Apply.
+  The scan therefore reuses Ingest's own `isRepoOptedOut` predicate rather than an inlined
+  `enabled !== false`, and `buildLabelImpact` skips ineligible jobs while still counting jobs with
+  no stored analysis (Ingest fails open there).
+- **A label change also has an Ingest cache window.** `getParam`'s 5-minute default would leave a
+  warm container claiming against the PREVIOUS label set for minutes after the write, while the
+  UI says the change takes effect on the next `workflow_job` delivery. Unlike the webhook secret
+  there is no failure signal to trigger a re-read from — an unclaimed job simply runs on
+  GitHub-hosted and nothing reports it — so the bound is the TTL itself: the claimed-label read
+  uses a 30 s TTL (`RUNNER_LABELS_TTL_MS`). Labels are a non-secret `String`, so the cost is one
+  extra `GetParameter` per container per 30 s on the webhook path.
+
+## ADR-035 — Platform-wide settings need their own fail-closed allow-list, not installation admin rights (M4)
+**Status**: Accepted (v1) · follows [ADR-022](#adr-022), [ADR-034](#adr-034)
+**Context**: every existing authorization decision in the console derives from
+`canAdminInstallation` — GitHub's own answer to "may this person administer this installation"
+(ADR-022). That is the right question for repo config, and it deliberately avoids interpreting
+org roles ourselves. It is the **wrong** question for the ADR-034 mutations. One environment can
+host several installations from unrelated accounts; re-pointing the GitHub App credentials or
+changing the claimed runner labels affects **all** of them. Under installation-derived
+authorization, an admin of any one installation could rotate the whole platform's credentials
+or stop every other tenant's jobs from being claimed.
+**Decision**: platform mutations require membership in an explicit allow-list,
+`/lca/<env>/config/platform-admins` (comma-separated GitHub logins), checked by
+`canAdminPlatform` — a predicate distinct from `canAdminInstallation`. It **fails closed**: an
+unset or empty list authorizes nobody, and the API answers 403 naming the parameter to set.
+`GET /api/settings` stays readable by any session (it exposes no secrets), and returns
+`canAdminPlatform` so the UI can render the actions as unavailable rather than failing on click.
+**Why**: GitHub has no concept of "administrator of this deployment", so the platform must hold
+that fact itself. Failing closed is the only safe default — the alternative (treat the first
+logged-in operator, or any installation admin, as a platform admin) grants environment-wide
+authority by accident on a fresh deploy. Alternatives rejected: deriving it from the account
+that owns the App (unavailable for user-owned Apps, and wrong for shared orgs); a DynamoDB
+admin table (a second source of truth needing its own bootstrap path, when the config parameter
+is already the platform's out-of-band convention per ADR-008).
+**Consequences**: one more out-of-band parameter to create at deploy time; without it Settings
+is read-only. It is a plain `String`, not a SecureString — a list of GitHub logins is not a
+secret, and the Mgmt λ reads it directly (alongside `config/runner-labels`) rather than through
+the broker. Revocation is a parameter edit, effective on the next request (the Mgmt λ reads it
+with `ttlMs=0`, so no cached grant survives). Pinned by `test/mgmt-settings.test.mjs`.
+
+`GET /api/settings` being readable by any session is **not** the same as returning everything to
+every session. Two of its blocks are not environment-level facts and are scoped per session
+(`scopeSettingsView`, pure + unit-tested):
+
+- **installations** name other tenants (account login + installation id). Any GitHub user can
+  complete the OAuth dance — and a zero-grant session is minted on purpose so the Setup screen is
+  reachable (ADR-022) — so an unscoped list would let an authenticated stranger enumerate every
+  org/user that installed the App. It is filtered to the session's own grants, matching
+  `GET /api/installations`.
+- **recentChanges** is the operator audit trail (who changed what, when) and is platform-admin
+  only.
+
+Platform admins receive both in full: they already hold environment-wide authority, and
+reviewing a relink needs the complete picture. Everything else — env/region, App linkage,
+effective labels, webhook evidence, flavors, diagnostics — stays visible so a fresh environment
+can still show its own state, which is the whole point of the screen.
+
 ## ADR-036 — Vanity console domain: config-derived origin + a us-east-1 cert stack (M5)
 **Status**: Accepted (v1) · supersedes the two-pass `publicOrigin` bootstrap in
 [ADR-024](#adr-024)

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { redactLiterals } from './redact.js';
 
 /**
  * GitHub App authentication chain (spec 01):
@@ -49,16 +50,26 @@ const tokenCache = new Map<number, CachedToken>();
 /**
  * A non-2xx response from the GitHub REST API, carrying the status as DATA.
  *
- * The message is deliberately unchanged (`GitHub <path> failed HTTP <status>: <body>`) because
- * several callers still match on that text (`isNotFound`, `classifyMintFailure`, the
- * `ensureBranch` existence probe). The typed `status` exists so the auto-rewrite λ can tell a
- * benign "no commits between base and head" 422 apart from a 403 (missing
- * `pull_requests:write`), a 429 (rate limited) or a 5xx — those must fail loudly and retry
- * rather than be reported to the operator as "nothing to do" (ADR-031).
+ * The message shape is stable (`GitHub <path> failed HTTP <status>: <detail>`) because several
+ * callers still match on that text (`isNotFound`, `classifyMintFailure`, the `ensureBranch`
+ * existence probe). What `<detail>` CONTAINS narrowed in ADR-034: it is GitHub's own `message`
+ * field, literal-redacted and capped, plus the request id — never the raw response body, which
+ * a 4xx can quote a submitted credential back into. The phrases those callers match on live in
+ * `message`, so the narrowing is behaviour-preserving for them.
+ *
+ * The typed `status` exists so the auto-rewrite λ can tell a benign "no commits between base
+ * and head" 422 apart from a 403 (missing `pull_requests:write`), a 429 (rate limited) or a
+ * 5xx — those must fail loudly and retry rather than be reported to the operator as "nothing
+ * to do" (ADR-031).
  */
 export class GithubApiError extends Error {
   readonly status: number;
   readonly responseText: string;
+  /**
+   * Parsed response body. Left UNSET by `githubJson` (ADR-034): the body is the leak vector
+   * this class's redaction exists to close, so nothing populates it today. The field remains
+   * for callers that construct the error themselves with a body they know to be safe.
+   */
   readonly responseBody: unknown;
   constructor(path: string, status: number, responseText: string, responseBody?: unknown) {
     super(`GitHub ${path} failed HTTP ${status}: ${responseText}`);
@@ -90,8 +101,20 @@ export function isNoCommitsBetween(err: unknown): boolean {
 
 async function githubJson<T>(
   path: string,
-  init: { method?: string; token: string; tokenType: 'Bearer' | 'token'; body?: unknown },
+  init: {
+    method?: string;
+    token: string;
+    tokenType: 'Bearer' | 'token';
+    body?: unknown;
+    /**
+     * Plaintext secrets present in THIS request, redacted by literal value from any error
+     * text. GitHub (or a proxy in front of it) can quote a rejected request value back, and an
+     * opaque secret like a webhook secret has no shape the pattern guard can recognize.
+     */
+    redactValues?: readonly (string | undefined)[];
+  },
 ): Promise<{ status: number; body: T }> {
+  const clean = (text: string): string => redactLiterals(text, init.redactValues ?? []);
   const res = await fetch(`${GITHUB_API}${path}`, {
     method: init.method ?? 'GET',
     headers: {
@@ -105,15 +128,40 @@ async function githubJson<T>(
   });
   const text = await res.text();
   let body: T;
+  let parsed = true;
   try {
     body = text ? (JSON.parse(text) as T) : ({} as T);
   } catch {
-    throw new Error(`GitHub ${path} returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    parsed = false;
+    body = {} as T;
+  }
+  if (!parsed) {
+    // Do NOT echo the raw body: a non-JSON response comes from an intermediary (proxy, WAF,
+    // error page) which may reflect the request — including a submitted credential.
+    throw new Error(
+      `GitHub ${path} returned non-JSON (HTTP ${res.status}, ${text.length} bytes)` +
+        requestIdOf(res),
+    );
   }
   if (res.status >= 400) {
-    throw new GithubApiError(path, res.status, text.slice(0, 300), body);
+    // Only GitHub's own `message` field, never the raw body, and literal-redacted on top:
+    // 422 validation errors quote the offending request value back.
+    //
+    // Thrown as trunk's `GithubApiError` so `githubErrorStatus` / `isNoCommitsBetween` keep
+    // working off `status`, but `responseText` carries ONLY the redacted message and
+    // `responseBody` is deliberately omitted — passing `text`/`body` through would restore
+    // exactly the raw-body leak this redaction exists to close.
+    const message = (body as { message?: unknown }).message;
+    const detail = typeof message === 'string' ? clean(message).slice(0, 200) : '';
+    throw new GithubApiError(path, res.status, `${detail}${requestIdOf(res)}`);
   }
   return { status: res.status, body };
+}
+
+/** GitHub's request id, so an operator-facing error is still traceable in a support ticket. */
+function requestIdOf(res: { headers: { get(name: string): string | null } }): string {
+  const id = res.headers?.get?.('x-github-request-id');
+  return id ? ` (request ${id.replace(/[^\x20-\x7e]/g, '').slice(0, 64)})` : '';
 }
 
 /**
@@ -253,6 +301,199 @@ export async function listUserInstallations(
     installationId: i.id,
     accountLogin: i.account?.login ?? '',
   }));
+}
+
+// ---- App identity + webhook introspection (spec 04 Settings, ADR-034) --------
+
+/** Identity of the App the environment's stored credentials actually authenticate as. */
+export interface AppIdentity {
+  appId: number;
+  name: string;
+  slug: string;
+  htmlUrl: string;
+  ownerLogin: string;
+  events: string[];
+  permissions: Record<string, string>;
+}
+
+/**
+ * `GET /app` with an App JWT — the live proof that the stored `app-id` + `app-pem` pair is
+ * valid and which App it belongs to. The Settings screen shows THIS rather than parroting
+ * SSM back, so "App linked" can never be green while the credentials are broken.
+ */
+export async function getAppIdentity(appId: string, pem: string): Promise<AppIdentity> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<{
+    id: number;
+    name: string;
+    slug: string;
+    html_url: string;
+    owner?: { login?: string };
+    events?: string[];
+    permissions?: Record<string, string>;
+  }>('/app', { token: jwt, tokenType: 'Bearer' });
+  return {
+    appId: body.id,
+    name: body.name,
+    slug: body.slug,
+    htmlUrl: body.html_url,
+    ownerLogin: body.owner?.login ?? '',
+    events: body.events ?? [],
+    permissions: body.permissions ?? {},
+  };
+}
+
+/** Every installation of the App, from GitHub (not our store) — App JWT scoped. */
+export async function listAppInstallations(
+  appId: string,
+  pem: string,
+): Promise<{ installationId: number; accountLogin: string; suspended: boolean }[]> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<
+    { id: number; account?: { login?: string }; suspended_at?: string | null }[]
+  >('/app/installations?per_page=100', { token: jwt, tokenType: 'Bearer' });
+  if (!Array.isArray(body)) return [];
+  return body.map((i) => ({
+    installationId: i.id,
+    accountLogin: i.account?.login ?? '',
+    suspended: Boolean(i.suspended_at),
+  }));
+}
+
+/**
+ * The App's webhook configuration (`GET /app/hook/config`, App JWT).
+ *
+ * GitHub returns the webhook `secret` field as a masked placeholder, never the real value —
+ * we drop the field entirely anyway and report only whether one is configured, so no code
+ * path can carry it toward the UI (AGENTS.md hard rule).
+ */
+export interface AppHookConfig {
+  url: string;
+  contentType: string;
+  insecureSsl: boolean;
+  secretConfigured: boolean;
+}
+
+export async function getAppHookConfig(appId: string, pem: string): Promise<AppHookConfig> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<{
+    url?: string;
+    content_type?: string;
+    insecure_ssl?: string | number;
+    secret?: string;
+  }>('/app/hook/config', { token: jwt, tokenType: 'Bearer' });
+  return {
+    url: body.url ?? '',
+    contentType: body.content_type ?? '',
+    insecureSsl: String(body.insecure_ssl ?? '0') !== '0',
+    secretConfigured: typeof body.secret === 'string' && body.secret.length > 0,
+  };
+}
+
+/**
+ * Point the App's webhook at this deployment and set the signing secret
+ * (`PATCH /app/hook/config`, App JWT).
+ *
+ * This is REQUIRED for a relink to be coherent, not a convenience. Storing a new
+ * `webhook-secret` in SSM without telling GitHub means GitHub keeps signing with the old one
+ * and Ingest's HMAC check rejects every subsequent delivery (401) — a rotation would silently
+ * take the environment offline. Same for the URL: a freshly created App points wherever its
+ * manifest said, which is not necessarily this deployment.
+ *
+ * The secret travels OUT to GitHub only; nothing is read back (GitHub masks it anyway) and
+ * this function returns no value.
+ */
+export async function updateAppHookConfig(
+  appId: string,
+  pem: string,
+  config: { url?: string; secret?: string },
+): Promise<void> {
+  const body: Record<string, string> = { content_type: 'json', insecure_ssl: '0' };
+  if (config.url) body.url = config.url;
+  if (config.secret) body.secret = config.secret;
+  const jwt = createAppJwt(appId, pem);
+  await githubJson<unknown>('/app/hook/config', {
+    method: 'PATCH',
+    token: jwt,
+    tokenType: 'Bearer',
+    body,
+    // The webhook secret is the one plaintext we send to GitHub on this path; if GitHub
+    // rejects the request and quotes it back, it must not survive into `hookError`.
+    redactValues: [config.secret],
+  });
+}
+
+/** One row of GitHub's own delivery log for the App's webhook. */
+export interface AppHookDelivery {
+  id: number;
+  guid: string;
+  event: string;
+  action: string | null;
+  status: string;
+  statusCode: number;
+  deliveredAt: string;
+  durationMs: number;
+  redelivery: boolean;
+}
+
+/**
+ * `GET /app/hook/deliveries` — GitHub's view of whether it can actually reach us. This is
+ * the only *external* evidence of webhook health: our own heartbeat row proves deliveries
+ * that arrived, this proves the ones that did not (wrong URL after a redeploy, 5xx, TLS).
+ */
+export async function listAppHookDeliveries(
+  appId: string,
+  pem: string,
+  perPage = 20,
+): Promise<AppHookDelivery[]> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<
+    {
+      id: number;
+      guid: string;
+      event: string;
+      action: string | null;
+      status: string;
+      status_code: number;
+      delivered_at: string;
+      duration: number;
+      redelivery: boolean;
+    }[]
+  >(`/app/hook/deliveries?per_page=${Math.min(Math.max(perPage, 1), 100)}`, {
+    token: jwt,
+    tokenType: 'Bearer',
+  });
+  if (!Array.isArray(body)) return [];
+  return body.map((d) => ({
+    id: d.id,
+    guid: d.guid,
+    event: d.event,
+    action: d.action ?? null,
+    status: d.status,
+    statusCode: d.status_code,
+    deliveredAt: d.delivered_at,
+    // GitHub reports duration in seconds (float).
+    durationMs: Math.round((d.duration ?? 0) * 1000),
+    redelivery: Boolean(d.redelivery),
+  }));
+}
+
+/**
+ * Ask GitHub to re-deliver a past delivery (`POST /app/hook/deliveries/{id}/attempts`).
+ * This is the "Test webhook delivery" round-trip: GitHub re-sends a real, signature-signed
+ * payload, so a success proves URL + TLS + our webhook secret all still agree.
+ */
+export async function redeliverAppHook(
+  appId: string,
+  pem: string,
+  deliveryId: number,
+): Promise<void> {
+  const jwt = createAppJwt(appId, pem);
+  await githubJson<unknown>(`/app/hook/deliveries/${deliveryId}/attempts`, {
+    method: 'POST',
+    token: jwt,
+    tokenType: 'Bearer',
+  });
 }
 
 // ---- workflow discovery (spec 03 § Discovery) -------------------------------
