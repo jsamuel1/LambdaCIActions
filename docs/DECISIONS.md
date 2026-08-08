@@ -638,8 +638,11 @@ partition), and a table Scan violates the < 300 ms p95 read target in spec 04.
 **Decision**: add **GSI2** — `gsi2pk = REPORUNS#<repoId>`, `gsi2sk = <createdAt ISO>` —
 written **once** in `buildQueuedItem` and never touched by transitions. The unfiltered
 "recent runs" view is a bounded fan-out: one small query per status merged and sorted in
-the λ. Deep pagination requires narrowing by repo or status, whose cursors are opaque
-base64url of the DynamoDB `LastEvaluatedKey`.
+the λ. Deep pagination requires narrowing by repo or status. Those cursors are the DynamoDB
+`LastEvaluatedKey` **sealed** before it crosses the API boundary — see
+[ADR-052](#adr-052), which hardens this decision: the base64url the store speaks is an
+encoding, not a protection, and on a post-query-filtered walk the key names a row the
+session may not see.
 **Why**: keying the sort on the **immutable** `createdAt` (not `updatedAt`) means a status
 transition rewrites GSI1 only — no double index churn on the hot path, and a run's position
 in history never moves while it executes. Alternatives rejected: a composite
