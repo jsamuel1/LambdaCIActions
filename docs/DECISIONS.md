@@ -2979,7 +2979,10 @@ Two supporting choices:
   `RawCursor | null` is not assignable. A paginated route with an undeclared body has no such
   protection, so the source guards in `test/mgmt-cursor-scope.test.mjs` scan every file under
   `src/` for the residue the types cannot see — reaching through `.raw`, minting a cursor
-  inside a route, dropping the 400, or returning a cursor from an untyped body.
+  inside a route, dropping the 400, or returning a cursor from an untyped body. Those guards
+  match the *shape* of a call rather than one spelling of it (balanced-paren extents, and the
+  binding name the route actually chose), because a line-shaped regex missed ES shorthand, a
+  renamed binding, a scope argument containing a call, and a prettier-wrapped multi-line call.
 
 **Alternatives rejected.**
 

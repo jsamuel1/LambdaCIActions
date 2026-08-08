@@ -212,6 +212,12 @@ test('openCursor never throws on hostile input', () => {
 //
 // The source scan therefore walks every route-bearing source file, not just `handler.ts`: a
 // new list route in a new file is exactly the case the type layer cannot catch on its own.
+//
+// These guards match SHAPES, not spellings. That distinction was earned: an earlier revision
+// keyed them on `nextCursor: <expr>` and on the literal line `const opened = openCursor(…);`,
+// and four ordinary ways of writing a route walked past all of them — ES shorthand
+// (`{ runs, nextCursor }`), a renamed binding, a scope argument containing a call, and a
+// prettier-wrapped multi-line call. Each is probed below the assertion that now catches it.
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
 
@@ -248,6 +254,27 @@ function stripComments(src) {
  */
 function stripTypeDecls(src) {
   return src.replace(/^(?:export )?(?:interface|type)\s+\w+[^{]*\{[\s\S]*?^\}/gm, '');
+}
+
+/**
+ * Index just past the `)` that closes the call whose `(` sits at `open`.
+ *
+ * The guards below used to be written as line-shaped regexes — `openCursor\([^)]*\);\n` and
+ * friends. Probing them showed why that is not good enough: `[^)]*` stops at the FIRST close
+ * paren, so a scope argument containing a call (`{ ...s, repoId: Number(q.repo) }`) or a
+ * prettier-wrapped multi-line call slid straight past the guard, and a route that dropped its
+ * 400 refusal stayed green. Match the call's real extent instead of a plausible spelling of it.
+ */
+function endOfCall(src, open) {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '(') depth++;
+    else if (src[i] === ')') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
 }
 
 function routeSources() {
@@ -294,6 +321,32 @@ test('every route seals its outgoing cursor', () => {
   assert.ok(found >= 3, 'expected the runs routes to be found');
 });
 
+test('a route cannot smuggle a cursor into a body by shorthand', () => {
+  // The rule above judges `nextCursor: <expression>`. ES shorthand has no expression to judge:
+  //
+  //     const nextCursor = page.nextCursor ?? null;
+  //     return { body: { runs, nextCursor, complete } };
+  //
+  // That was probed against the previous guard set and passed every one of them, in a NEW file
+  // with an untyped body — where the declared-body type layer has no contract to enforce
+  // either. It ships the same plaintext key as `"nextCursor":{"raw":"eyJwayI6…"}`.
+  //
+  // So require the field to be written out. `nextCursor` may appear only as an explicit field
+  // name (followed by `:`, judged above) or as a property read (`page.nextCursor`, preceded by
+  // a dot) — never as a bare identifier a shorthand could pick up. Type members are stripped
+  // first, since `RunListBody`/`WindowShape` legitimately declare the field.
+  const shorthand = /(?<![.\w$])nextCursor\b(?!\s*:)/;
+  for (const [rel, src] of SOURCES) {
+    const m = shorthand.exec(stripTypeDecls(src));
+    assert.equal(
+      m,
+      null,
+      `${rel}: write \`nextCursor: sealCursorOrNull(…)\` explicitly rather than binding it — ` +
+        `shorthand hides the expression from the seal guard`,
+    );
+  }
+});
+
 test('a paginated response body types its cursor as string | null', () => {
   // The type layer only bites where a body is declared. If a route hands `nextCursor` to an
   // untyped `json()` body, `RawCursor` is assignable and the leak compiles — so pin that the
@@ -327,11 +380,62 @@ test('every route that accepts a cursor opens it before querying', () => {
       const around = src.slice(Math.max(0, m.index - 120), m.index + 40);
       assert.ok(around.includes('openCursor('), `${rel}: q.cursor must be opened, near: ${around.slice(-80)}`);
     }
-    // And a failed open must refuse, not fall through to a head-page query.
-    for (const [, nextLine] of src.matchAll(/const opened = openCursor\([^)]*\);\n([^\n]*)\n/g)) {
-      assert.match(nextLine, /if \(!opened\.ok\) return problem\(400/, `${rel}: must refuse`);
-    }
   }
-  const opens = [...HANDLER.matchAll(/const opened = openCursor\([^)]*\);\n/g)];
-  assert.ok(opens.length >= 2, 'expected both runs branches to open a cursor');
+  assert.ok(guardedOpens(HANDLER) >= 2, 'expected both runs branches to open a cursor');
 });
+
+test('a failed open refuses with 400 rather than restarting the walk', () => {
+  // Keyed on the call's balanced extent and on whatever the route named the result, not on
+  // `const opened = openCursor(…);` followed by one line. Three spellings that a route would
+  // plausibly reach for — a renamed binding, a scope argument containing a call, and a
+  // prettier-wrapped multi-line call — each defeated the previous line-shaped regex, so a
+  // silent restart from the head page passed review.
+  for (const [rel, src] of SOURCES) {
+    if (!src.includes('openCursor(')) continue;
+    assert.ok(guardedOpens(src, rel) > 0, `${rel}: openCursor call found but none guarded`);
+  }
+});
+
+/**
+ * Count `openCursor(` calls in `src`, asserting each one binds its result and refuses with a
+ * 400 before doing anything else. An unbound result cannot be checked at all, so that is a
+ * failure in itself.
+ *
+ * Both binding styles are accepted, because rejecting a correct one would teach the next
+ * author to delete the guard rather than heed it: `const opened = openCursor(…)` checked as
+ * `!opened.ok`, and `const { ok, cursor } = openCursor(…)` — including a renamed `ok:` —
+ * checked as `!ok`.
+ */
+function guardedOpens(src, rel = 'mgmt/handler.ts') {
+  let count = 0;
+  for (const m of src.matchAll(/openCursor\(/g)) {
+    const end = endOfCall(src, m.index + 'openCursor'.length);
+    assert.notEqual(end, -1, `${rel}: unbalanced openCursor( call`);
+    const before = src.slice(0, m.index);
+    // What the route must negate to detect a failed open. `[\s\S]` so a wrapped
+    // `const x =\n  openCursor(` still resolves its binding.
+    const plain = /(?:const|let)\s+(\w+)\s*=[\s\S]{0,20}$/.exec(before);
+    const destructured = /(?:const|let)\s*\{([^}]*)\}\s*=[\s\S]{0,20}$/.exec(before);
+    let checked;
+    if (destructured) {
+      // `{ ok, cursor }` or `{ ok: renamed, cursor }` — the guard is on whatever `ok` became.
+      const okBind = /\bok\s*(?::\s*(\w+))?/.exec(destructured[1]);
+      assert.ok(okBind, `${rel}: an openCursor result must destructure \`ok\` so it can be checked`);
+      checked = okBind[1] ?? 'ok';
+    } else {
+      assert.ok(plain, `${rel}: an openCursor result must be bound so it can be checked`);
+      checked = `${plain[1]}.ok`;
+    }
+    // Everything up to the next statement boundary must be the refusal. 400 specifically:
+    // a 500 would read as our bug, and a silent fall-through re-serves the head page.
+    const after = src.slice(end, end + 300);
+    assert.match(
+      after,
+      new RegExp(`if\\s*\\(\\s*!\\s*${checked.replace('.', '\\.')}\\s*\\)[\\s\\S]{0,40}?problem\\(\\s*400`),
+      `${rel}: a failed open must \`return problem(400, …)\`, not fall through — after the ` +
+        `call: ${after.slice(0, 120)}`,
+    );
+    count++;
+  }
+  return count;
+}
