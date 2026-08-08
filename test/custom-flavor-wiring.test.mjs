@@ -546,3 +546,173 @@ test('the provisioner marks the run failed on a confirmed-unroutable flavor, and
   // And the degraded signal has to come from the store rather than being assumed.
   assert.match(src, /loadRoutableCustomFlavorsResult/);
 });
+
+// ---- 6. the claim gate (ADR-040) -------------------------------------------
+//
+// Ingest's allowlist check runs BEFORE flavor resolution, so this is the FIRST place a custom
+// flavor can be lost: a label absent from the effective allowlist means `claimed:false`, no
+// provisioning, and a job that sits queued on GitHub with no error anywhere. The pure derivation
+// (`requiredClaimLabels` / `routableCustomFlavors`) is covered in `custom-flavors.test.mjs`, but it
+// has no production caller — the live augmentation is `claimLabelsWithCustom` in the ingest
+// handler, and these assert THAT.
+//
+// `TABLE_NAME` is deliberately left unset: the default loader is never reached, because every case
+// below injects one.
+const { claimLabelsWithCustom } = await import('../dist/src/ingest/handler.js');
+const { shouldClaim } = await import('../dist/src/ingest/filter.js');
+
+const CLAIMED = ['lambda-ci', 'lambda-ci-node'];
+
+/** A stored custom-flavor row, complete enough for the projection the augmentation applies. */
+function row(over = {}) {
+  return {
+    pk: 'INSTALL#42',
+    sk: 'FLAVOR#custom-gpu',
+    entity: 'FLAVOR',
+    installationId: 42,
+    name: 'custom-gpu',
+    base: 'gpu',
+    label: 'lambda-ci-custom-gpu',
+    arch: 'arm64',
+    vcpu: 2,
+    memoryMb: 4096,
+    capabilities: ['docker'],
+    description: 'operator image',
+    imageArn: ARN,
+    state: 'valid',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    ...over,
+  };
+}
+
+function loader(rows, { fail = false } = {}) {
+  const state = { calls: 0 };
+  return {
+    state,
+    load: async () => {
+      state.calls += 1;
+      if (fail) throw new Error('DynamoDB throttled');
+      return rows;
+    },
+  };
+}
+
+test('a job naming no custom label performs NO custom-flavor read at claim time', async () => {
+  // ADR-040's "no I/O when none are registered" property, at the gate that runs first. The check
+  // has to be the JOB'S labels, not the installation's rows, because we cannot know whether rows
+  // exist without reading — which is the cost being avoided.
+  for (const labels of [
+    ['self-hosted', 'lambda-ci'],
+    ['ubuntu-latest'],
+    [],
+    ['self-hosted', 'lambda-ci-node'],
+  ]) {
+    const l = loader([row()]);
+    const res = await claimLabelsWithCustom(labels, CLAIMED, 42, l.load);
+    assert.equal(l.state.calls, 0, `read performed for ${JSON.stringify(labels)}`);
+    assert.equal(res.read, 'skipped');
+    assert.equal(res.labels, CLAIMED, 'the allowlist must be returned unchanged, not copied');
+  }
+});
+
+test('a VALID custom flavor makes its label claimable for its own installation', async () => {
+  const l = loader([row()]);
+  const res = await claimLabelsWithCustom(
+    ['self-hosted', 'lambda-ci-custom-gpu'],
+    CLAIMED,
+    42,
+    l.load,
+  );
+  assert.equal(l.state.calls, 1);
+  assert.equal(res.read, 'ok');
+  assert.ok(res.labels.includes('lambda-ci-custom-gpu'));
+  // ...and the gate itself accepts it, which is the property that actually matters.
+  assert.equal(
+    shouldClaim({ action: 'queued', workflow_job: { labels: ['self-hosted', 'lambda-ci-custom-gpu'], status: 'queued' } }, res.labels),
+    true,
+  );
+  // The built-in allowlist is preserved, not replaced.
+  for (const label of CLAIMED) assert.ok(res.labels.includes(label));
+});
+
+test('an UNVALIDATED custom flavor is never claimable — image/proof first, label second', async () => {
+  // Label-before-proof is strictly worse than leaving the job queued: claiming it removes the
+  // GitHub-hosted fallback, so the job then FAILS in provisioning instead of running elsewhere.
+  for (const state of ['pending', 'validating', 'invalid']) {
+    const l = loader([row({ state })]);
+    const res = await claimLabelsWithCustom(
+      ['self-hosted', 'lambda-ci-custom-gpu'],
+      CLAIMED,
+      42,
+      l.load,
+    );
+    assert.equal(res.read, 'ok', state);
+    assert.ok(!res.labels.includes('lambda-ci-custom-gpu'), `${state} contributed a label`);
+    assert.equal(
+      shouldClaim({ action: 'queued', workflow_job: { labels: ['self-hosted', 'lambda-ci-custom-gpu'], status: 'queued' } }, res.labels),
+      false,
+      `${state} was claimable`,
+    );
+  }
+});
+
+test('a store fault fails CLOSED — the label stays unclaimable rather than being assumed good', async () => {
+  // The opposite of the repo-config gate above it, deliberately. Failing open would claim a job
+  // whose flavor we could not confirm, and a claimed job can no longer run on GitHub-hosted; the
+  // resolution would then land on a built-in image while the runner still advertised the custom
+  // label, so the job would SUCCEED on an image it never asked for.
+  const l = loader([], { fail: true });
+  const res = await claimLabelsWithCustom(
+    ['self-hosted', 'lambda-ci-custom-gpu'],
+    CLAIMED,
+    42,
+    l.load,
+  );
+  assert.equal(l.state.calls, 1);
+  assert.equal(res.read, 'degraded', 'a fault must be distinguishable from an empty installation');
+  assert.equal(res.labels, CLAIMED, 'a fault must not augment the allowlist');
+  assert.equal(
+    shouldClaim({ action: 'queued', workflow_job: { labels: ['self-hosted', 'lambda-ci-custom-gpu'], status: 'queued' } }, res.labels),
+    false,
+  );
+});
+
+test('only the OWNING installation\u2019s flavors are consulted, and only their labels are added', async () => {
+  // The whole reason this is not an entry in `/lca/<env>/config/runner-labels`: that parameter is
+  // environment-scoped, so installation A's label would be claimable for B's jobs, and B would
+  // resolve nothing and run the job on `base` having already given up the hosted fallback.
+  const l = loader([row(), row({ name: 'custom-other', label: 'lambda-ci-custom-other', state: 'invalid' })]);
+  const res = await claimLabelsWithCustom(
+    ['self-hosted', 'lambda-ci-custom-gpu'],
+    CLAIMED,
+    42,
+    l.load,
+  );
+  assert.deepEqual(res.labels, [...CLAIMED, 'lambda-ci-custom-gpu']);
+  // The loader is called with the job's installation id, never a default or an ambient one.
+  const seen = [];
+  await claimLabelsWithCustom(['lambda-ci-custom-gpu'], CLAIMED, 99, async (id) => {
+    seen.push(id);
+    return [];
+  });
+  assert.deepEqual(seen, [99]);
+});
+
+test('the handler wires the seam rather than keeping a second inline copy', async () => {
+  const { readFileSync } = await import('node:fs');
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const src = strip(readFileSync(new URL('../src/ingest/handler.ts', import.meta.url), 'utf8'));
+  // `decideClaim` must consume the AUGMENTED set. An inline `claimedLabels` here would make every
+  // test above vacuous while leaving custom labels unclaimable in production.
+  const at = src.indexOf('const decision = decideClaim(');
+  assert.ok(at > 0, 'the claim decision is gone');
+  const block = src.slice(at, at + 300);
+  assert.match(block, /claimedLabels: effectiveClaimedLabels/);
+  assert.match(src, /await claimLabelsWithCustom\(/);
+  // ...and the augmentation is not also duplicated inline.
+  assert.ok(
+    !/routableCustomFlavors\(await listCustomFlavors\(wf\.installation\.id\)\)/.test(src),
+    'the inline augmentation is still present alongside the extracted seam',
+  );
+});

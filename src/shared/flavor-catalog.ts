@@ -171,9 +171,18 @@ export function composeCatalog(
  *
  * Ingest's claim gate (`shouldClaim` → `decideClaim`) runs BEFORE flavor resolution and only
  * accepts labels on that allowlist, so a label absent from it produces a successful webhook
- * response with `claimed:false` and a job that stays queued with no actionable error. This is
- * the single derivation the operator-facing seed regression consumes (`test/filter.test.mjs`), so
- * the documented seed command and the catalog cannot disagree.
+ * response with `claimed:false` and a job that stays queued with no actionable error.
+ *
+ * ## What consumes this, precisely
+ *
+ * Nothing in `src/` calls it today, and that is worth stating rather than implying otherwise. The
+ * operator-facing seed regression (`test/filter.test.mjs`) derives its expected label set by
+ * reading `microvm/flavors.json` directly, and the built-in half of the live claim allowlist is
+ * written by `scripts/build-images.mjs` one label at a time, after each image verifies (ADR-049) —
+ * neither goes through a whole-catalog derivation. This function exists as the ONE place that
+ * answers "which labels must be claimable for this catalog to be reachable", for a caller that
+ * needs the composed set (a console health/reconciliation view), and it is tested directly so the
+ * answer is a contract rather than an assumption.
  *
  * ## Why custom labels are NOT put in that parameter (ADR-040)
  *
@@ -183,9 +192,9 @@ export function composeCatalog(
  * be claimed and run on the wrong image, having already given up the GitHub-hosted fallback.
  *
  * `src/ingest/handler.ts` therefore resolves custom labels against the JOB'S OWN installation at
- * claim time, gated on the job actually carrying a `lambda-ci-custom-*` label so an installation
- * with no custom flavors performs no extra I/O. A custom label is claimable exactly where it is
- * resolvable, and only while its flavor is `valid`.
+ * claim time (`claimLabelsWithCustom`), gated on the job actually carrying a `lambda-ci-custom-*`
+ * label so an installation with no custom flavors performs no extra I/O. A custom label is
+ * claimable exactly where it is resolvable, and only while its flavor is `valid`.
  *
  * The optional `custom` argument is retained for callers that want the composed label set (e.g. a
  * console health view), NOT for seeding the parameter. Only `valid` flavors contribute, because
