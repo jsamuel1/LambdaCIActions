@@ -32,6 +32,7 @@ export type RouteId =
   | 'rewritePreview'
   | 'rewritePr'
   | 'listRuns'
+  | 'listRefusals'
   | 'getRun'
   | 'getRunLogs'
   | 'listFlavors'
@@ -71,6 +72,10 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'rewritePr', method: 'POST', template: '/api/repos/{repoId}/rewrite-pr', authRequired: true },
   // --- runs ---
   { id: 'listRuns', method: 'GET', template: '/api/runs', authRequired: true },
+  // Unclaimed jobs (ADR-049) — jobs the claim gate refused. A separate collection from `/api/runs`
+  // on purpose: a refusal has no microVM, no duration and no cost, so it is not a run and must not
+  // be paged, counted or priced as one.
+  { id: 'listRefusals', method: 'GET', template: '/api/unclaimed', authRequired: true },
   { id: 'getRun', method: 'GET', template: '/api/runs/{repoId}/{runId}/{jobId}', authRequired: true },
   { id: 'getRunLogs', method: 'GET', template: '/api/runs/{repoId}/{runId}/{jobId}/logs', authRequired: true },
   // --- platform ---

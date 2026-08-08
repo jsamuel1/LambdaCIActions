@@ -117,6 +117,12 @@ export interface WorkflowJob {
   /** Job runs on GitHub-hosted runners today; adopt mode would claim it (M5). */
   adoptCandidate: boolean;
   compat: { level: CompatLevel; messages: CompatMessage[] };
+  /**
+   * Live control-plane verdict on the job's resolved flavor (ADR-050). SEPARATE from `compat`:
+   * `compat` is the stored workflow-vs-arm64 analysis, this is whether the deployment can
+   * actually claim and launch the route today. `unknown` = the live read failed, NOT green.
+   */
+  platform?: RouteReadiness;
 }
 
 export interface Workflow {
@@ -128,6 +134,59 @@ export interface Workflow {
   updatedAt: string;
   adoptCandidates: number;
   jobs: WorkflowJob[];
+  /** Worst platform readiness across the workflow's jobs (ADR-050). */
+  platformLevel?: FlavorReadinessState | 'unknown';
+}
+
+/** Per-flavor live readiness state (ADR-050) — mirrors src/shared/flavor-readiness.ts. */
+export type FlavorReadinessState = 'ready' | 'imageMissing' | 'unclaimable' | 'unroutable';
+
+export interface FlavorReadiness {
+  flavor: string;
+  label: string;
+  labelAllowlisted: boolean;
+  imagePublished: boolean;
+  state: FlavorReadinessState;
+  runnable: boolean;
+  problem?: string;
+  fix?: string;
+}
+
+export interface RouteReadiness {
+  flavor?: string;
+  state: FlavorReadinessState | 'unknown';
+  runnable: boolean;
+  problem?: string;
+  fix?: string;
+}
+
+/**
+ * A job the claim gate refused (ADR-049) — the reason a queued PR never became a run.
+ *
+ * Not a `Run`: there is no microVM, no duration and no cost, so it is a separate collection and
+ * never appears in run lists, health counts or spend.
+ */
+export interface Unclaimed {
+  repoId: number;
+  repoFullName: string;
+  installationId: number;
+  runId: number;
+  jobId: number;
+  code: string;
+  reason: string;
+  fix?: string;
+  labels: string[];
+  /** The allowlist as it was AT REFUSAL TIME — compare against the live one to see if it's fixed. */
+  claimedLabels: string[];
+  mode: string;
+  workflowName?: string;
+  jobName?: string;
+  runnerGroup?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  /** Deliveries seen; >1 means it is still recurring. */
+  occurrences: number;
+  githubUrl: string;
 }
 
 /** Dry-run of the auto-rewrite PR (ADR-031). */
@@ -180,6 +239,17 @@ export interface Health {
   generatedAt: string;
   /** False when a status count hit the paging budget and is a floor, not a total. */
   countsExact?: boolean;
+  /**
+   * Jobs the claim gate refused (ADR-049) in the last `unclaimedWindowDays`. A third axis, outside
+   * `counts`: a refusal is not a run, so it never moves `active`, `errorRate` or `cost`. Windowed
+   * because refusal rows are retained for 90 days, and a badge that stays red long after the fix
+   * is one operators stop reading.
+   */
+  unclaimed?: number;
+  /** False when the refusal count hit its paging budget — the number is a floor. */
+  unclaimedExact?: boolean;
+  /** Days of history behind `unclaimed`. */
+  unclaimedWindowDays?: number;
 }
 
 export interface Flavor {
@@ -310,6 +380,17 @@ export interface Settings {
   diagnostics: { secrets: { param: string; label: string; present: boolean }[] };
   /** Whether THIS session may use the mutating actions. */
   canAdminPlatform: boolean;
+  /**
+   * Live catalog-vs-control-plane reconciliation (ADR-050); empty when the allowlist read failed,
+   * so the UI renders `unchecked` rather than marking every flavor broken on a transient error.
+   *
+   * The allowlist itself is NOT repeated here — `runnerLabels.labels` is the one field carrying it.
+   */
+  readiness?: FlavorReadiness[];
+  /** Allowlist entries that are not a catalog flavor's label (adopt labels, typos, custom). */
+  unmatchedAllowlistLabels?: string[];
+  /** False when the live read failed — readiness is unknown, not green. */
+  controlPlaneLive?: boolean;
 }
 
 /** Result of a runner-label write (or dry-run preview). */
@@ -593,9 +674,14 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   workflows: (installationId: number, repoId: number) =>
-    request<{ repo: Repo; compat: CompatRollup; workflows: Workflow[] }>(
-      `/api/repos/${repoId}/workflows?installation=${installationId}`,
-    ),
+    request<{
+      repo: Repo;
+      compat: CompatRollup;
+      workflows: Workflow[];
+      /** Jobs whose route the live control plane cannot run (ADR-050). */
+      unrunnableJobs?: number;
+      controlPlaneLive?: boolean;
+    }>(`/api/repos/${repoId}/workflows?installation=${installationId}`),
   rescan: (installationId: number, repoId: number) =>
     request<{ queued: boolean }>(`/api/repos/${repoId}/rescan?installation=${installationId}`, {
       method: 'POST',
@@ -634,6 +720,23 @@ export const api = {
   run: (repoId: number, runId: number, jobId: number) =>
     request<{ run: Run }>(`/api/runs/${repoId}/${runId}/${jobId}`),
   /**
+   * Unclaimed jobs (ADR-049): jobs the claim gate refused, with the live allowlist echoed so the
+   * UI can distinguish "already fixed, re-run it" from "still broken".
+   */
+  unclaimed: (query: { repo?: number; limit?: number; cursor?: string } = {}) => {
+    const p = new URLSearchParams();
+    if (query.repo !== undefined) p.set('repo', String(query.repo));
+    if (query.limit) p.set('limit', String(query.limit));
+    if (query.cursor) p.set('cursor', query.cursor);
+    const qs = p.toString();
+    return request<{
+      unclaimed: Unclaimed[];
+      nextCursor: string | null;
+      allowlist: string[];
+      controlPlaneLive: boolean;
+    }>(`/api/unclaimed${qs ? `?${qs}` : ''}`);
+  },
+  /**
    * One page of a run's logs. Pass `nextToken` while CloudWatch keeps issuing one; once it
    * stops (caught up), pass `since` = newest event timestamp + 1 ms so the tail resumes
    * instead of replaying the last page.
@@ -650,7 +753,15 @@ export const api = {
     const qs = p.toString();
     return request<LogPage>(`/api/runs/${repoId}/${runId}/${jobId}/logs${qs ? `?${qs}` : ''}`);
   },
-  flavors: () => request<{ flavors: Flavor[] }>('/api/flavors'),
+  flavors: () =>
+    request<{
+      flavors: Flavor[];
+      /** Live catalog-vs-control-plane reconciliation (ADR-050). */
+      readiness?: FlavorReadiness[];
+      allowlist?: string[];
+      unmatchedAllowlistLabels?: string[];
+      controlPlaneLive?: boolean;
+    }>('/api/flavors'),
   health: () => request<Health>('/api/health'),
   settings: () => request<Settings>('/api/settings'),
   /**

@@ -1,7 +1,37 @@
 import { useState } from 'react';
-import { api } from '../api.js';
+import { api, type RouteReadiness } from '../api.js';
 import { useApi } from '../hooks.js';
 import { CompatBadge, CompatRollupView, ErrorBox, Loading, formatTime } from '../components.js';
+
+/**
+ * Live control-plane verdict on a job's route (ADR-050).
+ *
+ * Rendered as its own column rather than folded into the compat badge, because the two answer
+ * different questions and only one of them moves when an operator publishes an image. A route can
+ * be `compat: ok` and still unrunnable — the state that left eight PRs queued with a reassuring
+ * green console.
+ *
+ * `unknown` renders as "unchecked", never as OK: a live read that failed is not evidence the route
+ * works, and claiming it is would recreate exactly the misleading green this column exists to kill.
+ */
+function PlatformBadge({ platform }: { platform?: RouteReadiness }): JSX.Element {
+  if (!platform || platform.state === 'unknown') {
+    return (
+      <span className="badge queued" title="Could not reconcile against the live control plane.">
+        unchecked
+      </span>
+    );
+  }
+  if (platform.runnable) return <span className="badge ok">runnable</span>;
+  // `unroutable`/`unclaimable` strand the job silently at the claim gate; `imageMissing` at least
+  // produces a run row that fails, so it is the less severe of the two.
+  const kind = platform.state === 'imageMissing' ? 'risk' : 'block';
+  return (
+    <span className={`badge ${kind}`} title={platform.problem}>
+      {platform.state}
+    </span>
+  );
+}
 
 /**
  * Repo detail — the parsed workflow table (jobs → runs-on → resolved flavor → compat) plus
@@ -42,6 +72,8 @@ export function RepoDetail({
   const repo = wf.data.repo;
   const map = draft ?? repo.flavorMap;
   const adoptCandidates = wf.data.workflows.reduce((n, w) => n + (w.adoptCandidates ?? 0), 0);
+  /** Jobs the live control plane cannot run — counted server-side from the same readiness data. */
+  const unrunnableJobs = wf.data.unrunnableJobs ?? 0;
 
   async function saveMap(next: Record<string, string>): Promise<void> {
     setErr(undefined);
@@ -140,6 +172,30 @@ export function RepoDetail({
         {err && <p className="error">{err}</p>}
       </div>
 
+      {unrunnableJobs > 0 && (
+        <div className="card">
+          <p className="error tight">
+            {unrunnableJobs} job{unrunnableJobs === 1 ? '' : 's'} route to a flavor this deployment
+            cannot run.
+          </p>
+          <p className="muted tight">
+            The workflow analysis below is computed from the catalog; these jobs were reconciled
+            against the LIVE control plane and their flavor's routing label is missing from the
+            claim allowlist, or its image is not published. A job in that state is left{' '}
+            <code>queued</code> by GitHub with no error — see the Platform column, and{' '}
+            <a href="#/unclaimed">Unclaimed</a> for jobs already refused.
+          </p>
+        </div>
+      )}
+      {wf.data.controlPlaneLive === false && (
+        <div className="card">
+          <p className="muted tight">
+            Could not read the live control plane, so the Platform column below reads{' '}
+            <em>unchecked</em> rather than green. Routing shown is catalog-only.
+          </p>
+        </div>
+      )}
+
       <div className="card">
         <h3>Workflows</h3>
         {!wf.data.workflows.length && <p className="muted">No workflows parsed yet — run a re-scan.</p>}
@@ -161,6 +217,7 @@ export function RepoDetail({
                     <th>runs-on</th>
                     <th>→ Flavor</th>
                     <th>Compat</th>
+                    <th>Platform</th>
                     <th>Findings</th>
                   </tr>
                 </thead>
@@ -176,7 +233,16 @@ export function RepoDetail({
                       <td>
                         <CompatBadge level={j.compat.level} />
                       </td>
+                      <td>
+                        <PlatformBadge platform={j.platform} />
+                      </td>
                       <td className="muted">
+                        {j.platform && j.platform.state !== 'unknown' && !j.platform.runnable && (
+                          <div>
+                            <strong>not runnable here</strong>: {j.platform.problem}
+                            {j.platform.fix && <div className="fix">Fix: {j.platform.fix}</div>}
+                          </div>
+                        )}
                         {j.adoptCandidate && (
                           <div>
                             <strong>adopt candidate</strong>: runs on GitHub-hosted runners unless
@@ -189,7 +255,10 @@ export function RepoDetail({
                             {m.fix && <div className="fix">Fix: {m.fix}</div>}
                           </div>
                         ))}
-                        {!j.adoptCandidate && !j.compat.messages.length && '—'}
+                        {!j.adoptCandidate &&
+                          !j.compat.messages.length &&
+                          (j.platform?.runnable !== false || j.platform?.state === 'unknown') &&
+                          '—'}
                       </td>
                     </tr>
                   ))}

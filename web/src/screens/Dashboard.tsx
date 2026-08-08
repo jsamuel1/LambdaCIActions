@@ -44,7 +44,31 @@ export function Dashboard({
         <Stat label="Error rate" value={`${Math.round(h.errorRate * 100)}%`} />
         <Stat label="Repos enabled" value={enabled} />
         <Stat label="Est. spend" value={formatCost(h.cost?.totalUsd)} />
+        {/*
+          Unclaimed is a THIRD axis, not a run status (ADR-049): a refused job never launched, so it
+          contributes nothing to Active, Error rate or spend. Shown here because it is the one
+          failure a user reports as "my PR is stuck" and which produces no run row to click.
+          Windowed (see `unclaimedWindowDays`) — refusal rows are retained for 90 days, and a stat
+          that can never return to zero is one an operator stops reading.
+        */}
+        <Stat
+          label={
+            h.unclaimedWindowDays ? `Unclaimed (${h.unclaimedWindowDays}d)` : 'Unclaimed'
+          }
+          value={
+            h.unclaimed === undefined
+              ? '—'
+              : `${h.unclaimedExact === false ? '≥ ' : ''}${h.unclaimed}`
+          }
+        />
       </div>
+      {(h.unclaimed ?? 0) > 0 && (
+        <p className="error">
+          {h.unclaimed} job{h.unclaimed === 1 ? '' : 's'} were refused
+          {h.unclaimedWindowDays ? ` in the last ${h.unclaimedWindowDays} days` : ''} and did not run
+          anywhere on this platform — <a href="#/unclaimed">see why</a>.
+        </p>
+      )}
       {h.countsExact === false && (
         <p className="muted">
           Run counts are a lower bound — history in at least one status exceeds the count paging

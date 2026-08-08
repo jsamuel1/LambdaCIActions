@@ -14,6 +14,7 @@ analysis, and the (optional) auto-rewrite.
 - [`runs-on` → flavor routing](#runs-on--flavor-routing)
 - [Compatibility analysis](#compatibility-analysis)
 - [Onboarding modes](#onboarding-modes)
+- [Refused claims are visible](#refused-claims-are-visible)
 - [Auto-rewrite (opt-in)](#auto-rewrite-opt-in)
 - [Edge cases](#edge-cases)
 - [Open questions](#open-questions)
@@ -233,6 +234,26 @@ Per-repo setting stored on the `Repo` row:
 
 Default on install: `label` (safe). UI nudges toward `adopt` once compat is green. Switching
 mode re-scans the repo, because the stored routing preview is resolved with the mode.
+
+## Refused claims are visible
+
+A refusal is a decision the operator has to be able to see. Ingest emits a structured log line for
+**every** `claimed:false` path — repo opted out, `decideClaim` rejection, non-default runner group,
+compat block — carrying a stable `code`, the job's labels, **the live runner-label allowlist
+snapshot**, the repo mode, the reason and a fix (ADR-049). The 202 body's `reason` is not an
+observability mechanism: its only reader is GitHub, which discards it.
+
+Refusals that are **actionable** are also persisted (`REFUSAL#<repoId>#<runId>#<jobId>`) and listed
+on the console's Unclaimed screen. Actionable means the job carries an LCA-shaped label — evidence
+someone meant it to run here — plus the two post-claim gates (runner group, compat block), which by
+definition only fire on a job we already agreed to take. The ordinary "no LCA label" answer to an
+un-onboarded repo's `ubuntu-latest` job is expected steady state: logged at debug, never stored.
+
+A refusal is deliberately **not** a run status. It has no microVM, duration or cost, so it never
+enters the active count, the error rate, cost eligibility, or reporting's status vocabulary.
+
+Classification is derived from the job's labels, never by matching `decideClaim`'s prose — the
+reason text is operator-facing and gets reworded.
 
 ## Auto-rewrite (opt-in)
 

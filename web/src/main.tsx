@@ -7,6 +7,7 @@ import { Repos } from './screens/Repos.js';
 import { RepoDetail } from './screens/RepoDetail.js';
 import { Runs } from './screens/Runs.js';
 import { RunDetail } from './screens/RunDetail.js';
+import { Unclaimed } from './screens/Unclaimed.js';
 import { Reports } from './screens/Reports.js';
 import { Flavors } from './screens/Platform.js';
 import { Settings } from './screens/Settings.js';
@@ -17,6 +18,9 @@ const NAV: { path: string; label: string }[] = [
   { path: '/', label: 'Dashboard' },
   { path: '/repos', label: 'Repos' },
   { path: '/runs', label: 'Runs' },
+  // Its own nav entry, not a Runs tab: an operator hunting a stuck PR is looking for something
+  // that is NOT in the run list, so it has to be findable without knowing that (ADR-049).
+  { path: '/unclaimed', label: 'Unclaimed' },
   { path: '/reports', label: 'Reports' },
   { path: '/flavors', label: 'Flavors' },
   { path: '/settings', label: 'Settings' },
@@ -127,6 +131,8 @@ function titleFor(segments: string[]): string {
       return segments[1] ? 'Repo detail' : 'Repos';
     case 'runs':
       return segments[1] ? 'Run detail' : 'Runs';
+    case 'unclaimed':
+      return 'Unclaimed jobs';
     case 'reports':
       return 'Reports';
     case 'flavors':
@@ -166,6 +172,13 @@ function renderRoute(
         <Runs
           repoFilter={ctx.repoFilter ? Number(ctx.repoFilter) : undefined}
           installations={ctx.installations}
+          navigate={ctx.navigate}
+        />
+      );
+    case 'unclaimed':
+      return (
+        <Unclaimed
+          repoFilter={ctx.repoFilter ? Number(ctx.repoFilter) : undefined}
           navigate={ctx.navigate}
         />
       );
