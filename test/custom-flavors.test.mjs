@@ -653,3 +653,71 @@ test('compat is unchanged when no custom flavors are supplied', () => {
   const resolution = { flavor: 'docker', reason: 'upgraded', replaced: 'python' };
   assert.deepEqual(analyzeCompat(job, resolution, []), analyzeCompat(job, resolution));
 });
+
+// ---- the single catalog seam (ADR-040 structural invariant) ----------------
+//
+// ADR-040's first claim is that `src/shared/flavor-catalog.ts` is the ONLY module that reads
+// `microvm/flavors.json`, because four independent `builtin ++ custom` compositions would give
+// four chances to disagree about what a flavor is. That was never pinned by a test, and it
+// promptly regressed: ADR-049's `src/shared/flavor-reconcile.ts` landed on `main` with its own
+// static import while this work was in review, so the merged tree had two readers and an ADR
+// asserting it had one. Structural claims need structural guards.
+
+test('flavor-catalog.ts is the only module in src/ that reads flavors.json', async () => {
+  const { readdirSync, readFileSync } = await import('node:fs');
+  const { join, relative } = await import('node:path');
+  const SRC = new URL('../src/', import.meta.url).pathname;
+  const offenders = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.ts')) {
+        // Strip comments first: the prose in these modules legitimately NAMES the JSON file
+        // (that is the whole point of documenting the seam), so a raw text match would flag
+        // every module that explains the rule and miss nothing that breaks it.
+        const code = readFileSync(p, 'utf8')
+          .replace(/\/\*[\s\S]*?\*\//g, '')
+          .replace(/^\s*\/\/.*$/gm, '');
+        if (/from\s+['"][^'"]*flavors\.json['"]/.test(code)) offenders.push(relative(SRC, p));
+      }
+    }
+  };
+  walk(SRC);
+  assert.deepEqual(
+    offenders,
+    ['shared/flavor-catalog.ts'],
+    `only the catalog seam may import flavors.json; found: ${offenders.join(', ')}. ` +
+      'Derive from `builtinFlavors()` instead — a second reader can silently disagree with the ' +
+      'resolver about labels, capabilities or pricing (ADR-040).',
+  );
+});
+
+test('the comment stripper does not make the seam guard vacuous', () => {
+  // Mutation-proofing the guard above: a commented-out import must NOT count as an offender,
+  // and a real one MUST be found even when a comment on the same file mentions the path.
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const re = /from\s+['"][^'"]*flavors\.json['"]/;
+  assert.equal(re.test(strip("// import x from '../../microvm/flavors.json';\n")), false);
+  assert.equal(re.test(strip("/** reads microvm/flavors.json */\nconst a = 1;\n")), false);
+  assert.equal(
+    re.test(strip("/** the seam over flavors.json */\nimport c from '../../microvm/flavors.json';\n")),
+    true,
+  );
+});
+
+test('the reconcile catalog and the routing catalog are the same built-in list', async () => {
+  // ADR-049's reconcile derivation answers "is this flavor runnable in the live environment"
+  // while the resolver answers "which flavor does this job get". They must be talking about the
+  // same flavors: a label present in one and absent from the other is either capacity that can
+  // never be selected, or a route with no image.
+  const { catalogFlavors, allCatalogLabels } = await import('../dist/src/shared/flavor-reconcile.js');
+  assert.deepEqual(
+    catalogFlavors().map((f) => f.name),
+    builtinFlavors().map((f) => f.name),
+  );
+  assert.deepEqual(allCatalogLabels(), builtinFlavors().map((f) => f.label));
+  // Reconciliation is built-in only: a custom flavor's image is the operator's own and is never
+  // published to `image-arn-<flavor>`, so it has nothing to reconcile against.
+  assert.ok(!allCatalogLabels().some((l) => isCustomFlavorLabel(l)));
+});

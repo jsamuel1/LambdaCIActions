@@ -409,6 +409,14 @@ export async function transitionFlavorValidation(input: {
 
   // A reason is state-scoped: carrying `invalid`'s reason into a later `valid` would leave the
   // console showing a failure message next to a passing flavor.
+  //
+  // `evidence` is deliberately NOT cleared the same way. It is a record of the last run that
+  // actually observed something, so a same-ARN re-validate keeps it as the previous verdict's
+  // evidence for the SAME artifact, and a caller that wants it gone passes `evidence` explicitly.
+  // `repointFlavorImage` does remove it, and that asymmetry is the point: a new ARN is a new
+  // artifact, so evidence gathered about the old one would be attributed to an image it was never
+  // collected from (ADR-041). Consumers must therefore read `evidence` as "last run", not "this
+  // state" — which is why `state` and `reason`, never `evidence`, decide routability.
   if (input.reason !== undefined) {
     sets.push('#reason = :reason');
     names['#reason'] = 'reason';

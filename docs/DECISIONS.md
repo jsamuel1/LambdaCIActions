@@ -1985,7 +1985,7 @@ GitHub with a 202 `claimed:false` and nothing logged as an error. That seed is n
 against the catalog by `test/filter.test.mjs`.
 
 ## ADR-040 — Custom flavors live in the store and are merged over the built-in catalog (M5)
-**Status**: Accepted (v1) · **implemented**
+**Status**: Accepted (v1) · **storage, resolution + claim implemented; the (4) bounds check is a fixed ceiling, not the live quota, and the console surface is deferred**
 **Context**: An operator cannot bring their own image. The catalog is `import
 flavorsCatalog from '../../microvm/flavors.json'` in `src/provision/flavor.ts`,
 `src/mgmt/views.ts` and `src/ingest/compat.ts` — compiled into each Lambda bundle at build
@@ -2052,6 +2052,22 @@ Two details the decision above did not anticipate:
   than invisibly wrong, and a transient fault is retried by SQS. This is also the claim→provision
   race: ingest claims while the flavor is `valid`, and a delete or re-validate in the interval must
   not silently reroute the job.
+Two parts of the decision are **not** fully met, recorded here rather than left to be discovered
+as bugs:
+
+- **(4) bounds — the memory check is a fixed sanity ceiling, not the region's quota.**
+  `validateCustomFlavor` / `staticGate` bound `memoryMb` to `DEFAULT_MAX_MEMORY_MB` (32768 MiB)
+  because nothing in the control plane reads the account+region microVM memory quota yet, and
+  `staticGate`'s `maxMemoryMb` parameter has **no production caller**. So an obvious typo
+  (`655360`) is caught, but a request that merely exceeds the account's real headroom is not — it
+  fails later, at launch. Closing this needs a quota read (there is no `getMicroVMQuota` helper in
+  `src/shared/microvm.ts`), so it belongs with the validator λ that would consume it.
+- **(4) rate before save — implemented in the API, not in the console.** `POST
+  /api/flavors/preview` returns `usdPerMinute` for the proposed shape with `rateIsEstimate: true`
+  (ADR-038), and `buildFlavorViews` carries it per row; no screen renders either yet. The Flavors
+  screen is deferred to the same successor card as the ADR-041 smoke-run λ, because a registration
+  form whose flavors can never reach `valid` would be a control with no outcome.
+
 - **Custom labels are NOT added to `/lca/<env>/config/runner-labels`.** That parameter is
   environment-scoped while a custom flavor is per-installation, so seeding it would make
   installation A's label claimable for installation B's jobs — B would resolve nothing, fall
