@@ -855,11 +855,22 @@ test('--fix scores itself on a RE-READ of live state, not on child exit codes', 
     'the pre-fix snapshot verdict must not survive alongside the re-read',
   );
 
-  // A post-fix read that cannot complete its probes is UNKNOWN, not success.
-  assert.match(
-    fix,
-    /probeFailures\.length[\s\S]{0,500}?process\.exit\(2\)/,
-    'an incomplete post-fix probe must exit 2, not pass as fixed',
+  // A post-fix read that cannot complete its probes is UNKNOWN, not success. Match the live
+  // BRANCH: `probeFailures.length` also appears in the diagnostic INSIDE that block, so a laxer
+  // pattern stays green after the condition is neutered to `if (false)` — which silently lets an
+  // AccessDenied on the second read pass as a verified fix.
+  const postProbe = /if \(probeFailures\.length\) \{[\s\S]{0,600}?process\.exit\(2\);/.exec(fix);
+  assert.ok(
+    postProbe,
+    'expected a live `if (probeFailures.length) { … process.exit(2) }` on the post-fix read',
+  );
+  assert.ok(
+    postProbe.index > reread,
+    'the post-fix probe check must follow the re-read, not precede it',
+  );
+  assert.ok(
+    postProbe.index < verdict.index,
+    'an incomplete post-fix probe must exit 2 before any drift verdict is reached',
   );
 
   // And the absent-allowlist cause is named, because the child only logged it.
