@@ -70,6 +70,17 @@ export function Unclaimed({
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreErr, setMoreErr] = useState<string | undefined>(undefined);
   /**
+   * Which window generation the in-flight "Load older" belongs to.
+   *
+   * Bumped by EVERY window reset — both a filter change and Refresh. A filter guard alone was not
+   * enough: Refresh does not change `repoFilter`, so an in-flight hop passed the guard and appended
+   * its pre-refresh rows, cursor and seam boundary into the window Refresh had just emptied. That
+   * restored exactly the hole — and the stale `pagedPastHead`/`boundaryKey` — that the seam warning
+   * tells the operator Refresh will clear, so the advertised recovery silently did not recover.
+   * Held in a ref because the in-flight closure captured the OLD generation.
+   */
+  const genRef = useRef(0);
+  /**
    * Which filter the appended pages belong to. "Load older" is async, so a response can land after
    * the operator changed the repo filter; applying it then would append another repo's refusals.
    * Held in a ref because the in-flight closure captured the OLD filter.
@@ -102,9 +113,15 @@ export function Unclaimed({
    * does not recover is worse than none: the operator believes the window is whole.
    */
   function resetWindow(): void {
+    // Invalidate any in-flight "Load older" FIRST, so its response cannot repopulate the window
+    // being emptied here (see `genRef`).
+    genRef.current += 1;
     setOlder([]);
     setCursor(undefined);
     setMoreErr(undefined);
+    // Cleared here, not left to the superseded hop's `finally` — that clear is generation-guarded,
+    // so without this a Refresh during an in-flight hop would leave the button spinning forever.
+    setLoadingMore(false);
     setSeam(noSeam);
   }
 
@@ -137,23 +154,27 @@ export function Unclaimed({
     setLoadingMore(true);
     setMoreErr(undefined);
     const requestedFor = repoFilter;
+    const requestedGen = genRef.current;
     // Captured from the SAME head snapshot the cursor was read from — recording it after the
     // await would pin a fresher head page than the resume point it is supposed to sit above,
     // and a window with a real hole would then report itself intact.
     const headTailKey = headRows.length ? refusalKey(headRows[headRows.length - 1]) : undefined;
     try {
       const next = await api.unclaimed({ repo: repoFilter, limit: PAGE, cursor: nextCursor });
-      if (filterRef.current !== requestedFor) return; // window no longer exists
+      // Either a filter change or a Refresh discards this response: the window it was fetched
+      // for no longer exists, and appending to the current one would reintroduce the gap.
+      if (genRef.current !== requestedGen || filterRef.current !== requestedFor) return;
       setOlder((prev) => [...prev, ...next.unclaimed]);
       setCursor(next.nextCursor);
       // Advanced even when the hop appended nothing: the cursor moved, so the head page is no
       // longer adjacent to the resume point.
       setSeam((prev) => seamAfterHop(prev, headTailKey));
     } catch (e) {
-      if (filterRef.current !== requestedFor) return;
+      if (genRef.current !== requestedGen || filterRef.current !== requestedFor) return;
       setMoreErr(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoadingMore(false);
+      // Guarded: a superseded hop must not clear the spinner state of the window that replaced it.
+      if (genRef.current === requestedGen) setLoadingMore(false);
     }
   }
 

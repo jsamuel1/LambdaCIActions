@@ -1243,7 +1243,12 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
       getWebhookHeartbeat().catch(() => undefined),
       listAudit(10).catch(() => []),
       appLinkage(),
-      imageAvailability(),
+      // Fail-soft, like every other live read on this route. The raw `imageAvailability()`
+      // REJECTS on an SSM fault, which would 500 the whole Settings screen — including the App
+      // linkage, webhook health and secret diagnostics an operator opened it for — over an
+      // image-presence probe that only annotates the flavor table. `undefined` renders those
+      // cells `unchecked` instead (ADR-051: unknown is neither broken nor green).
+      imageAvailabilityOrUndefined(),
     ]);
 
   const labels = parseRunnerLabels(labelsRaw);
@@ -1281,14 +1286,19 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
    * Deliberately not a second `controlPlaneSnapshot()` call. That would re-read the same
    * parameter and re-run one `DescribeParameters` per catalog flavor for values already in hand,
    * and — worse — could disagree with `runnerLabels.labels` rendered beside it if the parameter
-   * changed between the two reads. `live` is the allowlist read succeeding: `labelsRaw ===
-   * undefined` is the `.catch(() => undefined)` above, and an unread allowlist is not evidence
-   * that anything is broken.
+   * changed between the two reads.
+   *
+   * `live` is the AND of BOTH reads, exactly as `controlPlaneSnapshot` defines it, because
+   * `reconcileFlavors` derives a state from both and takes no view on liveness: an unread image
+   * map with `live: true` would make every allowlisted flavor `imageMissing` and every other one
+   * `unroutable`, and the screen would announce that the catalog cannot run here on the strength
+   * of a transient SSM error. `labelsRaw === undefined` and `flavors === undefined` are the two
+   * fail-soft sentinels above; neither is evidence that anything is broken.
    */
   const snapshot: ControlPlaneSnapshot = {
     allowlist: labels,
     imagePublished: flavors,
-    live: labelsRaw !== undefined,
+    live: labelsRaw !== undefined && flavors !== undefined,
   };
   const view: SettingsView = {
     envName: ENV_NAME,
@@ -1308,6 +1318,14 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
       labels,
       unset: labels.length === 0,
       hostedLabels: hostedLabelsIn(labels, HOSTED_LABELS),
+      /**
+       * Whether the allowlist was actually READ. `unset` above cannot carry this: a failed
+       * `getParam` catches to `undefined`, `parseRunnerLabels` turns that into `[]`, and the
+       * card would then badge `unset — no jobs claimed` — a positive claim that this
+       * environment claims nothing — directly above the ADR-051 line saying the live read
+       * failed. One card cannot assert both. `false` makes the client render `unchecked`.
+       */
+      live: labelsRaw !== undefined,
     },
     webhook: buildWebhookHealth({
       configuredUrl: linkage?.webhook?.configuredUrl,

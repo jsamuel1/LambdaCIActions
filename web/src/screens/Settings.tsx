@@ -537,7 +537,12 @@ function RunnerLabelsCard({ data, reload }: { data: SettingsData; reload: () => 
     <div className="card">
       <div className="row">
         <h3 className="tight">Runner labels</h3>
-        {data.runnerLabels.unset ? (
+        {data.runnerLabels.live === false ? (
+          // Not `unset`: the read failed, so the empty list is not evidence this environment
+          // claims nothing. Badging it `block` here would contradict the reconciliation line
+          // below in the same card (ADR-051 — unknown is neither broken nor green).
+          <Badge kind="warn">unchecked — could not read</Badge>
+        ) : data.runnerLabels.unset ? (
           <Badge kind="block">unset — no jobs claimed</Badge>
         ) : (
           <Badge kind="ok">{data.runnerLabels.labels.length} claimed</Badge>

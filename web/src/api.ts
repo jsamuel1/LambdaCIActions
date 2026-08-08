@@ -316,6 +316,14 @@ export interface RunnerLabels {
   labels: string[];
   unset: boolean;
   hostedLabels: string[];
+  /**
+   * Whether the allowlist parameter was actually read (ADR-051). Optional for compatibility with
+   * an API that predates the flag; absent is treated as read.
+   *
+   * `false` must NOT render as `unset`: a failed read degrades to an empty list, and badging that
+   * "no jobs claimed" asserts a broken environment on the strength of a transient SSM error.
+   */
+  live?: boolean;
 }
 
 export interface AuditEntry {

@@ -727,6 +727,16 @@ export interface RunnerLabelsView {
   unset: boolean;
   /** Labels in the list that name GitHub-hosted images (adopt-mode takeover). */
   hostedLabels: string[];
+  /**
+   * Whether the parameter was actually read (ADR-051). Optional for wire compatibility; absent
+   * is treated as read.
+   *
+   * `unset` cannot express this on its own: a failed read degrades to an empty list, which is
+   * indistinguishable from a genuinely absent parameter. The two mean opposite things to an
+   * operator — "this environment claims nothing" versus "we could not ask" — and only the first
+   * is a state to act on.
+   */
+  live?: boolean;
 }
 
 export interface AuditEntryView {

@@ -1248,3 +1248,83 @@ test('the unclaimed banner carries the same floor qualifier as its stat', () => 
   assert.match(banner, /unclaimedExact === false \? 'At least ' : ''/);
   assert.match(banner, /h\.unclaimed === 1 \? 'was' : 'were'/, 'the verb must agree after the prefix');
 });
+
+// ---- review fixes: unknown is neither broken nor green, and Refresh really resets ----------
+
+test('Settings degrades BOTH live reads to unknown — no 500, no false "unset"', () => {
+  const mgmt = stripComments(src('src/mgmt/handler.ts'));
+  const route = mgmt.slice(
+    mgmt.indexOf('async function settingsRoute('),
+    mgmt.indexOf('function installationsEnumerated('),
+  );
+  assert.ok(route.length > 0, 'settingsRoute not found — update this test');
+
+  // 1. The image probe must be the FAIL-SOFT variant. Raw `imageAvailability()` rejects on an SSM
+  //    fault, and it sits in a `Promise.all` with no catch — so an image-presence probe that only
+  //    annotates the flavor table would 500 the whole screen, taking the App linkage, webhook
+  //    health and secret diagnostics with it.
+  assert.match(route, /imageAvailabilityOrUndefined\(\),/);
+  assert.ok(
+    !/\bimageAvailability\(\),/.test(route),
+    'settingsRoute must not call the throwing imageAvailability() inside its Promise.all',
+  );
+
+  // 2. `live` must be the AND of both reads, as ControlPlaneSnapshot defines it. With
+  //    `live: true` and an unread image map, `reconcileFlavors` derives every allowlisted flavor
+  //    `imageMissing` and every other one `unroutable` — the screen would announce the catalog
+  //    cannot run here on the strength of a transient SSM error.
+  assert.match(route, /live: labelsRaw !== undefined && flavors !== undefined,/);
+
+  // 3. A failed allowlist read must not be badged `unset`. It degrades to `[]`, which is
+  //    indistinguishable from an absent parameter; only one of those is a broken environment.
+  assert.match(route, /live: labelsRaw !== undefined,/);
+});
+
+test('an unread allowlist renders unchecked, not "no jobs claimed"', () => {
+  // The contradiction this prevents: `unset — no jobs claimed` (a positive claim) directly above
+  // the ADR-051 line saying the live read failed, in ONE card.
+  const settings = stripComments(src('web/src/screens/Settings.tsx'));
+  const card = settings.slice(settings.indexOf('<h3 className="tight">Runner labels</h3>'));
+  const badge = card.slice(0, card.indexOf('</div>'));
+  const liveAt = badge.indexOf('data.runnerLabels.live === false');
+  const unsetAt = badge.indexOf('data.runnerLabels.unset');
+  assert.ok(liveAt > 0, 'the runner-labels badge must consult read liveness');
+  assert.ok(
+    unsetAt > liveAt,
+    'the liveness branch must precede `unset`, or a failed read still badges "no jobs claimed"',
+  );
+
+  // Same conflation on the Setup checklist, which reads the same field.
+  const setup = stripComments(src('web/src/screens/Setup.tsx'));
+  const row = setup.slice(setup.indexOf('<th>Runner labels</th>'));
+  const cell = row.slice(0, row.indexOf('</tr>'));
+  assert.ok(
+    cell.indexOf('runnerLabels.live === false') < cell.indexOf('runnerLabels.unset'),
+    'Setup must render an unread allowlist as unchecked before deciding it is unset',
+  );
+});
+
+test('Refresh invalidates an in-flight "Load older", not just a filter change', () => {
+  const screen = stripComments(src('web/src/screens/Unclaimed.tsx'));
+  // Refresh does not change `repoFilter`, so a filter-only guard lets a hop that was in flight
+  // append its pre-refresh rows, cursor and seam boundary into the window Refresh just emptied —
+  // restoring the exact hole (and the stale warning) that Refresh advertises it clears.
+  assert.match(screen, /const genRef = useRef\(0\);/);
+  const reset = screen.slice(screen.indexOf('function resetWindow(): void {'));
+  const resetBody = reset.slice(0, reset.indexOf('}'));
+  assert.match(resetBody, /genRef\.current \+= 1;/, 'every window reset must bump the generation');
+  // Otherwise a Refresh mid-hop leaves the button spinning forever: the hop's own clear is
+  // generation-guarded and will decline to fire.
+  assert.match(resetBody, /setLoadingMore\(false\);/);
+
+  const hop = screen.slice(screen.indexOf('async function loadOlder()'));
+  const body = hop.slice(0, hop.indexOf('function toggle('));
+  assert.match(body, /const requestedGen = genRef\.current;/);
+  // Both the success and the failure path must discard a superseded response.
+  const guards = body.match(/genRef\.current !== requestedGen/g) ?? [];
+  assert.ok(
+    guards.length >= 2,
+    `both the apply and the error path must check the generation (found ${guards.length})`,
+  );
+  assert.match(body, /if \(genRef\.current === requestedGen\) setLoadingMore\(false\);/);
+});

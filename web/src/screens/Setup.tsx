@@ -91,7 +91,12 @@ export function Setup(): JSX.Element {
                 <tr>
                   <th>Runner labels</th>
                   <td>
-                    {settings.data.runnerLabels.unset ? (
+                    {settings.data.runnerLabels.live === false ? (
+                      <>
+                        <span className="badge warn">unchecked</span>{' '}
+                        <span className="muted">could not read the allowlist</span>
+                      </>
+                    ) : settings.data.runnerLabels.unset ? (
                       <>
                         <span className="badge block">unset</span>{' '}
                         <span className="muted">no jobs will be claimed</span>
