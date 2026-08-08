@@ -154,7 +154,7 @@ export class MgmtStack extends Stack {
 
     // Reads across all entities (runs, installs, repos, workflow analyses).
     table.grantReadData(fn);
-    // Config writes ONLY: UpdateItem on the table. No Put/Delete → cannot forge or destroy
+    // Config writes ONLY: UpdateItem on the table. No Put/Delete here → cannot forge or destroy
     // run history, only patch existing rows. The handler restricts what it patches: repo
     // config (enabled/mode/defaultFlavor/flavorMap) and the ADR-037 installation GSI1 index
     // repair (gsi1pk/gsi1sk on an installation the session is already authorized for).
@@ -163,6 +163,30 @@ export class MgmtStack extends Stack {
         sid: 'PatchRepoConfig',
         actions: ['dynamodb:UpdateItem'],
         resources: [table.tableArn],
+      }),
+    );
+
+    // Custom-flavor rows (ADR-040) are the ONE thing the Mgmt API creates and destroys, so they
+    // need Put/Delete that the statement above deliberately withholds. Registration is a
+    // conditional `PutItem` (`attribute_not_exists`) and removal is a `DeleteItem`; the validation
+    // state machine and the image repoint are `UpdateItem`, already covered above.
+    //
+    // Scoped with `LeadingKeys` to the installation partitions, following the appcfg broker's
+    // `CONFIG#*` precedent, because that is the only partition-level scoping DynamoDB IAM offers —
+    // there is no sort-key condition, so `FLAVOR#` cannot be expressed in the policy. What the
+    // condition still buys is the property the forbidden-actions test exists to protect: run rows
+    // live in `RUN#<repoId>#<runId>#<jobId>` partitions, so this grant cannot forge or delete a
+    // single run, and Reports/cost/failure-rate history stays immutable from the Mgmt role.
+    // Confining the writes to `FLAVOR#` sort keys within those partitions is enforced in the
+    // handler (only the flavor-store functions Put/Delete), not in IAM.
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'WriteCustomFlavorRows',
+        actions: ['dynamodb:PutItem', 'dynamodb:DeleteItem'],
+        resources: [table.tableArn],
+        conditions: {
+          'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['INSTALL#*'] },
+        },
       }),
     );
 

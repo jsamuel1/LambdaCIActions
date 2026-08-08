@@ -2171,7 +2171,15 @@ rule true rather than advisory:
   when the λ below lands. It is tested directly against all three outcomes so that it is a
   contract rather than an assumption.
 - The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
-  re-validate trigger; a new image ARN atomically repoints and resets to `pending`.
+  re-validate trigger; a new image ARN atomically repoints and resets to `pending`. Those routes
+  needed an IAM grant the Mgmt role deliberately did not have: `PatchRepoConfig` is `UpdateItem`
+  only, so registration (`PutItem`) and delete (`DeleteItem`) would have failed with
+  `AccessDeniedException` in a deployed environment while every unit test passed, because the tests
+  drive the store through injected seams and `cdk synth` does not evaluate a policy. The grant is
+  `LeadingKeys`-scoped to `INSTALL#*` (the appcfg broker's `CONFIG#*` precedent) — DynamoDB IAM has
+  no sort-key condition, so `FLAVOR#` cannot be expressed in policy, but run rows live in
+  `RUN#<repoId>#<runId>#<jobId>` partitions and therefore stay unaddressable: the Mgmt role still
+  cannot forge or delete a run, which is the property `test/mgmt-stack.test.mjs` pins.
 
 **Not implemented:** the λ that actually *runs* a smoke run — launching the microVM, dispatching the
 nonce-bound workflow and observing registration/conclusion/self-termination — and its CDK wiring.
