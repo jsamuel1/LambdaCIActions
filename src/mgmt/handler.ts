@@ -75,19 +75,7 @@ import { staticGate, smokeWorkflowYaml } from '../flavorval/validate-core.js';
 import { shapeRatePerMinute } from './views.js';
 import { planPreviewFromAnalyses } from './rewrite.js';
 import { collectVisible } from './paging.js';
-import {
-  openCursor,
-  sealCursorOrNull,
-  type CursorScope,
-} from '../shared/cursor.js';
-
-/**
- * Refusal message for a cursor that will not open under the scope it was presented with
- * (ADR-052). Deliberately does not distinguish forged from cross-scope from
- * secret-rotated — the client's recovery is the same in every case: drop the cursor and
- * refetch the head page.
- */
-const CURSOR_REFUSED = 'cursor is not valid for this query; reload the list';
+import { openCursor, sealCursorOrNull, type CursorScope } from '../shared/cursor.js';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import {
   METRIC_CATALOG,
@@ -167,6 +155,14 @@ import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
  * signing key. Every other SSM path is probed for **presence only** via
  * `paramExists` (DescribeParameters), so no code path can return a SecureString value.
  */
+
+/**
+ * Refusal message for a cursor that will not open under the scope it was presented with
+ * (ADR-052). Deliberately does not distinguish forged from cross-scope from
+ * secret-rotated — the client's recovery is the same in every case: drop the cursor and
+ * refetch the head page.
+ */
+const CURSOR_REFUSED = 'cursor is not valid for this query; reload the list';
 
 const ENV_NAME = process.env.LCA_ENV ?? 'dev';
 const SSM_PREFIX = process.env.SSM_PREFIX ?? `/lca/${ENV_NAME}`;

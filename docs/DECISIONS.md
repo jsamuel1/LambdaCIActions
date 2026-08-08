@@ -2928,14 +2928,16 @@ That key names the last row **scanned**, not the last row **returned**. Whenever
 boundary row belonged to an installation the session may not administer — the normal case for
 an operator whose traffic is a minority of the platform's — its identifiers rode out inside
 the cursor beside a response body they had just been filtered out of:
-`RUN#<repoId>#<runId>#<jobId>` plus a timestamp, or `REFUSAL#<repoId>#<runId>#<jobId>` plus
-`lastSeenAt`. base64url is an encoding, not a protection. Any authenticated operator could
-decode the cursor and read another tenant's repo, run, and job ids.
+`RUN#<repoId>#<runId>#<jobId>` plus a timestamp. base64url is an encoding, not a protection.
+Any authenticated operator could decode the cursor and read another tenant's repo, run, and
+job ids.
 
 This was found while reviewing the unclaimed-jobs work and confirmed **pre-existing** at that
-branch's merge base, on both the repo-filtered and status-filtered `/api/runs` branches. It is
-a property of the shared paging seam (`collectVisible` + `encodeCursor`), so it was fixed
-there rather than per route.
+branch's merge base, on both the repo-filtered and status-filtered `/api/runs` branches — the
+only paginated routes that exist today. It is a property of the shared paging seam
+(`collectVisible` + `encodeCursor`), so it was fixed there rather than per route. The
+unclaimed/refusal list (PR #34) walks the same seam with `REFUSAL#…` keys and is still
+unlanded; it inherits the fix structurally rather than being patched here.
 
 **Decision.** A cursor crossing the API boundary is **sealed**: AES-256-GCM over the store's
 cursor, under a key derived by HKDF-SHA256 from the existing session secret, with the scope it
@@ -2947,7 +2949,10 @@ Three properties from one primitive:
 
 - **Confidentiality** — the DynamoDB key never leaves the Lambda in readable form. This is the
   requirement, and it is why an HMAC alone was rejected: signing the same base64url payload
-  stops tampering while leaving the identifiers in plain sight.
+  stops tampering while leaving the identifiers in plain sight. GCM is length-preserving, so
+  the residue is the *length* of the key — a magnitude hint about the scanned row's id digits,
+  naming nothing. Fixed-width padding is the mitigation if a future key shape makes that
+  meaningful; it is not worth a fixed-size cursor on every response today.
 - **Integrity** — a forged or edited cursor fails the GCM tag and is refused, so a caller
   cannot hand us an arbitrary `ExclusiveStartKey` and walk an index we would never have
   queried on their behalf. Bare pre-ADR-052 plaintext keys are refused for the same reason.

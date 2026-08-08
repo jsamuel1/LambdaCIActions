@@ -4,9 +4,10 @@
 // filter — the run indexes are keyed by status/repo/time, never by installation (ADR-023) —
 // and then returned DynamoDB's `LastEvaluatedKey` as `nextCursor`. That key names the last
 // row SCANNED, not the last row RETURNED. When the boundary row belonged to an installation
-// the session may not administer, its `RUN#<repoId>#<runId>#<jobId>` (or `REFUSAL#…`)
-// identifiers rode out in the cursor next to a body they had been filtered out of, in plain
-// base64url that any authenticated operator could decode.
+// the session may not administer, its `RUN#<repoId>#<runId>#<jobId>` identifiers rode out in
+// the cursor next to a body they had been filtered out of, in plain base64url that any
+// authenticated operator could decode. (A `REFUSAL#…` row is the same shape; that list is
+// still unlanded — see PR #34 — so only the run keys are exercised here.)
 //
 // Four invariants:
 //   1. a sealed cursor carries no readable identifier, in any encoding a client can apply;
@@ -33,16 +34,28 @@ const MINE = { view: 'runs:status', installationIds: [11], status: 'failed' };
 /**
  * A real GSI1 boundary key for a row owned by installation 99 — the shape the store hands
  * back when the last row scanned belongs to somebody else.
+ *
+ * The ids are deliberately GitHub-scale (9–11 digits) rather than toy values. The absence
+ * assertions below scan the sealed blob's `hex` and `latin1` renderings, which are
+ * effectively random bytes, so a SHORT id would collide there by chance: a 4-digit decimal
+ * string has a ~1-in-150 chance of appearing somewhere in ~460 hex characters, which is a
+ * flaky test rather than a leak. At 9+ digits the false-positive probability is ~1e-8.
  */
 const OTHER_TENANT_KEY = {
-  pk: 'RUN#4242#88888888#777777',
+  pk: 'RUN#987654321#15432198765#43219876543',
   sk: 'RUN',
   gsi1pk: 'RUNSTATUS#failed',
-  gsi1sk: '2026-08-01T00:00:00.000Z#4242#88888888#777777',
+  gsi1sk: '2026-08-01T00:00:00.000Z#987654321#15432198765#43219876543',
 };
 
 /** Every identifier from the other tenant's row that must not escape. */
-const SECRETS = ['4242', '88888888', '777777', 'RUN#4242', 'RUNSTATUS#failed'];
+const SECRETS = [
+  '987654321',
+  '15432198765',
+  '43219876543',
+  'RUN#987654321',
+  'RUNSTATUS#failed',
+];
 
 test('a sealed cursor exposes none of the scanned row identifiers', () => {
   const raw = encodeCursor(OTHER_TENANT_KEY);
@@ -102,7 +115,7 @@ test('a cursor is refused outside the scope it was minted for', () => {
     // resuming here would skip or repeat rows.
     { ...MINE, status: 'completed' },
     { view: MINE.view, installationIds: MINE.installationIds },
-    { ...MINE, repoId: 4242 },
+    { ...MINE, repoId: 987654321 },
     // Replayed by another operator, or by the same operator after their grants changed.
     { ...MINE, installationIds: [99] },
     { ...MINE, installationIds: [11, 99] },

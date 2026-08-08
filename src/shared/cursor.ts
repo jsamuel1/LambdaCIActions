@@ -11,10 +11,11 @@ import crypto from 'node:crypto';
  * handed the raw `LastEvaluatedKey` straight out as `nextCursor`, base64url of plain JSON.
  *
  * That key names the LAST ROW SCANNED, which is frequently a row the session may not see:
- * `RUN#<repoId>#<runId>#<jobId>` (or `REFUSAL#…`) plus a timestamp. The row was filtered
- * out of the response body and then leaked in the cursor beside it. base64url is an
- * encoding, not a protection — any authenticated operator could decode it and read another
- * tenant's repo/run/job ids.
+ * `RUN#<repoId>#<runId>#<jobId>` plus a timestamp. The row was filtered out of the response
+ * body and then leaked in the cursor beside it. base64url is an encoding, not a protection —
+ * any authenticated operator could decode it and read another tenant's repo/run/job ids.
+ * (The unclaimed/refusal list is the same seam with `REFUSAL#…` keys; it is still unlanded —
+ * PR #34 — and inherits this module structurally when it arrives.)
  *
  * ## Why sealing, and not just signing
  *
@@ -46,6 +47,16 @@ import crypto from 'node:crypto';
  * Deploys that roll the session secret invalidate outstanding cursors; the console recovers
  * on the next unpaginated fetch. Same blast radius as the session cookie, which is signed
  * with the same secret and already re-issued on rotation.
+ *
+ * ## What sealing does NOT hide
+ *
+ * AES-GCM is length-preserving, so the sealed blob's length still reveals the plaintext key's
+ * length — i.e. roughly how many DIGITS the scanned row's ids have, in ~3-byte steps once
+ * base64 is accounted for. That bounds an id's magnitude; it names no id, and repo/run/job
+ * ids are not secrets in themselves (GitHub numbers them sequentially and publishes them for
+ * public repos). Padding to a fixed width would close it, at the cost of a fixed-size cursor
+ * on every response; not worth it for a magnitude hint, but it is the mitigation if a future
+ * key shape makes length meaningful.
  *
  * Pure `node:crypto`, no AWS types — unit-testable (see `test/mgmt-cursor-scope.test.mjs`).
  */
