@@ -70,7 +70,10 @@ async function guardDeployTarget() {
     process.exit(1);
   }
   try {
-    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION });
+    // `env: ENV` binds the selected environment to the pin (ADR-033): publishing
+    // prod-namespaced image ARNs into the dev account is the same boundary violation as a
+    // cross-account deploy.
+    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION, env: ENV });
     REGION = target.region; // pin wins; all aws() calls get --region <pin>
   } catch (e) {
     console.error(`ERROR: ${e.message}`);
@@ -135,7 +138,13 @@ function cpDir(from, to) {
 }
 
 function buildFlavor(flavor, ctx) {
-  console.log(`\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.vcpu}vCPU/${flavor.memoryMb}MB) ===`);
+  // The operator-facing shape line. `vcpu` is DESCRIPTIVE only (ADR-038) — the API takes no
+  // vCPU request — so label it, or this log reads as "provisioned 4 vCPU" and re-creates the
+  // exact misattribution ADR-038 corrects in docs/VERIFY-M3.md.
+  console.log(
+    `\n=== flavor: ${flavor.name} (${flavor.arch}, ${flavor.memoryMb}MB requested; ` +
+      `${flavor.vcpu} vCPU descriptive-only) ===`,
+  );
   if (flavor.arch !== 'arm64') {
     // AGENTS.md hard rule — microVMs are Graviton only.
     throw new Error(`flavor ${flavor.name} arch=${flavor.arch}; microVMs are arm64 only`);
@@ -173,12 +182,34 @@ function buildFlavor(flavor, ctx) {
     JSON.stringify({
       port: Number(flavor.runHookPort ?? 8080),
       microvmImageHooks: { ready: 'ENABLED', readyTimeoutInSeconds: 120 },
-      microvmHooks: { run: 'ENABLED', runTimeoutInSeconds: 30 },
+      // 60 s, NOT 30 s — and 60 is the API MAXIMUM, not a preference
+      // (`MicrovmHooksRunTimeoutInSecondsInteger`: min 1, max 60, lambda-microvms 2025-09-09;
+      // the image hooks' readyTimeoutInSeconds is separate and allows up to 3600 s). The boot
+      // path's first act is a `jitconfig` call through the AWS CLI, and in a snapshot-resumed
+      // guest that CLI is cold: the 2026-07-28 dev verification saw attempts 1 and 2 time out
+      // on all three flavors and burn ~22 s of a 30 s deadline to get one success — i.e. the
+      // retry loop had no margin left for a single slow attempt. Take the whole ceiling and
+      // derive the retry budget down from it (run-hook.mjs: 2 × 15 s + 2 s = 32 s worst case,
+      // pinned by test/run-hook.test.mjs, which also pins this 60 s cap). This is a CEILING,
+      // not a delay: a healthy boot still ACKs in ~1 s, and an unhealthy VM is still capped —
+      // by the Reaper's own 2 h lifetime cap, which is what bounds the paid idle time.
+      microvmHooks: { run: 'ENABLED', runTimeoutInSeconds: 60 },
     }),
     // Capture build + hook logs to CloudWatch so ready/run hook failures are diagnosable.
     '--logging',
     JSON.stringify({ cloudWatch: { logGroup: `/aws/lambda/microvms/lca-${ENV}-${flavor.name}` } }),
   ];
+
+  // Resource + CPU shape (ADR-038). The GA API accepts memory ONLY:
+  // `--resources minimumMemoryInMiB` (single-element list) and `--cpu-configurations
+  // architecture=ARM_64` (whose only permitted value is ARM_64 — there is no vCPU knob, and
+  // `run-microvm` has no sizing parameter at all, so a VM's shape is fixed by its image).
+  // Before this was sent, every flavor was built at the service default and the catalog's
+  // memoryMb was inert — including for the 8 GB flavors.
+  if (flavor.memoryMb) {
+    commonArgs.push('--resources', `minimumMemoryInMiB=${flavor.memoryMb}`);
+  }
+  commonArgs.push('--cpu-configurations', 'architecture=ARM_64');
 
   // Extra OS capabilities for the guest (ADR-020). Default microVMs boot with an empty
   // capability set, a read-only /sys and no writable cgroup hierarchy, so a rootful Docker

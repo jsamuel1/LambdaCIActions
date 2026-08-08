@@ -14,8 +14,6 @@ export function Setup(): JSX.Element {
   if (installs.error) return <ErrorBox message={installs.error} />;
   if (!installs.data) return <Loading what="installations" />;
 
-  const missing = (settings.data?.secrets ?? []).filter((s) => !s.present);
-
   return (
     <div className="stack">
       <div className="card">
@@ -61,23 +59,76 @@ export function Setup(): JSX.Element {
       <div className="card">
         <h3>Platform readiness</h3>
         {settings.loading && <Loading what="settings" />}
-        {missing.length === 0 && settings.data && (
-          <p className="muted">All required parameters are present.</p>
-        )}
-        {missing.length > 0 && (
+        {settings.data && (
           <>
-            <p className="error">{missing.length} required parameter(s) missing:</p>
-            <ul className="muted">
-              {missing.map((m) => (
-                <li key={m.param}>
-                  {m.label} — <code>{m.param}</code>
-                </li>
-              ))}
-            </ul>
+            {/*
+              Readiness is expressed as *linkage + claim + delivery*, not "are the SSM
+              parameters present" (spec 04 § Settings): a first-run operator needs to know
+              whether the App authenticates and whether GitHub can reach us — parameter
+              presence proves neither.
+            */}
+            <table>
+              <tbody>
+                <tr>
+                  <th>GitHub App</th>
+                  <td>
+                    {settings.data.app ? (
+                      <>
+                        <span className="badge ok">verified</span> {settings.data.app.name} (id{' '}
+                        {settings.data.app.appId})
+                      </>
+                    ) : (
+                      <>
+                        <span className="badge block">not verified</span>{' '}
+                        <span className="muted">
+                          {settings.data.appVerifyError ??
+                            'run `npm run app:create`, or re-link from Settings'}
+                        </span>
+                      </>
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <th>Runner labels</th>
+                  <td>
+                    {settings.data.runnerLabels.unset ? (
+                      <>
+                        <span className="badge block">unset</span>{' '}
+                        <span className="muted">no jobs will be claimed</span>
+                      </>
+                    ) : (
+                      <span className="muted">
+                        {settings.data.runnerLabels.labels.join(', ')}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <th>Webhook</th>
+                  <td>
+                    <span
+                      className={`badge ${
+                        settings.data.webhook.state === 'healthy'
+                          ? 'ok'
+                          : settings.data.webhook.state === 'degraded'
+                            ? 'block'
+                            : 'warn'
+                      }`}
+                    >
+                      {settings.data.webhook.state}
+                    </span>{' '}
+                    <span className="muted">
+                      {settings.data.webhook.lastReceivedAt
+                        ? `last delivery ${formatTime(settings.data.webhook.lastReceivedAt)}`
+                        : 'no delivery received yet'}
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
             <p className="muted">
-              Create them out-of-band (ADR-008): `npm run app:create` writes the GitHub App
-              credentials; the console session key is created by the M4 deploy steps in
-              docs/DEPLOY-M4.md.
+              Full linkage detail, label editing and a webhook delivery test live on the{' '}
+              <a href="#/settings">Settings</a> screen.
             </p>
           </>
         )}

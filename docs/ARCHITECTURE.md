@@ -52,7 +52,8 @@ installed orgs/repos, discovered workflows, flavor mappings, and a run history/l
 Read-mostly; writes are config (flavor overrides, repo enable/disable). Implemented in M4 —
 see [spec 04](specs/04-web-ui.md); the plane's IAM boundary (no compute, no secret values,
 no Put/Delete on the table) is pinned by [ADR-025](DECISIONS.md#adr-025), and the console +
-API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-024)).
+API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-024)) — on a config-derived
+vanity hostname when one is configured ([ADR-036](DECISIONS.md#adr-036)).
 
 ```
 ┌── Control plane ─────────┐   ┌── Compute plane ──────────┐   ┌── Management plane ──────┐
@@ -73,12 +74,13 @@ API share one CloudFront origin ([ADR-024](DECISIONS.md#adr-024)).
 | Runner-request queue | SQS (+ DLQ) | Decouple ingest from provisioning; retries |
 | Provision λ | Lambda | Consume queue, mint JIT token, launch microVM w/ config |
 | Runner | Lambda microVM | Boot from snapshot, register JIT, run 1 job, terminate |
-| Hook broker λ | Lambda | Only AWS surface a runner microVM can call: hands back that run's JIT config and terminates that run's VM, capability-token gated (ADR-021) |
+| Hook broker λ | Lambda | Only AWS surface a runner microVM can call: hands back that run's JIT config and terminates that run's VM, capability-token gated (ADR-020) |
 | Reaper λ | Lambda (EventBridge schedule) | Kill microVMs exceeding max lifetime; reconcile orphans |
 | Image builder | Lambda + code bucket | Build/snapshot flavor images; publish image ARNs |
-| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config only (ADR-025) |
+| Mgmt API λ | Lambda | Read repos/workflows/runs/logs; write repo config + installation index repair only (ADR-025, ADR-037) |
 | Config + run store | DynamoDB | Installations, repos, workflows, flavor maps, run records |
-| Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024) |
+| Web UI | S3 (OAC) + CloudFront (SPA) | Operator console; same distribution fronts the API (ADR-024). Vanity alias + A/AAAA Route53 records when a console domain is configured (ADR-036) |
+| Console cert | ACM (**us-east-1**) | Viewer certificate for the vanity hostname — CloudFront accepts no other region. Only exists on the vanity-domain path (ADR-036) |
 | Auth | GitHub OAuth + signed session cookie | UI login scoped to installations the user can admin (ADR-022) |
 | Secrets | SSM Parameter Store (SecureString) | App private key, webhook secret, OAuth client secret |
 
@@ -149,14 +151,14 @@ copying log bodies into DynamoDB.
 - **Webhook auth**: HMAC-SHA256 with a secret stored in SSM SecureString; constant-time compare.
 - **GitHub App**: private key in SSM SecureString; short-lived installation tokens minted per provisioning; JIT runner tokens are single-use.
 - **Least privilege**: Provision λ launches/terminates microVMs scoped to the account/region (the GA API cannot scope by VM — ADR-015); Mgmt API λ scoped to config tables; no Lambda has the App key except those that must mint tokens.
-- **No ambient authority in the runner** (ADR-021): the execution role stamped on a microVM holds only its own log group plus `lambda:InvokeFunction` on the hook broker λ — no DynamoDB, no `TerminateMicrovm`. A VM authenticates to the broker with a per-run capability token, the broker derives the run key from the token-bound ref, and no `microvmId` ever reaches the guest. Untrusted workflow code therefore cannot read another run's row or kill another tenant's job. `test/exec-role-iam.test.mjs` asserts this against the synthesized template.
+- **No ambient authority in the runner** (ADR-020): the execution role stamped on a microVM holds only its own log group plus `lambda:InvokeFunction` on the hook broker λ — no DynamoDB, no `TerminateMicrovm`. A VM authenticates to the broker with a per-run capability token, the broker derives the run key from the token-bound ref, and no `microvmId` ever reaches the guest. Untrusted workflow code therefore cannot read another run's row or kill another tenant's job. `test/exec-role-iam.test.mjs` asserts this against the synthesized template.
 - **UI auth**: GitHub OAuth; a user sees only installations they can admin on GitHub. Optional Cognito layer for session mgmt.
 - **Runner isolation**: single-use microVM per job; no runner reuse ⇒ no cross-job leakage. Optional VPC attachment with egress filtering for jobs touching private resources.
 - **Secrets never in code/CFN**: SecureStrings are created out-of-band and only *referenced* by CDK (CloudFormation cannot create SecureStrings).
 
 ## Scaling, quotas & failure handling
 
-- **Broker concurrency** is capped (20 reserved) because its callers are untrusted VMs; that cap is itself a shared resource — see ADR-021's residual risk on boot-path contention.
+- **Broker concurrency** is capped (20 reserved) because its callers are untrusted VMs; that cap is itself a shared resource — see ADR-020's residual risk on boot-path contention.
 - **Concurrency** bounded by (a) SQS + Provision λ reserved concurrency and (b) **microVM service quotas** — default quotas are low; request increases early (see [05-infrastructure](specs/05-infrastructure.md)).
 - **Backpressure**: if quota is hit, messages stay on SQS and retry; DLQ captures poison messages. UI surfaces "queued > N min" as a health signal.
 - **Partial failures**: provisioning failure → message returns to queue (visibility timeout) → retry → DLQ after N attempts; run marked `failed` with reason.

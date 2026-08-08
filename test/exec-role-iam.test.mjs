@@ -8,6 +8,7 @@ import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { ControlStack } from '../dist/lib/control-stack.js';
 import { DataStack } from '../dist/lib/data-stack.js';
+import { envConfig } from '../dist/lib/env-config.js';
 
 function synth() {
   const app = new App();
@@ -19,6 +20,7 @@ function synth() {
     ssmPrefix: '/lca/test',
     tagPrefix: 'lca',
     table: data.table,
+    config: envConfig('test'),
   });
   return Template.fromStack(control);
 }

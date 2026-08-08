@@ -1,5 +1,5 @@
 {
-  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md & docs/specs/03-workflow-ingestion.md. All arm64/Graviton only.",
+  "$comment": "Flavor catalog — see docs/specs/02-microvm-runners.md & docs/specs/03-workflow-ingestion.md. All arm64/Graviton only. `memoryMb` is REQUESTED at image-build time as --resources minimumMemoryInMiB; `vcpu` is DESCRIPTIVE only — the GA lambda-microvms API exposes no vCPU knob (ADR-038).",
   "flavors": [
     {
       "name": "base",
@@ -19,7 +19,47 @@
       "vcpu": 2,
       "memoryMb": 4096,
       "capabilities": ["node"],
-      "description": "base + Node.js LTS toolchain (node/npm/pnpm/yarn) preinstalled for arm64."
+      "description": "base + Node.js LTS toolchain (node/npm/pnpm/yarn) preinstalled for arm64, prebaked into the runner tool cache so actions/setup-node resolves from cache."
+    },
+    {
+      "name": "python",
+      "label": "lambda-ci-python",
+      "dockerfile": "Dockerfile.python",
+      "arch": "arm64",
+      "vcpu": 2,
+      "memoryMb": 4096,
+      "capabilities": ["python"],
+      "description": "base + CPython 3.12 (arm64) prebaked into the runner tool cache from the same actions/python-versions artifact actions/setup-python downloads, so setup-python resolves from cache."
+    },
+    {
+      "name": "java",
+      "label": "lambda-ci-java",
+      "dockerfile": "Dockerfile.java",
+      "arch": "arm64",
+      "vcpu": 2,
+      "memoryMb": 8192,
+      "capabilities": ["java"],
+      "description": "base + Eclipse Temurin JDK 21 LTS (aarch64) prebaked into the runner tool cache as Java_temurin_jdk so actions/setup-java resolves from cache. 8 GB — JVM builds (Gradle/Maven daemons) are the memory-hungriest of the standard set."
+    },
+    {
+      "name": "go",
+      "label": "lambda-ci-go",
+      "dockerfile": "Dockerfile.go",
+      "arch": "arm64",
+      "vcpu": 2,
+      "memoryMb": 4096,
+      "capabilities": ["go"],
+      "description": "base + pinned Go toolchain (arm64) prebaked into the runner tool cache so actions/setup-go resolves from cache, plus a C toolchain for cgo."
+    },
+    {
+      "name": "rust",
+      "label": "lambda-ci-rust",
+      "dockerfile": "Dockerfile.rust",
+      "arch": "arm64",
+      "vcpu": 4,
+      "memoryMb": 8192,
+      "capabilities": ["rust"],
+      "description": "base + pinned Rust stable via rustup (rustc/cargo/clippy/rustfmt, aarch64-unknown-linux-gnu) on PATH. No tool-cache entry — the Rust actions drive rustup, not the runner tool cache. 8 GB for link-heavy release builds."
     },
     {
       "name": "docker",
@@ -30,7 +70,7 @@
       "memoryMb": 8192,
       "capabilities": ["docker"],
       "osCapabilities": ["ALL"],
-      "description": "base + Docker engine (rootful daemon started per-job, runner in docker group) for container:/services: jobs and docker build/run, arm64 images. Larger footprint (4 vCPU / 8 GB). Needs additionalOsCapabilities=ALL so dockerd can mount cgroup2 (ADR-020)."
+      "description": "base + Docker engine (rootful daemon started per-job, runner in docker group) for container:/services: jobs and docker build/run, arm64 images. Larger footprint (8 GB requested). Needs additionalOsCapabilities=ALL so dockerd can mount cgroup2 (ADR-020)."
     }
   ]
 }

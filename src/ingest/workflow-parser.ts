@@ -76,6 +76,19 @@ function normalizeRunsOn(v: unknown): string[] {
 }
 
 /**
+ * The runner group named by the object form `runs-on: { group: X, labels: [...] }`, else null.
+ *
+ * Kept SEPARATE from the label list on purpose: a group is not a label, and GitHub requires a
+ * runner to be in the requested group AND carry every requested label. We mint into the
+ * repo-level default group only, so the claim gate needs this value to refuse a job that asks
+ * for another group (ADR-030) instead of stranding it.
+ */
+function normalizeRunnerGroup(v: unknown): string | null {
+  if (!isRecord(v) || Array.isArray(v)) return null;
+  return scalarToString(v.group);
+}
+
+/**
  * Normalize `on:` (string | array | map) to a trigger-name string[].
  * Map form `{ push: {...}, pull_request: {...} }` → its keys.
  */
@@ -191,6 +204,7 @@ function parseJob(id: string, raw: unknown): ParsedJob {
   const job = isRecord(raw) ? raw : {};
   const name = scalarToString(job.name);
   const runsOn = normalizeRunsOn(job['runs-on']);
+  const runnerGroup = normalizeRunnerGroup(job['runs-on']);
   const container = normalizeContainer(job.container);
   const services = normalizeServices(job.services);
   const uses = scalarToString(job.uses);
@@ -201,6 +215,7 @@ function parseJob(id: string, raw: unknown): ParsedJob {
     id,
     name,
     runs_on: runsOn,
+    runner_group: runnerGroup,
     container,
     services,
     uses,

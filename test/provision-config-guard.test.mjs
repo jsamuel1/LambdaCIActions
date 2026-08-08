@@ -78,3 +78,96 @@ test('the plaintext token is never persisted, only shipped in the launch payload
     'the plaintext token must never be stored on the JIT config item',
   );
 });
+
+// A TRANSIENT mint failure must not write a terminal status. `failed` is terminal, so the
+// redelivered message's queued→provisioning guard (canTransition) would refuse to advance the
+// row and return early — the SQS retry we asked for would never reach generateJitConfig again.
+test('a transient JIT mint failure rethrows before any terminal transition', () => {
+  const mintCatch = src.indexOf('const { kind, reason } = classifyMintFailure(');
+  assert.ok(mintCatch > 0, 'mint failure classification not found');
+  const rethrow = src.indexOf("if (kind === 'transient') throw new Error(reason);", mintCatch);
+  const failWrite = src.indexOf("to: 'failed',", mintCatch);
+  assert.ok(rethrow > 0, 'transient rethrow not found');
+  assert.ok(failWrite > 0, 'permanent failure transition not found');
+  assert.ok(
+    rethrow < failWrite,
+    'the transient rethrow must precede the failed transition, or a retryable mint is terminalized',
+  );
+});
+
+// The SAME invariant on the LAUNCH path, which had the opposite bug: a quota throttle is
+// capacity, not correctness (spec 05 § Quotas), and RUNBOOK's quota-throttle entry promises
+// "jobs wait rather than fail once the throttled message is redelivered". Writing `failed`
+// before rethrowing broke that promise silently: the row is terminal, so the redelivered
+// message's queued→provisioning guard returns early and the retry never re-attempts the
+// launch. One throttle permanently failed a job that only needed to wait.
+test('a quota-throttled launch rethrows WITHOUT writing a terminal status', () => {
+  const launchCatch = src.indexOf('const quota = isQuotaError(err);');
+  assert.ok(launchCatch > 0, 'launch-failure quota classification not found');
+  const quotaRethrow = src.indexOf('if (quota) {', launchCatch);
+  const failWrite = src.indexOf("to: 'failed',", launchCatch);
+  assert.ok(quotaRethrow > 0, 'quota rethrow branch not found');
+  assert.ok(failWrite > 0, 'launch-failure transition not found');
+  assert.ok(
+    quotaRethrow < failWrite,
+    'the quota rethrow must precede the failed transition, or a retryable throttle is terminalized',
+  );
+  // The throttle must still be counted before it is rethrown, or the alarm never fires.
+  const emit = src.indexOf("{ name: 'QuotaThrottles'", launchCatch);
+  assert.ok(emit > 0 && emit < quotaRethrow, 'QuotaThrottles must be emitted before the rethrow');
+});
+
+// A job whose `runs-on` is entirely `${{ … }}` normalizes to NO labels (expressions are not
+// labels). Minting with `labels: []` succeeds: GitHub gives the runner only its automatic
+// defaults, which cannot match the job's real selector. The VM boots, consumes the single-use
+// JIT config, matches nothing, and idles until the Reaper — paid compute that could never take
+// the job. The refusal therefore has to happen BEFORE the mint, like the broker guard.
+test('an empty normalized label set is refused before the JIT config is minted', () => {
+  const guard = src.indexOf('if (!runnerLabels.length) throw new NoRunnerLabelsError(');
+  const mint = src.indexOf('await generateJitConfig(');
+  const stash = src.indexOf('await putJitConfig(');
+  const launch = src.indexOf('await launchMicroVM(');
+
+  assert.ok(guard > 0, 'empty-label guard not found');
+  assert.ok(guard < mint, 'guard must precede generateJitConfig (single-use credential)');
+  assert.ok(guard < stash, 'guard must precede putJitConfig');
+  assert.ok(guard < launch, 'guard must precede launchMicroVM');
+
+  // It must land inside the mint try/catch so `classifyMintFailure` turns it into an
+  // actionable run reason (permanent) rather than an unhandled throw that SQS retries.
+  const tryStart = src.lastIndexOf('try {', guard);
+  const mintCatch = src.indexOf('const { kind, reason } = classifyMintFailure(');
+  assert.ok(tryStart > 0 && tryStart < guard && guard < mintCatch, 'guard must sit in the mint try');
+});
+
+// The labels we advertise must be the NORMALIZED set, not the raw webhook labels: sending
+// `${{ matrix.os }}` verbatim registers a junk label that matches nothing.
+test('the mint is given the normalized label set, not req.labels', () => {
+  const mintStart = src.indexOf('await generateJitConfig(');
+  const mintCall = src.slice(mintStart, src.indexOf('});', mintStart));
+  assert.match(mintCall, /labels: runnerLabels,/);
+  assert.doesNotMatch(mintCall, /labels: req\.labels/);
+});
+
+// The MIRROR of the empty-label guard. `decideClaim` claims on the FULL webhook label set, so
+// a job like `[l1 … l20, lambda-ci]` is claimed — and a normalization that silently TRUNCATED
+// at MAX_JIT_LABELS would then register a runner that never advertises `lambda-ci`. GitHub
+// matches cumulatively, so that runner can never be assigned the job it was launched for: the
+// VM boots, burns the single-use JIT config, matches nothing, and idles until the Reaper —
+// while the run row already says `running`. Refuse pre-mint instead, in the same try so the
+// failure becomes an actionable permanent reason.
+test('an over-cap label set is refused before the JIT config is minted', () => {
+  const guard = src.indexOf('if (runnerLabels.length > MAX_JIT_LABELS) throw new TooManyRunnerLabelsError(');
+  const mint = src.indexOf('await generateJitConfig(');
+  const stash = src.indexOf('await putJitConfig(');
+  const launch = src.indexOf('await launchMicroVM(');
+
+  assert.ok(guard > 0, 'over-cap label guard not found');
+  assert.ok(guard < mint, 'guard must precede generateJitConfig (single-use credential)');
+  assert.ok(guard < stash, 'guard must precede putJitConfig');
+  assert.ok(guard < launch, 'guard must precede launchMicroVM');
+
+  const tryStart = src.lastIndexOf('try {', guard);
+  const mintCatch = src.indexOf('const { kind, reason } = classifyMintFailure(');
+  assert.ok(tryStart > 0 && tryStart < guard && guard < mintCatch, 'guard must sit in the mint try');
+});

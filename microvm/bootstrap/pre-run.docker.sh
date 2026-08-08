@@ -45,9 +45,11 @@ log "cgroup=$(head -1 /proc/self/cgroup) controllers=$(cat /sys/fs/cgroup/cgroup
 # is in the docker group) talks to /var/run/docker.sock for the rest of the job.
 nohup dockerd >/var/log/dockerd.log 2>&1 &
 
-# Wait for the socket to accept API calls. Measured cold start on a 4 vCPU Graviton microVM
-# is ~35-40s (containerd + plugin init from a cold snapshot), so allow real headroom but still
+# Wait for the socket to accept API calls. Measured cold start on a Graviton microVM is
+# ~35-40s (containerd + plugin init from a cold snapshot), so allow real headroom but still
 # fail fast enough to surface a broken daemon with its log rather than burn the VM lifetime.
+# (The vCPU count of those runs is not established — the API exposes no vCPU request; see
+# ADR-038. The measured range is real, the shape attribution was not.)
 deadline=$((SECONDS + 120))
 until docker version --format '{{.Server.Version}}' >/dev/null 2>&1; do
   if (( SECONDS >= deadline )); then

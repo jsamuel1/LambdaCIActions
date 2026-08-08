@@ -9,6 +9,7 @@ import {
   statusGsiKeys,
   buildQueuedItem,
   buildStampUpdate,
+  buildTransitionUpdate,
 } from '../dist/src/shared/run-store.js';
 
 test('forward transitions are allowed', () => {
@@ -80,7 +81,79 @@ test('buildQueuedItem produces a complete queued row with matching keys', () => 
   assert.deepEqual(item.labels, ['lambda-ci']);
 });
 
-// ADR-021: the stamp write is the ONLY place the hook capability token hash reaches the
+test('buildQueuedItem records the workflow/job names reports group by', () => {
+  const item = buildQueuedItem({
+    repoId: 1,
+    repoFullName: 'octo/repo',
+    installationId: 2,
+    runId: 3,
+    jobId: 4,
+    labels: [],
+    workflowName: 'CI',
+    jobName: 'build',
+  });
+  assert.equal(item.workflowName, 'CI');
+  assert.equal(item.jobName, 'build');
+});
+
+test('absent workflow/job names are OMITTED, not written as undefined', () => {
+  // A DynamoDB attribute with an undefined value is a validation error, and an empty string
+  // would show up in reports as a real group named ''.
+  const item = buildQueuedItem({
+    repoId: 1,
+    repoFullName: 'octo/repo',
+    installationId: 2,
+    runId: 3,
+    jobId: 4,
+    labels: [],
+  });
+  assert.ok(!('workflowName' in item));
+  assert.ok(!('jobName' in item));
+});
+
+// ADR-042: phase watermarks are the cost + latency basis. They must be write-once, and must
+// only ever be written by the same guarded transition that actually enters the phase.
+test('entering provisioning/running stamps a write-once phase watermark', () => {
+  const now = new Date('2026-07-11T00:00:00.000Z');
+  for (const [status, attr] of [
+    ['provisioning', 'provisioningAt'],
+    ['running', 'runningAt'],
+  ]) {
+    const { updateExpression } = buildTransitionUpdate(
+      { repoId: 1, runId: 2, jobId: 3, to: status },
+      now,
+    );
+    assert.ok(
+      updateExpression.includes(`${attr} = if_not_exists(${attr}, :now)`),
+      `${status} did not stamp ${attr} write-once: ${updateExpression}`,
+    );
+  }
+});
+
+test('a re-delivered transition cannot move an existing watermark', () => {
+  // `if_not_exists` is the whole guard: a plain SET would let a duplicate `running` webhook
+  // push runningAt forward, shrinking billable time and inflating queue latency.
+  const { updateExpression } = buildTransitionUpdate({ repoId: 1, runId: 2, jobId: 3, to: 'running' });
+  assert.ok(!/runningAt = :now/.test(updateExpression), 'watermark is overwritable');
+});
+
+test('terminal and queued transitions stamp no phase watermark', () => {
+  for (const to of ['completed', 'failed', 'timed_out', 'queued']) {
+    const { updateExpression } = buildTransitionUpdate({ repoId: 1, runId: 2, jobId: 3, to });
+    assert.ok(!updateExpression.includes('provisioningAt'), `${to} stamped provisioningAt`);
+    assert.ok(!updateExpression.includes('runningAt'), `${to} stamped runningAt`);
+  }
+});
+
+test('the watermark rides the same forward-only guarded write as the status', () => {
+  const { condition } = buildTransitionUpdate({ repoId: 1, runId: 2, jobId: 3, to: 'running' });
+  // Reachable only from queued/provisioning/running — so a watermark can never be stamped
+  // for a phase a terminal run never entered.
+  assert.match(condition, /attribute_exists\(pk\) AND #s IN \(/);
+  assert.ok(!condition.includes('completed'));
+});
+
+// ADR-020: the stamp write is the ONLY place the hook capability token hash reaches the
 // durable run row, and that row is what authorizes the brokered terminate at job end (the
 // JIT config item carrying the same hash ages out after 30 min). Pin both shapes.
 test('the stamp write mirrors the hook token hash onto the run row', () => {
