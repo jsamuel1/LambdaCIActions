@@ -1333,22 +1333,51 @@ test('every documented --json invocation pipes through `npm run --silent`', () =
   // one-document contract holds for the script, and the wrapper broke it in the very examples
   // that demonstrate it.
   //
-  // Scanned across every authored file that documents the command, not just the RUNBOOK: the
-  // script's own header usage block had the unparseable form after the RUNBOOK was fixed, and a
-  // RUNBOOK-only guard could not see it. `node scripts/flavors-reconcile.mjs --json` is exempt
-  // because it has no npm wrapper to banner.
+  // Scanned by WALKING the authored tree, not from a list of files known to mention the
+  // command. An enumeration is the same blind spot this guard exists to close: the script's own
+  // header kept the unparseable form after the RUNBOOK was fixed precisely because the check
+  // only looked where the bug had already been found. A new example — a CD summary step in
+  // `.github/workflows/deploy.yml`, a runbook page, an ADR — is caught wherever it lands.
+  // `node scripts/flavors-reconcile.mjs --json` is exempt because it has no npm wrapper to
+  // banner.
+  //
   // Unlike the behavioural guards in this file, this one reads the RAW sources: a usage block IS
   // a comment, so scanning `RECONCILE_CODE` (comment-stripped) would find nothing in the script
   // and pass vacuously — which is how the header kept the unparseable form.
-  const sources = [
-    ['docs/RUNBOOK.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'RUNBOOK.md'), 'utf8')],
-    ['docs/DEPLOY-M1.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOY-M1.md'), 'utf8')],
-    ['docs/DECISIONS.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DECISIONS.md'), 'utf8')],
-    ['docs/specs/05-infrastructure.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'specs', '05-infrastructure.md'), 'utf8')],
-    ['scripts/flavors-reconcile.mjs', RECONCILE_SCRIPT],
-    ['scripts/build-images.mjs', BUILD_SCRIPT],
-    ['README.md', fs.readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8')],
-  ];
+  //
+  // `test/` is the one exclusion, and it is a carve-out rather than a scope: this file has to
+  // quote the broken `npm run flavors:reconcile -- --json | jq` form verbatim to explain what is
+  // being prevented, so scanning itself would fail on its own counter-example.
+  const SKIP_DIRS = new Set([
+    '.git',
+    '.agents',
+    '.kermes-worktrees',
+    'node_modules',
+    'dist',
+    'cdk.out',
+    'coverage',
+    'test',
+  ]);
+  const SCAN_EXT = new Set(['.md', '.ts', '.tsx', '.mjs', '.js', '.json', '.sh', '.yml', '.yaml']);
+  const walk = (dir, out = []) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) walk(p, out);
+      } else if (
+        entry.isFile() &&
+        (SCAN_EXT.has(path.extname(entry.name)) || entry.name.startsWith('Dockerfile'))
+      ) {
+        out.push(p);
+      }
+    }
+    return out;
+  };
+  const sources = walk(REPO_ROOT).map((p) => [
+    path.relative(REPO_ROOT, p),
+    fs.readFileSync(p, 'utf8'),
+  ]);
+  assert.ok(sources.length > 20, `the walk found only ${sources.length} files — has the tree moved?`);
   let checked = 0;
   for (const [file, text] of sources) {
     for (const m of text.matchAll(/npm run (--silent )?flavors:reconcile[^\n`]*/g)) {

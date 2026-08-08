@@ -250,9 +250,9 @@ run on is the live claim allowlist plus a real image (ADR-049). Check the two ag
 catalog at any time — read-only, safe to run whenever:
 
 ```bash
-npm run flavors:reconcile -- --env <env>            # exits 1 on drift
-npm run --silent flavors:reconcile -- --env <env> --json      # machine-readable
-npm run flavors:reconcile -- --env <env> --no-image-check   # SSM params only
+npm run flavors:reconcile -- --env <env>                      # exits 1 on drift
+npm run --silent flavors:reconcile -- --env <env> --json       # machine-readable
+npm run flavors:reconcile -- --env <env> --no-image-check      # SSM params only
 ```
 
 Exit 2 means the report is **incomplete**, not that the plane is broken: either SSM could not be
