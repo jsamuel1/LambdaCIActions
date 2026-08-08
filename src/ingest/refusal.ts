@@ -1,4 +1,5 @@
 import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { incompatibleRunnerLabel } from './adopt.js';
 import type { RepoMode } from '../shared/types.js';
 
 /**
@@ -201,7 +202,14 @@ export function classifyRefusal(input: RefusalInput): RefusalClassification {
   }
 
   // `decideClaim` sub-cases, in the same precedence order the gate itself applies.
-  const incompatible = jobLabels.some((l) => INCOMPATIBLE_HINT.test(l));
+  //
+  // The SAME predicate the claim gate refuses on (`incompatibleRunnerLabel`), not a local shape
+  // test. A parallel regex here was identical to `nonLinuxHostedLabel`/`x86ArchLabel` on the day it
+  // was written and silently divergent the day someone adds a token to `X86_ARCH_LABELS`: the gate
+  // would still refuse the job, while this classified it `label-not-allowlisted` and told the
+  // operator to allowlist a label that would be refused again for a completely different reason.
+  // Both predicates are pure, so sharing one costs nothing.
+  const incompatible = incompatibleRunnerLabel(jobLabels) !== undefined;
   if (incompatible) {
     return {
       code: 'incompatible-label',
@@ -238,15 +246,6 @@ export function classifyRefusal(input: RefusalInput): RefusalClassification {
   }
   return { code: 'no-lca-label', level: 'debug', actionable: false, lcaLabels };
 }
-
-/**
- * Labels that make a job unrunnable here, as a shape test for CLASSIFICATION only.
- *
- * `decideClaim`/`incompatibleRunnerLabel` remain the authority on whether to refuse — this only
- * decides which bucket an already-refused job goes in, so a prefix/word test is adequate and
- * cannot change a claim outcome.
- */
-const INCOMPATIBLE_HINT = /^(windows|macos)|^(x64|x86|x86_64|x86-64|amd64|i386|i686)$/;
 
 /**
  * Fraction of NON-actionable refusals that are logged (ADR-050).

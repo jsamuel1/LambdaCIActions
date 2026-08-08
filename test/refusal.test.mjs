@@ -31,6 +31,7 @@ import {
   worstState,
 } from '../dist/src/shared/flavor-readiness.js';
 import { allowlistChanged } from '../dist/src/shared/allowlist.js';
+import { incompatibleRunnerLabel } from '../dist/src/ingest/adopt.js';
 import {
   countUnrunnableJobs,
   rollupRefusals,
@@ -187,6 +188,59 @@ test('incompatible-label wins over the allowlist miss, matching decideClaim prec
     mode: 'label',
   });
   assert.equal(cls.code, 'incompatible-label');
+});
+
+test('incompatible-label classification is the claim gate\'s own predicate, not a copy of it', () => {
+  // `classifyRefusal` used to re-implement the incompatible-label test as a local regex. It was
+  // correct on the day it was written, which is the problem: the day a token is added to
+  // `X86_ARCH_LABELS`, `decideClaim` refuses the job while the classifier calls it
+  // `label-not-allowlisted` and hands the operator a fix ("add it to runner-labels") that cannot
+  // work — the job would be refused again for a reason the console never mentioned.
+  //
+  // Asserted as an EQUIVALENCE over the shared predicate rather than as a list of labels, so the
+  // guard cannot go stale when the authoritative set changes.
+  const candidates = [
+    'windows-latest',
+    'windows-2022',
+    'macos-14',
+    'macos-latest',
+    'x64',
+    'x86',
+    'x86_64',
+    'x86-64',
+    'amd64',
+    'i386',
+    'i686',
+    'X64',
+    'ubuntu-latest',
+    'self-hosted',
+    'linux',
+    'arm64',
+    'gpu',
+  ];
+  for (const label of candidates) {
+    // Paired with an LCA label so the refusal is actionable either way: the assertion is about
+    // WHICH code is chosen, not about the noise split.
+    const cls = classifyRefusal({
+      gate: 'claim',
+      jobLabels: [label, 'lambda-ci-python'],
+      claimedLabels: DEV_ALLOWLIST,
+      mode: 'label',
+    });
+    const gateRefuses = incompatibleRunnerLabel([label]) !== undefined;
+    assert.equal(
+      cls.code === 'incompatible-label',
+      gateRefuses,
+      `${label}: classification (${cls.code}) disagrees with the claim gate's own predicate`,
+    );
+  }
+  // And the source must not have re-grown a parallel predicate.
+  const refusalSrc = stripComments(src('src/ingest/refusal.ts'));
+  assert.match(refusalSrc, /incompatibleRunnerLabel\(jobLabels\)/);
+  assert.ok(
+    !/windows\|macos/.test(refusalSrc),
+    'the incompatible-label test must come from adopt.ts, not a local regex',
+  );
 });
 
 test('repo-disabled is surfaced only when the job carries an LCA label', () => {
@@ -804,7 +858,7 @@ test('mgmt reads the allowlist VALUE live, and only that one non-secret paramete
     handler.indexOf('async function allowlistSnapshot('),
     handler.indexOf('async function controlPlaneSnapshot('),
   );
-  assert.match(allowlist, /getParam\(`\$\{SSM_PREFIX\}\/config\/runner-labels`\)/);
+  assert.match(allowlist, /getParam\(`\$\{SSM_PREFIX\}\/config\/runner-labels`, 0\)/);
   assert.match(allowlist, /live: false/, 'the allowlist read must fail soft too');
   // The Unclaimed route renders no image state, so it must not pay a DescribeParameters per
   // catalog flavor on every page load.
@@ -839,6 +893,32 @@ test('mgmt reads the allowlist VALUE live, and only that one non-secret paramete
   const grant = iam.slice(iam.indexOf("sid: 'ReadOwnAuthSecrets'"), iam.indexOf("sid: 'DescribeParamPresence'"));
   assert.match(grant, /config\/runner-labels/);
   assert.ok(!grant.includes('app-pem'), 'the App private key must never be readable here');
+});
+
+test('the "live" allowlist is read UNCACHED, so a just-applied fix is visible', () => {
+  // `getParam`'s default is a 5-minute per-container cache, and the label write goes through the
+  // appcfg broker (ADR-025/034) — a different Lambda, which cannot invalidate this one's cache. A
+  // cached read therefore breaks the exact sequence ADR-050 built this surface for: read
+  // `label-not-allowlisted` on Unclaimed → add the label in Settings → come back and be told, for
+  // up to five more minutes, that the allowlist is unchanged and the job is still broken. The
+  // stored snapshot the row is compared against is fixed, so the staleness cannot be noticed —
+  // `config changed` simply never lights.
+  const handler = stripComments(src('src/mgmt/handler.ts'));
+  const allowlist = handler.slice(
+    handler.indexOf('async function allowlistSnapshot('),
+    handler.indexOf('async function controlPlaneSnapshot('),
+  );
+  assert.ok(allowlist.length > 0, 'allowlistSnapshot not found — update this test');
+  const call = allowlist.match(/getParam\([^)]*\)/g) ?? [];
+  assert.equal(call.length, 1, 'expected exactly one allowlist read to pin');
+  assert.match(call[0], /,\s*0\)$/, 'the allowlist read must force a fresh GetParameter (ttlMs=0)');
+  // Every other allowlist reader in the handler already does this; they must not drift apart, or
+  // Settings and Unclaimed would disagree about what the live allowlist is on the same page load.
+  const others = handler.match(/getParam\(RUNNER_LABELS_PARAM[^)]*\)/g) ?? [];
+  assert.ok(others.length > 0, 'expected the Settings/impact allowlist reads to exist');
+  for (const c of others) {
+    assert.match(c, /,\s*0\)$/, `${c} must also be an uncached read`);
+  }
 });
 
 test('older refusals past the head page are reachable from the console', () => {

@@ -2200,10 +2200,18 @@ function catalogForReadiness(): ReadinessFlavor[] {
  * Fails soft for the same reason as the full snapshot: `live: false` degrades the comparison to
  * "unknown" instead of claiming the allowlist is empty, which would badge every refusal as
  * changed.
+ *
+ * UNCACHED (`ttlMs = 0`), like every other allowlist read in this handler (`settingsRoute`,
+ * `putRunnerLabelsRoute`). `getParam`'s default is a 5-minute per-container cache, and the label
+ * write goes through the appcfg broker, which cannot invalidate this Lambda's cache. Cached, the
+ * sequence this surface exists to serve breaks: an operator reads `label-not-allowlisted` on
+ * Unclaimed, adds the label in Settings, comes back — and the same warm container serves the OLD
+ * list for up to five minutes, so `config changed` stays dark and the screen asserts "still
+ * broken" about a fix that already landed. The word rendered beside it is `Live`.
  */
 async function allowlistSnapshot(): Promise<{ allowlist: string[]; live: boolean }> {
   try {
-    const raw = await getParam(`${SSM_PREFIX}/config/runner-labels`);
+    const raw = await getParam(`${SSM_PREFIX}/config/runner-labels`, 0);
     return { allowlist: raw.split(',').map((l) => l.trim()).filter(Boolean), live: true };
   } catch (err) {
     console.error(JSON.stringify({ msg: 'allowlist read failed', error: errMsg(err) }));

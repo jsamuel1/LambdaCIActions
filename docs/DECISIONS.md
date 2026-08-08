@@ -3026,8 +3026,16 @@ rows are not read.
   console access.
 - Refusal writes are best-effort: a store failure is logged and swallowed. A webhook that 5xx'd
   would make GitHub retry a delivery whose claim decision is already final.
-- The refusal store is write-only from Ingest and read-only from Mgmt (which holds no `PutItem`,
-  ADR-025), so the management plane cannot forge or delete refusals.
+- The refusal store is written only by Ingest and read only by Mgmt. The management plane cannot
+  **delete** a refusal — it holds no `dynamodb:DeleteItem` at all (ADR-025). It cannot **forge**
+  one either, but that half is a CODE property, not an IAM one: Mgmt's config-patch grant is
+  table-wide `dynamodb:UpdateItem`, and an `UpdateItem` against a key that does not exist creates
+  the item, so IAM alone does not fence the `REFUSAL#` partition off from it. What fences it is
+  that the Mgmt handler has no refusal write path — every refusal route is a `Query`. Anyone adding
+  a write to Mgmt must keep it to the entities it already patches (repo config, the ADR-037
+  installation index repair); scoping the grant by `dynamodb:LeadingKeys` would make the fence an
+  IAM one, and is not done today because the patched keys are per-repo and per-installation rather
+  than a single prefix.
 - Residual gap, deliberate: an operator's **custom** allowlist label (`my-runner`) later removed
   from the allowlist is not LCA-shaped, so its refusals stay in the debug/no-row lane. It is
   indistinguishable from `runs-on: [self-hosted, gpu]` targeting a foreign fleet, which must not
