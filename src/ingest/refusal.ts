@@ -1,4 +1,4 @@
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { builtinFlavors } from '../shared/flavor-catalog.js';
 import { incompatibleRunnerLabel } from './adopt.js';
 import type { RepoMode } from '../shared/types.js';
 
@@ -28,9 +28,19 @@ import type { RepoMode } from '../shared/types.js';
  * unit-testable without AWS.
  */
 
-/** Catalog labels, lower-cased. A job carrying one of these asked for LambdaCIActions by name. */
+/**
+ * Catalog labels, lower-cased. A job carrying one of these asked for LambdaCIActions by name.
+ *
+ * Read through `builtinFlavors()` rather than importing `microvm/flavors.json` directly, because
+ * ADR-040 makes `src/shared/flavor-catalog.ts` the single reader of that file: a second reader
+ * gets its own chance to disagree with the resolver about labels. Only the BUILT-IN catalog is
+ * relevant here — this predicate asks "was this label meant for us", and a built-in label is a
+ * compile-time fact, whereas a custom flavour's label is per-installation store state that a
+ * pure, I/O-free classifier cannot see. `lcaShapedLabel`'s prefix signal already covers a
+ * custom label that happens to be `lambda-ci`-shaped.
+ */
 const CATALOG_LABELS: ReadonlySet<string> = new Set(
-  (flavorsCatalog as { flavors: { label: string }[] }).flavors.map((f) => f.label.toLowerCase()),
+  builtinFlavors().map((f) => f.label.toLowerCase()),
 );
 
 /**

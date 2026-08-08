@@ -714,12 +714,36 @@ async function route_(
             JSON.stringify({ msg: 'custom flavor list read failed', installationId: scoped, error: errMsg(err) }),
           );
         }
+        // Same live snapshot as the unscoped branch below, for two reasons. Availability must be
+        // FAIL-SOFT: the raw `imageAvailability()` rejects on a transient SSM fault, which would
+        // 500 the one screen an operator opens to diagnose exactly that — and the Flavors screen
+        // asking "can these run" is the wrong place to answer "nothing, the API is down".
+        // Readiness must also be PRESENT: without it a request carrying `?installation=` renders
+        // `Runnable: unchecked` forever, so the ADR-051 surface never appears on the very path an
+        // onboarded installation uses.
+        const snapshot = await controlPlaneSnapshot();
         return json(200, {
-          flavors: buildFlavorViews(await imageAvailability(), custom ?? []),
+          flavors: buildFlavorViews(snapshot.imagePublished, custom ?? []),
           // `ok` = the installation's custom rows were read (possibly genuinely none);
           // `degraded` = they could not be read, so the rows above are built-ins ONLY and the
           // absence of a custom flavor here is not evidence that it does not exist.
           customFlavorsRead: custom ? 'ok' : 'degraded',
+          // BUILT-IN scoped, deliberately — `catalogForReadiness()` passes no custom rows.
+          //
+          // `reconcileFlavors` couples two axes into one state, and only one of them is
+          // meaningful for a custom flavor. The LABEL axis is real: the claim gate consults the
+          // allowlist before resolution, so a custom flavor whose label was never allowlisted
+          // strands its jobs exactly as `lambda-ci-python` did. But the IMAGE axis is not: a
+          // custom image ARN is supplied by the operator and lives on the stored row, NOT in this
+          // environment's `/config/image-arn-<name>` namespace, so `imagePublished[name]` is
+          // absent for every custom flavor and reconciling it would report `imageMissing` on rows
+          // whose image is fine. That is the inverted false certainty this ADR exists to remove.
+          // Custom routability is already carried per row by ADR-041 `validationState`/`routable`
+          // in `flavors` above; a custom-aware readiness axis needs its own state vocabulary and
+          // belongs with the smoke-run work, not smuggled in through a built-in reconciler.
+          readiness: snapshot.live ? reconcileFlavors(catalogForReadiness(), snapshot) : [],
+          unmatchedAllowlistLabels: unmatchedAllowlistLabels(catalogForReadiness(), snapshot.allowlist),
+          controlPlaneLive: snapshot.live,
           smokeWorkflow: smokeWorkflowYaml(),
         });
       }
