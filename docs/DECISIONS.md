@@ -638,8 +638,11 @@ partition), and a table Scan violates the < 300 ms p95 read target in spec 04.
 **Decision**: add **GSI2** — `gsi2pk = REPORUNS#<repoId>`, `gsi2sk = <createdAt ISO>` —
 written **once** in `buildQueuedItem` and never touched by transitions. The unfiltered
 "recent runs" view is a bounded fan-out: one small query per status merged and sorted in
-the λ. Deep pagination requires narrowing by repo or status, whose cursors are opaque
-base64url of the DynamoDB `LastEvaluatedKey`.
+the λ. Deep pagination requires narrowing by repo or status. Those cursors are the DynamoDB
+`LastEvaluatedKey` **sealed** before it crosses the API boundary — see
+[ADR-052](#adr-052), which hardens this decision: the base64url the store speaks is an
+encoding, not a protection, and on a post-query-filtered walk the key names a row the
+session may not see.
 **Why**: keying the sort on the **immutable** `createdAt` (not `updatedAt`) means a status
 transition rewrites GSI1 only — no double index churn on the hot path, and a run's position
 in history never moves while it executes. Alternatives rejected: a composite
@@ -3135,3 +3138,142 @@ allowlist is an operator-managed plain `String` whose value IS the thing being r
   management plane deliberately lacks (ADR-025) — so it belongs to the `flavors:reconcile` CLI
   command, which runs with an operator's own credentials and reports image state rather than
   parameter presence.
+
+---
+
+> **ADR numbering note.** This block takes **052**. The 050..051 pair above landed first as PR #34,
+> so 052 was the lowest free number at merge time and no renumber was needed here. Verified against
+> trunk's ledger and every open PR before publishing, per the convention the block above states.
+
+## ADR-052 — Pagination cursors are sealed and scope-bound, not merely encoded (M4 fix)
+**Status**: Accepted (v1) · hardens [ADR-023](#adr-023) (run indexes / opaque cursor) and
+[ADR-022](#adr-022) (session secret) · preserves [ADR-029](#adr-029) (`complete` contract)
+
+**Context.** Every paginated management list authorizes with a **post-query** installation
+filter: the run indexes are keyed by status/time and repo/time, never by installation
+(ADR-023), so `collectVisible` can only drop rows after DynamoDB has already returned them.
+The store then handed DynamoDB's `LastEvaluatedKey` straight back as `nextCursor`, base64url
+of plain JSON.
+
+That key names the last row **scanned**, not the last row **returned**. Whenever a page's
+boundary row belonged to an installation the session may not administer — the normal case for
+an operator whose traffic is a minority of the platform's — its identifiers rode out inside
+the cursor beside a response body they had just been filtered out of:
+`RUN#<repoId>#<runId>#<jobId>` plus a timestamp. base64url is an encoding, not a protection.
+Any authenticated operator could decode the cursor and read another tenant's repo, run, and
+job ids.
+
+This was found while reviewing the unclaimed-jobs work and confirmed **pre-existing** at that
+branch's merge base, on both the repo-filtered and status-filtered `/api/runs` branches. It is a
+property of the shared paging seam (`collectVisible` + `encodeCursor`), so it was fixed there
+rather than per route.
+
+That choice was then tested for real. The unclaimed/refusal list (PR #34) landed on trunk while
+this change was in review, walking the same seam with `REFUSAL#<repoId>#<runId>#<jobId>` keys and
+returning `page.nextCursor ?? null` against an undeclared `json()` body — the identical leak,
+written independently, by an author who had no reason to know this fix existed. Merging the two
+did not require noticing it: the `RawCursor` migration turned that line into a **compile error**
+in four places across `handler.ts` and `refusal-store.ts`. The route is now sealed here, with its
+own declared body and two scopes of its own (`unclaimed`, `unclaimed:repo`). This is the
+load-bearing evidence for the layering below — the type layer caught a real leak from a real
+concurrent branch, not a hypothetical one.
+
+**Decision.** A cursor crossing the API boundary is **sealed**: AES-256-GCM over the store's
+cursor, under a key derived by HKDF-SHA256 from the existing session secret, with the scope it
+was minted under bound as additional authenticated data. Scope is
+`(view, session installation grants, repo filter, status filter)`, canonicalized so it is
+structural rather than literal-order dependent.
+
+Three properties from one primitive:
+
+- **Confidentiality** — the DynamoDB key never leaves the Lambda in readable form. This is the
+  requirement, and it is why an HMAC alone was rejected: signing the same base64url payload
+  stops tampering while leaving the identifiers in plain sight. GCM is length-preserving, so
+  the residue is the *length* of the key — a magnitude hint about the scanned row's id digits,
+  naming nothing. Fixed-width padding is the mitigation if a future key shape makes that
+  meaningful; it is not worth a fixed-size cursor on every response today.
+- **Integrity** — a forged or edited cursor fails the GCM tag and is refused, so a caller
+  cannot hand us an arbitrary `ExclusiveStartKey` and walk an index we would never have
+  queried on their behalf. Bare pre-ADR-052 plaintext keys are refused for the same reason.
+- **Scope binding** — a cursor minted for one list is inert against another, and against a
+  session holding a different set of installation grants, closing cursor-swapping between
+  filters as well as the leak. The bound principal is the **grant set**, not the operator:
+  two operators administering exactly the same installations mint interchangeable cursors.
+  That is deliberate and discloses nothing — the scope pins every input to the visibility
+  filter, so such a cursor only resumes a walk over rows both sessions were already entitled
+  to. Making it per-session would require binding something session-specific (a login or a
+  per-session nonce), which buys no confidentiality and would invalidate cursors on every
+  re-login.
+
+Two supporting choices:
+
+- **A failed open is a 400, not a restart.** `decodeCursor` deliberately tolerates garbage —
+  a malformed cursor starts from the top rather than 500ing. A cursor that fails to *open* is
+  categorically different: forged, replayed across scopes, or minted under a rotated secret.
+  Restarting the walk would re-serve the head page under a "load older" click, surfacing as
+  duplicate rows rather than as the refusal it is.
+- **The raw cursor cannot be serialized, and the guards catch it earlier.** Three layers, in
+  increasing order of what they are worth. (1) `RawCursor` is `{ readonly raw: string }` rather
+  than a branded `string`, because a branded string stays assignable to `string` — which is
+  exactly how the original leak was written — so a **declared** body rejects it:
+  `RunListBody.nextCursor` is `string | null`, and `RawCursor | null` is not assignable. That
+  covers only routes that declare a body; `json()` takes `unknown`. (2) The source guards in
+  `test/mgmt-cursor-scope.test.mjs` scan every file under `src/` for the residue the types
+  cannot see — reaching through `.raw`, minting a cursor inside a route, dropping the 400,
+  spreading a store page into a body, or putting a cursor in a field under any name. They match
+  the *shape* of a call rather than one spelling of it (balanced-paren extents; the binding name
+  the route actually chose, for both the 400 check and the raw-cursor reads it must recognize;
+  the RHS's cursor *reads* rather than the field's name), because line-shaped and name-keyed
+  rules were each defeated in review — by ES shorthand, a renamed binding, a scope argument
+  containing a call, a prettier-wrapped multi-line call, an object **spread** of the page, a
+  field renamed from `nextCursor` to `cursor`, and a route that renamed its `openCursor` result
+  and echoed the inbound plaintext key back as a different field. (3) Because a leak
+  need not *spell* anything — a spread has no field name at all — the value itself refuses:
+  `asRawCursor` installs a non-enumerable `toJSON` that throws. `JSON.stringify` consults it for
+  any reachable value at any depth under any key, which is precisely the set of paths a
+  spelling-based scan cannot enumerate. The mgmt handler serializes exactly once
+  (`JSON.stringify(reply.body)`) inside the try/catch that logs to CloudWatch and returns a
+  sanitized error, so an unsealed cursor on some future route is a caught 500 — loud and
+  fail-closed — rather than silent plaintext. Layers 1 and 2 fail early, where a defect is
+  cheap; layer 3 is the one that holds for code nobody has written yet.
+
+**Alternatives rejected.**
+
+- *Sign the cursor (HMAC) only.* Fixes forgery and scope-swapping, not disclosure. Fails the
+  actual requirement: the identifiers stay readable.
+- *Filter before querying.* Cleanest where it applies, but it cannot serve the platform-wide
+  lists, whose purpose is a cross-repo index walk — and the repo-filtered branch would still
+  leak sibling jobs of runs the session cannot see.
+- *Truncate the page at the last visible row.* Would lose rows permanently: a page cursor
+  cannot express "resume mid-page", so surplus rows past the boundary become unreachable.
+  This is the `collectVisible` "limit is a floor, never slice" rule, and it is preserved.
+
+**Consequences.**
+
+- The ADR-029 `complete` contract is untouched. Sealing changes the cursor's *representation*,
+  not the walk: `collectVisible` still returns every visible row it collected, and `complete`
+  still answers "were rows dropped from this response" independently of cursor exhaustion.
+- A cursor stops working when the operator's installation grants change (a re-login after
+  access changes) — the conservative direction, since the cursor resumes a walk whose
+  visibility filter was computed from those grants.
+- Rotating the session secret invalidates outstanding cursors. Same blast radius as the
+  session cookie, which is signed with that secret and already re-issued on rotation.
+- Sealing costs one HKDF and one AES-GCM pass over ~200 bytes per page, plus one
+  non-enumerable property per cursor for the backstop — unmeasurable next to the DynamoDB query
+  it accompanies. Cursors grow by the 12-byte nonce, 16-byte tag, and version prefix. The
+  backstop is invisible to the seams that legitimately handle raw cursors: `sealCursor`,
+  `decodeCursor`, and the report fan-out all read `.raw` directly, and `toJSON` being
+  non-enumerable keeps the wrapper `deepEqual` to a plain `{ raw }`.
+- A future paginated route inherits the requirement from three places, and the last is the one
+  that does not depend on how the route is written: it cannot return a store cursor from a
+  **declared** body, because `RawCursor` is not assignable to `string | null`; the source guards
+  scan the whole `src/` tree, so a route that skips the declared body is caught by the test
+  rather than by the compiler; and if it evades both, serializing the cursor **throws**, so the
+  response fails closed instead of shipping plaintext. The unclaimed-jobs list exercised exactly
+  this path: it arrived from PR #34 with the leak, and was caught. Worth recording which layer
+  did the catching, because it is not the one the ADR would have predicted — reverting that route
+  to its `json(200, …)` form does **not** produce an assignability error, since an undeclared body
+  accepts a `RawCursor` happily; the compiler only reports the now-unused helper. The **source
+  guards** are what name the leak. That is the case layer 2 exists for, and it is why the guards
+  scan every file under `src/` rather than the handlers that happened to exist when they were
+  written.

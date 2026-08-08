@@ -5,6 +5,7 @@ import {
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { decodeCursor, encodeCursor, terminalTtlSeconds } from './run-store.js';
+import { type RawCursor } from './cursor.js';
 import type { RefusalRecord, RepoMode } from './types.js';
 
 /**
@@ -194,14 +195,31 @@ export async function recordRefusal(input: RecordRefusalInput): Promise<void> {
   );
 }
 
+/**
+ * A page of refusals, shaped as `Page<RefusalRecord>` so `collectVisible` consumes it directly.
+ *
+ * The rows are named `runs` rather than `refusals` deliberately: an adapter in the route
+ * (`{ runs: res.refusals, nextCursor: res.nextCursor }`) would have to READ the raw cursor in
+ * route code, which is exactly the shape the ADR-052 source guards forbid there — and rightly,
+ * since that read is one keystroke from a response body. Conforming to the shared page shape
+ * keeps every raw-cursor read on the store side of the boundary.
+ */
 export interface RefusalPage {
-  refusals: RefusalRecord[];
-  nextCursor?: string;
+  runs: RefusalRecord[];
+  /**
+   * The store's index position, typed `RawCursor` so it cannot reach a response body (ADR-052).
+   *
+   * It matters more here than on the run lists: a refusal key is
+   * `REFUSAL#<repoId>#<runId>#<jobId>` plus `lastSeenAt`, and the unclaimed list is walked
+   * platform-wide by an installation-filtered caller, so the boundary row this names belongs to
+   * an installation the session may not administer as the NORMAL case rather than the edge one.
+   */
+  nextCursor?: RawCursor;
 }
 
 /** Platform-wide refusals, most recently refused first, via GSI1 (`lastSeenAt` sort key). */
 export async function listRefusals(
-  opts: { limit?: number; cursor?: string } = {},
+  opts: { limit?: number; cursor?: RawCursor } = {},
 ): Promise<RefusalPage> {
   const res = await requireDoc().send(
     new QueryCommand({
@@ -215,7 +233,7 @@ export async function listRefusals(
     }),
   );
   return {
-    refusals: (res.Items ?? []) as unknown as RefusalRecord[],
+    runs: (res.Items ?? []) as unknown as RefusalRecord[],
     nextCursor: encodeCursor(res.LastEvaluatedKey),
   };
 }
@@ -223,7 +241,7 @@ export async function listRefusals(
 /** One repo's refusals, most recently refused first, via GSI2 (same clock as GSI1). */
 export async function listRefusalsByRepo(
   repoId: number,
-  opts: { limit?: number; cursor?: string } = {},
+  opts: { limit?: number; cursor?: RawCursor } = {},
 ): Promise<RefusalPage> {
   const res = await requireDoc().send(
     new QueryCommand({
@@ -237,7 +255,7 @@ export async function listRefusalsByRepo(
     }),
   );
   return {
-    refusals: (res.Items ?? []) as unknown as RefusalRecord[],
+    runs: (res.Items ?? []) as unknown as RefusalRecord[],
     nextCursor: encodeCursor(res.LastEvaluatedKey),
   };
 }

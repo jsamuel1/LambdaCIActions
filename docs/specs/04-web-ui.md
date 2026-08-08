@@ -211,15 +211,26 @@ Lambda container (misses too, for 5 s, so polling a booting VM does not re-scan 
 returned as `logStream`, which the pane shows so an operator can open the same stream in the
 CloudWatch console.
 
-Run-list pagination uses an opaque cursor (base64url of the DynamoDB `LastEvaluatedKey`);
-the unfiltered multi-status view returns `nextCursor: null` — narrow by repo or status to
-page deeper (ADR-023). Because the run indexes are not keyed by installation, authorization
-is a **post-query filter**, so filtered endpoints walk up to 5 index pages per request to
-fill a page of visible rows; `nextCursor` is null only when the index is exhausted
-(`src/mgmt/paging.ts`, `test/mgmt-authz-paging.test.mjs`). `limit` is a **floor** on those
-endpoints: because the cursor addresses an index page, a response may carry a few rows beyond
-`limit` (whatever the last fetched page contributed) rather than dropping rows the cursor can
-no longer reach.
+Run-list pagination uses a **sealed** cursor; the unfiltered multi-status view returns
+`nextCursor: null` — narrow by repo or status to page deeper (ADR-023). Because the run
+indexes are not keyed by installation, authorization is a **post-query filter**, so filtered
+endpoints walk up to 5 index pages per request to fill a page of visible rows; `nextCursor` is
+null only when the index is exhausted (`src/mgmt/paging.ts`,
+`test/mgmt-authz-paging.test.mjs`). `limit` is a **floor** on those endpoints: because the
+cursor addresses an index page, a response may carry a few rows beyond `limit` (whatever the
+last fetched page contributed) rather than dropping rows the cursor can no longer reach.
+
+That post-query filter is also why the cursor is sealed rather than merely encoded
+([ADR-052](../DECISIONS.md#adr-052)). The DynamoDB `LastEvaluatedKey` names the last row
+**scanned**, not the last row returned, so on a filtered walk it habitually identifies a row
+belonging to an installation the session may not administer. It is encrypted (AES-256-GCM
+under a key derived from the session secret) with its scope — view, the session's installation
+grants, and any repo/status filter — bound as additional authenticated data. A cursor is
+therefore unreadable, unforgeable, and inert outside the list and the visibility scope that
+minted it (the bound principal is the session's **grant set**, not its operator — see
+[ADR-052](../DECISIONS.md#adr-052)). A cursor that will not open is answered with **400**, not
+a silent restart from the head page: the client's recovery is to drop it and refetch
+(`test/mgmt-cursor-scope.test.mjs`).
 
 `GET /api/health` counts are **platform-wide** (the status index is not per-installation),
 while `stuck` and every run list are filtered to the session's installations. Counts follow

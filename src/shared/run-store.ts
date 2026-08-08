@@ -9,6 +9,7 @@ import {
   GetCommand,
 } from '@aws-sdk/lib-dynamodb';
 import type { RunRecord, RunStatus } from './types.js';
+import { asRawCursor, type RawCursor } from './cursor.js';
 
 /**
  * Run store (ADR-009, spec 02 state machine). Persists + transitions run rows in the
@@ -384,16 +385,24 @@ export async function listRunsByStatus(status: RunStatus, limit = 100): Promise<
   return (res.Items ?? []) as unknown as RunRecord[];
 }
 
-/** An opaque, caller-supplied pagination cursor (base64url of a DynamoDB LastEvaluatedKey). */
-export function encodeCursor(key: Record<string, unknown> | undefined): string | undefined {
+/**
+ * Store-internal pagination cursor: base64url of a DynamoDB `LastEvaluatedKey`.
+ *
+ * **This value is NOT fit to hand a client.** The key names the last row SCANNED, which on a
+ * post-query-authorized list is routinely a row the session may not see, and base64url is an
+ * encoding rather than a protection. It is typed `RawCursor` so a declared response body
+ * (`nextCursor: string | null`) rejects it, and it throws if anything serializes it, so an
+ * undeclared body fails closed too. Cross the boundary with `sealCursor` (ADR-052).
+ */
+export function encodeCursor(key: Record<string, unknown> | undefined): RawCursor | undefined {
   if (!key) return undefined;
-  return Buffer.from(JSON.stringify(key)).toString('base64url');
+  return asRawCursor(Buffer.from(JSON.stringify(key)).toString('base64url'));
 }
 
-export function decodeCursor(cursor: string | undefined): Record<string, unknown> | undefined {
+export function decodeCursor(cursor: RawCursor | undefined): Record<string, unknown> | undefined {
   if (!cursor) return undefined;
   try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    const parsed = JSON.parse(Buffer.from(cursor.raw, 'base64url').toString('utf8'));
     return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined;
   } catch {
     return undefined; // malformed cursor → start from the top rather than 500
@@ -402,7 +411,7 @@ export function decodeCursor(cursor: string | undefined): Record<string, unknown
 
 export interface RunPage {
   runs: RunRecord[];
-  nextCursor?: string;
+  nextCursor?: RawCursor;
 }
 
 /**
@@ -411,7 +420,7 @@ export interface RunPage {
  */
 export async function listRunsByRepo(
   repoId: number,
-  opts: { limit?: number; cursor?: string } = {},
+  opts: { limit?: number; cursor?: RawCursor } = {},
 ): Promise<RunPage> {
   const res = await requireDoc().send(
     new QueryCommand({
@@ -436,7 +445,7 @@ export async function listRunsByRepo(
  */
 export async function listRunsByStatusPaged(
   status: RunStatus,
-  opts: { limit?: number; cursor?: string } = {},
+  opts: { limit?: number; cursor?: RawCursor } = {},
 ): Promise<RunPage> {
   const res = await requireDoc().send(
     new QueryCommand({

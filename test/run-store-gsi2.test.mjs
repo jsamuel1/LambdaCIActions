@@ -47,9 +47,17 @@ test('status index and repo index use different partitions', () => {
 test('cursors round-trip and tolerate garbage', () => {
   const key = { pk: 'RUN#1#2#3', sk: 'RUN', gsi2pk: 'REPORUNS#1', gsi2sk: 'x' };
   const cursor = encodeCursor(key);
+  // Store cursors are WRAPPED (`{ raw }`), not bare strings — ADR-052 makes handing one to a
+  // client fail against a declared `nextCursor: string | null` body rather than being a
+  // forgotten call. Assert the shape, or a regression back to a bare string would still
+  // satisfy the round-trip below.
+  assert.equal(typeof cursor?.raw, 'string');
   assert.deepEqual(decodeCursor(cursor), key);
   assert.equal(encodeCursor(undefined), undefined);
   assert.equal(decodeCursor(undefined), undefined);
-  assert.equal(decodeCursor('!!!not-base64!!!'), undefined);
-  assert.equal(decodeCursor(Buffer.from('"a string"').toString('base64url')), undefined);
+  assert.equal(decodeCursor({ raw: '!!!not-base64!!!' }), undefined);
+  assert.equal(
+    decodeCursor({ raw: Buffer.from('"a string"').toString('base64url') }),
+    undefined,
+  );
 });

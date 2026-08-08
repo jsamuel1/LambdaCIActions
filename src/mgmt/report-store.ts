@@ -1,6 +1,7 @@
 import { listRepos } from '../shared/install-store.js';
 import { listRunsByRepo } from '../shared/run-store.js';
 import type { RunRecord } from '../shared/types.js';
+import type { RawCursor } from '../shared/cursor.js';
 import type { SessionPayload } from './session.js';
 import type { ReportSpec } from './reports.js';
 
@@ -118,7 +119,7 @@ export async function fetchReportRuns(
       const repo = queue.shift();
       if (!repo || budgetSpent) return;
       read.add(repo.repoId);
-      let cursor: string | undefined;
+      let cursor: RawCursor | undefined;
       for (let page = 0; page < MAX_PAGES_PER_REPO; page++) {
         const res = await fetchPage(repo.repoId, { limit: PAGE_SIZE, cursor });
         let reachedOlderThanWindow = false;
