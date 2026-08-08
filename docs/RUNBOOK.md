@@ -258,7 +258,9 @@ npm run flavors:reconcile -- --env <env> --no-image-check   # SSM params only
 Exit 2 means the report is **incomplete**, not that the plane is broken: either SSM could not be
 read, or `get-microvm-image` failed for a reason other than `ResourceNotFoundException`
 (AccessDenied, expired credentials, wrong region, or an `aws` older than 2.35.17 with no
-`lambda-microvms` service). Those flavors are reported `image_unverified` rather than as missing
+`lambda-microvms` service) — or it succeeded but returned no `state`, which is a response we
+could not interpret rather than a missing image. Those flavors are reported `image_unverified`
+rather than as missing
 images, and `--fix` refuses — an unreadable image is *unknown*, and rebuilding a healthy catalog
 on the strength of a permissions error is the harm that avoids.
 
@@ -292,7 +294,9 @@ npm run build:images -- --env <env> --rebuild                 # whole set
 Quiesce first for either — the image-hook contract is a serialized skew window, so no job may
 be in flight. **`build:images` enforces this itself**: it enumerates all pages of
 `lambda-microvms list-microvms` and refuses while any microVM is non-terminated (`--publish-label-only`
-and `--dry-run` are exempt — neither touches an image). Observation is not a freeze, though:
+and `--dry-run` are exempt — neither touches an image). Only `TERMINATED` counts as terminal
+(`MicrovmState` has no `FAILED`; `TERMINATING` still exists and may still be resuming), and an
+unrecognized state counts as live. Observation is not a freeze, though:
 pause the other writers too (this repo dogfoods its own runners, so a merge mid-window strands
 its jobs). `--force-unquiesced` overrides the refusal for a VM wedged non-terminal that the
 Reaper has not yet collected — only after you have frozen the writers by hand.

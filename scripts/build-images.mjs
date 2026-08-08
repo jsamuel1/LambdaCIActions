@@ -180,7 +180,7 @@ function aws(cliArgs, { capture = true } = {}) {
  * (docs/DEPLOY-M1.md phase 2). A partial read here would make the gate worse than no gate — it
  * would license the swap it exists to prevent.
  */
-function nonTerminatedMicroVms() {
+function nonTerminatedMicroVms(reconcile) {
   const live = [];
   let token = null;
   for (;;) {
@@ -189,8 +189,12 @@ function nonTerminatedMicroVms() {
     const r = aws(cmd); // throws on failure: an unreadable fleet is not an empty one
     const body = JSON.parse(r.stdout);
     for (const vm of body.items ?? body.microvms ?? []) {
-      const state = String(vm.state ?? '').toUpperCase();
-      if (state !== 'TERMINATED' && state !== 'FAILED') live.push(vm);
+      // `isLiveMicroVmState` (src/shared/flavor-reconcile.ts) owns the vocabulary: `MicrovmState`
+      // is PENDING|RUNNING|SUSPENDING|SUSPENDED|TERMINATING|TERMINATED, so TERMINATED is the only
+      // terminal state and an unrecognized/absent one counts as live. Excluding anything else
+      // here (a `FAILED` that the model does not define, say) would widen "terminal" and license
+      // the very image swap this gate exists to refuse.
+      if (reconcile.isLiveMicroVmState(vm.state)) live.push(vm);
     }
     token = body.nextToken ?? body.NextToken ?? null;
     if (!token) return live;
@@ -204,12 +208,12 @@ function nonTerminatedMicroVms() {
  * gating it on an idle fleet would block the safe half of remediation during ordinary traffic
  * — and a label add cannot skew a running VM: it changes only which future jobs are claimed.
  */
-function assertQuiescentFleet() {
+function assertQuiescentFleet(reconcile) {
   if (DRY_RUN) {
     console.log('  [dry-run] would require zero non-terminated microVMs (all pages)');
     return;
   }
-  const live = nonTerminatedMicroVms();
+  const live = nonTerminatedMicroVms(reconcile);
   if (live.length === 0) {
     console.log('fleet:          quiescent (0 non-terminated microVMs, all pages)');
     return;
@@ -278,7 +282,12 @@ function imageState(imageArn, reconcile) {
     return reconcile.classifyImageProbeFailure(r.stderr) === 'absent' ? null : undefined;
   }
   try {
-    return JSON.parse(r.stdout).state ?? null;
+    const state = JSON.parse(r.stdout).state;
+    // A 200 whose body carries no `state` is a response we could not INTERPRET, not an image
+    // that is gone: `null` here would mean "absent", and absence is a claim only the API's own
+    // ResourceNotFoundException can make. Returning unknown keeps `ensureLabel`'s refusal
+    // honest ("could not read") instead of sending an operator to rebuild a healthy image.
+    return typeof state === 'string' && state.length > 0 ? state : undefined;
   } catch {
     return undefined;
   }
@@ -629,7 +638,7 @@ async function main() {
   // Quiesce BEFORE anything is staged, uploaded or triggered (ADR-049). Cheap, and refusing
   // after a 200 MB upload would still have raced nothing — but refusing after
   // `update-microvm-image` would be too late by definition.
-  assertQuiescentFleet();
+  assertQuiescentFleet(reconcile);
 
   const bucket = DRY_RUN ? '<image-code-bucket>' : ssmGet(`${SSM_PREFIX}/config/image-code-bucket`);
   const buildRoleArn = DRY_RUN

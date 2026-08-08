@@ -173,7 +173,14 @@ function imageState(imageArn) {
     return undefined;
   }
   try {
-    return JSON.parse(r.stdout).state ?? null;
+    const state = JSON.parse(r.stdout).state;
+    // Absence is a claim only `ResourceNotFoundException` can make. A 200 with no `state` is a
+    // response we could not interpret, so it joins the probe failures and exits 2 with the
+    // unparseable case — reporting it as `null` would render `image_missing`/`not_built`, which
+    // carries safeFix:'build' and would have `--fix` rebuild a healthy image (ADR-049).
+    if (typeof state === 'string' && state.length > 0) return state;
+    probeFailures.push({ imageArn, stderr: 'get-microvm-image returned no `state` field' });
+    return undefined;
   } catch {
     probeFailures.push({ imageArn, stderr: 'unparseable get-microvm-image response' });
     return undefined;
@@ -188,7 +195,7 @@ function imageState(imageArn) {
  * Throws on a failed read — an unreadable fleet is not an empty one, and the caller maps that
  * to exit 2 rather than letting "could not look" read as ordinary drift.
  */
-function nonTerminatedMicroVms() {
+function nonTerminatedMicroVms(reconcile) {
   const live = [];
   let token = null;
   for (;;) {
@@ -198,8 +205,10 @@ function nonTerminatedMicroVms() {
     if (!r.ok) throw new Error(`list-microvms failed: ${r.stderr.trim()}`);
     const body = JSON.parse(r.stdout);
     for (const vm of body.items ?? body.microvms ?? []) {
-      const state = String(vm.state ?? '').toUpperCase();
-      if (state !== 'TERMINATED' && state !== 'FAILED') live.push(vm);
+      // Same shared predicate the build script uses (src/shared/flavor-reconcile.ts): TERMINATED
+      // is the only terminal `MicrovmState`, and an unrecognized state counts as live. Two copies
+      // of this rule is how one of them stops matching the service model.
+      if (reconcile.isLiveMicroVmState(vm.state)) live.push(vm);
     }
     token = body.nextToken ?? body.NextToken ?? null;
     if (!token) return live;
@@ -329,7 +338,7 @@ async function main() {
   // routing change, so one gate covers both.
   let live;
   try {
-    live = nonTerminatedMicroVms();
+    live = nonTerminatedMicroVms(reconcile);
   } catch (e) {
     // An unreadable fleet is not a quiescent one, and it is not drift either.
     console.error(`\nERROR: could not read the microVM fleet — ${e.message}`);

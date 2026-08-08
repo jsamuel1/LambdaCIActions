@@ -70,6 +70,37 @@ export const PENDING_IMAGE_STATES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The only TERMINAL microVM state, per the deployed service model.
+ *
+ * `MicrovmState` in `lambda-microvms` 2025-09-09 is exactly
+ * `PENDING | RUNNING | SUSPENDING | SUSPENDED | TERMINATING | TERMINATED`. There is no
+ * `FAILED` microVM state — `FAILED` belongs to `BuildState`/`MicrovmImageVersionState`, which
+ * describe an image BUILD, not a VM. Excluding it from the live set would widen "terminal"
+ * beyond the model in the one direction a safety gate must never widen: a state the gate
+ * treats as terminal is a VM it will happily replace an image underneath.
+ *
+ * `TERMINATING` is deliberately LIVE. The VM still exists and may still be resuming from the
+ * image about to be swapped, which is the exact skew the quiesce gate exists to refuse.
+ *
+ * Lives here rather than in each script because both `build-images.mjs` and
+ * `flavors:reconcile --fix` gate on it, and two copies of a safety predicate is how one of
+ * them quietly stops matching the model (ADR-049 § one derivation).
+ */
+export const TERMINAL_MICROVM_STATES: ReadonlySet<string> = new Set(['TERMINATED']);
+
+/**
+ * Whether a microVM counts as live for the quiesce gate.
+ *
+ * Unknown counts as LIVE: an absent, empty or unrecognized state is not evidence the VM is
+ * gone, and the safe reading of "I do not know what this VM is doing" is to refuse the image
+ * swap. That is the same optional-by-ignorance rule the image/allowlist observations use, with
+ * the bias pointed at refusing rather than proceeding.
+ */
+export function isLiveMicroVmState(state: string | undefined | null): boolean {
+  return !TERMINAL_MICROVM_STATES.has(String(state ?? '').toUpperCase());
+}
+
+/**
  * What we observed about one flavor in one environment.
  *
  * Every field is optional-by-ignorance rather than optional-by-default: a consumer that

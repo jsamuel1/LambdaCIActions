@@ -25,6 +25,8 @@ import {
   mayClaimLabel,
   classifyImageProbeFailure,
   classifySsmReadFailure,
+  isLiveMicroVmState,
+  TERMINAL_MICROVM_STATES,
   USABLE_IMAGE_STATES,
   PENDING_IMAGE_STATES,
 } from '../dist/src/shared/flavor-reconcile.js';
@@ -360,6 +362,88 @@ test('build-images distinguishes an unreadable image from an absent one when ref
   assert.match(BUILD_CODE, /2\.35\.17/);
 });
 
+// --- the quiesce gate's state vocabulary must match the service model -------
+
+test('TERMINATED is the only terminal MicrovmState — FAILED is not one at all', () => {
+  // `MicrovmState` in the deployed model (lambda-microvms 2025-09-09) is exactly
+  // PENDING|RUNNING|SUSPENDING|SUSPENDED|TERMINATING|TERMINATED. `FAILED` belongs to
+  // `BuildState`/`MicrovmImageVersionState` — an image BUILD, not a VM — so treating it as
+  // terminal would widen the terminal set beyond the model in the one direction a safety gate
+  // must never widen: a state the gate calls terminal is a VM it will replace an image under.
+  assert.deepEqual([...TERMINAL_MICROVM_STATES], ['TERMINATED']);
+  for (const state of ['PENDING', 'RUNNING', 'SUSPENDING', 'SUSPENDED', 'TERMINATING']) {
+    assert.equal(isLiveMicroVmState(state), true, `${state} is live and must block an image swap`);
+  }
+  assert.equal(isLiveMicroVmState('TERMINATED'), false);
+  assert.equal(isLiveMicroVmState('terminated'), false, 'case must not defeat the gate');
+
+  // FAILED is not a MicrovmState, so a VM reporting it is a VM we do not understand — live.
+  assert.equal(isLiveMicroVmState('FAILED'), true, 'FAILED must not be treated as terminal');
+
+  // Unknown counts as LIVE in every form: absent, empty, or a state the model gains later. The
+  // safe reading of "I do not know what this VM is doing" is to refuse the swap.
+  for (const state of [undefined, null, '', 'SOME_FUTURE_STATE']) {
+    assert.equal(isLiveMicroVmState(state), true, `unknown (${String(state)}) must count as live`);
+  }
+
+  // TERMINATING deserves its own line: the VM still exists and may still be resuming from the
+  // image about to be replaced, which is precisely the skew window the gate refuses.
+  assert.equal(isLiveMicroVmState('TERMINATING'), true);
+});
+
+// --- a successful probe with no state is unknown, not absent -----------------
+
+test('a 200 get-microvm-image with no `state` is unknown in both scripts, never absent', () => {
+  // Third member of the same family as the `classifyImageProbeFailure` /
+  // `classifySsmReadFailure` rules, and the one a non-zero exit does not cover: the CLI exited
+  // 0, so nothing was "classified", but the body carried no state. `null` there means ABSENT,
+  // which renders `image_missing`/`not_built` — verdicts carrying safeFix:'build', so `--fix`
+  // would rebuild a healthy image on the strength of a response it merely failed to read.
+  for (const [label, code] of [
+    ['build-images', BUILD_CODE],
+    ['flavors-reconcile', RECONCILE_CODE],
+  ]) {
+    const body = code.slice(
+      code.indexOf('function imageState('),
+      code.indexOf('function imageState(') + 1400,
+    );
+    assert.ok(body.includes('JSON.parse'), `${label}: imageState body not found`);
+    assert.doesNotMatch(
+      body,
+      /JSON\.parse\(r\.stdout\)\.state \?\? null/,
+      `${label}: a shapeless response must not collapse to absent`,
+    );
+    assert.match(
+      body,
+      /typeof state === 'string'/,
+      `${label}: must require an actual state string before believing it`,
+    );
+  }
+
+  // And in the CLI it must reach the incomplete-probe exit, not pass as a clean report: the
+  // whole 1-vs-2 split is "the plane disagrees" vs "do not trust this report".
+  const cliBody = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('function imageState('),
+    RECONCILE_CODE.indexOf('function nonTerminatedMicroVms('),
+  );
+  assert.match(
+    cliBody,
+    /no `state` field[\s\S]{0,80}?\}\);\s*return undefined;/,
+    'a stateless response must be recorded as a probe failure and returned as unknown',
+  );
+  const failures = [...cliBody.matchAll(/probeFailures\.push\(/g)];
+  assert.equal(
+    failures.length,
+    3,
+    'all three unknown routes must be recorded: unreadable exit, stateless body, unparseable body',
+  );
+  assert.match(cliBody, /stderr: 'unparseable get-microvm-image response'/);
+
+  // The verdict that unknown produces is the honest one, end to end.
+  assert.equal(rowFor(obs({ imageState: undefined })).health, 'image_unverified');
+  assert.equal(mayClaimLabel({ imageArn: ARN, imageState: undefined }), false);
+});
+
 // --- report shape -----------------------------------------------------------
 
 test('every catalog flavor appears in the report, in catalog order', () => {
@@ -600,6 +684,15 @@ test('build-images refuses to build or replace an image on a live fleet', () => 
   );
   assert.match(lister, /token = body\.nextToken/, 'must read the next token from the response');
   assert.match(lister, /aws\(cmd\)/, 'must use aws(), which throws — unreadable is not empty');
+  // The vocabulary comes from the shared module, not a literal pair in this script (see the
+  // MicrovmState test below). A local `state !== 'TERMINATED' && state !== 'FAILED'` would be a
+  // second copy of a safety predicate, and `FAILED` is not a MicrovmState at all.
+  assert.match(
+    lister,
+    /reconcile\.isLiveMicroVmState\(/,
+    'the live/terminal decision must come from the shared predicate',
+  );
+  assert.doesNotMatch(lister, /'FAILED'|"FAILED"/, 'FAILED is not a MicrovmState');
 
   // The gate refuses; it does not warn and continue.
   const gate = BUILD_CODE.slice(
@@ -612,7 +705,7 @@ test('build-images refuses to build or replace an image on a live fleet', () => 
   // ...and it runs before ANY image side effect: before the bucket/role reads, before staging,
   // before create/update. Refusing after `update-microvm-image` would be too late by definition.
   const mainBody = BUILD_CODE.slice(BUILD_CODE.indexOf('async function main('));
-  const gateCall = mainBody.indexOf('assertQuiescentFleet()');
+  const gateCall = mainBody.indexOf('assertQuiescentFleet(reconcile)');
   const firstBuild = mainBody.indexOf('buildFlavor(flavor, ctx)');
   const bucketRead = mainBody.indexOf('config/image-code-bucket');
   assert.ok(gateCall > 0, 'main() must call the quiesce gate');
@@ -638,7 +731,7 @@ test('the quiesce gate exempts --dry-run and the label-only path, and nothing el
   const mainOnly = BUILD_CODE.slice(BUILD_CODE.indexOf('async function main('));
   const only = mainOnly.slice(
     mainOnly.indexOf('if (PUBLISH_LABEL_ONLY) {'),
-    mainOnly.indexOf('assertQuiescentFleet()'),
+    mainOnly.indexOf('assertQuiescentFleet(reconcile)'),
   );
   assert.ok(only.length > 0, 'publish-label-only branch must precede the gate');
   assert.doesNotMatch(only, /assertQuiescentFleet\(/);
@@ -696,9 +789,15 @@ test('--fix never removes a label and refuses a non-quiescent fleet', () => {
     'the fleet check must SEND the pagination token, not only read it back',
   );
   assert.match(lister, /token = body\.nextToken/);
+  assert.match(
+    lister,
+    /reconcile\.isLiveMicroVmState\(/,
+    'both gates must share one live/terminal predicate',
+  );
+  assert.doesNotMatch(lister, /'FAILED'|"FAILED"/, 'FAILED is not a MicrovmState');
   assert.match(RECONCILE_CODE, /non-terminated microVM/);
   const fixIdx = RECONCILE_CODE.indexOf('--fix: fleet is quiescent');
-  const gateIdx = RECONCILE_CODE.indexOf('nonTerminatedMicroVms()');
+  const gateIdx = RECONCILE_CODE.indexOf('nonTerminatedMicroVms(reconcile)');
   assert.ok(gateIdx > 0 && fixIdx > gateIdx, 'the quiesce gate must precede any remediation');
 });
 

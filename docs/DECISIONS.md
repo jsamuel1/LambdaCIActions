@@ -2636,6 +2636,16 @@ during ordinary traffic. `--force-unquiesced` exists for a VM wedged non-termina
 has not collected, and is logged loudly. The gate is a floor, not the whole procedure: pause the
 other writers too.
 
+The terminal set is `TERMINATED` and nothing else, taken from the deployed service model rather
+than guessed: `MicrovmState` (lambda-microvms 2025-09-09) is
+`PENDING | RUNNING | SUSPENDING | SUSPENDED | TERMINATING | TERMINATED`. There is no `FAILED`
+microVM state — `FAILED` belongs to `BuildState`/`MicrovmImageVersionState`, which describe an
+image *build*. Treating it as terminal would widen the terminal set beyond the model in the one
+direction a safety gate must not widen, because a state the gate calls terminal is a VM whose
+image it will replace. `TERMINATING` is deliberately live, and an absent or unrecognized state
+counts as live: "I do not know what this VM is doing" resolves to refusing the swap. The
+predicate is `isLiveMicroVmState` in the shared module, so the two gates cannot drift apart.
+
 **4c. Exit codes distinguish "the plane disagrees" from "do not trust this report."** 1 is drift
 — including drift `--fix` will not touch, so a partially-remediated run cannot exit 0 and claim
 agreement. 2 is an operational failure: unreadable live state, an incomplete image probe, an
@@ -2656,7 +2666,10 @@ an observed disagreement does.
 A probe that fails for any reason other than `ResourceNotFoundException` yields *unknown*, not
 *absent*: an AccessDenied or a pre-2.35.17 AWS CLI would otherwise report a healthy catalog as
 `image_missing`/`blocked` — a confident verdict about a plane never observed, and one carrying
-`safeFix: 'build'`. The CLI exits 2 on an incomplete probe and `--fix` refuses.
+`safeFix: 'build'`. The CLI exits 2 on an incomplete probe and `--fix` refuses. A *successful*
+`get-microvm-image` whose body carries no `state` is the same fact: the call returned, but we
+could not interpret it, so it is unknown rather than absent (the CLI records it as an incomplete
+probe and exits 2). Only the API's own not-found signal may assert absence.
 
 **6. Missing flavors do NOT auto-build, and CD's reconcile is report-only.** An image build
 takes minutes, is deploy-touching, and mutates the plane every runner boots from. Three
