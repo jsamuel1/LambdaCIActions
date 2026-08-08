@@ -43,6 +43,12 @@
  *   npm run flavors:reconcile -- --env dev --json
  *   npm run flavors:reconcile -- --no-image-check   # SSM params only, no microVM API calls
  *   npm run flavors:reconcile -- --fix              # deploy-touching; builds what is missing
+ *
+ * `--json` makes stdout exactly one document, on every path that produces a report (exit 0 and
+ * 1, with or without `--fix`). Everything that narrates — the deploy-pin confirmation, `--fix`
+ * progress, `build-images`' own output — goes to stderr, because a single line ahead of the
+ * document makes the whole stream unparseable. Exit 2 prints no document: there is no
+ * trustworthy report to serialize.
  */
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -98,7 +104,15 @@ async function guardDeployTarget() {
     process.exit(2);
   }
   try {
-    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION, env: ENV });
+    // Under `--json` stdout carries exactly one document, so the pin confirmation goes to
+    // stderr — still visible in a terminal, but it cannot land ahead of the JSON and make it
+    // unparseable.
+    const target = mod.assertDeployTarget({
+      repoRoot: REPO_ROOT,
+      region: REGION,
+      env: ENV,
+      log: JSON_OUT ? console.error : console.log,
+    });
     REGION = target.region;
   } catch (e) {
     console.error(`ERROR: ${e.message}`);
@@ -216,8 +230,17 @@ function nonTerminatedMicroVms(reconcile) {
   }
 }
 
+/**
+ * Progress narration. Goes to stderr under `--json` so that stdout stays a single parseable
+ * document (ADR-049); plain stdout otherwise, where it is the output an operator reads.
+ */
+const note = (msg) => (JSON_OUT ? console.error(msg) : console.log(msg));
+
 function run(cmd, cmdArgs) {
-  const r = spawnSync(cmd, cmdArgs, { stdio: 'inherit' });
+  // The child (build-images) writes its own progress to stdout. Under `--json` that would sit
+  // ahead of our document on the same stream, so map the child's stdout onto our stderr.
+  const stdio = JSON_OUT ? ['ignore', 2, 'inherit'] : 'inherit';
+  const r = spawnSync(cmd, cmdArgs, { stdio });
   if (r.status !== 0) throw new Error(`${cmd} ${cmdArgs.join(' ')} exited ${r.status}`);
 }
 
@@ -382,11 +405,11 @@ async function main() {
     process.exit(2);
   }
 
-  console.log('\n--fix: fleet is quiescent; applying safe remediations.');
+  note('\n--fix: fleet is quiescent; applying safe remediations.');
   for (const r of actionable) {
     const flags = ['--env', ENV, '--region', REGION, '--flavor', r.name];
     if (r.safeFix === 'add-label') flags.push('--publish-label-only');
-    console.log(`\n→ ${r.name} (${r.health}): build-images ${flags.join(' ')}`);
+    note(`\n→ ${r.name} (${r.health}): build-images ${flags.join(' ')}`);
     try {
       run(process.execPath, [path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), ...flags]);
     } catch (e) {
@@ -413,7 +436,7 @@ async function main() {
   //
   // Re-reading is a handful of API calls and it generalises: any remediation that silently
   // no-ops is caught, not just this one.
-  console.log('\n--fix applied; re-reading live state to verify.');
+  note('\n--fix applied; re-reading live state to verify.');
   let after;
   try {
     after = observe(reconcile);
@@ -462,7 +485,7 @@ async function main() {
     }
     process.exit(1);
   }
-  console.log('\n--fix complete: catalog and live state now agree.');
+  note('\n--fix complete: catalog and live state now agree.');
 }
 
 // A thrown error anywhere above is an operational failure, not drift: exit 2 so a caller can

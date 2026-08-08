@@ -2668,6 +2668,14 @@ a run with no safely-fixable row emits that report itself (with an empty `fixed`
 leaving a consumer prose and no document — reachable both on a healthy environment (exit 0) and
 with a build in flight (`image_building` is warn with no safe fix, exit 1).
 
+"One document" is a claim about the whole stream, so everything else that narrates moves off it
+under `--json`: the deploy-pin confirmation (`assertDeployTarget` takes a log sink for exactly
+this), the `--fix` progress lines, and `build-images`' own stdout, which `stdio: 'inherit'` used
+to merge into ours. A document preceded by a `✓ deploy target verified: …` line is not parseable,
+so the contract was previously false on every `--json` path regardless of which branch printed.
+Exit 2 is deliberately outside it: an unreadable plane or a failed remediation has no trustworthy
+report to serialize, and the diagnosis goes to stderr.
+
 **5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
 a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the
 console shows it green is the same class of bug as the one being fixed here, so the mapping from
