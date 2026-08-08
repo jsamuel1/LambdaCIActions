@@ -2917,6 +2917,234 @@ skipped report instead of failing the deploy.
 
 ---
 
+> **ADR numbering note.** This block takes **050..051**, the lowest free pair. `kermes/task-wintry-owl`
+> / PR #31 ("A flavor is published image-first, label-second") held the concurrent claim above 048
+> and has since landed on trunk as **ADR-049**, so 049 is taken and 050 is the first free number.
+> This block was authored at 049..050 and renumbered up by one to yield 049 to that branch. ADR
+> numbers are a shared mutable namespace across branches, and `test/adr-refs.test.mjs` only catches
+> a duplicate once both blocks are in one tree, so each branch renumbers to the lowest free pair
+> rather than deferring to whichever lands second — a gap is cheaper than a duplicate.
+
+## ADR-050 — A refused claim is a first-class, visible record — not a discarded 202 body (M4 fix)
+**Status**: Accepted (v1) · fixes the observability gap in [ADR-030](#adr-030) (claim decision)
+and [ADR-005](#adr-005) (label contract)
+
+**Context**: Ingest answers a `workflow_job.queued` webhook it will not claim with
+`202 {ok:true, claimed:false, reason}`. The recipient of that body is **GitHub**, which discards
+it. Three of the four refusal branches also `console.log`ged a structured line (repo opted out,
+non-default runner group, compat block). The fourth — `decideClaim`'s rejection, which includes
+an explicit `lambda-ci-*` label that is not in the live `/lca/<env>/config/runner-labels`
+allowlist — logged **nothing** and wrote **nothing**.
+
+That is the one refusal an operator actually hits. Observed in dev on `jsamuel1/SauhsojVideo`
+(2026-08-07): eight PRs sat `QUEUED` for ~7 h. The workflow said
+`runs-on: [self-hosted, lambda-ci-python]`; the live allowlist held
+`lambda-ci,lambda-ci-node,lambda-ci-docker`. `/aws/lambda/lca-dev-ingest` was invoked repeatedly,
+returned 2xx every time, and contained **zero** claim or refusal lines. `lca-dev-provision` had no
+events for the repo. The repo was onboarded and `enabled: true`. There was no run row, so there
+was nothing in the console to click, and nothing in the run list to explain. The platform's answer
+to "why is my PR stuck?" was silence at every layer.
+
+**Decision**: **every** `claimed: false` path emits a structured log line, and an **actionable**
+refusal is additionally persisted as its own entity that the console lists.
+
+*One emitter.* `src/ingest/refusal.ts` classifies a refusal into a stable `RefusalCode`
+(`label-not-allowlisted`, `incompatible-label`, `repo-disabled`, `runner-group`, `compat-block`,
+`no-lca-label`, `no-standard-label`) and the handler routes all four branches through a single
+`refuse()`. The line carries repo, run/job ids, job name, workflow, the job's labels, **the live
+allowlist snapshot**, the LCA-shaped labels found, the repo mode, the reason and a fix. The
+allowlist is included because it is the other half of the diagnosis and it changes over time — a
+line without it cannot be re-read a day later to explain the decision.
+
+*Noise is designed for, not discovered later.* An un-onboarded repo's `ubuntu-latest` jobs
+refusing with "no LCA label" are the normal, high-volume steady state; logging each at info and
+storing a row per job would bury the misconfiguration and cost money. So a refusal is
+**actionable** only when the job carries evidence someone meant it to run here — an LCA-shaped
+label (catalog label, or `lambda-ci`-prefixed) — which in the allowlist-miss case is exactly the
+label the operator forgot to allowlist. Actionable ⇒ `level: info` + a stored row. Otherwise ⇒
+`level: debug`, **sampled 1-in-100**, no row. `runner-group` and `compat-block` are always
+actionable: both are reached only after a claim decision already said yes.
+
+The sampling is the enforcement, not the `level` field. These Lambdas emit with `console.log`, so a
+`level: debug` tag inside the JSON payload lands in CloudWatch at exactly the same level, volume and
+ingest cost as the actionable line it is supposed to be distinguishable from — the tag alone left the
+noise lane fully loud, which is the outcome the paragraph above exists to prevent. The non-actionable
+lane is therefore gated on `sampleRefusalLog`, which is deterministic in the job id rather than
+random: GitHub re-delivers webhooks, and a random draw would make one job's line appear and vanish
+between deliveries — reading as a platform fault to whoever is reading the log to diagnose one. The
+rate is not zero because a sampled line still answers "is the webhook arriving at all?", the first
+fork when a repo looks inert.
+
+Classification is derived from the **labels**, never by parsing `decideClaim`'s prose. The reason
+string is operator-facing and gets reworded; matching on it would make the classification
+silently wrong at the next edit.
+
+*Why a separate entity, not a new `RunStatus`.* The alternative was a terminal run row with an
+`unclaimed`/`refused` status. Rejected: `RunStatus` is load-bearing in seven places
+(`ALL_STATUSES`, `ACTIVE_STATUSES`, `STATUS_RANK`/`canTransition`, `isCostEligible`,
+`buildHealth`'s error rate, the reports status vocabulary and filters, `foldRunStatus`), and a
+refused job has no microVM, no duration and no cost. Adding it there means auditing every one of
+those consumers to teach them "this status is not a run", and a single miss makes a refusal look
+billable or inflates the platform error rate — the two outcomes this card explicitly forbids. A
+`REFUSAL#<repoId>#<runId>#<jobId>` row in the same table (ADR-009) needs none of them to change.
+
+Row semantics: `firstSeenAt` is `if_not_exists` (so "this has been broken for 7 hours" survives
+every re-delivery) and `occurrences` is an `ADD` — so the row distinguishes "happened once an hour
+ago" from "still happening on every push", which a last-write-wins row cannot express. Every other
+attribute describes the MOST RECENT refusal, and one that refusal does not have is `REMOVE`d rather
+than left in place: the row is keyed on (repo, run, job), the stored analysis is re-read on every
+delivery, and a re-scan between two deliveries of one queued job can move it from the runner-group
+gate to the compat gate — a retained `runnerGroup` would then render "runner group: gpu" beneath a
+`compat-block` reason, asserting a cause that is not the one that refused the job. **Both GSI
+sort keys track `lastSeenAt`, not `firstSeenAt`**: the screen answers "what is broken NOW", and
+keying the index on first sight sank a refusal that started hours ago and is still firing below the
+head page, where no client-side sort could recover it. Using different sort clocks per index was
+rejected too — the same list would reorder itself when a repo filter was applied. The cost is a GSI
+delete+insert per re-delivery rather than an in-place update, acceptable *because* the store only
+holds actionable refusals. TTL matches terminal run retention (ADR-033). GSI1 partition `REFUSALS`
+(platform-wide) and GSI2 partition `REPOREFUSALS#<repoId>` are distinct values from the run store's
+`RUNSTATUS#…` / `REPORUNS#…`, so no existing query can see refusals and vice versa. A single hot
+GSI1 partition is acceptable **because** only actionable refusals are written; that is the
+invariant that keeps it low-cardinality.
+
+*Console surface.* A dedicated **Unclaimed** screen (`GET /api/unclaimed`, `#/unclaimed`) — its
+own nav entry rather than a Runs tab, because an operator hunting a stuck PR is looking for
+something that is by definition not in the run list. Each row pairs the allowlist snapshot stored
+at refusal time with the **live** allowlist, and badges `config changed` when they differ as
+case-insensitive sets (the claim gate lower-cases both sides, so a re-cased entry is not a fix):
+"I already added the label" and "the label is still missing" are otherwise indistinguishable. The
+list walks the cursor ("Load older"), because a row that exists in the store and cannot be reached
+from the console is the same invisibility this ADR is about; the polled head page is de-duplicated
+against held older pages by refusal identity, since a recurring row's sort key moves. The Dashboard
+shows an `Unclaimed (7d)` stat as a third axis (never folded into `active`/`errorRate`/cost),
+reported as a floor (`≥ N`) when the count hit its paging budget — in the banner beside it as well
+as in the stat, since a bare "N jobs were refused" states an exact figure the platform did not
+finish counting. A count that FAILED is reported as unknown (`—`, no banner), never as `0`: a
+reassuring zero on the one stat that exists to contradict a green console is the same false
+certainty as the stored `compat: ok`, relocated to the headline. That stat is **windowed on
+`lastSeenAt`** while the screen shows the full retained history: rows live for the ADR-033 retention
+(90 days by default), so an unwindowed headline would stay red for months after the fix, and a
+permanently-red indicator is one operators stop reading. The window is a sort-key range, so skipped
+rows are not read.
+
+**Consequences**:
+- An allowlist miss is now visible in three places within one webhook delivery: the ingest log,
+  the Unclaimed screen, and the Dashboard stat. The stuck-PR question is answerable without AWS
+  console access.
+- Refusal writes are best-effort: a store failure is logged and swallowed. A webhook that 5xx'd
+  would make GitHub retry a delivery whose claim decision is already final.
+- The refusal store is written only by Ingest and read only by Mgmt. The management plane cannot
+  **delete** a refusal — it holds no `dynamodb:DeleteItem` at all (ADR-025). It cannot **forge**
+  one either, but that half is a CODE property, not an IAM one: Mgmt's config-patch grant is
+  table-wide `dynamodb:UpdateItem`, and an `UpdateItem` against a key that does not exist creates
+  the item, so IAM alone does not fence the `REFUSAL#` partition off from it. What fences it is
+  that the Mgmt handler has no refusal write path — every refusal route is a `Query`. Anyone adding
+  a write to Mgmt must keep it to the entities it already patches (repo config, the ADR-037
+  installation index repair); scoping the grant by `dynamodb:LeadingKeys` would make the fence an
+  IAM one, and is not done today because the patched keys are per-repo and per-installation rather
+  than a single prefix.
+- Residual gap, deliberate: an operator's **custom** allowlist label (`my-runner`) later removed
+  from the allowlist is not LCA-shaped, so its refusals stay in the debug/no-row lane. It is
+  indistinguishable from `runs-on: [self-hosted, gpu]` targeting a foreign fleet, which must not
+  become an error in every repo. Naming custom labels with the `lambda-ci` prefix opts them in.
+- The `no-lca-label` / `no-standard-label` lanes are sampled at `REFUSAL_LOG_SAMPLE_RATE` (1%), so
+  99 of every 100 expected refusals leave no trace at all. That is the intended trade: the lane is
+  the dominant webhook volume for any org with GitHub-hosted CI, and its decisions are already known
+  to be correct. A specific ordinary job's refusal is therefore usually NOT greppable — if one must
+  be, raise the rate to 1 in the emitter. Actionable refusals are never sampled.
+
+## ADR-051 — Routing display reconciles against the LIVE control plane, not the catalog (M4 fix)
+**Status**: Accepted (v1) · amends [ADR-030](#adr-030) (routing preview) and the Flavors view of
+[spec 04](specs/04-web-ui.md)
+
+**Context**: The console's routing preview and stored `compat` are computed from
+`microvm/flavors.json`. The catalog describes what the platform *can* route; it says nothing about
+what a given deployment can actually run. On 2026-08-07 those diverged and the console reported
+the reassuring half: stored analysis said
+`routes.offline = {flavor: "python", reason: "explicit LCA label 'lambda-ci-python'"}`,
+`compat.level: "ok"`, `eligible: true` — while the deployed allowlist had no `lambda-ci-python`,
+no `image-arn-python` parameter existed, and `get-microvm-image` on
+`…:microvm-image:lca-dev-python` returned `ResourceNotFoundException`. Both statements were true
+in their own layer; the operator saw only the green one.
+
+**Decision**: derive per-flavor **readiness** from two live control-plane facts and render it as
+its own axis next to compat.
+
+The two facts fail at different points in the pipeline, so they are not interchangeable:
+`/lca/<env>/config/runner-labels` is read by the **claim gate, before routing** — missing ⇒ the
+job is never claimed and queues silently; `image-arn-<flavor>` is read by **Provision** — missing
+⇒ the job IS claimed and then fails, which at least leaves a run row. The four-way matrix is
+therefore named, not collapsed: `unroutable` (neither), `unclaimable` (image but no label — built
+capacity nothing can select), `imageMissing` (label but no image), `ready` (both).
+
+`src/shared/flavor-readiness.ts` holds the derivation as a **pure** function over the catalog plus
+a snapshot, so the three console surfaces that render it (Flavors, Settings, Repo detail) share one
+classification and cannot disagree.
+
+It is **not** shared with the `npm run flavors:reconcile` CLI, which has its own module
+(`src/shared/flavor-reconcile.ts`, added by the sibling flavor-publishing work) and its own
+`reconcileFlavors`. That split is
+a permission boundary: the CLI runs with an operator's credentials and can call
+`get-microvm-image`, so it observes real image STATE and reports build health; the management plane
+cannot make that call (ADR-025) and can only see whether an `image-arn-*` parameter exists. One
+shared module would force the console to render states it cannot observe, or the CLI to discard the
+evidence only it has. The duplicated symbol name is the accepted cost; the two vocabularies are
+different on purpose.
+
+*Read time, never stored.* Readiness is NOT written onto the workflow-analysis row. The stored
+route is a function of the YAML and the catalog and is correct whenever it was written;
+runnability is a function of the deployment, which changes with no push to re-trigger discovery.
+Persisting it would produce a row asserting `ready` about a control plane that has since lost the
+image — the same stale green, one layer down.
+
+*A separate axis from `compat`.* Folding a live platform gap into `compat` would make
+`rollupCompat` counts move when an operator publishes an image with no workflow change, and would
+imply Ingest refused the job for a compat reason when in fact the claim gate never saw it. So the
+job view carries `platform: RouteReadiness` alongside `compat`, and the workflow carries
+`platformLevel`.
+
+*Fail soft, three-valued.* A failed live read yields `unknown`, not `ready` and not a failure
+state. `ready` on an unread control plane is the original bug; crying wolf on a transient SSM error
+teaches operators to ignore the one surface whose value is being trusted when it warns.
+`countUnrunnableJobs` therefore excludes `unknown`.
+
+*The two live facts fail independently.* Readiness needs both the allowlist and the image map, so
+`ControlPlaneSnapshot.live` is their AND and `reconcileFlavors` is only ever called with it true. But
+the Flavors table also renders the image half **on its own**, so that half carries its own liveness:
+`imagePublished === undefined` means the presence check did not run, and `FlavorView.imageAvailable`
+is correspondingly `boolean | null`. Folding both reads into one failure sentinel meant an allowlist
+error discarded an image map that had been read successfully, and the table then asserted every
+catalog flavor was "not built" — an evidence-free claim in the column beside the one correctly saying
+`unchecked`. Absence and ignorance are different answers in every column, not just the derived one.
+
+The Mgmt λ's SSM grant gains `GetParameter` on `${ssmPrefix}/config/runner-labels`. This does not
+weaken spec 04's hard rule: the rule is that no **secret** value is readable from the management
+plane, and every SecureString path is still presence-checked with `DescribeParameters` only. The
+allowlist is an operator-managed plain `String` whose value IS the thing being reconciled.
+
+**Consequences**:
+- Flavors gains `Label allowlisted` and `Runnable` columns with the concrete fix per state; the
+  Settings screen shows the live allowlist plus entries that match no catalog label (expected for
+  adopt-mode `ubuntu-*` and FlavorMap labels; a near-miss like `lambda-ci-pyton` is a typo an
+  operator has to be able to see). Repo detail gains a `Platform` column and a banner counting
+  jobs the deployment cannot run.
+- Every reconciliation reads SSM live: `GetParameter` on one path (5-minute container cache) plus
+  the `DescribeParameters` probes the Flavors view already did. A repository unit test cannot prove
+  deployment state, so the check is deliberately a request-time read, not an assertion against the
+  catalog.
+- **A published `image-arn-<flavor>` parameter is not proof the image still exists.** `ready` means
+  "both parameters present"; a deleted image behind a live ARN still reads `ready` here.
+  Closing that needs a `get-microvm-image` call, which is a control-plane permission the
+  management plane deliberately lacks (ADR-025) — so it belongs to the `flavors:reconcile` CLI
+  command, which runs with an operator's own credentials and reports image state rather than
+  parameter presence.
+
+---
+
+> **ADR numbering note.** This block takes **052**. The 050..051 pair above landed first as PR #34,
+> so 052 was the lowest free number at merge time and no renumber was needed here. Verified against
+> trunk's ledger and every open PR before publishing, per the convention the block above states.
+
 ## ADR-052 — Pagination cursors are sealed and scope-bound, not merely encoded (M4 fix)
 **Status**: Accepted (v1) · hardens [ADR-023](#adr-023) (run indexes / opaque cursor) and
 [ADR-022](#adr-022) (session secret) · preserves [ADR-029](#adr-029) (`complete` contract)
@@ -2936,11 +3164,19 @@ Any authenticated operator could decode the cursor and read another tenant's rep
 job ids.
 
 This was found while reviewing the unclaimed-jobs work and confirmed **pre-existing** at that
-branch's merge base, on both the repo-filtered and status-filtered `/api/runs` branches — the
-only paginated routes that exist today. It is a property of the shared paging seam
-(`collectVisible` + `encodeCursor`), so it was fixed there rather than per route. The
-unclaimed/refusal list (PR #34) walks the same seam with `REFUSAL#…` keys and is still
-unlanded; it inherits the fix structurally rather than being patched here.
+branch's merge base, on both the repo-filtered and status-filtered `/api/runs` branches. It is a
+property of the shared paging seam (`collectVisible` + `encodeCursor`), so it was fixed there
+rather than per route.
+
+That choice was then tested for real. The unclaimed/refusal list (PR #34) landed on trunk while
+this change was in review, walking the same seam with `REFUSAL#<repoId>#<runId>#<jobId>` keys and
+returning `page.nextCursor ?? null` against an undeclared `json()` body — the identical leak,
+written independently, by an author who had no reason to know this fix existed. Merging the two
+did not require noticing it: the `RawCursor` migration turned that line into a **compile error**
+in four places across `handler.ts` and `refusal-store.ts`. The route is now sealed here, with its
+own declared body and two scopes of its own (`unclaimed`, `unclaimed:repo`). This is the
+load-bearing evidence for the layering below — the type layer caught a real leak from a real
+concurrent branch, not a hypothetical one.
 
 **Decision.** A cursor crossing the API boundary is **sealed**: AES-256-GCM over the store's
 cursor, under a key derived by HKDF-SHA256 from the existing session secret, with the scope it
@@ -3033,6 +3269,11 @@ Two supporting choices:
   **declared** body, because `RawCursor` is not assignable to `string | null`; the source guards
   scan the whole `src/` tree, so a route that skips the declared body is caught by the test
   rather than by the compiler; and if it evades both, serializing the cursor **throws**, so the
-  response fails closed instead of shipping plaintext. The unclaimed-jobs list is the first such
-  route, needs a `view` of its own when it lands, and should declare its body the way
-  `RunListBody` does.
+  response fails closed instead of shipping plaintext. The unclaimed-jobs list exercised exactly
+  this path: it arrived from PR #34 with the leak, and was caught. Worth recording which layer
+  did the catching, because it is not the one the ADR would have predicted — reverting that route
+  to its `json(200, …)` form does **not** produce an assignability error, since an undeclared body
+  accepts a `RawCursor` happily; the compiler only reports the now-unused helper. The **source
+  guards** are what name the leak. That is the case layer 2 exists for, and it is why the guards
+  scan every file under `src/` rather than the handlers that happened to exist when they were
+  written.

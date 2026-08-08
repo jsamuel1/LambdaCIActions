@@ -36,13 +36,26 @@ import {
   toRepoView,
   toRunView,
   toSecretStatus,
-  toWorkflowView,
   type AppInstallationView,
   type LabelImpactView,
   type RunView,
   type SettingsView,
   type WebhookDeliveryView,
 } from './views.js';
+import {
+  countUnrunnableJobs,
+  sortRefusalsNewestFirst,
+  toRefusalView,
+  toWorkflowViewWithReadiness,
+  type RefusalView,
+} from './refusal-views.js';
+import {
+  reconcileFlavors,
+  unmatchedAllowlistLabels,
+  type ControlPlaneSnapshot,
+  type FlavorReadiness,
+  type ReadinessFlavor,
+} from '../shared/flavor-readiness.js';
 import {
   HOSTED_LABELS,
   parseLimit,
@@ -75,7 +88,7 @@ import {
 import { staticGate, smokeWorkflowYaml } from '../flavorval/validate-core.js';
 import { shapeRatePerMinute } from './views.js';
 import { planPreviewFromAnalyses } from './rewrite.js';
-import { collectVisible } from './paging.js';
+import { collectVisible, type Page } from './paging.js';
 import { openCursor, sealCursorOrNull, type CursorScope } from '../shared/cursor.js';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import {
@@ -110,6 +123,11 @@ import {
   listRunsByStatusPaged,
 } from '../shared/run-store.js';
 import {
+  countRefusals,
+  listRefusals,
+  listRefusalsByRepo,
+} from '../shared/refusal-store.js';
+import {
   getInstallation,
   getRepo,
   listInstallations,
@@ -133,6 +151,7 @@ import {
   listUserInstallations,
 } from '../shared/github-app.js';
 import type {
+  RefusalRecord,
   RepoRecord,
   RewriteRequest,
   RunRecord,
@@ -190,6 +209,30 @@ function runList(body: RunListBody): Reply {
   return json(200, body);
 }
 
+/**
+ * The `GET /api/unclaimed` body (ADR-050 surface, ADR-052 cursor contract).
+ *
+ * Declared for the reason `RunListBody` is declared, and the reason applies harder here. This
+ * list walks the refusal indexes, whose keys carry `REFUSAL#<repoId>#<runId>#<jobId>`, and its
+ * platform-wide branch is an installation-filtered walk over EVERY tenant's refusals — so the
+ * row a raw cursor names is one this session may not administer in the ordinary case, not the
+ * unlucky one. When this route landed (PR #34) it returned `page.nextCursor ?? null` against an
+ * undeclared `json()` body; the `RawCursor` migration turned that line into a compile error
+ * rather than leaving it to the runtime backstop, which is the whole point of the type.
+ */
+interface UnclaimedListBody {
+  unclaimed: RefusalView[];
+  /** SEALED cursor (`sealCursorOrNull`) or `null`. A store `RawCursor` cannot satisfy this. */
+  nextCursor: string | null;
+  allowlist: string[];
+  controlPlaneLive: boolean;
+}
+
+/** `json(200, …)` for the unclaimed list, with the sealed-cursor contract enforced by the type. */
+function unclaimedList(body: UnclaimedListBody): Reply {
+  return json(200, body);
+}
+
 const ENV_NAME = process.env.LCA_ENV ?? 'dev';
 const SSM_PREFIX = process.env.SSM_PREFIX ?? `/lca/${ENV_NAME}`;
 const SESSION_SECRET_PARAM = process.env.SESSION_SECRET_PARAM ?? `${SSM_PREFIX}/mgmt/session-secret`;
@@ -220,6 +263,17 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL ?? '';
  * an attempt at a complete billing window.
  */
 const COST_SAMPLE_PER_STATUS = 50;
+
+/**
+ * How far back the Dashboard's unclaimed badge looks (ADR-050).
+ *
+ * Refusal rows are retained for the full ADR-033 window (`RUN_RETENTION_DAYS`, 90 days by default),
+ * which is right for the Unclaimed screen's history and wrong for a headline badge: an unwindowed
+ * count stays non-zero — and its banner keeps claiming jobs "are not running" — for months after
+ * the operator fixed the allowlist. Seven days is long enough to cover a weekend plus a working
+ * week, so a Monday-morning operator still sees Friday's breakage.
+ */
+const UNCLAIMED_WINDOW_DAYS = 7;
 const REWRITE_QUEUE_URL = process.env.REWRITE_QUEUE_URL ?? '';
 /**
  * Deployment-wide auto-rewrite flag (ADR-031). Off unless the string is exactly `true`, so a
@@ -536,10 +590,20 @@ async function route_(
       const repo = await authorizeRepo(session, match, q);
       if ('reply' in repo) return repo.reply;
       const analyses = await listWorkflowAnalyses(repo.record.repoId);
+      // Reconciled against the LIVE control plane, not just the catalog (ADR-051). A route to a
+      // flavor whose label is absent from the live allowlist, or whose image is unpublished, is
+      // not runnable however green its stored compat is — which is exactly what this repo's
+      // workflows looked like while eight PRs sat queued.
+      const readiness = await flavorReadinessOrUndefined();
+      const workflows = analyses.map((a) => toWorkflowViewWithReadiness(a, readiness));
       return json(200, {
         repo: toRepoView(repo.record),
         compat: rollupCompat(analyses),
-        workflows: analyses.map(toWorkflowView),
+        workflows,
+        /** Jobs routing somewhere the live control plane cannot run. */
+        unrunnableJobs: countUnrunnableJobs(workflows),
+        /** False when the live read failed — the platform verdicts are `unknown`, not green. */
+        controlPlaneLive: readiness !== undefined,
       });
     }
 
@@ -640,6 +704,9 @@ async function route_(
     case 'listRuns':
       return listRunsRoute(session, q, secret);
 
+    case 'listRefusals':
+      return listRefusalsRoute(session, q, secret);
+
     case 'getRun': {
       const run = await authorizeRun(session, match);
       if ('reply' in run) return run.reply;
@@ -709,16 +776,60 @@ async function route_(
             JSON.stringify({ msg: 'custom flavor list read failed', installationId: scoped, error: errMsg(err) }),
           );
         }
+        // Same live snapshot as the unscoped branch below, for two reasons. Availability must be
+        // FAIL-SOFT: the raw `imageAvailability()` rejects on a transient SSM fault, which would
+        // 500 the one screen an operator opens to diagnose exactly that — and the Flavors screen
+        // asking "can these run" is the wrong place to answer "nothing, the API is down".
+        // Readiness must also be PRESENT: without it a request carrying `?installation=` renders
+        // `Runnable: unchecked` forever, so the ADR-051 surface never appears on the very path an
+        // onboarded installation uses.
+        const snapshot = await controlPlaneSnapshot();
         return json(200, {
-          flavors: buildFlavorViews(await imageAvailability(), custom ?? []),
+          flavors: buildFlavorViews(snapshot.imagePublished, custom ?? []),
           // `ok` = the installation's custom rows were read (possibly genuinely none);
           // `degraded` = they could not be read, so the rows above are built-ins ONLY and the
           // absence of a custom flavor here is not evidence that it does not exist.
           customFlavorsRead: custom ? 'ok' : 'degraded',
+          // BUILT-IN scoped, deliberately — `catalogForReadiness()` passes no custom rows.
+          //
+          // `reconcileFlavors` couples two axes into one state, and only one of them is
+          // meaningful for a custom flavor. The LABEL axis is real: the claim gate consults the
+          // allowlist before resolution, so a custom flavor whose label was never allowlisted
+          // strands its jobs exactly as `lambda-ci-python` did. But the IMAGE axis is not: a
+          // custom image ARN is supplied by the operator and lives on the stored row, NOT in this
+          // environment's `/config/image-arn-<name>` namespace, so `imagePublished[name]` is
+          // absent for every custom flavor and reconciling it would report `imageMissing` on rows
+          // whose image is fine. That is the inverted false certainty this ADR exists to remove.
+          // Custom routability is already carried per row by ADR-041 `validationState`/`routable`
+          // in `flavors` above; a custom-aware readiness axis needs its own state vocabulary and
+          // belongs with the smoke-run work, not smuggled in through a built-in reconciler.
+          readiness: snapshot.live ? reconcileFlavors(catalogForReadiness(), snapshot) : [],
+          unmatchedAllowlistLabels: unmatchedAllowlistLabels(catalogForReadiness(), snapshot.allowlist),
+          controlPlaneLive: snapshot.live,
           smokeWorkflow: smokeWorkflowYaml(),
         });
       }
-      return json(200, { flavors: buildFlavorViews(await imageAvailability()) });
+      const snapshot = await controlPlaneSnapshot();
+      return json(200, {
+        // Passed through with its own liveness: `undefined` renders the Image column as unchecked
+        // instead of asserting every flavor is unbuilt when only the SSM read failed.
+        flavors: buildFlavorViews(snapshot.imagePublished),
+        // The live control-plane reconciliation (ADR-051). Kept a SEPARATE array rather than
+        // merged into each FlavorView so the catalog projection stays a pure function of the
+        // catalog, and a per-flavor axis added elsewhere cannot collide with this one.
+        //
+        // EMPTY when EITHER live read failed, never reconciled against a failure sentinel.
+        // `reconcileFlavors` takes no view on `live` — so reconciling an unread allowlist or an
+        // unread image map would derive every catalog flavor as `unroutable`/`imageMissing` and
+        // make the screen announce "N flavors cannot run in this environment" on a transient SSM
+        // error. That is the same false certainty as the misleading green this ADR removes, only
+        // inverted, and an alarm that fires when nothing is wrong is one operators stop reading.
+        // Same rule as `flavorReadinessOrUndefined` and the Settings route: unknown ≠ broken.
+        readiness: snapshot.live ? reconcileFlavors(catalogForReadiness(), snapshot) : [],
+        allowlist: snapshot.allowlist,
+        unmatchedAllowlistLabels: unmatchedAllowlistLabels(catalogForReadiness(), snapshot.allowlist),
+        controlPlaneLive: snapshot.live,
+      });
     }
 
     case 'registerFlavor':
@@ -982,7 +1093,35 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
   const costRuns: RunRecord[] = terminalPages
     .flatMap((p) => p.runs)
     .filter((r) => canAdminInstallation(session, r.installationId));
-  return json(200, { ...buildHealth(counts, active, new Date(), costRuns), countsExact: exact });
+  // Unclaimed jobs (ADR-050). A THIRD axis, deliberately outside `counts`: a refused job is not
+  // a run, so it must not move the active count, the error rate, or any cost figure. Bounded and
+  // reported as a floor (`unclaimedExact`) like the status counts, so the badge never claims an
+  // exact number it did not finish counting. Platform-wide like `counts` — the route already
+  // refuses a zero-grant session for exactly that reason.
+  //
+  // Windowed to the last `UNCLAIMED_WINDOW_DAYS`, unlike `counts`. A refusal row survives for the
+  // full ADR-033 retention (90 days by default), so an unwindowed count keeps the badge red — and
+  // its banner asserting in the present tense that jobs "are not running" — for months after the
+  // operator fixed the allowlist. Recency is what the badge is for; the Unclaimed screen still
+  // lists the full retained history.
+  const since = new Date(Date.now() - UNCLAIMED_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const refusals = await countRefusals({ sinceIso: since }).catch((err) => {
+    // A refusal-count failure must not blank the whole dashboard; the badge degrades instead.
+    //
+    // UNKNOWN, not zero. `{ count: 0 }` would render a reassuring `0` on the one stat whose whole
+    // purpose is to stop the console reporting that nothing is wrong while jobs are stranded —
+    // the same false green as the stored `compat: ok`, moved to the headline. `undefined` omits
+    // the field, so the badge shows `—` and the banner (which triggers on a positive count) stays
+    // silent rather than claiming a count it does not have.
+    console.error(JSON.stringify({ msg: 'countRefusals failed', error: errMsg(err) }));
+    return undefined;
+  });
+  return json(200, {
+    ...buildHealth(counts, active, new Date(), costRuns),
+    countsExact: exact,
+    ...(refusals ? { unclaimed: refusals.count, unclaimedExact: refusals.exact } : {}),
+    unclaimedWindowDays: UNCLAIMED_WINDOW_DAYS,
+  });
 }
 
 // ---- reports (spec 04 § Reports) -------------------------------------------
@@ -1208,7 +1347,12 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
       getWebhookHeartbeat().catch(() => undefined),
       listAudit(10).catch(() => []),
       appLinkage(),
-      imageAvailability(),
+      // Fail-soft, like every other live read on this route. The raw `imageAvailability()`
+      // REJECTS on an SSM fault, which would 500 the whole Settings screen — including the App
+      // linkage, webhook health and secret diagnostics an operator opened it for — over an
+      // image-presence probe that only annotates the flavor table. `undefined` renders those
+      // cells `unchecked` instead (ADR-051: unknown is neither broken nor green).
+      imageAvailabilityOrUndefined(),
     ]);
 
   const labels = parseRunnerLabels(labelsRaw);
@@ -1239,6 +1383,27 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
   const resolved = resolveInstallationList(linkage, storedInstalls, knownIds);
 
   const deliveries: WebhookDeliveryView[] = linkage?.webhook?.recentDeliveries ?? [];
+  /**
+   * Live control-plane reconciliation (ADR-051), derived from the two facts this route ALREADY
+   * read: the runner-label allowlist and which flavors have a published `image-arn-*`.
+   *
+   * Deliberately not a second `controlPlaneSnapshot()` call. That would re-read the same
+   * parameter and re-run one `DescribeParameters` per catalog flavor for values already in hand,
+   * and — worse — could disagree with `runnerLabels.labels` rendered beside it if the parameter
+   * changed between the two reads.
+   *
+   * `live` is the AND of BOTH reads, exactly as `controlPlaneSnapshot` defines it, because
+   * `reconcileFlavors` derives a state from both and takes no view on liveness: an unread image
+   * map with `live: true` would make every allowlisted flavor `imageMissing` and every other one
+   * `unroutable`, and the screen would announce that the catalog cannot run here on the strength
+   * of a transient SSM error. `labelsRaw === undefined` and `flavors === undefined` are the two
+   * fail-soft sentinels above; neither is evidence that anything is broken.
+   */
+  const snapshot: ControlPlaneSnapshot = {
+    allowlist: labels,
+    imagePublished: flavors,
+    live: labelsRaw !== undefined && flavors !== undefined,
+  };
   const view: SettingsView = {
     envName: ENV_NAME,
     region: process.env.AWS_REGION ?? '',
@@ -1257,6 +1422,14 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
       labels,
       unset: labels.length === 0,
       hostedLabels: hostedLabelsIn(labels, HOSTED_LABELS),
+      /**
+       * Whether the allowlist was actually READ. `unset` above cannot carry this: a failed
+       * `getParam` catches to `undefined`, `parseRunnerLabels` turns that into `[]`, and the
+       * card would then badge `unset — no jobs claimed` — a positive claim that this
+       * environment claims nothing — directly above the ADR-051 line saying the live read
+       * failed. One card cannot assert both. `false` makes the client render `unchecked`.
+       */
+      live: labelsRaw !== undefined,
     },
     webhook: buildWebhookHealth({
       configuredUrl: linkage?.webhook?.configuredUrl,
@@ -1287,6 +1460,18 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     ...scoped,
     /** Whether THIS session may use the mutating actions (drives the UI's disabled state). */
     canAdminPlatform: isPlatformAdmin,
+    /**
+     * Per-flavor live readiness (ADR-051) — empty when the allowlist read failed, so the client
+     * renders `unchecked` rather than marking every flavor broken on a transient SSM error.
+     *
+     * `runnerLabels.labels` above already carries the allowlist itself, so it is NOT repeated
+     * here: one field, one meaning.
+     */
+    readiness: snapshot.live ? reconcileFlavors(catalogForReadiness(), snapshot) : [],
+    /** Allowlist entries that are not a catalog flavor's label (adopt labels, FlavorMap, typos). */
+    unmatchedAllowlistLabels: unmatchedAllowlistLabels(catalogForReadiness(), snapshot.allowlist),
+    /** False when the live allowlist read failed — readiness is unknown, not green. */
+    controlPlaneLive: snapshot.live,
   });
 }
 
@@ -2113,6 +2298,183 @@ async function imageAvailability(): Promise<Record<string, boolean>> {
     names.map(async (n) => [n, await paramExists(`${SSM_PREFIX}/config/image-arn-${n}`)] as const),
   );
   return Object.fromEntries(entries);
+}
+
+/**
+ * The catalog fields readiness reconciliation needs (ADR-051): flavor name + routing label.
+ *
+ * Sourced from the same catalog projection the Flavors view uses, so a flavor cannot appear in
+ * one and be missing from the other.
+ */
+function catalogForReadiness(): ReadinessFlavor[] {
+  return buildFlavorViews({}).map((f) => ({ name: f.name, label: f.label }));
+}
+
+/**
+ * Just the live claim allowlist — no image probing.
+ *
+ * Separate from `controlPlaneSnapshot` because the two callers need different things: readiness
+ * reconciliation needs both facts, while the Unclaimed screen only compares a refusal's stored
+ * allowlist against the current one. Using the full snapshot there would fire one
+ * `DescribeParameters` per catalog flavor on every page load to compute image presence nothing
+ * renders.
+ *
+ * Fails soft for the same reason as the full snapshot: `live: false` degrades the comparison to
+ * "unknown" instead of claiming the allowlist is empty, which would badge every refusal as
+ * changed.
+ *
+ * UNCACHED (`ttlMs = 0`), like every other allowlist read in this handler (`settingsRoute`,
+ * `putRunnerLabelsRoute`). `getParam`'s default is a 5-minute per-container cache, and the label
+ * write goes through the appcfg broker, which cannot invalidate this Lambda's cache. Cached, the
+ * sequence this surface exists to serve breaks: an operator reads `label-not-allowlisted` on
+ * Unclaimed, adds the label in Settings, comes back — and the same warm container serves the OLD
+ * list for up to five minutes, so `config changed` stays dark and the screen asserts "still
+ * broken" about a fix that already landed. The word rendered beside it is `Live`.
+ *
+ * Reads `RUNNER_LABELS_PARAM`, the SAME module constant every sibling allowlist reader uses
+ * (`settingsRoute`, `putRunnerLabelsRoute`), NOT a locally rebuilt `${SSM_PREFIX}/...` literal.
+ * The two are equal in the deployed stack (both derive from `ssmPrefix`), so this is not a live
+ * defect — but the constant exists because the path is env-overridable, and a second hard-coded
+ * copy is precisely the console-versus-control-plane divergence ADR-051 exists to remove: with
+ * `RUNNER_LABELS_PARAM` overridden, Settings would edit one parameter while Unclaimed, Flavors
+ * and workflow readiness reconciled against another, reporting `config changed` and `unroutable`
+ * against a list nothing claims on. It would also fall outside the Mgmt λ's `GetParameter` grant,
+ * so the surface would fail soft to "unknown" for a reason no operator could see.
+ */
+async function allowlistSnapshot(): Promise<{ allowlist: string[]; live: boolean }> {
+  try {
+    const raw = await getParam(RUNNER_LABELS_PARAM, 0);
+    return { allowlist: raw.split(',').map((l) => l.trim()).filter(Boolean), live: true };
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'allowlist read failed', error: errMsg(err) }));
+    return { allowlist: [], live: false };
+  }
+}
+
+/**
+ * Which flavors have a published `image-arn-<name>` parameter — or `undefined` when the check
+ * could not be performed.
+ *
+ * `undefined` rather than `{}` on failure (ADR-051): `{}` is a positive claim that no flavor has
+ * an image, which would render the whole catalog "not built" on a transient SSM error. Presence
+ * only — `DescribeParameters` returns no values, so no SecureString can leak here.
+ */
+async function imageAvailabilityOrUndefined(): Promise<Record<string, boolean> | undefined> {
+  try {
+    return await imageAvailability();
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'image availability read failed', error: errMsg(err) }));
+    return undefined;
+  }
+}
+
+/**
+ * Read the LIVE control plane: the claim allowlist and which flavor images are published
+ * (ADR-051).
+ *
+ * The allowlist is read with `GetParameter`, not `DescribeParameters`: its VALUE is the thing
+ * being reconciled, and it is a plain `String` parameter (an operator-managed list of runner
+ * labels), never a SecureString. The Mgmt λ's grant names this one path explicitly — spec 04's
+ * hard rule is that no SECRET value is readable here, not that no parameter is.
+ *
+ * Fails SOFT, and the two facts fail INDEPENDENTLY. `live` is the AND of both, because readiness
+ * reconciliation needs both to derive a state. But the image map keeps its own liveness
+ * (`undefined` = unread), so an allowlist failure cannot make the Flavors table claim every image
+ * is missing — the catalog projection would otherwise report a confident "not built" for an
+ * evidence-free reason. A false alarm on this surface is worse than a missing one: it is the
+ * surface whose whole purpose is to be trusted when it warns.
+ */
+async function controlPlaneSnapshot(): Promise<ControlPlaneSnapshot> {
+  const [labels, imagePublished] = await Promise.all([
+    allowlistSnapshot(),
+    imageAvailabilityOrUndefined(),
+  ]);
+  if (!labels.live || imagePublished === undefined) {
+    console.error(
+      JSON.stringify({
+        msg: 'control-plane snapshot incomplete',
+        allowlistLive: labels.live,
+        imagesLive: imagePublished !== undefined,
+      }),
+    );
+  }
+  return {
+    allowlist: labels.allowlist,
+    imagePublished,
+    live: labels.live && imagePublished !== undefined,
+  };
+}
+
+/**
+ * Per-flavor readiness, or `undefined` when the live read failed.
+ *
+ * `undefined` rather than an all-`unroutable` array on purpose: the caller must be able to tell
+ * "the control plane cannot run this" from "we could not ask", and only the first is a warning.
+ */
+async function flavorReadinessOrUndefined(): Promise<FlavorReadiness[] | undefined> {
+  const snapshot = await controlPlaneSnapshot();
+  if (!snapshot.live) return undefined;
+  return reconcileFlavors(catalogForReadiness(), snapshot);
+}
+
+/**
+ * Unclaimed (refused) jobs — the console surface for a claim the platform declined (ADR-050).
+ *
+ * Authorization is the same post-query installation filter every run list uses (`collectVisible`),
+ * because the refusal indexes are keyed by repo/time, not by installation.
+ *
+ * That filter is exactly why the cursor is SEALED (ADR-052), and this is the route where it bites
+ * hardest: the platform-wide branch walks a cross-tenant index, so the boundary row the store's
+ * cursor names routinely belongs to an installation this session may not administer, carrying
+ * `REFUSAL#<repoId>#<runId>#<jobId>` and a timestamp. The two branches get DISTINCT scopes so a
+ * cursor minted platform-wide cannot be replayed against `?repo=`, whose visible sequence differs.
+ */
+async function listRefusalsRoute(
+  session: SessionPayload,
+  q: Record<string, string | undefined>,
+  secret: string,
+): Promise<Reply> {
+  const limit = parseLimit(q.limit);
+  const installationIds = grantedInstallationIds(session);
+  const visible = (rows: RefusalRecord[]): RefusalRecord[] =>
+    rows.filter((r) => canAdminInstallation(session, r.installationId));
+
+  let page: Page<RefusalRecord>;
+  let scope: CursorScope;
+  if (q.repo !== undefined) {
+    const repoId = asPositiveInt(q.repo);
+    if (!repoId) return problem(400, 'repo must be a numeric repo id');
+    scope = { view: 'unclaimed:repo', installationIds, repoId };
+    const opened = openCursor(q.cursor, scope, secret);
+    if (!opened.ok) return problem(400, CURSOR_REFUSED);
+    page = await collectVisible(
+      (cursor) => listRefusalsByRepo(repoId, { limit, cursor }),
+      visible,
+      limit,
+      opened.cursor,
+    );
+  } else {
+    scope = { view: 'unclaimed', installationIds };
+    const opened = openCursor(q.cursor, scope, secret);
+    if (!opened.ok) return problem(400, CURSOR_REFUSED);
+    page = await collectVisible(
+      (cursor) => listRefusals({ limit, cursor }),
+      visible,
+      limit,
+      opened.cursor,
+    );
+  }
+
+  // The live allowlist is echoed so the UI can show what it is NOW alongside what it was when
+  // each job was refused: "you already fixed this, re-run the job" and "this is still broken"
+  // look identical without both. Only the allowlist — image presence is not rendered here.
+  const snapshot = await allowlistSnapshot();
+  return unclaimedList({
+    unclaimed: sortRefusalsNewestFirst(page.runs).map(toRefusalView),
+    nextCursor: sealCursorOrNull(page.nextCursor, scope, secret),
+    allowlist: snapshot.allowlist,
+    controlPlaneLive: snapshot.live,
+  });
 }
 
 // ---- authorization helpers -------------------------------------------------

@@ -122,15 +122,53 @@ A control-plane λ is throwing. Read its log group; the handlers log structured 
 
 ## Common diagnoses
 
-**"Jobs queue in GitHub but nothing ever starts."** Work the chain in order — the first
-missing link explains it:
+**"Jobs queue in GitHub but nothing ever starts."** Start in the console: **Unclaimed**
+(`#/unclaimed`) lists every job the claim gate refused, with the reason, a fix, the job's labels,
+and the runner-label allowlist as it was at refusal time versus now (ADR-050). If the job is
+there, the answer is there — no AWS access needed.
+
+If it is NOT there, work the chain in order — the first missing link explains it:
 1. Is the webhook arriving? GitHub App → Advanced → Recent Deliveries (expect 202).
 2. Did we claim it? `aws logs filter-log-events --log-group-name /aws/lambda/lca-<env>-ingest
-   --filter-pattern '{ $.msg = "job claimed" }'`. A `claimed: false` response carries a
-   `reason` naming the gate that declined (no LCA label, repo opted out, compat block).
+   --filter-pattern '{ $.msg = "job claimed" }'`. For refusals:
+   `--filter-pattern '{ $.msg = "job not claimed*" }'` — the line carries `code`, `jobLabels`,
+   the live `claimedLabels` snapshot, `mode`, `reason` and `fix`. A `code` of
+   `label-not-allowlisted` means the job named an LCA label the live allowlist does not have.
+
+   **An absent line here is not evidence the webhook never arrived.** A job that is not on
+   Unclaimed was refused for an ordinary reason (`no-lca-label` / `no-standard-label`), and that
+   lane is **sampled 1-in-100** by design — 99 of every 100 leave no log line at all (ADR-050).
+   So for the un-onboarded case, go to step 1 (Recent Deliveries) for arrival evidence, or
+   confirm the decision was correct by reading the repo's mode and the allowlist rather than by
+   grepping for a line that is probably not there. Only actionable refusals — the ones on
+   Unclaimed — are logged on every delivery.
 3. Did a runner register? The run row's `status` tells you how far it got:
    `queued` (never provisioned) → `provisioning` (launch attempted) → `running`.
 4. Did the VM boot? Run logs, stream = the run's `microvmId`.
+
+**"The console says the job routes to flavor X and is eligible, but it never runs."** Routing
+preview is computed from the catalog; runnability needs the LIVE control plane (ADR-051). Check
+**Flavors** — the `Runnable` column reconciles both live facts, and the state names which is
+missing:
+
+| State | Meaning | Fix |
+|---|---|---|
+| `unroutable` | label not allowlisted AND no image | build the image, then add the label |
+| `unclaimable` | image exists, label not allowlisted | add the label to `runner-labels` |
+| `imageMissing` | label allowlisted, no image | `npm run build:images -- --flavor <name>` |
+
+Read the same two facts directly if you prefer:
+
+```sh
+aws ssm get-parameter --name /lca/<env>/config/runner-labels \
+  --region <lca-region> --query Parameter.Value --output text
+aws ssm get-parameters-by-path --path /lca/<env>/config/ --region <lca-region> \
+  --query 'Parameters[?contains(Name,`image-arn`)].[Name,Value]' --output text
+```
+
+The allowlist is consulted by the claim gate **before** routing, so a missing label produces a
+silently unclaimed job; a missing image produces a claimed job that fails in provisioning. Use
+the LCA deployment's own pinned region here — not the workload's.
 
 **A run is stuck non-terminal.** The Reaper sweeps every 5 minutes and marks lifetime-capped
 or orphaned runs `timed_out`/`failed`. If a run sits `running` longer than a job plausibly

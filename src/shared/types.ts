@@ -440,6 +440,62 @@ export interface WorkflowAnalysisRecord {
   updatedAt: string;
 }
 
+/**
+ * A refused (unclaimed) job, persisted so the console can show WHY a queued job never became a
+ * run (ADR-050). Deliberately NOT a `RunRecord` with a new status: a refusal is not a run, and
+ * folding it into `RunStatus` would put a never-launched job into the health rollup, the
+ * active-run count, cost eligibility and every report's status vocabulary.
+ *
+ * Keys (single-table, ADR-009): PK = `REFUSAL#<repoId>#<runId>#<jobId>`, SK = `REFUSAL`.
+ * GSI1 = `REFUSALS` / `lastSeenAt` (platform-wide, most recent first) — a different partition
+ * value from the run store's `RUNSTATUS#<status>`, so the two never mix in one query.
+ * GSI2 = `REPOREFUSALS#<repoId>` / `lastSeenAt` (per repo, same ordering) — likewise distinct
+ * from `REPORUNS#<repoId>`.
+ *
+ * Only ACTIONABLE refusals are written (`classifyRefusal`): the ordinary "no LCA label" answer
+ * to an un-onboarded repo's `ubuntu-latest` job is high-volume and expected, and writing a row
+ * per such job would both cost money and bury the misconfiguration this record exists to show.
+ */
+export interface RefusalRecord {
+  repoId: number;
+  repoFullName: string;
+  installationId: number;
+  runId: number;
+  jobId: number;
+  /** Stable machine tag (`src/ingest/refusal.ts` — `RefusalCode`). */
+  code: string;
+  /** Operator-facing explanation of the refusal. */
+  reason: string;
+  /** Actionable remedy, when the code has one. */
+  fix?: string;
+  /** The job's `runs-on` labels, verbatim from the webhook. */
+  labels: string[];
+  /**
+   * The LIVE allowlist snapshot at refusal time (`/lca/<env>/config/runner-labels`). Stored
+   * because it is the other half of the diagnosis and it CHANGES: without it, a refusal read
+   * an hour later cannot show what the allowlist actually said when the job was refused.
+   */
+  claimedLabels: string[];
+  /** Repo onboarding mode in force at refusal time. */
+  mode: RepoMode;
+  workflowName?: string;
+  jobName?: string;
+  /** Non-default runner group, when that was the refusal. */
+  runnerGroup?: string;
+  /** First delivery of this (repo, run, job) refusal — write-once, so "since when" survives. */
+  firstSeenAt: string;
+  /**
+   * Most recent delivery, and BOTH GSI sort keys. GitHub re-delivers, and a user re-runs a stuck
+   * job — either way a recurring refusal must rise in the list rather than sink below the head
+   * page on the strength of when it first happened.
+   */
+  lastSeenAt: string;
+  /** Deliveries seen. >1 means the operator is still hitting it, not that it happened once. */
+  occurrences: number;
+  /** Epoch seconds — DynamoDB TTL, same retention as terminal run rows (ADR-033). */
+  ttl?: number;
+}
+
 /** Thrown by `parseWorkflow` when the YAML is malformed / not a mapping. Catchable by callers. */
 export class WorkflowParseError extends Error {
   readonly path: string;

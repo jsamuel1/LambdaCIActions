@@ -259,7 +259,12 @@ const SRC = fileURLToPath(new URL('../src/', import.meta.url));
  * one back to its SERVER-side caller (`collectVisible` returns `{ runs, nextCursor }`). None of
  * them build a response body. Everything else under `src/` is treated as route code.
  */
-const CURSOR_OWNERS = ['shared/cursor.ts', 'shared/run-store.ts', 'mgmt/paging.ts'];
+const CURSOR_OWNERS = [
+  'shared/cursor.ts',
+  'shared/run-store.ts',
+  'shared/refusal-store.ts',
+  'mgmt/paging.ts',
+];
 
 /**
  * Strip comments before scanning. The guards below match on shapes like
@@ -550,13 +555,26 @@ test('a route cannot smuggle a cursor into a body by shorthand', () => {
 
 test('a paginated response body types its cursor as string | null', () => {
   // The type layer only bites where a body is declared. If a route hands `nextCursor` to an
-  // untyped `json()` body, `RawCursor` is assignable and the leak compiles — so pin that the
-  // runs list keeps its declared contract.
+  // untyped `json()` body, `RawCursor` is assignable and the leak compiles — so pin that every
+  // paginated list keeps its declared contract. `/api/unclaimed` is here because it arrived
+  // AFTER this rule (PR #34) already returning `page.nextCursor ?? null` against an undeclared
+  // body: the declaration is what turned that into a compile error instead of a runtime throw.
   assert.match(HANDLER, /interface RunListBody \{[^}]*nextCursor: string \| null;/s);
+  assert.match(HANDLER, /interface UnclaimedListBody \{[^}]*nextCursor: string \| null;/s);
+  // One seal per paginated RESPONSE, not per branch: the runs list seals in each of its two
+  // branches because they return separately, while the unclaimed list assigns a branch-specific
+  // `scope` and then seals once on the shared way out. What pins the per-branch scope is
+  // `guardedOpens === 4` below plus the runtime cross-scope refusal tests — a seal count cannot
+  // see which scope it was handed. A new paginated response must add its seal here.
   const sealed = [...HANDLER.matchAll(/nextCursor: sealCursorOrNull\(/g)];
-  assert.equal(sealed.length, 2, 'both paginated runs branches seal');
-  // …and that they return through the typed helper rather than a bare `json(200, {…})`.
-  assert.equal([...HANDLER.matchAll(/return runList\(\{/g)].length, 3, 'all three via runList');
+  assert.equal(sealed.length, 3, 'runs seals per branch (2), unclaimed seals once for both');
+  // …and that they return through the typed helpers rather than a bare `json(200, {…})`.
+  assert.equal([...HANDLER.matchAll(/return runList\(\{/g)].length, 3, 'all three runs via runList');
+  assert.equal(
+    [...HANDLER.matchAll(/return unclaimedList\(\{/g)].length,
+    1,
+    'the unclaimed list returns through its typed helper',
+  );
 });
 
 test('no route reaches through the RawCursor wrapper or re-encodes a key itself', () => {
@@ -582,7 +600,9 @@ test('every route that accepts a cursor opens it before querying', () => {
       assert.ok(around.includes('openCursor('), `${rel}: q.cursor must be opened, near: ${around.slice(-80)}`);
     }
   }
-  assert.ok(guardedOpens(HANDLER) >= 2, 'expected both runs branches to open a cursor');
+  // Four paginated branches accept a cursor (runs?repo, runs?status, unclaimed?repo, unclaimed)
+  // and every one must open it under a scope before it reaches a query.
+  assert.equal(guardedOpens(HANDLER), 4, 'every paginated branch opens its cursor under a scope');
 });
 
 test('a failed open refuses with 400 rather than restarting the walk', () => {
