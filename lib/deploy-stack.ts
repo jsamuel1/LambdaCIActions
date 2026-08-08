@@ -78,6 +78,13 @@ const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
  * between passes) and `lambda:GetFunctionConfiguration` on the mgmt function (to assert
  * `PUBLIC_ORIGIN` actually landed). No IAM action, no `Resource: "*"`, no managed policy.
  *
+ * A third read-only grant serves the report-only flavor reconcile step (ADR-049):
+ * `ssm:GetParameter`/`GetParameters`/`GetParametersByPath` on `/lca/<env>/config/*` only. That
+ * subtree holds the claim allowlist and the `image-arn-*` pointers — non-secret operational
+ * config. `/lca/<env>/github/*` and `/lca/<env>/mgmt/*` (App PEM, webhook secret, OAuth client
+ * secret, console session key) are outside it and stay unreachable from CD. The step carries
+ * no microVM-image authority at all: CD reports drift, it never builds.
+ *
  * **It is nonetheless admin-by-proxy, and honesty about that matters more than the shape of
  * the policy:** the bootstrap `cfn-exec-role` in this account carries `AdministratorAccess`
  * (the CDKToolkit default — `CloudFormationExecutionPolicies` is empty). Anything the deploy
@@ -218,6 +225,24 @@ export class DeployStack extends Stack {
         actions: ['lambda:GetFunctionConfiguration'],
         resources: [
           `arn:${Aws.PARTITION}:lambda:${this.region}:${this.account}:function:lca-${envName}-mgmt`,
+        ],
+      }),
+    );
+
+    // Read-only, and needed by the workflow's report-only flavor reconcile step (ADR-049).
+    // Values, not just presence: the whole point is to compare the LIVE claim allowlist and
+    // the published `image-arn-*` parameters against the catalog, and a presence check is
+    // exactly the weak evidence that let a published-but-nonexistent image look healthy.
+    // Scoped to this env's non-secret `config/` subtree — `/lca/<env>/github/*` and
+    // `/lca/<env>/mgmt/*` (the App PEM, webhook secret, OAuth client secret, session key) are
+    // deliberately NOT reachable, so a compromised CD run cannot read a credential.
+    this.role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadFlavorConfigForReconcile',
+        actions: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath'],
+        resources: [
+          `arn:${Aws.PARTITION}:ssm:${this.region}:${this.account}:parameter/lca/${envName}/config`,
+          `arn:${Aws.PARTITION}:ssm:${this.region}:${this.account}:parameter/lca/${envName}/config/*`,
         ],
       }),
     );

@@ -148,6 +148,33 @@ jobs:
           [ "$got" = '${{ steps.console.outputs.console_url }}' ] \
             || { echo "::error::PUBLIC_ORIGIN is '$got', expected '${{ steps.console.outputs.console_url }}'"; exit 1; }
 
+      # Flavor reconcile — REPORT ONLY (ADR-049).
+      #
+      # Answers "does this environment run what its catalog advertises?", which no repository
+      # test can: the catalog and the docs are repo facts, the claim allowlist and the
+      # `image-arn-*` parameters are deployment facts. On 2026-08-07 the two disagreed for four
+      # of seven flavors and the only symptom was PRs queued for ~7h with no error anywhere.
+      #
+      # Deliberately NOT a fix, NOT a build, and NOT a gate:
+      #  - Building an image is deploy-touching, minutes long, and mutates the plane every
+      #    runner boots from. It also cannot honour its own quiesce precondition here: this job
+      #    IS a microVM, so the fleet is provably non-empty. Builds are a human, workstation-
+      #    pinned action (`npm run build:images -- --flavor <name>`).
+      #  - ADR-047: CI must never deploy LCA-Image-*, and this role has no microVM authority.
+      #
+      # `--no-image-check` keeps it to SSM reads: the deploy role holds `ssm:GetParameter*` on
+      # `/lca/dev/config/*` only (lib/deploy-stack.ts). Verdicts therefore degrade to
+      # `image_unverified` rather than a falsely confident `ok`. `continue-on-error` because a
+      # flavor gap must not fail a management-plane deploy — and because the grant above lands
+      # only when LCA-Deploy-dev is redeployed from a workstation, which is not this workflow's
+      # to do (it is off CD's allowlist by design).
+      - name: Flavor reconcile (report only)
+        id: reconcile
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          npm run flavors:reconcile -- --env dev --no-image-check 2>&1 | tee /tmp/reconcile.txt
+
       - name: Summary
         if: always()
         run: |
@@ -162,6 +189,13 @@ jobs:
             echo "| stacks NOT touched | LCA-Image-dev, LCA-Control-dev, LCA-Data-dev, LCA-Deploy-dev |"
             echo "| commit | ${GITHUB_SHA} |"
             echo "| runner | self-hosted microVM (lambda-ci-node) |"
+            echo "| flavor reconcile | ${{ steps.reconcile.outcome }} (report only, ADR-049) |"
+            echo
+            echo "### Flavor reconcile (report only)"
+            echo
+            echo '```'
+            cat /tmp/reconcile.txt 2>/dev/null || echo '(reconcile produced no output)'
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           mkdir -p .agents/cd-artifacts
           {

@@ -43,30 +43,62 @@ test('a flavor label absent from the claim list is silently never claimed', () =
   assert.equal(shouldClaim(job('queued', ['self-hosted', 'lambda-ci-python']), CLAIMED), false);
 });
 
-test('the documented runner-labels seed claims EVERY catalog flavor label', () => {
-  // DEPLOY-M1 phase 0 is the only place an operator learns what to put in this parameter, so
-  // the command it prints must stay a superset of the catalog. Adding a flavor without
-  // extending that seed fails here instead of in a queued-forever job.
+test('DEPLOY-M1 documents the full claim-label set for EVERY catalog flavor', () => {
+  // DEPLOY-M1 phase 0 is the only place an operator learns what this parameter is for, so the
+  // label set it prints must stay a superset of the catalog. Adding a flavor without extending
+  // that reference fails here instead of in a queued-forever job.
+  //
+  // NOTE the shape this asserts, and why it changed (ADR-049). It used to parse the
+  // `put-parameter --value '...'` seed COMMAND and require that to list every flavor. That was
+  // wrong in the harmful direction: pre-seeding a label for a flavor whose image does not
+  // exist yet makes ingest CLAIM those jobs and fail them in provisioning, after the
+  // GitHub-hosted fallback is already gone. The seed command now bootstraps `lambda-ci` only
+  // and `build:images` appends each label after its image verifies, so what must be complete
+  // is the documented REFERENCE set, not the initial write.
   const catalog = JSON.parse(
     fs.readFileSync(path.join(REPO_ROOT, 'microvm', 'flavors.json'), 'utf8'),
   );
   const deploy = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOY-M1.md'), 'utf8');
-  const seeded = [...deploy.matchAll(/--value '([^']*lambda-ci[^']*)'/g)]
+  // Scope to FENCED CODE BLOCKS only. A bare document-wide search for `lambda-ci*` would be
+  // satisfied by prose — including prose saying a label must NOT be seeded — so the reference
+  // block this test exists to protect could be deleted while the guard stayed green. What an
+  // operator can copy is what counts.
+  const fenced = [...deploy.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].map((m) => m[1]).join('\n');
+  assert.ok(fenced.length > 0, 'DEPLOY-M1 has no fenced blocks — has the runbook been rewritten?');
+  const documented = [...fenced.matchAll(/(lambda-ci[A-Za-z0-9,-]*)/g)]
     .flatMap((m) => m[1].split(','))
     .map((l) => l.trim())
     .filter(Boolean);
-  assert.ok(seeded.length > 0, 'DEPLOY-M1 no longer shows a runner-labels seed command');
+  assert.ok(documented.length > 0, 'DEPLOY-M1 no longer documents any runner label');
   for (const flavor of catalog.flavors) {
     assert.ok(
-      seeded.includes(flavor.label),
-      `DEPLOY-M1's runner-labels seed omits '${flavor.label}' (flavor ${flavor.name}) — jobs ` +
-        'with that label would be dropped by shouldClaim before resolution ever runs',
+      documented.includes(flavor.label),
+      `DEPLOY-M1 never mentions '${flavor.label}' (flavor ${flavor.name}) — jobs with that ` +
+        'label are dropped by shouldClaim before resolution ever runs, and an operator reading ' +
+        'the runbook would have no way to know the label exists',
     );
-    // ...and the seed must be a value the gate actually accepts.
+    // ...and the documented label must be a value the gate actually accepts.
     assert.equal(
-      shouldClaim(job('queued', ['self-hosted', flavor.label]), seeded),
+      shouldClaim(job('queued', ['self-hosted', flavor.label]), documented),
       true,
-      `${flavor.label} should be claimed with the documented seed`,
+      `${flavor.label} should be claimed once documented`,
+    );
+  }
+});
+
+test('DEPLOY-M1 does not seed a label for a flavor phase 2 has not built', () => {
+  // The ordering rule, asserted against the runbook (ADR-049). A seed command that pre-claims
+  // every flavor label recreates the label-without-image state on a fresh environment: phase 0
+  // runs before phase 2, so every one of those labels is claimed with no image behind it.
+  const deploy = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOY-M1.md'), 'utf8');
+  const seeds = [...deploy.matchAll(/--value '([^']*lambda-ci[^']*)'/g)].map((m) => m[1]);
+  for (const seed of seeds) {
+    const labels = seed.split(',').map((l) => l.trim()).filter(Boolean);
+    assert.deepEqual(
+      labels,
+      ['lambda-ci'],
+      `DEPLOY-M1 seeds ${labels.length} labels (${seed}); phase 0 must seed only the base ` +
+        'label — build:images adds each flavor label after that flavor\'s image verifies',
     );
   }
 });

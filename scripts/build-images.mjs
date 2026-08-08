@@ -5,13 +5,33 @@
  * `lambda-microvms` API (2025-09-09).
  *
  * For each flavor in microvm/flavors.json:
+ *   0. Refuse unless the fleet is quiescent (zero non-terminated microVMs, ALL pages).
  *   1. Stage the flavor's Dockerfile.<flavor> as `Dockerfile` in a temp build context.
  *   2. Zip the microvm/ context.
  *   3. Upload the zip to the image code bucket (from ImageStack; discovered via SSM).
  *   4. `aws lambda-microvms create-microvm-image` from the uploaded context (requires a
- *      base image ARN + build role ARN + code-artifact uri).
- *   5. Poll `get-microvm-image` until state=CREATED; prune old image versions (keep last N).
+ *      base image ARN + build role ARN + code-artifact uri). An image that already exists is
+ *      UPDATED instead (a rebuild adds a version) — see `--rebuild`.
+ *   5. Poll `get-microvm-image` until state=CREATED/UPDATED; prune old versions (keep last N).
  *   6. Publish the resulting image ARN to SSM: <ssmPrefix>/config/image-arn-<flavor>.
+ *   7. ONLY THEN add the flavor's label to <ssmPrefix>/config/runner-labels (ADR-049).
+ *
+ * ## Step 7 is an ordering guarantee, not a convenience (ADR-049)
+ *
+ * The claim allowlist and the image are two independent pieces of live state, and the order
+ * in which they are written decides which failure an operator gets:
+ *
+ *   - image, then label  → the flavor is unreachable until it is ready, then works. The
+ *     intermediate state is a job that stays queued on GitHub and can still be run by a
+ *     GitHub-hosted runner.
+ *   - label, then image  → ingest CLAIMS the job (`shouldClaim` passes), provisioning then
+ *     fails because there is no image, and the job has already lost its GitHub-hosted
+ *     fallback. Strictly worse.
+ *
+ * So this script writes the image ARN first and refuses to add a label whose image is not in
+ * a usable state (`mayClaimLabel`, src/shared/flavor-reconcile.ts — the same predicate the
+ * reconcile CLI uses, and the one the console health item must use when it lands, so they
+ * cannot disagree).
  *
  * Requires AWS CLI >= 2.35.17 (ships the `lambda-microvms` service). See
  * docs/specs/05-infrastructure.md § Toolchain prerequisites.
@@ -19,9 +39,29 @@
  * Zero npm deps — Node built-ins + AWS CLI (matches create-github-app.mjs conventions).
  *
  * Usage:
- *   node scripts/build-images.mjs --env dev --region us-west-2
- *   node scripts/build-images.mjs --env dev --flavor base       # single flavor
- *   node scripts/build-images.mjs --dry-run                     # print plan, no side effects
+ *   node scripts/build-images.mjs --env dev --region us-west-2   # whole catalog
+ *   node scripts/build-images.mjs --env dev --all                # explicit whole catalog
+ *   node scripts/build-images.mjs --env dev --flavor python       # one flavor (build/rebuild)
+ *   node scripts/build-images.mjs --env dev --flavor node --rebuild
+ *   node scripts/build-images.mjs --env dev --flavor go --skip-label
+ *   node scripts/build-images.mjs --env dev --flavor python --publish-label-only
+ *   node scripts/build-images.mjs --dry-run                       # print plan, no side effects
+ *   node scripts/build-images.mjs --env dev --flavor node --rebuild --force-unquiesced
+ *
+ * ## The quiesce gate is enforced here, not left to the runbook (ADR-049)
+ *
+ * `update-microvm-image` replaces the image every runner in the environment boots from, and the
+ * image-hook contract is a serialized skew window: a VM resuming from a snapshot whose image is
+ * being replaced fails `/run` rather than running degraded (docs/DEPLOY-M1.md phase 2,
+ * docs/VERIFY-DEPLOY-ADR021-M4.md). `flavors:reconcile --fix` already refuses on a live fleet,
+ * and it fixes drift by shelling out to THIS script — so leaving the direct invocation ungated
+ * would mean the documented primary command (`npm run build:images -- --flavor <name>`) is the
+ * only path that can race, which is exactly backwards. The check reads every page: page 1 caps
+ * at 10, so a first-page-only read calls the window quiet while a live VM sits on page 2.
+ *
+ * Observation is not a freeze — pause the other writers too (this repo dogfoods its own
+ * runners, so a merge mid-window strands its jobs). The gate is the floor, not the whole
+ * procedure.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -55,7 +95,45 @@ const ENV = args.env || 'dev';
 let REGION = args.region || null;
 const ONLY_FLAVOR = args.flavor || null;
 const DRY_RUN = Boolean(args['dry-run']);
+const ALL = Boolean(args.all);
+/**
+ * Rebuild an already-published flavor (patch day / base Dockerfile change). Functionally the
+ * update path already runs when the image exists, so this flag exists to make the INTENT
+ * explicit in a runbook line and in the log — and, unlike a fresh build, it must never remove
+ * the label: the flavor stays claimable across the rebuild, which is the whole point of
+ * repointing the ARN only after the new version verifies.
+ */
+const REBUILD = Boolean(args.rebuild);
+/** Add the label for an image that ALREADY exists and verifies. No build. */
+const PUBLISH_LABEL_ONLY = Boolean(args['publish-label-only']);
+/**
+ * Build + publish the ARN but do NOT touch the allowlist. For staging capacity ahead of
+ * advertising it (or for an env whose allowlist is managed elsewhere). Leaves `label_missing`
+ * drift, which `npm run flavors:reconcile` reports and can safely fix later.
+ */
+const SKIP_LABEL = Boolean(args['skip-label']);
+/**
+ * Escape hatch for the quiesce gate, for the one case the gate cannot distinguish: a microVM
+ * wedged in a non-terminal state that the Reaper has not yet collected, when the operator has
+ * already frozen every writer by hand. Deliberately verbose and deliberately logged — it
+ * disables the only automated protection against a mid-boot image swap.
+ */
+const FORCE_UNQUIESCED = Boolean(args['force-unquiesced']);
 const SSM_PREFIX = `/lca/${ENV}`;
+const LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
+
+if (PUBLISH_LABEL_ONLY && SKIP_LABEL) {
+  console.error('ERROR: --publish-label-only and --skip-label are contradictory.');
+  process.exit(2);
+}
+if (ONLY_FLAVOR && ALL) {
+  console.error('ERROR: --flavor and --all are contradictory.');
+  process.exit(2);
+}
+if (PUBLISH_LABEL_ONLY && !ONLY_FLAVOR) {
+  console.error('ERROR: --publish-label-only requires --flavor <name>.');
+  process.exit(2);
+}
 
 // Deploy-target pin (ADR-018): refuse to touch AWS unless .env.local pins the account +
 // region AND the ambient credentials actually resolve to that account. Dry runs exempt.
@@ -94,6 +172,73 @@ function aws(cliArgs, { capture = true } = {}) {
   return r;
 }
 
+/**
+ * Every non-terminated microVM, across ALL pages.
+ *
+ * Pagination is the sharp edge: `list-microvms` caps page 1 at 10 and the CLI applies `--query`
+ * per page, so the obvious one-liner can report an empty fleet while a live VM sits on page 2
+ * (docs/DEPLOY-M1.md phase 2). A partial read here would make the gate worse than no gate — it
+ * would license the swap it exists to prevent.
+ */
+function nonTerminatedMicroVms(reconcile) {
+  const live = [];
+  let token = null;
+  for (;;) {
+    const cmd = ['lambda-microvms', 'list-microvms', '--output', 'json'];
+    if (token) cmd.push('--next-token', token);
+    const r = aws(cmd); // throws on failure: an unreadable fleet is not an empty one
+    const body = JSON.parse(r.stdout);
+    for (const vm of body.items ?? body.microvms ?? []) {
+      // `isLiveMicroVmState` (src/shared/flavor-reconcile.ts) owns the vocabulary: `MicrovmState`
+      // is PENDING|RUNNING|SUSPENDING|SUSPENDED|TERMINATING|TERMINATED, so TERMINATED is the only
+      // terminal state and an unrecognized/absent one counts as live. Excluding anything else
+      // here (a `FAILED` that the model does not define, say) would widen "terminal" and license
+      // the very image swap this gate exists to refuse.
+      if (reconcile.isLiveMicroVmState(vm.state)) live.push(vm);
+    }
+    token = body.nextToken ?? body.NextToken ?? null;
+    if (!token) return live;
+  }
+}
+
+/**
+ * Refuse to build or replace an image while any microVM is live.
+ *
+ * Only guards the BUILD path. `--publish-label-only` writes one label and touches no image, so
+ * gating it on an idle fleet would block the safe half of remediation during ordinary traffic
+ * — and a label add cannot skew a running VM: it changes only which future jobs are claimed.
+ */
+function assertQuiescentFleet(reconcile) {
+  if (DRY_RUN) {
+    console.log('  [dry-run] would require zero non-terminated microVMs (all pages)');
+    return;
+  }
+  const live = nonTerminatedMicroVms(reconcile);
+  if (live.length === 0) {
+    console.log('fleet:          quiescent (0 non-terminated microVMs, all pages)');
+    return;
+  }
+  const listed = live
+    .slice(0, 10)
+    .map((vm) => `  ${vm.microvmId ?? '?'} ${vm.state ?? '?'}`)
+    .join('\n');
+  if (FORCE_UNQUIESCED) {
+    console.warn(
+      `\n!! --force-unquiesced: proceeding with ${live.length} non-terminated microVM(s). A VM ` +
+        'booting from an image being replaced fails /run (ADR-049). Only correct if you have ' +
+        `frozen every writer by hand.\n${listed}`,
+    );
+    return;
+  }
+  throw new Error(
+    `${live.length} non-terminated microVM(s) — refusing to build or replace an image. The ` +
+      'image-hook contract is a serialized skew window: a VM resuming while its image is ' +
+      'replaced fails /run instead of running degraded. Wait for the fleet to drain (and pause ' +
+      'the other writers — this repo dogfoods its own runners), then re-run. ' +
+      `--force-unquiesced overrides, once you know why.\n${listed}`,
+  );
+}
+
 function ssmGet(name) {
   const r = aws(['ssm', 'get-parameter', '--name', name, '--query', 'Parameter.Value', '--output', 'text']);
   return DRY_RUN ? `<${name}>` : r.stdout.trim();
@@ -102,6 +247,122 @@ function ssmGet(name) {
 function ssmPut(name, value) {
   aws(['ssm', 'put-parameter', '--name', name, '--value', value, '--type', 'String', '--overwrite']);
   console.log(`  ✓ published ${name}`);
+}
+
+/** Read a parameter that may not exist yet. Returns `{ value, absent }` — `absent:false` with a
+ *  `null` value means the read FAILED for some other reason (AccessDenied, expired token), which
+ *  is a different fact from an absent parameter and must not be reported as one. */
+function ssmGetOptional(name, reconcile) {
+  if (DRY_RUN) return { value: `<${name}>`, absent: false };
+  const full = REGION
+    ? ['ssm', 'get-parameter', '--name', name, '--query', 'Parameter.Value', '--output', 'text', '--region', REGION]
+    : ['ssm', 'get-parameter', '--name', name, '--query', 'Parameter.Value', '--output', 'text'];
+  const r = spawnSync('aws', full, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  if (r.status === 0) return { value: r.stdout.trim(), absent: false };
+  const absent = reconcile
+    ? reconcile.classifySsmReadFailure(r.stderr) === 'absent'
+    : false;
+  return { value: null, absent, stderr: (r.stderr || '').trim().split('\n')[0] };
+}
+
+/**
+ * Concrete image state: a state string, `null` when the API says the image does not exist, or
+ * `undefined` when we could not find out (AccessDenied, expired token, throttling, an AWS CLI
+ * with no `lambda-microvms` service). The three are different facts, and `ensureLabel` must not
+ * tell an operator their freshly built image is "absent" when the truth is that we never asked
+ * successfully — see classifyImageProbeFailure in src/shared/flavor-reconcile.ts.
+ */
+function imageState(imageArn, reconcile) {
+  if (DRY_RUN) return 'CREATED';
+  const full = REGION
+    ? ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn, '--region', REGION]
+    : ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn];
+  const r = spawnSync('aws', full, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  if (r.status !== 0) {
+    return reconcile.classifyImageProbeFailure(r.stderr) === 'absent' ? null : undefined;
+  }
+  try {
+    const state = JSON.parse(r.stdout).state;
+    // A 200 whose body carries no `state` is a response we could not INTERPRET, not an image
+    // that is gone: `null` here would mean "absent", and absence is a claim only the API's own
+    // ResourceNotFoundException can make. Returning unknown keeps `ensureLabel`'s refusal
+    // honest ("could not read") instead of sending an operator to rebuild a healthy image.
+    return typeof state === 'string' && state.length > 0 ? state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Add a flavor's label to the live claim allowlist — the SECOND half of the ordering contract
+ * (ADR-049), and only ever after its image verifies.
+ *
+ * Refuses rather than warns. `mayClaimLabel` requires a published ARN AND a usable state, so
+ * an unverifiable image cannot be talked into a label write by a caller in a hurry: adding the
+ * label first is what turns a recoverable queued job into a claimed job that dies in
+ * provisioning with its GitHub-hosted fallback already given away.
+ *
+ * Append-only and idempotent (`addRunnerLabel`), so it preserves non-catalog labels an
+ * operator put there for a FlavorMap (`ubuntu-latest`, ADR-030) and rewrites nothing when the
+ * label is already present.
+ */
+function ensureLabel(flavor, imageArn, reconcile) {
+  const state = imageState(imageArn, reconcile);
+  if (!reconcile.mayClaimLabel({ imageArn, imageState: state })) {
+    // `undefined` and `null` both refuse, but they are different diagnoses and the message must
+    // say which: "absent" sends an operator to rebuild an image that may be perfectly fine.
+    const why =
+      state === undefined
+        ? 'could NOT be read (credential or AWS CLI problem — the microVM API is separate ' +
+          'from SSM, and `lambda-microvms` needs aws >= 2.35.17)'
+        : `${state ?? 'absent'}, not a usable state (${[...reconcile.USABLE_IMAGE_STATES].join('/')})`;
+    throw new Error(
+      `refusing to add '${flavor.label}' to ${LABELS_PARAM}: image ${imageArn} is ${why}. ` +
+        'Label-before-image would make ingest claim jobs it cannot run (ADR-049).',
+    );
+  }
+  const current = ssmGetOptional(LABELS_PARAM, reconcile);
+  if (current.value === null) {
+    if (current.absent) {
+      console.log(
+        `  ! ${LABELS_PARAM} does not exist — seed it first (docs/DEPLOY-M1.md phase 0). ` +
+          'Not creating it here: the parameter is the whole claim allowlist, and creating it ' +
+          'from one flavor would silently DROP every label an operator had seeded.',
+      );
+      return false;
+    }
+    // Unreadable is not absent. Telling an operator to seed a parameter that may already hold
+    // a full allowlist invites exactly the overwrite the branch above exists to prevent.
+    throw new Error(
+      `could not read ${LABELS_PARAM} (${current.stderr}) — this is NOT the same as the ` +
+        'parameter being absent, so refusing to guess. Fix the credential/region and re-run; ' +
+        `the image ARN is already published, so \`--publish-label-only\` will finish the job.`,
+    );
+  }
+  const { value, changed } = reconcile.addRunnerLabel(current.value, flavor.label);
+  if (!changed) {
+    console.log(`  ✓ '${flavor.label}' already claimed in ${LABELS_PARAM}`);
+    return false;
+  }
+  ssmPut(LABELS_PARAM, value);
+  console.log(`  ✓ claimed '${flavor.label}' (image ${state}) → ${value}`);
+  return true;
+}
+
+/**
+ * The shared catalog-vs-live derivation (src/shared/flavor-reconcile.ts, via dist/). Imported
+ * rather than reimplemented so this script, `flavors:reconcile` and the console cannot form
+ * three different opinions about whether a flavor is runnable.
+ */
+async function loadReconcile() {
+  try {
+    return await import(path.join(REPO_ROOT, 'dist', 'src', 'shared', 'flavor-reconcile.js'));
+  } catch {
+    console.error(
+      'ERROR: dist/src/shared/flavor-reconcile.js not found — run `npm run build` first.',
+    );
+    process.exit(1);
+  }
 }
 
 function loadFlavors() {
@@ -164,7 +425,7 @@ function buildFlavor(flavor, ctx) {
   // state:CREATING }; poll get-microvm-image for CREATED.
   const imageName = `lca-${ENV}-${flavor.name}`;
   const imageArnFull = `arn:aws:lambda:${ctx.region}:${ctx.accountId}:microvm-image:${imageName}`;
-  const exists = imageExists(imageArnFull);
+  const exists = imageExists(imageArnFull, ctx.reconcile);
   const commonArgs = [
     '--base-image-arn',
     ctx.baseImageArn,
@@ -233,19 +494,34 @@ function buildFlavor(flavor, ctx) {
   pollUntilCreated(imageArn);
   pruneOldVersions(imageArn);
 
+  // Image ARN FIRST (ADR-049). A rebuild repoints this only after the new version verified,
+  // so the flavor is never advertised against an image that does not exist.
   ssmPut(`${SSM_PREFIX}/config/image-arn-${flavor.name}`, imageArn);
   return imageArn;
 }
 
 // True if a microVM image already exists at this ARN (so we update vs create).
 // get-microvm-image requires the FULL ARN (a bare name → ValidationException).
-function imageExists(imageArn) {
+//
+// A failed probe is NOT the same as "does not exist" (ADR-049). Reading an AccessDenied or an
+// expired token as absence sends the script down the CREATE path for an image that is already
+// there, whose only outcome is a ValidationException blaming the name — so the operator is told
+// their image name is wrong when the truth is that we never managed to look. Refuse instead: we
+// cannot choose between create and update without knowing which one applies.
+function imageExists(imageArn, reconcile) {
   if (DRY_RUN) return false;
   const full = REGION
     ? ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn, '--region', REGION]
     : ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn];
   const r = spawnSync('aws', full, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  return r.status === 0;
+  if (r.status === 0) return true;
+  if (reconcile.classifyImageProbeFailure(r.stderr) === 'absent') return false;
+  throw new Error(
+    `could not read ${imageArn} to decide create-vs-update: ` +
+      `${(r.stderr || '').trim().split('\n')[0]}. This is NOT evidence the image is absent, so ` +
+      'refusing to guess. Check the credential/region and that `aws` is >= 2.35.17 ' +
+      '(`aws lambda-microvms help`).',
+  );
 }
 
 function pollUntilCreated(imageArn) {
@@ -317,8 +593,52 @@ function discoverBaseImageArn() {
   return (al2023 || items[0]).imageArn;
 }
 
-function main() {
-  const flavors = loadFlavors();  console.log(`Building ${flavors.length} flavor(s) for env=${ENV}${DRY_RUN ? ' (dry-run)' : ''}`);
+async function main() {
+  const reconcile = await loadReconcile();
+  const flavors = loadFlavors();
+
+  // --publish-label-only: no build at all. Reads the published ARN, verifies the image, then
+  // adds the label. This is the safe half of `flavors:reconcile --fix` for the
+  // `label_missing` case (built capacity that can never be selected).
+  if (PUBLISH_LABEL_ONLY) {
+    const flavor = flavors[0];
+    const arnParam = `${SSM_PREFIX}/config/image-arn-${flavor.name}`;
+    const published = ssmGetOptional(arnParam, reconcile);
+    const arn = published.value;
+    if (!arn) {
+      // Absent and unreadable are different facts here too, and the wrong one is expensive:
+      // "not published" sends the operator to `build:images`, a slow, deploy-touching image
+      // build, on the strength of what may be nothing more than an expired token. Only say the
+      // ARN is missing when SSM actually said ParameterNotFound.
+      if (!published.absent) {
+        throw new Error(
+          `could not read ${arnParam} (${published.stderr}) — this is NOT the same as the ` +
+            'parameter being absent, so refusing to guess. Fix the credential/region and ' +
+            're-run; do NOT rebuild the image on the strength of a failed read.',
+        );
+      }
+      throw new Error(
+        `no ${arnParam} published — build the image first ` +
+          `(\`npm run build:images -- --flavor ${flavor.name}\`). Adding '${flavor.label}' now ` +
+          'would make ingest claim jobs that cannot be provisioned (ADR-049).',
+      );
+    }
+    console.log(`\n=== flavor: ${flavor.name} (label publish only) ===`);
+    console.log(`  published ARN: ${arn}`);
+    ensureLabel(flavor, arn, reconcile);
+    console.log('\nDone.');
+    return;
+  }
+
+  console.log(
+    `${REBUILD ? 'Rebuilding' : 'Building'} ${flavors.length} flavor(s) for env=${ENV}` +
+      `${DRY_RUN ? ' (dry-run)' : ''}`,
+  );
+
+  // Quiesce BEFORE anything is staged, uploaded or triggered (ADR-049). Cheap, and refusing
+  // after a 200 MB upload would still have raced nothing — but refusing after
+  // `update-microvm-image` would be too late by definition.
+  assertQuiescentFleet(reconcile);
 
   const bucket = DRY_RUN ? '<image-code-bucket>' : ssmGet(`${SSM_PREFIX}/config/image-code-bucket`);
   const buildRoleArn = DRY_RUN
@@ -333,16 +653,34 @@ function main() {
     bucket,
     buildRoleArn,
     baseImageArn,
+    reconcile,
     region: REGION || 'us-west-2',
     accountId: DRY_RUN ? 'ACCOUNT' : accountId(),
   };
   const results = {};
-  for (const flavor of flavors) results[flavor.name] = buildFlavor(flavor, ctx);
+  for (const flavor of flavors) {
+    results[flavor.name] = buildFlavor(flavor, ctx);
+    // Label SECOND, and only for a verified image (ADR-049). A rebuild leaves the label in
+    // place (`ensureLabel` is idempotent) — removing and re-adding it would open a window in
+    // which live jobs stop being claimed.
+    if (SKIP_LABEL) {
+      console.log(
+        `  – --skip-label: '${flavor.label}' NOT added to ${LABELS_PARAM}; the flavor stays ` +
+          'unclaimable until you add it (`npm run flavors:reconcile` reports this as drift)',
+      );
+    } else {
+      ensureLabel(flavor, results[flavor.name], reconcile);
+    }
+  }
 
   console.log('\nDone. Image ARNs published to SSM:');
   for (const [name, arn] of Object.entries(results)) console.log(`  ${name}: ${arn}`);
-  console.log('\nNext: deploy the orchestrator (cdk deploy LCA-Control-<env>).');
+  if (!SKIP_LABEL) {
+    const shown = ssmGetOptional(LABELS_PARAM, reconcile);
+    console.log(`Claim allowlist: ${shown.value ?? (shown.absent ? '(absent)' : '(unreadable)')}`);
+  }
+  console.log('\nNext: `npm run flavors:reconcile` to confirm catalog == live state.');
 }
 
 await guardDeployTarget();
-main();
+await main();

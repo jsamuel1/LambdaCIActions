@@ -2541,3 +2541,181 @@ stays available as a later optimisation.
   resolver is only date-bounded because the route passes the run's `createdAt`, and dropping
   that argument would leave every logs test green while silently degrading resolution to the
   recency fallback — which cannot find a finished run's stream.
+
+---
+
+## ADR-049 — A flavor is published image-first, label-second; drift is a command, not a belief (M5 fix)
+**Status**: Accepted (v1) · amends [ADR-039](#adr-039) (expanded standard set) and
+[ADR-011](#adr-011) (phased deploy) · constrained by [ADR-047](#adr-047) (CD allowlist)
+
+**Context**: `microvm/flavors.json` defined seven flavors. The dev environment could run three.
+
+On 2026-08-07, eight PRs in `jsamuel1/SauhsojVideo` sat `QUEUED` for about seven hours. The
+workflow named `[self-hosted, lambda-ci-python]`; the catalog defined `python`;
+`docs/DEPLOY-M1.md` documented `lambda-ci-python` in its seed command; `test/filter.test.mjs`
+asserted that documented seed covers every catalog label — and all of that was true while the
+deployed plane had neither the label nor the image:
+
+| flavor | live allowlist | `image-arn-*` | image |
+|---|---|---|---|
+| base, node, docker | yes | yes | `UPDATED` |
+| python | no | no | `ResourceNotFoundException` |
+| java, go, rust | no | no | never built |
+
+Live `/lca/dev/config/runner-labels` was `lambda-ci,lambda-ci-node,lambda-ci-docker`.
+
+Three separate gaps produced that, and each is worth naming because the fix addresses all
+three rather than the symptom:
+
+1. **No supported way to build one flavor.** `scripts/build-images.mjs` existed but no
+   workflow invoked it (CD deploys `LCA-Mgmt-dev`/`LCA-Web-dev` only), and publishing the
+   label was a hand-written `aws ssm put-parameter` in a doc. So a catalog entry became
+   capacity only if a human remembered two commands in the right order.
+2. **No way to observe the disagreement.** Nothing compared the catalog to live state. A unit
+   test over `flavors.json` and a doc string cannot: both are repository facts, and the bug
+   was a *deployment* fact. The only symptom was a queued job with no error in any log,
+   because `shouldClaim` refuses before flavor resolution and GitHub discards ingest's 202.
+3. **No ordering rule.** The two writes (image ARN parameter, allowlist label) were
+   independent, and nothing said which comes first.
+
+**Decision**:
+
+**1. Image first, label second — enforced, not documented.** `build-images.mjs` publishes
+`/lca/<env>/config/image-arn-<flavor>` only after the image reaches `CREATED`/`UPDATED`, then
+adds the flavor's label to `/lca/<env>/config/runner-labels`, and **refuses** to add a label
+whose image is not in a usable state (`mayClaimLabel`).
+
+This ordering is a safety property, not a preference, because the two intermediate states are
+not symmetric:
+
+- *image, no label* → the job stays queued on GitHub. Nothing is consumed, and **a
+  GitHub-hosted runner can still take it.** Recoverable, and the operator's own workflow can
+  fall back.
+- *label, no image* → ingest **claims** the job, provisioning then fails. The claim is the
+  damage: GitHub considers the job assigned to a self-hosted runner, so the fallback is
+  already gone. A worse failure, reached faster, with a less obvious cause.
+
+`--skip-label` exists for staging capacity ahead of advertising it; it leaves `label_missing`
+drift, which the reconcile command reports and can safely fix. `--publish-label-only` is the
+other half — an image that already verified, label not yet added.
+
+**2. Rebuild repoints, never unpublishes.** `create-microvm-image` is not idempotent, so an
+existing image is UPDATED (a new version) — build, verify, then repoint the ARN. The label is
+left alone across a rebuild (`ensureLabel` is idempotent and append-only): removing and
+re-adding it would open a window in which live jobs stop being claimed, which is the exact
+harm this ADR is about. `--flavor <name>` does one; the default (or `--all`) does the set.
+
+**3. `npm run flavors:reconcile` — drift is a command.** Read-only by default: per flavor it
+prints catalog ∙ live allowlist ∙ ARN parameter ∙ **real image state**, and exits non-zero on
+drift. It is pinned to a deploy target (ADR-018/ADR-037) with no dry-run exemption, because an
+unpinned read produces a confident report about the wrong environment — and a
+`ParameterNotFound` from the wrong region is indistinguishable from a missing flavor. That is
+not hypothetical: SauhsojVideo's own workload region differs from LCA's, and querying the
+former is what first suggested the parameters did not exist at all.
+
+Checking that a parameter *exists* is not evidence the image does. The published ARN for
+`python` would have looked fine to a presence check; `get-microvm-image` returned
+`ResourceNotFoundException`. So the CLI resolves the concrete image state, and its
+`--no-image-check` mode (for a credential without the microVM API) degrades to
+`image_unverified` rather than `ok` — an unchecked image is *unknown*, not present.
+
+**4. `--fix` moves in the safe direction only.** Build a missing image, or add a label for an
+image that verifies. It **never removes a label**: that takes routing away from jobs which may
+depend on it right now, and "advertised but unbuildable" is a decision (build it, or delete
+the catalog entry), not a cleanup. `--fix` is rejected outright with `--no-image-check`.
+
+**4b. The quiesce gate lives in `build-images`, not only in `--fix`.** Both commands refuse on a
+non-quiescent fleet, enumerating **all pages** of non-terminated microVMs — the image-hook
+contract has a serialized skew window, and a VM resuming from a snapshot whose image is being
+replaced fails `/run` instead of running degraded. Putting the gate only in `--fix` would have
+left the *documented primary command* (`npm run build:images -- --flavor <name>`) as the one path
+that could race, while its own wrapper was safe — and `--fix` remediates by shelling out to that
+very script. `--publish-label-only` is exempt: a label write cannot skew a running VM, it only
+changes which future jobs are claimed, and gating it would block the safe half of remediation
+during ordinary traffic. `--force-unquiesced` exists for a VM wedged non-terminal that the Reaper
+has not collected, and is logged loudly. The gate is a floor, not the whole procedure: pause the
+other writers too.
+
+The terminal set is `TERMINATED` and nothing else, taken from the deployed service model rather
+than guessed: `MicrovmState` (lambda-microvms 2025-09-09) is
+`PENDING | RUNNING | SUSPENDING | SUSPENDED | TERMINATING | TERMINATED`. There is no `FAILED`
+microVM state — `FAILED` belongs to `BuildState`/`MicrovmImageVersionState`, which describe an
+image *build*. Treating it as terminal would widen the terminal set beyond the model in the one
+direction a safety gate must not widen, because a state the gate calls terminal is a VM whose
+image it will replace. `TERMINATING` is deliberately live, and an absent or unrecognized state
+counts as live: "I do not know what this VM is doing" resolves to refusing the swap. The
+predicate is `isLiveMicroVmState` in the shared module, so the two gates cannot drift apart.
+
+**4c. Exit codes distinguish "the plane disagrees" from "do not trust this report."** 1 is drift
+— including drift `--fix` will not touch, so a partially-remediated run cannot exit 0 and claim
+agreement. 2 is an operational failure: unreadable live state, an incomplete image probe, an
+unreadable fleet, or a remediation that failed part-way (which stops rather than continuing).
+Collapsing the two would let "I could not look" render as an ordinary drift table.
+
+That verdict is taken from a **re-read of the plane after remediating**, not from the child
+processes' exit codes against the pre-fix report. The two are different facts, and the gap is
+reachable: `build-images` exits 0 when `runner-labels` is *absent* — it publishes the image ARN,
+warns, and refuses to CREATE the parameter, because creating it from one flavor would drop every
+other label an operator had seeded. On an environment that skipped the phase-0 seed every row is
+`label_missing`/`not_built`, so the set of rows `--fix` will not touch is empty, and scoring the
+run against that snapshot reports success after adding no label at all — the whole catalog still
+unrunnable, from a command that just said it fixed it. Re-observing costs a handful of API calls
+and generalises to any remediation that silently no-ops. An incomplete probe on that second read
+is exit 2 (unknown), not success. With `--json`, `--fix` emits exactly one document — the
+post-fix report — because two on one stdout parse as neither.
+
+**5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
+a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the
+console shows it green is the same class of bug as the one being fixed here, so the mapping from
+(label, ARN, image state) → status/severity/fix exists exactly once. The console surface is a
+separate card and does **not** consume it yet; this ADR fixes the derivation it must use, and
+pins (in `test/flavor-reconcile.test.mjs`) that the console's presence-only evidence projects to
+`image_unverified` rather than `ok`. The symmetric case is pinned too: an observation that never
+read `runner-labels` projects to `label_unverified`, not `ok` — `ok` asserts *label claimed*, and a
+consumer that read only `image-arn-*` has not observed that. Neither unknown counts as drift; only
+an observed disagreement does.
+
+A probe that fails for any reason other than `ResourceNotFoundException` yields *unknown*, not
+*absent*: an AccessDenied or a pre-2.35.17 AWS CLI would otherwise report a healthy catalog as
+`image_missing`/`blocked` — a confident verdict about a plane never observed, and one carrying
+`safeFix: 'build'`. The CLI exits 2 on an incomplete probe and `--fix` refuses. A *successful*
+`get-microvm-image` whose body carries no `state` is the same fact: the call returned, but we
+could not interpret it, so it is unknown rather than absent (the CLI records it as an incomplete
+probe and exits 2). Only the API's own not-found signal may assert absence.
+
+**6. Missing flavors do NOT auto-build, and CD's reconcile is report-only.** An image build
+takes minutes, is deploy-touching, and mutates the plane every runner boots from. Three
+reasons it stays out of CD:
+
+- **It cannot honour its own quiesce requirement.** The build would run *on a microVM runner*,
+  so the fleet is provably non-empty at the moment the check runs — the job itself is the
+  counter-example. A gate that can never pass is worse than no gate.
+- **ADR-047's allowlist forbids it.** Image work belongs to `LCA-Image-*`, which CI must never
+  deploy, and the deploy role holds no microVM-image authority.
+- **Cost and blast radius.** Rebuilding seven images per CD run to fix a rare gap inverts the
+  cost/benefit.
+
+So: **building is a human, workstation-pinned action**; CD runs `flavors:reconcile
+--no-image-check` as a **report-only** step (`continue-on-error`) so a live allowlist gap is
+visible in the run summary rather than discovered by a stuck PR seven hours later. Its
+credential needs `ssm:GetParameter`/`GetParametersByPath` on `/lca/<env>/config/*`, added to
+`DeployStack`; until that role is redeployed **from a workstation** the step degrades to a
+skipped report instead of failing the deploy.
+
+**Consequences**:
+- One documented command turns a catalog entry into capacity, in the order that cannot strand
+  a job: `npm run build:images -- --flavor <name>`.
+- `npm run flavors:reconcile` answers "does this environment really run what it advertises?"
+  and is safe to run any time; it exits 1 on drift, so it works as a scheduled check.
+- The `label_missing` state is now merely a warning with a one-line safe fix, and
+  `image_missing` — the state label-first creates — is reported as `blocked`.
+- A repository unit test still cannot prove deployment state, and this ADR does not claim
+  otherwise. `test/filter.test.mjs` keeps the docs↔catalog guard because a wrong *documented*
+  seed is its own bug; the live check is a command an operator (or CD) runs.
+- **No flavor is built by this change.** `python`, `java`, `go` and `rust` all remain unbuilt
+  and unadvertised: the tooling landed, the live build did not (the workstation that authored
+  this had no deploy pin for the LCA account, and the pin correctly refused). Reconcile reports
+  all four as `not_built` (`blocked`) every run — which is the correct nag. Building `python`
+  unblocks the `lambda-ci-python` workflows that motivated this card and is the intended first
+  use of `npm run build:images -- --flavor python`; building or deleting `java`/`go`/`rust` is a
+  separate decision. What is no longer possible is *not knowing*.

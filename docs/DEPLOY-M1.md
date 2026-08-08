@@ -69,18 +69,46 @@ Also seed the claimed-labels config the Ingest λ reads. This is the **claim all
 `shouldClaim` (`src/ingest/filter.ts`) drops any `workflow_job` whose `runs-on` contains none
 of these labels, *before* flavor resolution runs. A flavor label that is missing here is a
 silent dead end — the job is acked 202 `claimed:false`, no runner is ever provisioned, and the
-job just sits queued on GitHub with no error anywhere. So seed **every** flavor label from
-`microvm/flavors.json`, not just `lambda-ci` (pinned by `test/filter.test.mjs`):
+job just sits queued on GitHub with no error anywhere.
+
+Seed **exactly one label, `lambda-ci`** — and nothing else. The parameter has to exist before
+phase 2, because `build:images` appends to it and deliberately will not create it (creating it
+from one flavor would drop everything else an operator had seeded):
 
 ```sh
 aws ssm put-parameter --name /lca/dev/config/runner-labels \
   --type String --overwrite --region us-west-2 \
-  --value 'lambda-ci,lambda-ci-node,lambda-ci-python,lambda-ci-java,lambda-ci-go,lambda-ci-rust,lambda-ci-docker'
+  --value 'lambda-ci'
+```
+
+**Do not pre-seed a label for a flavor you have not built** (ADR-049). It is not a harmless
+head start: ingest would CLAIM those jobs and then fail in provisioning, and a claimed job has
+already lost its GitHub-hosted fallback — strictly worse than staying queued. From phase 2 on,
+`build:images` adds each label itself, only after that flavor's image verifies.
+
+That rule makes this one-label seed look like an exception, so be clear about why it is not a
+precedent to generalise from: on a **fresh** environment there is no ingest λ yet. The webhook
+endpoint and the GitHub App do not exist until phase 3, so between phase 0 and phase 2 there is
+nothing that can claim a job and no repo that could send one. The bootstrap value is inert until
+long after phase 2 has built the base image behind it. On a **live** environment that reasoning
+is gone — every label in this parameter is claimable the moment it is written, so never add one
+by hand for a flavor that is not already built. Use `npm run build:images -- --flavor <name>`
+(or `--publish-label-only` for an image that already verified), which enforces the ordering.
+
+The full set, for reference — **not** a value to seed (`test/filter.test.mjs` pins this list
+against the catalog, so a new flavor fails there rather than in a queued-forever job):
+
+```
+lambda-ci,lambda-ci-node,lambda-ci-python,lambda-ci-java,lambda-ci-go,lambda-ci-rust,lambda-ci-docker
 ```
 
 Add any non-LCA label you intend to claim via a repo `FlavorMap` (e.g. `ubuntu-latest`) to
-this list too — the map is consulted during *resolution*, which the claim gate runs before.
-Re-run this command after adding a flavor to the catalog; nothing publishes it automatically.
+this parameter by hand — the map is consulted during *resolution*, which the claim gate runs
+before. `build:images` is append-only and preserves such labels.
+
+Check the result at any time with `npm run flavors:reconcile` (ADR-049), which compares the
+catalog against the live allowlist, the `image-arn-*` parameters and the real image state, and
+exits non-zero on drift.
 
 ## Phase 1 — infra (image build bucket + role)
 
@@ -91,15 +119,49 @@ npx cdk deploy LCA-Image-dev -c env=dev -c region=us-west-2
 Publishes `/lca/dev/config/image-code-bucket` to SSM. No orchestrator yet (image ARNs
 don't exist).
 
-## Phase 2 — build the microVM image
+## Phase 2 — build the microVM images
 
-Stages `microvm/Dockerfile.base`, zips the context, uploads it, runs `create-microvm-image`,
-polls to `CREATED`, and publishes the image ARN to `/lca/dev/config/image-arn-base`.
+Per flavor: stages `microvm/Dockerfile.<flavor>`, zips the context, uploads it, runs
+`create-microvm-image` (or `update-microvm-image` when it already exists), polls to
+`CREATED`/`UPDATED`, publishes the image ARN to `/lca/dev/config/image-arn-<flavor>`, **and
+only then** adds the flavor's label to `/lca/dev/config/runner-labels`.
 
 ```sh
+# whole catalog
 npm run build:images -- --env dev --region us-west-2
+# one flavor (the normal way to add or rebuild one)
+npm run build:images -- --env dev --region us-west-2 --flavor python
 # preview only:
 npm run build:images -- --env dev --region us-west-2 --dry-run
+```
+
+**Image first, label second is enforced (ADR-049).** The script refuses to add a label whose
+image is not in a usable state, because the two intermediate states are not symmetric: an
+image with no label leaves the job queued and still runnable by a GitHub-hosted runner, while
+a label with no image makes ingest *claim* the job and then fail in provisioning, with the
+fallback already given away.
+
+Other flags:
+
+| flag | effect |
+|---|---|
+| `--flavor <name>` | build/rebuild one flavor |
+| `--all` | explicit whole catalog (the default) |
+| `--rebuild` | intent marker for a patch-day rebuild; repoints the ARN after the new version verifies and leaves the label in place |
+| `--skip-label` | publish the ARN but do not advertise the flavor yet (leaves `label_missing` drift) |
+| `--publish-label-only` | no build: verify an already-published image and add its label |
+| `--force-unquiesced` | override the quiesce refusal below. For a VM wedged non-terminal with every writer already frozen by hand |
+
+**The quiesce gate is enforced, not advisory.** Before staging or uploading anything, the
+script enumerates **all pages** of non-terminated microVMs and refuses if any exist — replacing
+an image that a resuming VM boots from fails `/run` rather than running degraded (see the freeze
+gate below). `--publish-label-only` is exempt: it writes one label and touches no image, so it
+cannot skew a running VM. `--dry-run` is exempt because it calls nothing.
+
+Confirm afterwards:
+
+```sh
+npm run flavors:reconcile -- --env dev
 ```
 
 **arm64 only** (AGENTS.md / ADR-007) — the base image + runner tarball are Graviton.
@@ -109,7 +171,8 @@ the control plane must move together (ADR-021 replaced `table` with `broker` + `
 an existing env, rebuild the images in the same window as the Phase 3 deploy, with no
 in-flight jobs. A version-skewed pair fails `/run` (400) instead of running degraded.
 
-The freeze gate is "zero non-`TERMINATED` microVMs", and it has one sharp edge:
+The freeze gate is "zero non-`TERMINATED` microVMs", `build:images` enforces it itself, and it
+has one sharp edge:
 `list-microvms` paginates (page 1 caps at 10) and the CLI evaluates `--query` **per page**,
 printing one result per page. A first-page-only read can call the window quiet while a live
 VM sits on page 2, so filter for the non-terminated set and read every page:
