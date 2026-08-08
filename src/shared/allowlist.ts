@@ -4,11 +4,12 @@
  * A deliberate LEAF module: no imports, so the console can consume it without dragging
  * `src/mgmt/views.ts` and the flavor catalog into the browser bundle for a set comparison.
  *
- * Its only production caller is the Unclaimed screen (`web/src/screens/Unclaimed.tsx`), which is
- * where the comparison belongs: the Mgmt λ echoes the LIVE allowlist alongside each refusal's
- * stored snapshot and takes no view on whether they differ. It lives under `src/shared/` rather
- * than `web/src/` so the comparison is unit-testable off the built Lambda output like the rest of
- * the claim-gate logic, and so a future server-side consumer cannot fork it.
+ * Its only production caller is the Unclaimed screen (`web/src/screens/Unclaimed.tsx`), which reaches
+ * it through the `web/src/allowlist.ts` barrel — the comparison belongs on the client because the
+ * Mgmt λ echoes the LIVE allowlist alongside each refusal's stored snapshot and takes no view on
+ * whether they differ. It lives under `src/shared/` rather than `web/src/` so the comparison is
+ * unit-testable off the built Lambda output like the rest of the claim-gate logic, and so a future
+ * server-side consumer cannot fork it.
  */
 
 /** Normalize an operator-edited label list the way the claim gate does. */

@@ -43,8 +43,10 @@ export class DataStack extends Stack {
       removalPolicy: envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
     });
 
-    // GSI1 — status/time index. Sparse: only rows that set gsi1pk/gsi1sk appear (run rows,
-    // plus installation rows which use `gsi1pk=INSTALLS` so the UI can enumerate them).
+    // GSI1 — status/time index. Sparse: only rows that set gsi1pk/gsi1sk appear. Three tenants,
+    // each in its OWN partition-key namespace so no query can ever read another's rows:
+    // run rows (`RUNSTATUS#<status>`), installation rows (`INSTALLS`, so the UI can enumerate
+    // them), and refusal rows (`REFUSALS`, ADR-050).
     this.table.addGlobalSecondaryIndex({
       indexName: 'gsi1',
       partitionKey: { name: 'gsi1pk', type: ddb.AttributeType.STRING },
@@ -53,8 +55,14 @@ export class DataStack extends Stack {
     });
 
     // GSI2 — repo/time index (ADR-023), the M4 run-history read path:
-    // GSI2PK=`REPORUNS#<repoId>`, GSI2SK=`<createdAt ISO>`. Both components are immutable,
-    // so run transitions never rewrite this index. Sparse: run rows only.
+    // GSI2PK=`REPORUNS#<repoId>`, GSI2SK=`<createdAt ISO>`. Both components are immutable for a
+    // run, so run transitions never rewrite this index.
+    //
+    // Sparse, and shared with per-repo refusal rows since ADR-050 (`REPOREFUSALS#<repoId>` /
+    // `lastSeenAt`) — a disjoint partition namespace, so the run query cannot see them. Note the
+    // refusal sort key is NOT immutable: it is rewritten every time a refusal recurs, which costs
+    // a GSI delete+insert per re-delivery. That is affordable only because Ingest stores
+    // ACTIONABLE refusals only; do not widen what is written without revisiting it.
     this.table.addGlobalSecondaryIndex({
       indexName: 'gsi2',
       partitionKey: { name: 'gsi2pk', type: ddb.AttributeType.STRING },

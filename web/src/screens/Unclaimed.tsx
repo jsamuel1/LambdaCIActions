@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, type Unclaimed as UnclaimedJob } from '../api.js';
-import { allowlistChanged } from '../../../src/shared/allowlist.js';
+import { allowlistChanged } from '../allowlist.js';
 import { headSeamIntact, noSeam, seamAfterHop, type SeamState } from '../rollup.js';
 import { useApi } from '../hooks.js';
 import { ErrorBox, Loading, formatTime } from '../components.js';

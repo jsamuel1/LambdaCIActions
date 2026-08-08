@@ -926,9 +926,17 @@ test('a re-cased allowlist is NOT reported as a config change', () => {
   assert.equal(allowlistChanged(['lambda-ci'], ['lambda-ci-node'], true), true);
   // A failed live read cannot be evidence of anything.
   assert.equal(allowlistChanged(['lambda-ci'], [], false), false);
-  // The screen must consume the shared helper, not re-implement the comparison.
+  // The screen must consume the shared helper, not re-implement the comparison — and it must reach
+  // it through the `web/src` barrel, the same convention `rollup.ts` established, so the whole
+  // console→API boundary stays auditable from two files rather than from deep relative paths
+  // scattered across screens.
   const screen = stripComments(src('web/src/screens/Unclaimed.tsx'));
-  assert.match(screen, /import \{ allowlistChanged \} from '\.\.\/\.\.\/\.\.\/src\/shared\/allowlist\.js'/);
+  assert.match(screen, /import \{ allowlistChanged \} from '\.\.\/allowlist\.js'/);
+  assert.match(
+    stripComments(src('web/src/allowlist.ts')),
+    /export \{ allowlistChanged \} from '\.\.\/\.\.\/src\/shared\/allowlist\.js'/,
+    'the barrel must re-export the shared module, not fork the comparison',
+  );
   assert.ok(
     !/liveAllowlist\.includes\(/.test(screen),
     'a raw-case comparison in the screen would re-introduce the false "config changed" badge',

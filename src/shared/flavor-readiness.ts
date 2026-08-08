@@ -17,9 +17,22 @@
  *     IS claimed and then fails in provisioning, which at least produces a run row.
  *
  * This module is PURE: it takes the catalog plus two live snapshots and derives per-flavor state.
- * The reads live in the callers (the Mgmt λ over SSM; the CLI reconcile command), so the same
- * derivation serves the console and the command line and the two cannot disagree — one
- * classification, two front ends.
+ * The read lives in the caller — the Mgmt λ over SSM — so the console's Flavors, Settings and
+ * Repo-detail surfaces share ONE classification and cannot disagree with each other.
+ *
+ * **Scope boundary — this is the READ-TIME CONSOLE derivation, not the operator CLI's.** The
+ * `npm run flavors:reconcile` command has its own richer module (`src/shared/flavor-reconcile.ts`,
+ * added by the sibling flavor-publishing work) which also exports a `reconcileFlavors`. The two
+ * are deliberately separate and the split is a permission boundary, not an oversight: the CLI runs
+ * with an operator's own credentials and can call `get-microvm-image`, so it observes real image
+ * STATE (`CREATED`/`UPDATED`/absent) and reports a build-health vocabulary. The management plane
+ * cannot make that call (ADR-025), so this module can only ever see whether an `image-arn-*`
+ * parameter EXISTS. A shared module would either need the console to render states it cannot
+ * observe, or the CLI to discard the evidence it uniquely has.
+ *
+ * Consequence to keep in mind when editing: `image-arn-<flavor>` present ⇒ `ready` here, even if
+ * the image behind the ARN was deleted. The CLI is the authority on that case; this module must
+ * not claim to be (ADR-051 § Consequences).
  *
  * Deliberately independent of `src/mgmt/views.ts` (`FlavorView`, rates, cost) so a flavor's
  * readiness can be composed alongside other per-flavor axes — e.g. a custom flavor's validation

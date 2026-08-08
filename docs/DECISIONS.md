@@ -3047,9 +3047,18 @@ therefore named, not collapsed: `unroutable` (neither), `unclaimable` (image but
 capacity nothing can select), `imageMissing` (label but no image), `ready` (both).
 
 `src/shared/flavor-readiness.ts` holds the derivation as a **pure** function over the catalog plus
-a snapshot. It lives in `shared/`, not `mgmt/`, because the same reconciliation is needed by a CLI
-`flavors:reconcile` command; one derivation with two front ends cannot disagree, and a second copy
-would.
+a snapshot, so the three console surfaces that render it (Flavors, Settings, Repo detail) share one
+classification and cannot disagree.
+
+It is **not** shared with the `npm run flavors:reconcile` CLI, which has its own module
+(`src/shared/flavor-reconcile.ts`, added by the sibling flavor-publishing work) and its own
+`reconcileFlavors`. That split is
+a permission boundary: the CLI runs with an operator's credentials and can call
+`get-microvm-image`, so it observes real image STATE and reports build health; the management plane
+cannot make that call (ADR-025) and can only see whether an `image-arn-*` parameter exists. One
+shared module would force the console to render states it cannot observe, or the CLI to discard the
+evidence only it has. The duplicated symbol name is the accepted cost; the two vocabularies are
+different on purpose.
 
 *Read time, never stored.* Readiness is NOT written onto the workflow-analysis row. The stored
 route is a function of the YAML and the catalog and is correct whenever it was written;
@@ -3086,5 +3095,6 @@ allowlist is an operator-managed plain `String` whose value IS the thing being r
 - **A published `image-arn-<flavor>` parameter is not proof the image still exists.** `ready` means
   "both parameters present"; a deleted image behind a live ARN still reads `ready` here.
   Closing that needs a `get-microvm-image` call, which is a control-plane permission the
-  management plane deliberately lacks (ADR-025) — so it belongs to the CLI reconcile command,
-  which runs with an operator's own credentials.
+  management plane deliberately lacks (ADR-025) — so it belongs to the `flavors:reconcile` CLI
+  command, which runs with an operator's own credentials and reports image state rather than
+  parameter presence.
