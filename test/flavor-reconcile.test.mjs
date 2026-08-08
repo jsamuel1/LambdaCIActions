@@ -1,4 +1,4 @@
-// Flavor ⇄ control-plane reconciliation (ADR-051).
+// Flavor ⇄ control-plane reconciliation (ADR-049).
 //
 // The bug this file exists to prevent: `microvm/flavors.json` advertised seven flavors while
 // the deployed dev plane could run three, and NOTHING in the repository could observe that.
@@ -103,6 +103,22 @@ test('usable image + label absent ⇒ label_missing, warn, safely fixable by add
   assert.equal(row.safeFix, 'add-label');
   assert.match(row.fix, /--publish-label-only/);
   assert.match(row.detail, /never be selected/);
+});
+
+test('label absent + image UNCHECKED still reports drift, but claims no usable image', () => {
+  // The console passes `imageState: undefined` by design, and so does `--no-image-check`. The
+  // label gap is a verified fact (the allowlist was read), so this must stay drift — but the
+  // image was never probed, so the row must not assert it is usable, and must not offer an
+  // unattended consumer a label write on that non-evidence. `mayClaimLabel` would refuse it.
+  const row = rowFor(obs({ labelClaimed: false, imageState: undefined }));
+  assert.equal(row.health, 'label_missing');
+  assert.equal(row.severity, 'warn', 'an unselectable catalog flavor is still drift');
+  assert.equal(row.safeFix, null, 'unknown must never authorise a live routing change');
+  assert.doesNotMatch(row.detail, /image is usable/, 'the image was never checked');
+  assert.match(row.detail, /not checked from here/);
+  // The command is still offered — it re-verifies and refuses on its own.
+  assert.match(row.fix, /--publish-label-only/);
+  assert.equal(reconcileFlavors([obs({ labelClaimed: false, imageState: undefined })]).drift, true);
 });
 
 test('a published ARN whose image is *_FAILED is blocked, not ok', () => {
@@ -357,7 +373,7 @@ test('a label added by addRunnerLabel is actually accepted by the claim gate', (
 // --- ordering, asserted at the source level ---------------------------------
 
 test('build-images publishes the image ARN BEFORE touching the allowlist', () => {
-  // Three orderings, one property (ADR-051): no allowlist write is reachable without a
+  // Three orderings, one property (ADR-049): no allowlist write is reachable without a
   // verified image ahead of it.
 
   // (a) inside ensureLabel: the mayClaimLabel guard precedes the parameter write.
@@ -429,9 +445,54 @@ test('--publish-label-only refuses when no image ARN is published', () => {
   assert.match(BUILD_CODE, /build the image first/);
 });
 
+test('--publish-label-only does not read an unreadable ARN param as an unpublished one', () => {
+  // "not published" prescribes `build:images` — a slow, deploy-touching image build. Reaching
+  // that advice from an AccessDenied/expired token is the same conflation ADR-049 removes from
+  // the image probe and the allowlist read, and here it costs a real rebuild.
+  const only = BUILD_CODE.slice(
+    BUILD_CODE.indexOf('if (PUBLISH_LABEL_ONLY) {'),
+    BUILD_CODE.indexOf('const bucket ='),
+  );
+  assert.ok(only.length > 0, 'publish-label-only branch not found');
+  // It must consult `absent`, not merely the value...
+  assert.match(only, /published\.absent/, 'must distinguish absent from unreadable');
+  // ...and the unreadable branch must refuse BEFORE the "build the image first" advice.
+  const unreadable = only.indexOf('NOT the same as the');
+  const buildAdvice = only.indexOf('build the image first');
+  assert.ok(unreadable > 0, 'expected an explicit unreadable refusal');
+  assert.ok(
+    unreadable < buildAdvice,
+    'an unreadable read must refuse before the rebuild advice is reachable',
+  );
+  const unreadableBranch = only.slice(unreadable, buildAdvice);
+  assert.doesNotMatch(
+    unreadableBranch,
+    /build:images/,
+    'must not prescribe a rebuild on the strength of a failed read',
+  );
+});
+
+test('imageExists refuses an unreadable probe instead of assuming the image is absent', () => {
+  // `false` here means "create it", so an unreadable probe would send CREATE at an image that
+  // already exists and surface a ValidationException blaming the NAME — telling the operator
+  // their image name is wrong when the truth is that the probe never succeeded.
+  const body = BUILD_CODE.slice(
+    BUILD_CODE.indexOf('function imageExists('),
+    BUILD_CODE.indexOf('function pollUntilCreated('),
+  );
+  assert.ok(body.length > 0, 'imageExists body not found');
+  assert.match(body, /classifyImageProbeFailure\(/, 'must use the shared classifier');
+  const absent = body.indexOf("=== 'absent'");
+  const refuse = body.indexOf('throw new Error(');
+  assert.ok(absent > 0 && refuse > 0, 'expected an absence check and a refusal');
+  assert.ok(absent < refuse, 'only ResourceNotFoundException may return false');
+  // The old behaviour — every non-zero exit collapsing to "does not exist" — must be gone.
+  assert.doesNotMatch(body, /return r\.status === 0;/);
+});
+
 test('a rebuild repoints the ARN and leaves the label alone', () => {
   // Removing and re-adding the label across a rebuild would open a window where live jobs stop
-  // being claimed — the exact harm ADR-051 is about. There must be no label-removal path.
+  // being claimed — the exact harm ADR-049 is about. There must be no label-removal path.
   assert.doesNotMatch(BUILD_CODE, /removeRunnerLabel|delete-parameter/);
   assert.match(BUILD_CODE, /REBUILD/);
 });
@@ -476,7 +537,7 @@ test('there is exactly ONE runner-label parser in the codebase', () => {
   // #28 landed `parseRunnerLabels` in src/mgmt/validate.ts for the Settings write path; this
   // module re-exports it rather than carrying a second copy. Two parsers for one hand-edited
   // parameter is how a label the UI shows as present becomes one the claim gate does not
-  // accept — the same class of catalog-vs-live disagreement ADR-051 exists to close.
+  // accept — the same class of catalog-vs-live disagreement ADR-049 exists to close.
   const src = fs.readFileSync(path.join(REPO_ROOT, 'src', 'shared', 'flavor-reconcile.ts'), 'utf8');
   assert.doesNotMatch(
     src,

@@ -48,7 +48,7 @@ test('DEPLOY-M1 documents the full claim-label set for EVERY catalog flavor', ()
   // label set it prints must stay a superset of the catalog. Adding a flavor without extending
   // that reference fails here instead of in a queued-forever job.
   //
-  // NOTE the shape this asserts, and why it changed (ADR-051). It used to parse the
+  // NOTE the shape this asserts, and why it changed (ADR-049). It used to parse the
   // `put-parameter --value '...'` seed COMMAND and require that to list every flavor. That was
   // wrong in the harmful direction: pre-seeding a label for a flavor whose image does not
   // exist yet makes ingest CLAIM those jobs and fail them in provisioning, after the
@@ -87,7 +87,7 @@ test('DEPLOY-M1 documents the full claim-label set for EVERY catalog flavor', ()
 });
 
 test('DEPLOY-M1 does not seed a label for a flavor phase 2 has not built', () => {
-  // The ordering rule, asserted against the runbook (ADR-051). A seed command that pre-claims
+  // The ordering rule, asserted against the runbook (ADR-049). A seed command that pre-claims
   // every flavor label recreates the label-without-image state on a fresh environment: phase 0
   // runs before phase 2, so every one of those labels is claimed with no image behind it.
   const deploy = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOY-M1.md'), 'utf8');

@@ -78,7 +78,7 @@ const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
  * between passes) and `lambda:GetFunctionConfiguration` on the mgmt function (to assert
  * `PUBLIC_ORIGIN` actually landed). No IAM action, no `Resource: "*"`, no managed policy.
  *
- * A third read-only grant serves the report-only flavor reconcile step (ADR-051):
+ * A third read-only grant serves the report-only flavor reconcile step (ADR-049):
  * `ssm:GetParameter`/`GetParameters`/`GetParametersByPath` on `/lca/<env>/config/*` only. That
  * subtree holds the claim allowlist and the `image-arn-*` pointers — non-secret operational
  * config. `/lca/<env>/github/*` and `/lca/<env>/mgmt/*` (App PEM, webhook secret, OAuth client
@@ -229,7 +229,7 @@ export class DeployStack extends Stack {
       }),
     );
 
-    // Read-only, and needed by the workflow's report-only flavor reconcile step (ADR-051).
+    // Read-only, and needed by the workflow's report-only flavor reconcile step (ADR-049).
     // Values, not just presence: the whole point is to compare the LIVE claim allowlist and
     // the published `image-arn-*` parameters against the catalog, and a presence check is
     // exactly the weak evidence that let a published-but-nonexistent image look healthy.

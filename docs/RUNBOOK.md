@@ -246,7 +246,7 @@ every image available, and a test push completes green.
 ## Flavors: adding, rebuilding, and checking one against reality
 
 A catalog entry in `microvm/flavors.json` is a **claim**, not capacity. What a job can actually
-run on is the live claim allowlist plus a real image (ADR-051). Check the two against the
+run on is the live claim allowlist plus a real image (ADR-049). Check the two against the
 catalog at any time — read-only, safe to run whenever:
 
 ```bash
@@ -305,7 +305,7 @@ it from `flavors.json` *and* edit the allowlist parameter by hand.
 
 CD runs `flavors:reconcile --no-image-check` as a **report-only** step, so drift shows up in the
 deploy summary. It never builds: an image build is deploy-touching, and the CD job is itself a
-microVM, so it cannot honour the quiesce precondition (ADR-051).
+microVM, so it cannot honour the quiesce precondition (ADR-049).
 
 ### A job that stays queued forever
 

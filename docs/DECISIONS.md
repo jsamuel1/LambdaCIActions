@@ -2544,7 +2544,7 @@ stays available as a later optimisation.
 
 ---
 
-## ADR-051 — A flavor is published image-first, label-second; drift is a command, not a belief (M5 fix)
+## ADR-049 — A flavor is published image-first, label-second; drift is a command, not a belief (M5 fix)
 **Status**: Accepted (v1) · amends [ADR-039](#adr-039) (expanded standard set) and
 [ADR-011](#adr-011) (phased deploy) · constrained by [ADR-047](#adr-047) (CD allowlist)
 

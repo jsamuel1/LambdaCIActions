@@ -115,7 +115,7 @@ test('the role holds exactly assume-bootstrap-roles + the workflow reads', () =>
   assert.deepEqual(actions, [
     'cloudformation:DescribeStacks',
     'lambda:GetFunctionConfiguration',
-    // Flavor reconcile, report-only (ADR-051). Reads are scoped to /lca/<env>/config/* —
+    // Flavor reconcile, report-only (ADR-049). Reads are scoped to /lca/<env>/config/* —
     // asserted below — so the secret subtrees stay unreachable from CD.
     'ssm:GetParameter',
     'ssm:GetParameters',

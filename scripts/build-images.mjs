@@ -13,9 +13,9 @@
  *      UPDATED instead (a rebuild adds a version) — see `--rebuild`.
  *   5. Poll `get-microvm-image` until state=CREATED/UPDATED; prune old versions (keep last N).
  *   6. Publish the resulting image ARN to SSM: <ssmPrefix>/config/image-arn-<flavor>.
- *   7. ONLY THEN add the flavor's label to <ssmPrefix>/config/runner-labels (ADR-051).
+ *   7. ONLY THEN add the flavor's label to <ssmPrefix>/config/runner-labels (ADR-049).
  *
- * ## Step 7 is an ordering guarantee, not a convenience (ADR-051)
+ * ## Step 7 is an ordering guarantee, not a convenience (ADR-049)
  *
  * The claim allowlist and the image are two independent pieces of live state, and the order
  * in which they are written decides which failure an operator gets:
@@ -199,7 +199,7 @@ function imageState(imageArn, reconcile) {
 
 /**
  * Add a flavor's label to the live claim allowlist — the SECOND half of the ordering contract
- * (ADR-051), and only ever after its image verifies.
+ * (ADR-049), and only ever after its image verifies.
  *
  * Refuses rather than warns. `mayClaimLabel` requires a published ARN AND a usable state, so
  * an unverifiable image cannot be talked into a label write by a caller in a hurry: adding the
@@ -222,7 +222,7 @@ function ensureLabel(flavor, imageArn, reconcile) {
         : `${state ?? 'absent'}, not a usable state (${[...reconcile.USABLE_IMAGE_STATES].join('/')})`;
     throw new Error(
       `refusing to add '${flavor.label}' to ${LABELS_PARAM}: image ${imageArn} is ${why}. ` +
-        'Label-before-image would make ingest claim jobs it cannot run (ADR-051).',
+        'Label-before-image would make ingest claim jobs it cannot run (ADR-049).',
     );
   }
   const current = ssmGetOptional(LABELS_PARAM, reconcile);
@@ -329,7 +329,7 @@ function buildFlavor(flavor, ctx) {
   // state:CREATING }; poll get-microvm-image for CREATED.
   const imageName = `lca-${ENV}-${flavor.name}`;
   const imageArnFull = `arn:aws:lambda:${ctx.region}:${ctx.accountId}:microvm-image:${imageName}`;
-  const exists = imageExists(imageArnFull);
+  const exists = imageExists(imageArnFull, ctx.reconcile);
   const commonArgs = [
     '--base-image-arn',
     ctx.baseImageArn,
@@ -398,7 +398,7 @@ function buildFlavor(flavor, ctx) {
   pollUntilCreated(imageArn);
   pruneOldVersions(imageArn);
 
-  // Image ARN FIRST (ADR-051). A rebuild repoints this only after the new version verified,
+  // Image ARN FIRST (ADR-049). A rebuild repoints this only after the new version verified,
   // so the flavor is never advertised against an image that does not exist.
   ssmPut(`${SSM_PREFIX}/config/image-arn-${flavor.name}`, imageArn);
   return imageArn;
@@ -406,13 +406,26 @@ function buildFlavor(flavor, ctx) {
 
 // True if a microVM image already exists at this ARN (so we update vs create).
 // get-microvm-image requires the FULL ARN (a bare name → ValidationException).
-function imageExists(imageArn) {
+//
+// A failed probe is NOT the same as "does not exist" (ADR-049). Reading an AccessDenied or an
+// expired token as absence sends the script down the CREATE path for an image that is already
+// there, whose only outcome is a ValidationException blaming the name — so the operator is told
+// their image name is wrong when the truth is that we never managed to look. Refuse instead: we
+// cannot choose between create and update without knowing which one applies.
+function imageExists(imageArn, reconcile) {
   if (DRY_RUN) return false;
   const full = REGION
     ? ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn, '--region', REGION]
     : ['lambda-microvms', 'get-microvm-image', '--image-identifier', imageArn];
   const r = spawnSync('aws', full, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  return r.status === 0;
+  if (r.status === 0) return true;
+  if (reconcile.classifyImageProbeFailure(r.stderr) === 'absent') return false;
+  throw new Error(
+    `could not read ${imageArn} to decide create-vs-update: ` +
+      `${(r.stderr || '').trim().split('\n')[0]}. This is NOT evidence the image is absent, so ` +
+      'refusing to guess. Check the credential/region and that `aws` is >= 2.35.17 ' +
+      '(`aws lambda-microvms help`).',
+  );
 }
 
 function pollUntilCreated(imageArn) {
@@ -493,12 +506,25 @@ async function main() {
   // `label_missing` case (built capacity that can never be selected).
   if (PUBLISH_LABEL_ONLY) {
     const flavor = flavors[0];
-    const arn = ssmGetOptional(`${SSM_PREFIX}/config/image-arn-${flavor.name}`, reconcile).value;
+    const arnParam = `${SSM_PREFIX}/config/image-arn-${flavor.name}`;
+    const published = ssmGetOptional(arnParam, reconcile);
+    const arn = published.value;
     if (!arn) {
+      // Absent and unreadable are different facts here too, and the wrong one is expensive:
+      // "not published" sends the operator to `build:images`, a slow, deploy-touching image
+      // build, on the strength of what may be nothing more than an expired token. Only say the
+      // ARN is missing when SSM actually said ParameterNotFound.
+      if (!published.absent) {
+        throw new Error(
+          `could not read ${arnParam} (${published.stderr}) — this is NOT the same as the ` +
+            'parameter being absent, so refusing to guess. Fix the credential/region and ' +
+            're-run; do NOT rebuild the image on the strength of a failed read.',
+        );
+      }
       throw new Error(
-        `no ${SSM_PREFIX}/config/image-arn-${flavor.name} published — build the image first ` +
+        `no ${arnParam} published — build the image first ` +
           `(\`npm run build:images -- --flavor ${flavor.name}\`). Adding '${flavor.label}' now ` +
-          'would make ingest claim jobs that cannot be provisioned (ADR-051).',
+          'would make ingest claim jobs that cannot be provisioned (ADR-049).',
       );
     }
     console.log(`\n=== flavor: ${flavor.name} (label publish only) ===`);
@@ -526,13 +552,14 @@ async function main() {
     bucket,
     buildRoleArn,
     baseImageArn,
+    reconcile,
     region: REGION || 'us-west-2',
     accountId: DRY_RUN ? 'ACCOUNT' : accountId(),
   };
   const results = {};
   for (const flavor of flavors) {
     results[flavor.name] = buildFlavor(flavor, ctx);
-    // Label SECOND, and only for a verified image (ADR-051). A rebuild leaves the label in
+    // Label SECOND, and only for a verified image (ADR-049). A rebuild leaves the label in
     // place (`ensureLabel` is idempotent) — removing and re-adding it would open a window in
     // which live jobs stop being claimed.
     if (SKIP_LABEL) {

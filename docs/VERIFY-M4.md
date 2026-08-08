@@ -412,7 +412,7 @@ values are never returned by the API or shown here"*, and eight rows **all readi
 | Runner labels | `/lca/dev/config/runner-labels` | set |
 | Run table name | `/lca/dev/config/table-name` | set |
 
-> **Retrospective note (2026-08-07, ADR-051).** `set` is presence only, and for
+> **Retrospective note (2026-08-07, ADR-049).** `set` is presence only, and for
 > `runner-labels` presence was **not** the interesting fact: its live value at this moment was
 > `lambda-ci,lambda-ci-node,lambda-ci-docker`, while the catalog advertised seven flavors. This
 > pane reported a green row for a parameter that was missing four labels, and a

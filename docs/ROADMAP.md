@@ -67,7 +67,7 @@ True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033
 - Opt-in auto-rewrite PR (ADR-031): line-level `runs-on` edit, dry-run label preview in the
   console, three independent gates, branch+PR only. `contents:write` stays **off by default**.
 - **Flavor catalog expansion** — standard language flavors (`python`, `java`, `go`, `rust`) with a prebaked runner tool cache so `setup-*` actions short-circuit (ADR-039); flavor images request their catalog memory (ADR-038).
-- **Flavor publication + reconciliation** (ADR-051) — `npm run build:images -- --flavor <name>`
+- **Flavor publication + reconciliation** (ADR-049) — `npm run build:images -- --flavor <name>`
   builds/rebuilds one flavor and publishes it **image-first, label-second** (refusing a label
   whose image is absent); `npm run flavors:reconcile` reports catalog vs live allowlist vs
   `image-arn-*` vs real image state and exits non-zero on drift. Closes the hole that left four

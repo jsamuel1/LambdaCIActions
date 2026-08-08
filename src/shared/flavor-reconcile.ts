@@ -2,7 +2,7 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
 import { parseRunnerLabels as parse, serializeRunnerLabels as serialize } from '../mgmt/validate.js';
 
 /**
- * Flavor ⇄ control-plane reconciliation (ADR-051).
+ * Flavor ⇄ control-plane reconciliation (ADR-049).
  *
  * The catalog (`microvm/flavors.json`) is a *claim*. What a job can actually run on is
  * decided by two independent pieces of LIVE state:
@@ -99,8 +99,9 @@ export interface FlavorObservation {
  * - `ok`                  — label claimed, ARN published, image usable.
  * - `image_unverified`    — label + ARN present, image state not checked (console view).
  * - `image_building`      — ARN present, image mid-build. Transient.
- * - `label_missing`       — image usable but the label is not claimed: built capacity that
- *                          can never be selected. Safe to fix by adding the label.
+ * - `label_missing`       — the label is not claimed, so the flavor can never be selected. Safe
+ *                          to fix by adding the label ONLY when the image was verified usable;
+ *                          an unchecked image reports the same health with `safeFix: null`.
  * - `image_missing`       — label claimed but no usable image: jobs are claimed and then
  *                          fail in provisioning, having lost the GitHub-hosted fallback.
  *                          The worst state, and the one label-before-image creates.
@@ -207,8 +208,17 @@ function detailOf(row: Omit<FlavorReconcileRow, 'detail' | 'fix' | 'safeFix'>): 
     case 'image_building':
       return `image is ${row.imageState} — not launchable until it reaches CREATED/UPDATED`;
     case 'label_missing':
-      return `image is usable but '${row.label}' is absent from the live allowlist — jobs are ` +
-        'dropped by shouldClaim before routing, so this capacity can never be selected';
+      // Two different observations land here, and only one of them has earned the claim that the
+      // image works. An unchecked image (`imageState: undefined` — the console's evidence, and
+      // `--no-image-check`) must not be described as usable: that is the same false confidence
+      // ADR-049 exists to remove, one field over. The label gap itself is a verified fact either
+      // way, so this stays drift.
+      return row.imageState === undefined
+        ? `'${row.label}' is absent from the live allowlist — jobs are dropped by shouldClaim ` +
+            'before routing, so this flavor can never be selected. An image ARN is published but ' +
+            'its state was not checked from here, so the label is not yet earned'
+        : `image is usable but '${row.label}' is absent from the live allowlist — jobs are ` +
+            'dropped by shouldClaim before routing, so this capacity can never be selected';
     case 'image_missing':
       return `'${row.label}' IS claimed but there is no usable image — jobs get claimed and ` +
         'then fail in provisioning, with no GitHub-hosted fallback left';
@@ -222,7 +232,11 @@ function detailOf(row: Omit<FlavorReconcileRow, 'detail' | 'fix' | 'safeFix'>): 
   }
 }
 
-function fixOf(health: FlavorHealth, name: string): { fix?: string; safeFix: SafeFix } {
+function fixOf(
+  health: FlavorHealth,
+  name: string,
+  imageVerified: boolean,
+): { fix?: string; safeFix: SafeFix } {
   switch (health) {
     case 'not_built':
     case 'image_failed':
@@ -232,7 +246,14 @@ function fixOf(health: FlavorHealth, name: string): { fix?: string; safeFix: Saf
       // already claimed, so this strictly reduces harm.
       return { fix: `npm run build:images -- --flavor ${name}`, safeFix: 'build' };
     case 'label_missing':
-      return { fix: `npm run build:images -- --flavor ${name} --publish-label-only`, safeFix: 'add-label' };
+      // The command is the same either way — `--publish-label-only` re-verifies the image via
+      // `mayClaimLabel` and refuses if it cannot. But `safeFix` is what an automated consumer
+      // acts on unattended, so an unverified image earns no automatic action: unknown must never
+      // authorise a live routing change.
+      return {
+        fix: `npm run build:images -- --flavor ${name} --publish-label-only`,
+        safeFix: imageVerified ? 'add-label' : null,
+      };
     case 'image_building':
       return { fix: 'wait for the build to reach CREATED/UPDATED', safeFix: null };
     default:
@@ -265,7 +286,11 @@ export function reconcileFlavors(
       health,
       severity: SEVERITY[health],
     };
-    return { ...base, detail: detailOf(base), ...fixOf(health, f.name) };
+    return {
+      ...base,
+      detail: detailOf(base),
+      ...fixOf(health, f.name, mayClaimLabel(obs)),
+    };
   });
 
   const counts: Record<FlavorSeverity, number> = { ok: 0, warn: 0, blocked: 0 };
@@ -349,7 +374,7 @@ export function mayClaimLabel(obs: Pick<FlavorObservation, 'imageArn' | 'imageSt
  *                  wrong region, or an AWS CLI older than 2.35.17 (no `lambda-microvms`
  *                  service model at all). NOT a fact about the image: `imageState: undefined`.
  *
- * Collapsing the second case into the first is the whole bug ADR-051 exists to close, one
+ * Collapsing the second case into the first is the whole bug ADR-049 exists to close, one
  * level down. A CLI that cannot call the microVM API would otherwise report every healthy
  * flavor as `image_missing`/`blocked` — a confident verdict about a plane it never observed,
  * exactly like the `ParameterNotFound` from the wrong region that misled the original

@@ -82,7 +82,7 @@ aws ssm put-parameter --name /lca/dev/config/runner-labels \
   --value 'lambda-ci'
 ```
 
-**Do not pre-seed a label for a flavor you have not built** (ADR-051). It is not a harmless
+**Do not pre-seed a label for a flavor you have not built** (ADR-049). It is not a harmless
 head start: ingest would CLAIM those jobs and then fail in provisioning, and a claimed job has
 already lost its GitHub-hosted fallback — strictly worse than staying queued. From phase 2 on,
 `build:images` adds each label itself, only after that flavor's image verifies. The full set,
@@ -97,7 +97,7 @@ Add any non-LCA label you intend to claim via a repo `FlavorMap` (e.g. `ubuntu-l
 this parameter by hand — the map is consulted during *resolution*, which the claim gate runs
 before. `build:images` is append-only and preserves such labels.
 
-Check the result at any time with `npm run flavors:reconcile` (ADR-051), which compares the
+Check the result at any time with `npm run flavors:reconcile` (ADR-049), which compares the
 catalog against the live allowlist, the `image-arn-*` parameters and the real image state, and
 exits non-zero on drift.
 
@@ -126,7 +126,7 @@ npm run build:images -- --env dev --region us-west-2 --flavor python
 npm run build:images -- --env dev --region us-west-2 --dry-run
 ```
 
-**Image first, label second is enforced (ADR-051).** The script refuses to add a label whose
+**Image first, label second is enforced (ADR-049).** The script refuses to add a label whose
 image is not in a usable state, because the two intermediate states are not symmetric: an
 image with no label leaves the job queued and still runnable by a GitHub-hosted runner, while
 a label with no image makes ingest *claim* the job and then fail in provisioning, with the

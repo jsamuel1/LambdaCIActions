@@ -102,7 +102,7 @@ only *referenced* by CDK.
 | `/lca/<env>/github/app-id` | String | App ID |
 | `/lca/<env>/github/app-slug` | String | App slug, for install URLs. Written by `create-github-app.mjs` and re-written by the App-config broker on relink/rollback (ADR-034) |
 | `/lca/<env>/config/image-arn-<flavor>` | String | Published by build script |
-| `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Seeded with `lambda-ci` at phase 0; `build:images` appends each flavor's label after that flavor's image verifies (ADR-051), and never removes one. A label with no image is worse than a missing label — see [Flavor publication & reconciliation](#flavor-publication--reconciliation). Check with `npm run flavors:reconcile`. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
+| `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Seeded with `lambda-ci` at phase 0; `build:images` appends each flavor's label after that flavor's image verifies (ADR-049), and never removes one. A label with no image is worse than a missing label — see [Flavor publication & reconciliation](#flavor-publication--reconciliation). Check with `npm run flavors:reconcile`. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
 | `/lca/<env>/config/table-name` | String | Published by `DataStack` |
 | `/lca/<env>/config/platform-admins` | String | Comma-separated GitHub logins allowed to make **platform-wide** settings changes (relink the App, change runner labels, test webhook delivery). **Fails closed** — unset authorizes nobody (ADR-035). Created manually, see [DEPLOY-M4](../DEPLOY-M4.md) |
 
@@ -132,7 +132,7 @@ console-origin pass, and a one-time step 0 when CD is used:
                           (per flavor: stage Dockerfile.<flavor>, zip microvm/,
                            upload, build, snapshot, poll, prune, write image ARN → SSM,
                            THEN add the flavor's label to runner-labels — in that order,
-                           ADR-051)
+                           ADR-049)
                           NOTE: this is a node script, not the CDK app — it reads its own
                           `--env` (default `dev`), NOT `-c env=…`. On a prod deploy the flag
                           is mandatory, or the ARNs land under /lca/dev and step 3 fails.
@@ -162,7 +162,7 @@ runbook: [DEPLOY-M4](../DEPLOY-M4.md).
 ## Flavor publication & reconciliation
 
 Step 2 publishes **two** pieces of live state per flavor, and the order between them is a
-safety property (ADR-051):
+safety property (ADR-049):
 
 1. `/lca/<env>/config/image-arn-<flavor>` — only after the image reaches `CREATED`/`UPDATED`.
 2. `/lca/<env>/config/runner-labels` — the flavor's label appended, and **only** if (1)
@@ -194,7 +194,7 @@ the console health item must consume when it lands so the CLI and the console ca
 Building is **workstation-only**. CD runs the reconcile as a report-only step
 (`--no-image-check`, `continue-on-error`) under a credential scoped to `/lca/<env>/config/*`;
 it holds no microVM-image authority, and an image build could not honour its own quiesce
-precondition from inside a microVM job anyway (ADR-047/ADR-051).
+precondition from inside a microVM job anyway (ADR-047/ADR-049).
 
 ## IAM posture
 

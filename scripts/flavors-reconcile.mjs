@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // @ts-nocheck
 /**
- * flavors-reconcile.mjs — `npm run flavors:reconcile` (ADR-051).
+ * flavors-reconcile.mjs — `npm run flavors:reconcile` (ADR-049).
  *
  * Read-only drift report between the flavor CATALOG (`microvm/flavors.json`) and the LIVE
  * control plane of one environment:
@@ -26,7 +26,7 @@
  *   - `label_missing`                                → add the label (image already verified)
  * It NEVER removes a label. Removing one takes routing away from jobs that may depend on it
  * right now, and "advertised but unbuildable" is a human decision (build it, or delete the
- * catalog entry) — see ADR-051.
+ * catalog entry) — see ADR-049.
  *
  * The verdicts come from src/shared/flavor-reconcile.ts (via dist/), which the console health
  * item on the Management API side must also consume when it lands, so the CLI and the UI cannot
@@ -69,7 +69,7 @@ const FIX = Boolean(args.fix);
 /**
  * Params-only mode: read the allowlist + `image-arn-*` parameters but do NOT call
  * `get-microvm-image`. For a caller whose credential has SSM read but not the microVM API
- * (the CD report step, ADR-051). Verdicts degrade to `image_unverified` rather than a falsely
+ * (the CD report step, ADR-049). Verdicts degrade to `image_unverified` rather than a falsely
  * confident `ok` — an unchecked image is unknown, not present.
  */
 const NO_IMAGE_CHECK = Boolean(args['no-image-check']);
@@ -301,7 +301,7 @@ async function main() {
     console.error(
       '\nERROR: --fix requires the real image state; it cannot run with --no-image-check. ' +
         'Adding a label on the strength of an unverified parameter is the exact ordering ' +
-        'violation ADR-051 forbids.',
+        'violation ADR-049 forbids.',
     );
     process.exit(2);
   }
