@@ -432,7 +432,7 @@ function RelinkForm({
 // ---- runner labels ---------------------------------------------------------
 
 /**
- * What the allowlist means for the flavor catalog (ADR-050).
+ * What the allowlist means for the flavor catalog (ADR-051).
  *
  * The card below shows WHICH labels this environment claims. This says whether those labels
  * actually let a job run: the claim gate consults the allowlist BEFORE routing, so a catalog

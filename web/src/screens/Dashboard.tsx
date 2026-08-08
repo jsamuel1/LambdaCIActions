@@ -45,7 +45,7 @@ export function Dashboard({
         <Stat label="Repos enabled" value={enabled} />
         <Stat label="Est. spend" value={formatCost(h.cost?.totalUsd)} />
         {/*
-          Unclaimed is a THIRD axis, not a run status (ADR-049): a refused job never launched, so it
+          Unclaimed is a THIRD axis, not a run status (ADR-050): a refused job never launched, so it
           contributes nothing to Active, Error rate or spend. Shown here because it is the one
           failure a user reports as "my PR is stuck" and which produces no run row to click.
           Windowed (see `unclaimedWindowDays`) — refusal rows are retained for 90 days, and a stat

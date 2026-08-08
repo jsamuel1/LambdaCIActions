@@ -1,5 +1,5 @@
 /**
- * Flavor readiness — reconciling the built-in catalog against the LIVE control plane (ADR-050).
+ * Flavor readiness — reconciling the built-in catalog against the LIVE control plane (ADR-051).
  *
  * `microvm/flavors.json` describes what the platform CAN route. It says nothing about whether a
  * given deployment can actually run it, and the two diverge in practice: `lambda-ci-python` was

@@ -124,7 +124,7 @@ A control-plane λ is throwing. Read its log group; the handlers log structured 
 
 **"Jobs queue in GitHub but nothing ever starts."** Start in the console: **Unclaimed**
 (`#/unclaimed`) lists every job the claim gate refused, with the reason, a fix, the job's labels,
-and the runner-label allowlist as it was at refusal time versus now (ADR-049). If the job is
+and the runner-label allowlist as it was at refusal time versus now (ADR-050). If the job is
 there, the answer is there — no AWS access needed.
 
 If it is NOT there, work the chain in order — the first missing link explains it:
@@ -139,7 +139,7 @@ If it is NOT there, work the chain in order — the first missing link explains 
 4. Did the VM boot? Run logs, stream = the run's `microvmId`.
 
 **"The console says the job routes to flavor X and is eligible, but it never runs."** Routing
-preview is computed from the catalog; runnability needs the LIVE control plane (ADR-050). Check
+preview is computed from the catalog; runnability needs the LIVE control plane (ADR-051). Check
 **Flavors** — the `Runnable` column reconciles both live facts, and the state names which is
 missing:
 

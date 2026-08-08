@@ -4,7 +4,7 @@ import { useApi } from '../hooks.js';
 import { CompatBadge, CompatRollupView, ErrorBox, Loading, formatTime } from '../components.js';
 
 /**
- * Live control-plane verdict on a job's route (ADR-050).
+ * Live control-plane verdict on a job's route (ADR-051).
  *
  * Rendered as its own column rather than folded into the compat badge, because the two answer
  * different questions and only one of them moves when an operator publishes an image. A route can

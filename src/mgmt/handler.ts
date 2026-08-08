@@ -205,7 +205,7 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL ?? '';
 const COST_SAMPLE_PER_STATUS = 50;
 
 /**
- * How far back the Dashboard's unclaimed badge looks (ADR-049).
+ * How far back the Dashboard's unclaimed badge looks (ADR-050).
  *
  * Refusal rows are retained for the full ADR-033 window (`RUN_RETENTION_DAYS`, 90 days by default),
  * which is right for the Unclaimed screen's history and wrong for a headline badge: an unwindowed
@@ -528,7 +528,7 @@ async function route_(
       const repo = await authorizeRepo(session, match, q);
       if ('reply' in repo) return repo.reply;
       const analyses = await listWorkflowAnalyses(repo.record.repoId);
-      // Reconciled against the LIVE control plane, not just the catalog (ADR-050). A route to a
+      // Reconciled against the LIVE control plane, not just the catalog (ADR-051). A route to a
       // flavor whose label is absent from the live allowlist, or whose image is unpublished, is
       // not runnable however green its stored compat is — which is exactly what this repo's
       // workflows looked like while eight PRs sat queued.
@@ -726,7 +726,7 @@ async function route_(
       const snapshot = await controlPlaneSnapshot();
       return json(200, {
         flavors: buildFlavorViews(snapshot.imagePublished),
-        // The live control-plane reconciliation (ADR-050). Kept a SEPARATE array rather than
+        // The live control-plane reconciliation (ADR-051). Kept a SEPARATE array rather than
         // merged into each FlavorView so the catalog projection stays a pure function of the
         // catalog, and a per-flavor axis added elsewhere cannot collide with this one.
         //
@@ -988,7 +988,7 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
   const costRuns: RunRecord[] = terminalPages
     .flatMap((p) => p.runs)
     .filter((r) => canAdminInstallation(session, r.installationId));
-  // Unclaimed jobs (ADR-049). A THIRD axis, deliberately outside `counts`: a refused job is not
+  // Unclaimed jobs (ADR-050). A THIRD axis, deliberately outside `counts`: a refused job is not
   // a run, so it must not move the active count, the error rate, or any cost figure. Bounded and
   // reported as a floor (`unclaimedExact`) like the status counts, so the badge never claims an
   // exact number it did not finish counting. Platform-wide like `counts` — the route already
@@ -1269,7 +1269,7 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
 
   const deliveries: WebhookDeliveryView[] = linkage?.webhook?.recentDeliveries ?? [];
   /**
-   * Live control-plane reconciliation (ADR-050), derived from the two facts this route ALREADY
+   * Live control-plane reconciliation (ADR-051), derived from the two facts this route ALREADY
    * read: the runner-label allowlist and which flavors have a published `image-arn-*`.
    *
    * Deliberately not a second `controlPlaneSnapshot()` call. That would re-read the same
@@ -1333,7 +1333,7 @@ async function settingsRoute(session: SessionPayload): Promise<Reply> {
     /** Whether THIS session may use the mutating actions (drives the UI's disabled state). */
     canAdminPlatform: isPlatformAdmin,
     /**
-     * Per-flavor live readiness (ADR-050) — empty when the allowlist read failed, so the client
+     * Per-flavor live readiness (ADR-051) — empty when the allowlist read failed, so the client
      * renders `unchecked` rather than marking every flavor broken on a transient SSM error.
      *
      * `runnerLabels.labels` above already carries the allowlist itself, so it is NOT repeated
@@ -2173,7 +2173,7 @@ async function imageAvailability(): Promise<Record<string, boolean>> {
 }
 
 /**
- * The catalog fields readiness reconciliation needs (ADR-050): flavor name + routing label.
+ * The catalog fields readiness reconciliation needs (ADR-051): flavor name + routing label.
  *
  * Sourced from the same catalog projection the Flavors view uses, so a flavor cannot appear in
  * one and be missing from the other.
@@ -2207,7 +2207,7 @@ async function allowlistSnapshot(): Promise<{ allowlist: string[]; live: boolean
 
 /**
  * Read the LIVE control plane: the claim allowlist and which flavor images are published
- * (ADR-050).
+ * (ADR-051).
  *
  * The allowlist is read with `GetParameter`, not `DescribeParameters`: its VALUE is the thing
  * being reconciled, and it is a plain `String` parameter (an operator-managed list of runner
@@ -2247,7 +2247,7 @@ async function flavorReadinessOrUndefined(): Promise<FlavorReadiness[] | undefin
 }
 
 /**
- * Unclaimed (refused) jobs — the console surface for a claim the platform declined (ADR-049).
+ * Unclaimed (refused) jobs — the console surface for a claim the platform declined (ADR-050).
  *
  * Authorization is the same post-query installation filter every run list uses (`collectVisible`),
  * because the refusal indexes are keyed by repo/time, not by installation.

@@ -3,7 +3,7 @@ import { useApi } from '../hooks.js';
 import { ErrorBox, Loading, formatCost } from '../components.js';
 
 /**
- * Per-flavor live readiness (ADR-050).
+ * Per-flavor live readiness (ADR-051).
  *
  * `imageAvailable` alone was misleading: an image can be published while the flavor's routing
  * label is absent from the live claim allowlist, in which case the capacity exists and no job can

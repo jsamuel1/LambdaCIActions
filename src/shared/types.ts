@@ -442,7 +442,7 @@ export interface WorkflowAnalysisRecord {
 
 /**
  * A refused (unclaimed) job, persisted so the console can show WHY a queued job never became a
- * run (ADR-049). Deliberately NOT a `RunRecord` with a new status: a refusal is not a run, and
+ * run (ADR-050). Deliberately NOT a `RunRecord` with a new status: a refusal is not a run, and
  * folding it into `RunStatus` would put a never-launched job into the health rollup, the
  * active-run count, cost eligibility and every report's status vocabulary.
  *

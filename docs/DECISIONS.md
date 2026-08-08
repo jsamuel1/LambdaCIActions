@@ -2923,7 +2923,7 @@ skipped report instead of failing the deploy.
 > blocks are in one tree, so each branch renumbers to the lowest free pair rather than deferring to
 > whichever lands second.
 
-## ADR-049 — A refused claim is a first-class, visible record — not a discarded 202 body (M4 fix)
+## ADR-050 — A refused claim is a first-class, visible record — not a discarded 202 body (M4 fix)
 **Status**: Accepted (v1) · fixes the observability gap in [ADR-030](#adr-030) (claim decision)
 and [ADR-005](#adr-005) (label contract)
 
@@ -3022,7 +3022,7 @@ rows are not read.
   they are still in CloudWatch and greppable; they are simply not promoted to a row. If that
   volume ever matters, the emitter is the single place to add sampling.
 
-## ADR-050 — Routing display reconciles against the LIVE control plane, not the catalog (M4 fix)
+## ADR-051 — Routing display reconciles against the LIVE control plane, not the catalog (M4 fix)
 **Status**: Accepted (v1) · amends [ADR-030](#adr-030) (routing preview) and the Flavors view of
 [spec 04](specs/04-web-ui.md)
 

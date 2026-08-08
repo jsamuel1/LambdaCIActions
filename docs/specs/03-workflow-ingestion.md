@@ -240,7 +240,7 @@ mode re-scans the repo, because the stored routing preview is resolved with the 
 A refusal is a decision the operator has to be able to see. Ingest emits a structured log line for
 **every** `claimed:false` path — repo opted out, `decideClaim` rejection, non-default runner group,
 compat block — carrying a stable `code`, the job's labels, **the live runner-label allowlist
-snapshot**, the repo mode, the reason and a fix (ADR-049). The 202 body's `reason` is not an
+snapshot**, the repo mode, the reason and a fix (ADR-050). The 202 body's `reason` is not an
 observability mechanism: its only reader is GitHub, which discards it.
 
 Refusals that are **actionable** are also persisted (`REFUSAL#<repoId>#<runId>#<jobId>`) and listed

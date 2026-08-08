@@ -8,7 +8,7 @@ import { decodeCursor, encodeCursor, terminalTtlSeconds } from './run-store.js';
 import type { RefusalRecord, RepoMode } from './types.js';
 
 /**
- * Refusal store (ADR-049) — the durable record of a job the platform declined to claim.
+ * Refusal store (ADR-050) — the durable record of a job the platform declined to claim.
  *
  * Lives in the shared table (ADR-009) as its own entity rather than as a run row with a new
  * status, because a refusal is not a run: it has no microVM, no duration, no cost, and must

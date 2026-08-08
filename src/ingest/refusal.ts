@@ -2,7 +2,7 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
 import type { RepoMode } from '../shared/types.js';
 
 /**
- * Claim-refusal classification (ADR-049).
+ * Claim-refusal classification (ADR-050).
  *
  * Every path in Ingest that answers a `workflow_job.queued` webhook with `claimed: false`
  * comes through here, so a refusal has exactly one machine-readable shape regardless of which
@@ -57,7 +57,7 @@ const LCA_LABEL_PREFIX = 'lambda-ci';
  * later REMOVED from the allowlist is not LCA-shaped by either signal, so its refusals stay in
  * the sampled/no-row lane. It is indistinguishable from a job targeting a foreign self-hosted
  * fleet — `runs-on: [self-hosted, gpu]` must NOT become an error in every repo — and the fix is
- * to name custom labels with the `lambda-ci` prefix. Recorded in ADR-049.
+ * to name custom labels with the `lambda-ci` prefix. Recorded in ADR-050.
  */
 export function lcaShapedLabel(label: string): boolean {
   const l = label.trim().toLowerCase();

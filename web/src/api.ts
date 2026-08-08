@@ -118,7 +118,7 @@ export interface WorkflowJob {
   adoptCandidate: boolean;
   compat: { level: CompatLevel; messages: CompatMessage[] };
   /**
-   * Live control-plane verdict on the job's resolved flavor (ADR-050). SEPARATE from `compat`:
+   * Live control-plane verdict on the job's resolved flavor (ADR-051). SEPARATE from `compat`:
    * `compat` is the stored workflow-vs-arm64 analysis, this is whether the deployment can
    * actually claim and launch the route today. `unknown` = the live read failed, NOT green.
    */
@@ -134,11 +134,11 @@ export interface Workflow {
   updatedAt: string;
   adoptCandidates: number;
   jobs: WorkflowJob[];
-  /** Worst platform readiness across the workflow's jobs (ADR-050). */
+  /** Worst platform readiness across the workflow's jobs (ADR-051). */
   platformLevel?: FlavorReadinessState | 'unknown';
 }
 
-/** Per-flavor live readiness state (ADR-050) — mirrors src/shared/flavor-readiness.ts. */
+/** Per-flavor live readiness state (ADR-051) — mirrors src/shared/flavor-readiness.ts. */
 export type FlavorReadinessState = 'ready' | 'imageMissing' | 'unclaimable' | 'unroutable';
 
 export interface FlavorReadiness {
@@ -161,7 +161,7 @@ export interface RouteReadiness {
 }
 
 /**
- * A job the claim gate refused (ADR-049) — the reason a queued PR never became a run.
+ * A job the claim gate refused (ADR-050) — the reason a queued PR never became a run.
  *
  * Not a `Run`: there is no microVM, no duration and no cost, so it is a separate collection and
  * never appears in run lists, health counts or spend.
@@ -240,7 +240,7 @@ export interface Health {
   /** False when a status count hit the paging budget and is a floor, not a total. */
   countsExact?: boolean;
   /**
-   * Jobs the claim gate refused (ADR-049) in the last `unclaimedWindowDays`. A third axis, outside
+   * Jobs the claim gate refused (ADR-050) in the last `unclaimedWindowDays`. A third axis, outside
    * `counts`: a refusal is not a run, so it never moves `active`, `errorRate` or `cost`. Windowed
    * because refusal rows are retained for 90 days, and a badge that stays red long after the fix
    * is one operators stop reading.
@@ -381,7 +381,7 @@ export interface Settings {
   /** Whether THIS session may use the mutating actions. */
   canAdminPlatform: boolean;
   /**
-   * Live catalog-vs-control-plane reconciliation (ADR-050); empty when the allowlist read failed,
+   * Live catalog-vs-control-plane reconciliation (ADR-051); empty when the allowlist read failed,
    * so the UI renders `unchecked` rather than marking every flavor broken on a transient error.
    *
    * The allowlist itself is NOT repeated here — `runnerLabels.labels` is the one field carrying it.
@@ -678,7 +678,7 @@ export const api = {
       repo: Repo;
       compat: CompatRollup;
       workflows: Workflow[];
-      /** Jobs whose route the live control plane cannot run (ADR-050). */
+      /** Jobs whose route the live control plane cannot run (ADR-051). */
       unrunnableJobs?: number;
       controlPlaneLive?: boolean;
     }>(`/api/repos/${repoId}/workflows?installation=${installationId}`),
@@ -720,7 +720,7 @@ export const api = {
   run: (repoId: number, runId: number, jobId: number) =>
     request<{ run: Run }>(`/api/runs/${repoId}/${runId}/${jobId}`),
   /**
-   * Unclaimed jobs (ADR-049): jobs the claim gate refused, with the live allowlist echoed so the
+   * Unclaimed jobs (ADR-050): jobs the claim gate refused, with the live allowlist echoed so the
    * UI can distinguish "already fixed, re-run it" from "still broken".
    */
   unclaimed: (query: { repo?: number; limit?: number; cursor?: string } = {}) => {
@@ -756,7 +756,7 @@ export const api = {
   flavors: () =>
     request<{
       flavors: Flavor[];
-      /** Live catalog-vs-control-plane reconciliation (ADR-050). */
+      /** Live catalog-vs-control-plane reconciliation (ADR-051). */
       readiness?: FlavorReadiness[];
       allowlist?: string[];
       unmatchedAllowlistLabels?: string[];

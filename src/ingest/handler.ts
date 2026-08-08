@@ -384,7 +384,7 @@ async function handleWorkflowJob(
   let repoMode: RepoMode | undefined;
 
   /**
-   * Emit one refusal (ADR-049): a structured log line always, plus a durable row when the
+   * Emit one refusal (ADR-050): a structured log line always, plus a durable row when the
    * refusal is actionable.
    *
    * Every `claimed: false` path funnels through here. Before this existed, `decideClaim`'s

@@ -163,20 +163,20 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/installations` | List installations the caller can admin | ✅ |
 | `GET /api/repos?installation=<id>` | List repos + compat rollup | ✅ |
 | `PATCH /api/repos/{repoId}` | Set `enabled`, `mode`, `defaultFlavor` (a flavor name, or `null` to clear the override), `flavorMap`, `rewriteEnabled` | ✅ |
-| `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat + **live platform readiness** per job (ADR-050) | ✅ |
+| `GET /api/repos/{repoId}/workflows` | Parsed workflows + routing + compat + **live platform readiness** per job (ADR-051) | ✅ |
 | `POST /api/repos/{repoId}/rescan` | Enqueue a Discovery scan | ✅ |
 | `GET/PUT /api/repos/{repoId}/flavor-map` | Read/replace label→flavor overrides | ✅ |
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`; `repo`+`status` compose); returns `complete` (were any job rows dropped from this response?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
-| `GET /api/unclaimed` | Jobs the claim gate refused (`repo`, `limit`, `cursor`), plus the **live** runner-label allowlist (ADR-049) | ✅ |
-| `GET /api/flavors` | Catalog + per-flavor image availability + **live readiness reconciliation** (ADR-050). With `?installation=<id>`: also the installation's custom flavors in every state (each row carries `routable`) plus the smoke workflow YAML the operator must commit | ✅ |
+| `GET /api/unclaimed` | Jobs the claim gate refused (`repo`, `limit`, `cursor`), plus the **live** runner-label allowlist (ADR-050) | ✅ |
+| `GET /api/flavors` | Catalog + per-flavor image availability + **live readiness reconciliation** (ADR-051). With `?installation=<id>`: also the installation's custom flavors in every state (each row carries `routable`) plus the smoke workflow YAML the operator must commit | ✅ |
 | `POST /api/flavors?installation=<id>` | Register a custom flavor (ADR-040). Body carries the **base** name; the `custom-` prefix is server-added. Refuses a built-in name/label collision and a description advertising a vCPU shape (ADR-038). Registers as `pending` — never routable on creation | ✅ M5 |
 | `POST /api/flavors/preview?installation=<id>` | Static-gate + rate **preview** for a proposed flavor — writes nothing, probes nothing. A pass is explicitly **not** validation | ✅ M5 |
 | `DELETE /api/flavors/{name}?installation=<id>` | Remove a custom flavor | ✅ M5 |
 | `POST /api/flavors/{name}/revalidate?installation=<id>` | Manual re-validate (ADR-041); an `imageArn` in the body atomically repoints the image and resets to `pending`. Returns `validationTriggered: false` while the smoke-run λ is undeployed | ✅ M5 · trigger only |
 | `GET /api/health` | Dashboard aggregates + stuck-run detection + cost sample (`cost.jobs` — run rows are per-job, so a matrix workflow contributes one each; the denominator and mean are per job, not per workflow run) | ✅ |
-| `GET /api/settings` | Env identity, verified App linkage, runner labels + **live catalog reconciliation** (ADR-050), webhook health | ✅ |
+| `GET /api/settings` | Env identity, verified App linkage, runner labels + **live catalog reconciliation** (ADR-051), webhook health | ✅ |
 | `PUT /api/settings/runner-labels` | Replace the claimed runner labels (`dryRun` returns impact only) | ✅ |
 | `POST /api/settings/github-app/relink` | Write-only credential intake: verify against GitHub, then store | ✅ |
 | `POST /api/settings/github-app/rollback` | Undo a relink: restore replaced parameter versions and/or `remove` ones it created | ✅ |

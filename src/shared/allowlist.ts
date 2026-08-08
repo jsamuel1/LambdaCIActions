@@ -1,5 +1,5 @@
 /**
- * Runner-label allowlist comparison (ADR-049).
+ * Runner-label allowlist comparison (ADR-050).
  *
  * A deliberate LEAF module: no imports, so the console can consume it without dragging
  * `src/mgmt/views.ts` and the flavor catalog into the browser bundle for a set comparison.

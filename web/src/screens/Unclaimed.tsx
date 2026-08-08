@@ -13,7 +13,7 @@ function refusalKey(r: UnclaimedJob): string {
 }
 
 /**
- * Unclaimed — jobs the claim gate refused (ADR-049).
+ * Unclaimed — jobs the claim gate refused (ADR-050).
  *
  * This screen exists because a refused job used to be invisible everywhere. Ingest returned
  * `claimed: false` with a reason in the 202 body, GitHub discarded it, nothing was logged, and no

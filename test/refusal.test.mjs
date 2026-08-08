@@ -1,5 +1,5 @@
-// Refusal classification + store + console read models (ADR-049), and the live control-plane
-// reconciliation that kills the misleading green (ADR-050).
+// Refusal classification + store + console read models (ADR-050), and the live control-plane
+// reconciliation that kills the misleading green (ADR-051).
 //
 // Why this file exists: the bug it pins was INVISIBLE. Ingest computed a refusal reason, returned
 // it in a 202 body GitHub discards, and logged nothing — so `test/adopt.test.mjs` could pass
@@ -266,7 +266,7 @@ test('a refusal row lives in partitions no run query can reach', () => {
   assert.equal(up.key.sk, REFUSAL_SK);
   assert.equal(up.values[':g1pk'], REFUSALS_GSI1PK);
   assert.equal(up.values[':g2pk'], refusalRepoGsi2pk(1326532617));
-  // The load-bearing isolation claim of ADR-049: refusals share GSI1/GSI2 with run rows, so their
+  // The load-bearing isolation claim of ADR-050: refusals share GSI1/GSI2 with run rows, so their
   // partition VALUES must be disjoint or a status/repo run query would start returning refusals
   // (and vice versa) — which is precisely the aggregate corruption the card forbids.
   for (const status of ALL_STATUSES) {
@@ -374,7 +374,7 @@ test('rollupRefusals counts by code', () => {
   assert.deepEqual(roll, { 'label-not-allowlisted': 2, 'runner-group': 1 });
 });
 
-// ---- live reconciliation (ADR-050) ----------------------------------------
+// ---- live reconciliation (ADR-051) ----------------------------------------
 
 const READINESS_CATALOG = CATALOG.map((f) => ({ name: f.name, label: f.label }));
 
@@ -548,7 +548,7 @@ test('readiness covers every catalog flavor the Flavors view lists', () => {
 // ---- aggregate safety ------------------------------------------------------
 
 test('no refusal status was added to the run status vocabulary', () => {
-  // ADR-049's central decision. If a refusal ever becomes a RunStatus, it must be a deliberate
+  // ADR-050's central decision. If a refusal ever becomes a RunStatus, it must be a deliberate
   // change that audits cost eligibility, the health error rate and the report status filters —
   // not an accident that silently makes refusals billable.
   for (const forbidden of ['unclaimed', 'refused', 'rejected']) {

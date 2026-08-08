@@ -19,7 +19,7 @@ const NAV: { path: string; label: string }[] = [
   { path: '/repos', label: 'Repos' },
   { path: '/runs', label: 'Runs' },
   // Its own nav entry, not a Runs tab: an operator hunting a stuck PR is looking for something
-  // that is NOT in the run list, so it has to be findable without knowing that (ADR-049).
+  // that is NOT in the run list, so it has to be findable without knowing that (ADR-050).
   { path: '/unclaimed', label: 'Unclaimed' },
   { path: '/reports', label: 'Reports' },
   { path: '/flavors', label: 'Flavors' },

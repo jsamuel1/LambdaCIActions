@@ -8,7 +8,7 @@ import {
 import { toWorkflowView, type WorkflowJobView, type WorkflowView } from './views.js';
 
 /**
- * Read models for the two console surfaces this milestone adds (ADR-049, ADR-050):
+ * Read models for the two console surfaces this milestone adds (ADR-050, ADR-051):
  * the **Unclaimed** job list, and the live-control-plane readiness overlay on routing.
  *
  * Deliberately its own module rather than more of `views.ts`. `views.ts` owns the run/cost/compat
@@ -92,7 +92,7 @@ export function rollupRefusals(refusals: readonly RefusalView[]): Record<string,
 // ---- routing readiness overlay --------------------------------------------
 
 /**
- * Live-control-plane verdict attached to a job's stored route (ADR-050).
+ * Live-control-plane verdict attached to a job's stored route (ADR-051).
  *
  * Computed at READ time, never stored on the analysis row. The stored route is a function of the
  * workflow YAML plus the catalog and is correct whenever it was written; runnability is a

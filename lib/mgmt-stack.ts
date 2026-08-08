@@ -75,7 +75,7 @@ export { DEFAULT_REPORTS_MODEL_ID } from './env-config.js';
  *     ADR-037 installation index repair — both `SET`s of specific attributes on an existing
  *     row). No `PutItem`/`DeleteItem`, so it cannot forge run rows or delete history.
  *   - SSM: reads ONLY its own OAuth client id/secret + session key, plus the plain-String
- *     runner-label allowlist the console reconciles against the catalog (ADR-050). Every other
+ *     runner-label allowlist the console reconciles against the catalog (ADR-051). Every other
  *     parameter is checked for presence via `DescribeParameters` (a metadata action that returns
  *     no values) — so no code path can leak a SecureString (spec 04 hard rule).
  *   - CloudWatch Logs: read-only on the per-env run log group.
@@ -197,7 +197,7 @@ export class MgmtStack extends Stack {
     // appear in every workflow file and the admin list is a set of GitHub logins — neither is
     // a secret, and showing the effective value is the point (spec 04 § Settings).
     //
-    // `runner-labels` has a SECOND reader since ADR-050: the live control-plane reconciliation
+    // `runner-labels` has a SECOND reader since ADR-051: the live control-plane reconciliation
     // behind the Flavors `Runnable` column compares its VALUE against the flavor catalog. Same
     // grant, no widening — spec 04's hard rule is that no SECRET value is readable here, and
     // every SecureString path is still presence-checked via `DescribeParameters` only.
