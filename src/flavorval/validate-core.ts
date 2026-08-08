@@ -47,13 +47,45 @@ export interface StaticGateFailure {
     | 'missing-image-arn'
     | 'image-unusable'
     | 'image-unreadable'
+    | 'image-probe-failed'
     | 'missing-smoke-repo';
   message: string;
 }
 
+/**
+ * Failure codes that are NOT a verdict about the flavor — the check could not be performed.
+ *
+ * `classifySmoke` already refuses to spend terminal `invalid` on our own transient fault; the
+ * static gate needs the same three-outcome shape for the same reason. `getMicroVMImageState`
+ * deliberately distinguishes an ANSWER (`ABSENT` / `FORBIDDEN`) from a probe that could not run
+ * (throttle, missing SDK command, an unmodelled error), and that distinction is worthless if the
+ * gate collapses it: a throttled `GetMicrovmImage` would permanently condemn a working image and
+ * force a manual re-validate to recover.
+ */
+const INCONCLUSIVE_CODES: ReadonlySet<StaticGateFailure['code']> = new Set(['image-probe-failed']);
+
+/**
+ * Whether these failures are all "could not check" rather than "is broken".
+ *
+ * A caller must map this to `pending` (retry later), never to `invalid` — which is terminal.
+ * Mixed failures are NOT inconclusive: a real defect alongside a failed probe is still a real
+ * defect, and the operator should be told about it now rather than after a retry.
+ */
+export function isInconclusive(failures: readonly StaticGateFailure[]): boolean {
+  return failures.length > 0 && failures.every((f) => INCONCLUSIVE_CODES.has(f.code));
+}
+
 export type StaticGateResult =
   | { ok: true }
-  | { ok: false; failures: StaticGateFailure[] };
+  | {
+      ok: false;
+      failures: StaticGateFailure[];
+      /**
+       * True when every failure is a "could not check" (see {@link isInconclusive}). The caller
+       * must route this to `pending`, not to terminal `invalid`.
+       */
+      inconclusive: boolean;
+    };
 
 export interface StaticGateInput {
   /** The flavor as registered (or as proposed, for a pre-save preview). */
@@ -77,6 +109,10 @@ export interface StaticGateInput {
 /**
  * Run the ADR-041 static gate. Collects EVERY failure rather than short-circuiting: an operator
  * fixing a registration wants the whole list, not one error per round-trip.
+ *
+ * A failed result carries `inconclusive` — true when nothing it found was a verdict about the
+ * flavor (only a probe that could not run). Route that to `pending`, never terminal `invalid`;
+ * {@link staticFailureVerdict} does it for you.
  */
 export function staticGate(input: StaticGateInput): StaticGateResult {
   const f = input.flavor;
@@ -137,7 +173,19 @@ export function staticGate(input: StaticGateInput): StaticGateResult {
   if (!f.imageArn) {
     failures.push({ code: 'missing-image-arn', message: 'imageArn is required' });
   } else if (input.image) {
-    if (input.image.state === 'FORBIDDEN') {
+    if (input.image.state === 'UNKNOWN') {
+      // The probe itself did not run (throttle, an SDK without the command, an unmodelled error).
+      // That is not evidence about the image, so it must not become a terminal verdict — see
+      // `INCONCLUSIVE_CODES`. `UNKNOWN` is the one state `getMicroVMImageState` uses for exactly
+      // this case; `ABSENT` and `FORBIDDEN` are real answers and fall through below.
+      failures.push({
+        code: 'image-probe-failed',
+        message:
+          `could not determine the state of image ${f.imageArn}` +
+          (input.image.error ? `: ${input.image.error}` : '') +
+          ' — this is not a verdict about the image; retry validation',
+      });
+    } else if (input.image.state === 'FORBIDDEN') {
       // Distinguished from "broken" because the remedy is completely different: the operator must
       // grant the provisioner's role read access, not rebuild anything.
       failures.push({
@@ -166,12 +214,30 @@ export function staticGate(input: StaticGateInput): StaticGateResult {
     });
   }
 
-  return failures.length ? { ok: false, failures } : { ok: true };
+  return failures.length
+    ? { ok: false, failures, inconclusive: isInconclusive(failures) }
+    : { ok: true };
 }
 
 /** Render static-gate failures into the single `reason` string stored on an `invalid` flavor. */
 export function formatStaticFailures(failures: readonly StaticGateFailure[]): string {
   return `static checks failed: ${failures.map((f) => f.message).join('; ')}`;
+}
+
+/**
+ * Turn a failed static gate into the state to store, so no caller has to re-derive the
+ * inconclusive rule (ADR-041: `invalid` is terminal and must never be spent on our own fault).
+ */
+export function staticFailureVerdict(failures: readonly StaticGateFailure[]): ValidationVerdict {
+  if (isInconclusive(failures)) {
+    return {
+      state: 'pending',
+      reason: `validation could not complete (not a verdict about the image): ${failures
+        .map((f) => f.message)
+        .join('; ')}`,
+    };
+  }
+  return { state: 'invalid', reason: formatStaticFailures(failures) };
 }
 
 // ---- smoke run (ADR-041 gate 2) ---------------------------------------------
@@ -220,19 +286,30 @@ export interface SmokeObservations {
   orchestrationError?: string;
 }
 
-export type SmokeVerdict =
+/**
+ * A validation verdict: the state to store, plus the operator-facing reason.
+ *
+ * Three outcomes, not two, and the third is the important one. `invalid` is TERMINAL (ADR-041),
+ * so it must only ever be spent on evidence ABOUT THE IMAGE. Anything that says nothing about the
+ * image — a GitHub 500, a throttle, a probe that could not run, the λ losing its remaining time —
+ * returns to `pending`, because permanently condemning a working image on our own transient fault
+ * would force a manual re-validate to recover.
+ */
+export type ValidationVerdict =
   | { state: 'valid'; reason: string }
   | { state: 'invalid'; reason: string }
   /** The run could not be completed for reasons that say nothing about the image. */
   | { state: 'pending'; reason: string };
 
+/** A smoke run's verdict. Same three outcomes as every other gate — see {@link ValidationVerdict}. */
+export type SmokeVerdict = ValidationVerdict;
+
 /**
  * Classify a smoke run's observations into a validation verdict.
  *
- * Three outcomes, not two, and the third is the important one: an orchestration failure (a GitHub
- * 500, a throttle, the λ losing its remaining time) must return to `pending` rather than mark the
- * operator's image `invalid`. `invalid` is TERMINAL (ADR-041) — spending it on our own transient
- * fault would permanently condemn a working image and force a manual re-validate to recover.
+ * Three outcomes — see {@link ValidationVerdict} for why the third exists. `staticFailureVerdict`
+ * applies the same rule to the static gate, so neither gate can spend terminal `invalid` on our
+ * own fault.
  *
  * Everything the ADR requires must be positively observed. In particular a `success` conclusion is
  * NOT sufficient on its own: without `selfTerminated` the ADR-021 hook path is unproven, and an

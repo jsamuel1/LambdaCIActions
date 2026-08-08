@@ -4,10 +4,10 @@ import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
  * The flavor catalog seam (ADR-040).
  *
  * This is the ONLY module that imports `microvm/flavors.json` at runtime. Before ADR-040 the
- * JSON was imported statically in three places (`src/provision/flavor.ts`, `src/mgmt/views.ts`,
- * `src/ingest/compat.ts`) plus `src/mgmt/rewrite.ts`; composing `builtin ++ custom` in four
- * places would have given four chances to disagree about what a flavor is. Everything that
- * needs the catalog now derives it from here.
+ * JSON was imported statically in five places (`src/provision/flavor.ts`, `src/mgmt/views.ts`,
+ * `src/ingest/compat.ts`, `src/mgmt/rewrite.ts`, `src/shared/flavor-reconcile.ts`); composing
+ * `builtin ++ custom` in five places would have given five chances to disagree about what a
+ * flavor is. Everything that needs the catalog now derives it from here.
  *
  * The JSON stays **read-only and build-time**: it is compiled into each Lambda bundle, so it is
  * physically not writable at runtime. Custom flavors live in the store

@@ -24,21 +24,26 @@ import {
   isCustomFlavorName,
   isCustomFlavorLabel,
   requiredClaimLabels,
+  MAX_CUSTOM_FLAVOR_BASE_LENGTH,
 } from '../dist/src/shared/flavor-catalog.js';
 import {
   buildFlavorRecord,
   InvalidFlavorError,
   canTransitionValidation,
+  clampReason,
   isRoutableState,
   routableCustomFlavors,
   toCatalogFlavor,
   FLAVOR_VALIDATION_STATES,
   flavorSk,
   MAX_CUSTOM_FLAVORS_PER_INSTALLATION,
+  MAX_FLAVOR_REASON_LENGTH,
 } from '../dist/src/shared/flavor-store.js';
 import {
   staticGate,
   classifySmoke,
+  isInconclusive,
+  staticFailureVerdict,
   smokeLabel,
   isSmokeLabel,
   smokeWorkflowYaml,
@@ -50,6 +55,14 @@ import { shouldClaim } from '../dist/src/ingest/filter.js';
 import { isRunRef, isSmokeRef, isBrokerRef, keysFromRef, parseHookRequest } from '../dist/src/hook/broker-core.js';
 import { smokePk, smokeRef } from '../dist/src/shared/smoke-store.js';
 import { buildFlavorViews, flavorNames } from '../dist/src/mgmt/views.js';
+import {
+  validateCustomFlavor,
+  isMicrovmImageArn,
+  MAX_CUSTOM_FLAVOR_DESCRIPTION,
+  MAX_IMAGE_ARN_LENGTH,
+  MAX_SMOKE_REPO_LENGTH,
+  MAX_SMOKE_WORKFLOW_PATH_LENGTH,
+} from '../dist/src/mgmt/validate.js';
 import { analyzeCompat } from '../dist/src/ingest/compat.js';
 
 /** A registered-and-valid custom flavor, as the resolver would receive it. */
@@ -475,6 +488,45 @@ test('an absent image is a verdict; an unreadable one names the grant as the rem
   const forbidden = staticGate({ flavor: record(), image: { usable: false, state: 'FORBIDDEN' } });
   const f = forbidden.failures.find((x) => x.code === 'image-unreadable');
   assert.match(f.message, /readable by the provisioner/);
+  // Both are ANSWERS about the image, so both may spend terminal `invalid`.
+  assert.equal(absent.inconclusive, false);
+  assert.equal(forbidden.inconclusive, false);
+  assert.equal(staticFailureVerdict(absent.failures).state, 'invalid');
+  assert.equal(staticFailureVerdict(forbidden.failures).state, 'invalid');
+});
+
+test('a probe that could not run is NOT a verdict and must not spend terminal invalid', () => {
+  // `getMicroVMImageState` reports a throttle / missing SDK command / unmodelled error as
+  // `state: 'UNKNOWN'` WITH an `error`, precisely so a caller can tell "this image is broken" from
+  // "I could not find out". `invalid` is terminal (ADR-041), so collapsing the two would let one
+  // throttled GetMicrovmImage permanently condemn a working image and force a manual re-validate.
+  const r = staticGate({
+    flavor: record(),
+    image: { usable: false, state: 'UNKNOWN', error: 'Rate exceeded' },
+  });
+  assert.equal(r.ok, false);
+  const f = r.failures.find((x) => x.code === 'image-probe-failed');
+  assert.ok(f, 'a failed probe must have its own code, not image-unusable');
+  assert.match(f.message, /Rate exceeded/);
+  assert.match(f.message, /not a verdict about the image/);
+  assert.ok(!r.failures.some((x) => x.code === 'image-unusable'));
+  assert.equal(r.inconclusive, true);
+
+  const verdict = staticFailureVerdict(r.failures);
+  assert.equal(verdict.state, 'pending');
+  assert.match(verdict.reason, /could not complete/);
+});
+
+test('a real defect alongside a failed probe is still a real defect', () => {
+  // The bias only runs one way: a flavor that is independently broken must be told so NOW, not
+  // after a retry that will reach the same conclusion.
+  const r = staticGate({
+    flavor: { ...record(), arch: 'x86_64' },
+    image: { usable: false, state: 'UNKNOWN', error: 'Rate exceeded' },
+  });
+  assert.equal(r.inconclusive, false);
+  assert.equal(staticFailureVerdict(r.failures).state, 'invalid');
+  assert.equal(isInconclusive([]), false, 'no failures is not "inconclusive"');
 });
 
 test('an unprobed image runs every cheap check without inventing an image verdict', () => {
@@ -733,26 +785,82 @@ test('the reconcile catalog and the routing catalog are the same built-in list',
 test('the flavor cap is orders of magnitude below a DynamoDB query page', () => {
   // The claim being pinned is not "64 is a nice number" — it is that 64 rows of this shape cannot
   // approach 1 MiB, which is what makes one page provably the whole set.
+  //
+  // Every variable-length component is taken from the EXPORTED cap the validator enforces, not from
+  // a plausible-looking literal. A hand-picked 60-character ARN would assert a bound nothing
+  // actually applies: `isMicrovmImageArn` used to accept an unbounded name, so three ~400 KiB rows
+  // could truncate the page, silently drop later `valid` flavors out of ingest's claim allowlist,
+  // and let the registration cap itself be bypassed (it counts only the page it got back). Deriving
+  // the worst case from the caps means adding a new unbounded field, or raising one, fails HERE.
+  const arnPrefix = 'arn:aws:lambda:us-west-2:123456789012:microvm-image/';
   const rec = buildFlavorRecord({
     installationId: 42,
-    base: 'g'.repeat(32),
+    base: 'g'.repeat(MAX_CUSTOM_FLAVOR_BASE_LENGTH),
     vcpu: 4,
     memoryMb: 8192,
     capabilities: ['docker', 'node', 'python', 'java', 'go', 'rust'],
-    description: 'x'.repeat(200),
-    imageArn: `arn:aws:lambda:us-west-2:123456789012:microvm-image/${'i'.repeat(60)}`,
-    smokeRepoFullName: 'owner/repo',
-    smokeWorkflowPath: '.github/workflows/lca-flavor-validate.yml',
+    description: 'x'.repeat(MAX_CUSTOM_FLAVOR_DESCRIPTION),
+    imageArn: arnPrefix + 'i'.repeat(MAX_IMAGE_ARN_LENGTH - arnPrefix.length),
+    smokeRepoFullName: `${'o'.repeat(60)}/${'r'.repeat(MAX_SMOKE_REPO_LENGTH - 61)}`,
+    smokeWorkflowPath: `.github/workflows/${'w'.repeat(MAX_SMOKE_WORKFLOW_PATH_LENGTH - 23)}.yml`,
     actor: 'octocat',
   });
-  // Worst case: max-length name, every capability, max description. Evidence is added later, so
-  // allow generous headroom for it on top.
-  const worstCaseBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8') + 1024;
+  // The row a verdict eventually writes is bigger than the row registration wrote: `reason` and
+  // `evidence` are added later, so include them at their own bounds rather than guessing headroom.
+  const settled = {
+    ...rec,
+    reason: 'x'.repeat(MAX_FLAVOR_REASON_LENGTH),
+    evidence: {
+      imageArn: rec.imageArn,
+      microvmId: 'm'.repeat(64),
+      runnerId: 999999999,
+      workflowRunId: 999999999,
+      workflowConclusion: 'success',
+      selfTerminated: true,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    },
+  };
+  const worstCaseBytes = Buffer.byteLength(JSON.stringify(settled), 'utf8');
   const pageBytes = 1024 * 1024;
   assert.ok(
     worstCaseBytes * MAX_CUSTOM_FLAVORS_PER_INSTALLATION < pageBytes / 4,
     `${MAX_CUSTOM_FLAVORS_PER_INSTALLATION} × ${worstCaseBytes}B must stay well under a ${pageBytes}B page`,
   );
+});
+
+test('every operator-supplied persisted field is length-bounded', () => {
+  // The size argument above is only sound if nothing on the row can grow without limit. These are
+  // the fields an operator controls; each must be refused past its cap by the validator that gates
+  // the single writer.
+  const arn = 'arn:aws:lambda:us-west-2:123456789012:microvm-image/';
+  assert.equal(isMicrovmImageArn(arn + 'i'.repeat(MAX_IMAGE_ARN_LENGTH - arn.length)), true);
+  assert.equal(isMicrovmImageArn(arn + 'i'.repeat(MAX_IMAGE_ARN_LENGTH)), false, 'imageArn is unbounded');
+
+  const over = (patch) => validateCustomFlavor({
+    name: 'gpu',
+    vcpu: 2,
+    memoryMb: 4096,
+    capabilities: ['docker'],
+    description: 'gpu builder',
+    imageArn: arn + 'img',
+    ...patch,
+  });
+  assert.equal(over({ imageArn: arn + 'i'.repeat(MAX_IMAGE_ARN_LENGTH) }).ok, false);
+  assert.equal(over({ smokeRepoFullName: `owner/${'r'.repeat(MAX_SMOKE_REPO_LENGTH)}` }).ok, false);
+  assert.equal(
+    over({ smokeWorkflowPath: `.github/workflows/${'w'.repeat(MAX_SMOKE_WORKFLOW_PATH_LENGTH)}.yml` }).ok,
+    false,
+  );
+  // ...and a legitimate registration is unaffected.
+  assert.equal(over({ smokeRepoFullName: 'octocat/ci', smokeWorkflowPath: '.github/workflows/v.yml' }).ok, true);
+
+  // `reason` is written by US, not the operator, but can embed an unbounded AWS error message. It
+  // is clamped rather than refused: a verdict must always be recordable.
+  assert.equal(clampReason('short'), 'short');
+  const clamped = clampReason('y'.repeat(MAX_FLAVOR_REASON_LENGTH * 3));
+  assert.equal(clamped.length, MAX_FLAVOR_REASON_LENGTH);
+  assert.match(clamped, /…$/);
 });
 
 test('the cap is a real bound, not a comment', async () => {

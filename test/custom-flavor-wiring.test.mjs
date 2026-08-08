@@ -428,3 +428,65 @@ test('a signal upgrade away from a routable custom flavor is legitimate, not a r
   assert.equal(res.replaced, 'custom-nodocker');
   assert.equal(res.unresolvedCustom, undefined);
 });
+
+// ---- 6. the refusal must be CLASSIFIED, not a bare throw -------------------
+//
+// The custom-flavor read fails open to `[]`, so "the flavor is not in the catalog" has two causes
+// that need opposite handling — and the routing layer cannot tell them apart on its own:
+//
+//   - deleted / no longer `valid`  ⇒ DETERMINISTIC. Retrying cannot fix it. The run must be marked
+//     `failed` with a reason an operator can read, and the SQS message consumed. Throwing instead
+//     burns three redeliveries into the DLQ and leaves the row in `provisioning`, which the console
+//     renders as a healthy in-flight run — so the operator watches a job hang forever.
+//   - the store faulted           ⇒ TRANSIENT. Rethrow so SQS redelivers, and write NO terminal
+//     status: `failed` is terminal, so the redelivered message's queued→provisioning guard would
+//     refuse to advance the row and return early — the retry would never reach the launch again.
+
+test('the store reports a degraded read distinguishably from an empty one', async () => {
+  const { loadRoutableCustomFlavorsResult, routableCustomFlavors } = await import(
+    '../dist/src/shared/flavor-store.js'
+  );
+  // Unconfigured store (no TABLE_NAME) ⇒ the read throws internally ⇒ degraded, not "none".
+  const res = await loadRoutableCustomFlavorsResult(42);
+  assert.deepEqual(res.flavors, []);
+  assert.equal(res.degraded, true, 'a faulted read must not look like an empty installation');
+  // ...whereas a successful read of an installation with no valid rows is NOT degraded. Proven on
+  // the pure projection the loader wraps, since the loader itself needs DynamoDB.
+  assert.deepEqual(routableCustomFlavors([]), []);
+  assert.deepEqual(routableCustomFlavors([{ name: 'custom-x', state: 'pending' }]), []);
+});
+
+test('the provisioner marks the run failed on a confirmed-unroutable flavor, and retries a degraded read', async () => {
+  const { readFileSync } = await import('node:fs');
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const src = strip(readFileSync(new URL('../src/provision/handler.ts', import.meta.url), 'utf8'));
+
+  // The refusal consults the degraded flag...
+  const refusal = src.indexOf('resolution.unresolvedCustom');
+  assert.ok(refusal > 0, 'the unresolved-custom refusal is gone');
+  const block = src.slice(refusal, refusal + 1600);
+  assert.match(block, /if \(customReadDegraded\)/, 'the refusal no longer distinguishes a degraded read');
+  // ...rethrows on the transient branch...
+  assert.match(block, /throw new Error\(`\$\{detail\}/);
+  // ...and writes a terminal `failed` with a reason on the deterministic branch.
+  assert.match(block, /to: 'failed'/);
+  assert.match(block, /reason,/);
+
+  // The transient branch must NOT write a terminal status: the throw has to come before it.
+  assert.ok(
+    block.indexOf('if (customReadDegraded)') < block.indexOf("to: 'failed'"),
+    'a degraded read must rethrow BEFORE any terminal transition, or the retry cannot advance the row',
+  );
+
+  // A lookup that threw outright never performed the custom read, so it is degraded too —
+  // otherwise a `getRepo` fault permanently fails a job whose flavor is perfectly valid.
+  const fallback = src.slice(src.indexOf('resolve-options lookup failed'));
+  assert.match(
+    fallback.slice(0, 200),
+    /customReadDegraded: true/,
+    'a thrown options lookup must count as degraded, not as evidence the flavor is gone',
+  );
+
+  // And the degraded signal has to come from the store rather than being assumed.
+  assert.match(src, /loadRoutableCustomFlavorsResult/);
+});

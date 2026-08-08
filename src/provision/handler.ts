@@ -13,7 +13,7 @@ import { matchJobAnalysis } from '../ingest/job-match.js';
 import { incompatibleRunnerLabel } from '../ingest/adopt.js';
 import type { ProvisionRequest, RunHookPayload } from '../shared/types.js';
 import { resolveFlavor, needsCustomFlavors, type ResolveOptions } from './flavor.js';
-import { loadRoutableCustomFlavors, getCustomFlavor } from '../shared/flavor-store.js';
+import { loadRoutableCustomFlavorsResult, getCustomFlavor } from '../shared/flavor-store.js';
 import { isCustomFlavorName } from '../shared/flavor-catalog.js';
 import { jitRunnerLabels, classifyMintFailure, NoRunnerLabelsError, TooManyRunnerLabelsError, IncompatibleRunnerLabelError, MAX_JIT_LABELS } from './labels.js';
 import { emitMetrics, isQuotaError } from '../shared/metrics.js';
@@ -101,9 +101,14 @@ async function provisionOne(record: SQSRecord): Promise<void> {
 
   // 1. flavor → image ARN. FlavorMap override + parsed step signals are best-effort: a
   //    missing analysis / DB fault degrades to label-only routing, never a failed launch.
-  const resolveOpts = await lookupResolveOptions(req).catch((err) => {
+  //
+  //    A lookup that threw outright counts as DEGRADED for the custom-flavor refusal below: the
+  //    custom read may never have run, so "the flavor is not in the catalog" is not something we
+  //    actually learned, and treating it as a verdict would permanently fail a job whose flavor is
+  //    perfectly valid.
+  const { opts: resolveOpts, customReadDegraded } = await lookupResolveOptions(req).catch((err) => {
     console.error(JSON.stringify({ msg: 'resolve-options lookup failed (label-only)', error: errMsg(err) }));
-    return {} as ResolveOptions;
+    return { opts: {} as ResolveOptions, customReadDegraded: true };
   });
   const resolution = resolveFlavor(req.labels, resolveOpts);
   const { flavor, reason: flavorReason } = resolution;
@@ -117,18 +122,52 @@ async function provisionOne(record: SQSRecord): Promise<void> {
   // a REAL built-in image ARN, while `jitRunnerLabels(req.labels)` still advertises the original
   // `lambda-ci-custom-*` label — so GitHub would assign the job and it would SUCCEED on an image
   // the workflow never asked for. That is worse than any failure: it is a wrong answer that looks
-  // right.
+  // right. No runner is minted on either branch below, so the job is never assigned.
   //
-  // Throwing routes the message to SQS redelivery and ultimately the DLQ. No runner is ever minted,
-  // so the job simply stays queued from GitHub's side — visibly not-run rather than invisibly wrong
-  // — and a genuinely transient store fault is retried. This is also why the gated custom-flavor
-  // read failing open to `[]` is safe: every job that reaches that read named a custom flavor, so
-  // an empty catalog is caught here rather than silently downgrading the launch.
+  // WHICH refusal depends on why — the same permanent/transient split the JIT mint below already
+  // makes, for the same reasons:
+  //
+  //   - the store read DEGRADED ⇒ transient. Rethrow so SQS redelivers, and deliberately write NO
+  //     terminal status: `failed` is terminal, so the redelivered message's queued→provisioning
+  //     guard would refuse to advance the row and return early — the retry we asked for would
+  //     never reach this point again.
+  //   - the read SUCCEEDED and the flavor is simply not routable ⇒ deterministic. Retrying cannot
+  //     fix a deleted or unvalidated flavor, so mark the run `failed` with an actionable reason and
+  //     consume the message. Throwing here instead would burn three redeliveries into the DLQ and
+  //     leave the row in `provisioning`, which the console renders as a healthy in-flight run — so
+  //     the operator would watch a job hang forever instead of reading why it was refused.
   if (resolution.unresolvedCustom) {
-    throw new Error(
+    const detail =
       `job named custom flavor '${resolution.unresolvedCustom}' which is not currently routable ` +
-        `(deleted, or validation not \`valid\`) — refusing to launch on fallback '${flavor}'`,
+      `— refusing to launch on fallback '${flavor}'`;
+    if (customReadDegraded) {
+      throw new Error(`${detail} (custom-flavor lookup degraded — retrying)`);
+    }
+    const reason =
+      `custom flavor '${resolution.unresolvedCustom}' is not routable: it was deleted, or its ` +
+      'validation state is not `valid` (ADR-041). Re-validate it, or remove the label from this job.';
+    emitMetrics(
+      [{ name: 'ProvisionFailures', value: 1, unit: 'Count' }],
+      { env: LCA_ENV, flavor, via: req.claimVia ?? 'label', kind: 'unroutable-flavor' },
+      { repo: req.repoFullName, runId: req.runId, jobId: req.jobId },
     );
+    console.error(
+      JSON.stringify({
+        msg: 'refusing unroutable custom flavor',
+        runId: req.runId,
+        jobId: req.jobId,
+        detail,
+      }),
+    );
+    await transitionRun({
+      repoId: req.repoId,
+      runId: req.runId,
+      jobId: req.jobId,
+      to: 'failed',
+      flavor,
+      reason,
+    }).catch(() => {});
+    return;
   }
 
   const imageArn = await resolveImageArn(req.installationId, flavor);
@@ -351,12 +390,6 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * Assemble ResolveOptions for a job: the repo's FlavorMap override + operator-chosen
- * defaultFlavor (repo row, written by the console — spec 04) + the job's parsed step signals
- * (stored workflow analysis, matched by rendered name). Any part may be absent —
- * resolveFlavor treats missing opts as label-only.
- */
-/**
  * Decide whether a custom flavor row may be launched, and with which image (ADR-040/041).
  *
  * Pure and exported so the LAST gate before a real VM boots from an operator-supplied image is
@@ -407,8 +440,21 @@ async function resolveImageArn(installationId: number, flavor: string): Promise<
   return launchableCustomImageArn(flavor, rec, installationId);
 }
 
-async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptions> {
+/**
+ * Assemble ResolveOptions for a job: the repo's FlavorMap override + operator-chosen
+ * defaultFlavor (repo row, written by the console — spec 04) + the job's parsed step signals
+ * (stored workflow analysis, matched by rendered name). Any part may be absent —
+ * resolveFlavor treats missing opts as label-only.
+ *
+ * `customReadDegraded` reports that the custom-flavor read FAULTED rather than finding nothing.
+ * The caller needs it because "this flavor is not in the catalog" then means two different things
+ * — gone, or unreadable — and only one of them is worth retrying.
+ */
+async function lookupResolveOptions(
+  req: ProvisionRequest,
+): Promise<{ opts: ResolveOptions; customReadDegraded: boolean }> {
   const opts: ResolveOptions = {};
+  let customReadDegraded = false;
 
   const repo = await getRepo(req.installationId, req.repoId).catch(() => undefined);
   if (repo?.flavorMap) opts.flavorMap = repo.flavorMap;
@@ -430,11 +476,15 @@ async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptio
   // Custom flavors (ADR-040), gated on the job actually NAMING one. `needsCustomFlavors` is pure
   // and reads the labels/FlavorMap/defaultFlavor we already have, so an installation that uses
   // only built-ins performs NO extra I/O here — the ADR's "byte-identical, no I/O" requirement.
-  // The load itself fails OPEN (returns `[]` and logs), so a DynamoDB fault degrades this job to
-  // built-in-only routing rather than failing a launch that `base` could have served.
+  // The load itself fails OPEN (returns `[]` and logs) so a DynamoDB fault degrades this job to
+  // built-in-only routing rather than throwing from a lookup that is best-effort for every other
+  // field — but it reports THAT it degraded, because the caller's refusal has to distinguish an
+  // unreadable table (retry) from a flavor that is genuinely gone (fail with a reason).
   if (needsCustomFlavors(req.labels, opts)) {
-    opts.customFlavors = await loadRoutableCustomFlavors(req.installationId);
+    const res = await loadRoutableCustomFlavorsResult(req.installationId);
+    opts.customFlavors = res.flavors;
+    customReadDegraded = res.degraded;
   }
 
-  return opts;
+  return { opts, customReadDegraded };
 }

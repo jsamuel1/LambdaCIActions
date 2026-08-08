@@ -2024,17 +2024,33 @@ than failing the launch. `flavorNames()` (used by `validateFlavorMap`/`validateR
 `buildFlavorViews` become installation-scoped, which changes the Mgmt API's validation surface.
 
 **As implemented.** The single catalog seam is `src/shared/flavor-catalog.ts` — the only module
-that imports `microvm/flavors.json` — and `src/shared/flavor-store.ts` owns the rows. Four static
-imports moved behind it (`src/provision/flavor.ts`, `src/mgmt/views.ts`, `src/ingest/compat.ts`,
-`src/mgmt/rewrite.ts`); `rewrite.ts` deliberately stays **built-in only**, because it plans a YAML
+that imports `microvm/flavors.json` — and `src/shared/flavor-store.ts` owns the rows. All five
+static imports moved behind it (`src/provision/flavor.ts`, `src/mgmt/views.ts`,
+`src/ingest/compat.ts`, `src/mgmt/rewrite.ts`, `src/shared/flavor-reconcile.ts`); `rewrite.ts` and
+`flavor-reconcile.ts` deliberately stay **built-in only** — `rewrite.ts` because it plans a YAML
 edit to a customer's workflow file and a per-installation label can be revoked, which would leave a
-committed `runs-on` nobody claims. The optional `custom`/`customFlavors` parameters are trailing on
+committed `runs-on` nobody claims; `flavor-reconcile.ts` because it reconciles the catalog against
+`image-arn-<flavor>` in SSM and the env-scoped label allowlist, neither of which a custom flavor
+participates in. The optional `custom`/`customFlavors` parameters are trailing on
 every seam, so omitting them is the pre-ADR-040 behavior exactly, and `composeCatalog([])` returns
 the built-in array *itself* — no copy, no re-sort, satisfying (5) in code rather than by convention.
 The hot-path read is gated by `needsCustomFlavors()`, a pure test for whether the job could name a
 custom flavor at all, so an installation with no custom flavors performs **no I/O**.
 
-Two details the decision above did not anticipate:
+Three details the decision above did not anticipate:
+
+- **The 64-flavor cap needs a bounded ROW, not just a bounded count.** `listCustomFlavors` reads one
+  DynamoDB query page and the cap is what makes that page provably the whole set — an argument that
+  only holds if a row has a bounded size. A DynamoDB item may be 400 KiB, so three rows carrying a
+  few hundred KiB of ARN suffix would exceed a 1 MiB page: later `valid` flavors would silently
+  vanish from the read, dropping their labels out of ingest's claim allowlist (jobs never claimed,
+  no error anywhere) and letting the cap itself be bypassed, since it counts only the returned page.
+  Every operator-supplied variable-length field is therefore capped at registration
+  (`MAX_IMAGE_ARN_LENGTH`, `MAX_SMOKE_REPO_LENGTH`, `MAX_SMOKE_WORKFLOW_PATH_LENGTH`, alongside the
+  existing name/description bounds), and the control-plane-written `reason` is clamped at the store
+  (`clampReason`) rather than refused, because a verdict must always be recordable. The page-size
+  regression builds its worst-case row FROM those exported caps, so adding a new unbounded field
+  fails the test instead of silently widening the row.
 
 - **Image ARNs cannot share a lookup.** A built-in's ARN comes from SSM
   (`/lca/<env>/config/image-arn-<flavor>`, published by `scripts/build-images.mjs`); a custom
@@ -2049,9 +2065,18 @@ Two details the decision above did not anticipate:
   therefore reports an unresolvable named custom flavor as `unresolvedCustom` (covering a custom
   label, a FlavorMap value, and a custom `defaultFlavor` once the fallback is actually taken), and
   the provisioner refuses the launch — no runner is minted, so the job stays visibly queued rather
-  than invisibly wrong, and a transient fault is retried by SQS. This is also the claim→provision
-  race: ingest claims while the flavor is `valid`, and a delete or re-validate in the interval must
-  not silently reroute the job.
+  than invisibly wrong. This is also the claim→provision race: ingest claims while the flavor is
+  `valid`, and a delete or re-validate in the interval must not silently reroute the job.
+
+  The refusal is **classified**, not a bare throw, because the fail-open read makes "gone" and
+  "unreadable" look identical at the routing layer and they need opposite handling — the same
+  permanent/transient split the JIT mint already makes. `loadRoutableCustomFlavorsResult` reports
+  `degraded`, so a store fault (or a `lookupResolveOptions` that threw before the read ran) rethrows
+  for SQS redelivery and leaves the row `provisioning`, while a successful read that simply does not
+  contain the flavor marks the run **`failed` with an operator-readable reason** and consumes the
+  message. Throwing on the deterministic case would burn three redeliveries into the DLQ and leave
+  the row in `provisioning`, which the console renders as a healthy in-flight run — so the operator
+  would watch a job hang forever instead of reading why it was refused.
 Two parts of the decision are **not** fully met, recorded here rather than left to be discovered
 as bugs:
 
@@ -2131,8 +2156,11 @@ rule true rather than advisory:
 - The static gate (`src/flavorval/validate-core.ts`) and the smoke *classifier*
   (`classifySmoke`) are implemented and unit-tested, including the three-outcome rule that an
   orchestration failure returns to `pending` rather than spending terminal `invalid` on our own
-  transient fault. `src/shared/microvm.ts` can probe an image's real state, distinguishing
-  `ABSENT`/`FORBIDDEN` (answers) from a failed probe (not an answer).
+  transient fault. **Both** gates share that rule: `src/shared/microvm.ts` distinguishes an image
+  ANSWER (`ABSENT`/`FORBIDDEN`) from a probe that could not run, and `staticGate` preserves the
+  distinction as `image-probe-failed` + an `inconclusive` flag, with `staticFailureVerdict` mapping
+  it to `pending`. Collapsing them would let one throttled `GetMicrovmImage` permanently condemn a
+  working image.
 - The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
   re-validate trigger; a new image ARN atomically repoints and resets to `pending`.
 

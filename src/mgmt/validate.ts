@@ -437,6 +437,25 @@ export function parseEpochMs(raw: string | undefined): number | undefined {
 export const MAX_CUSTOM_FLAVOR_DESCRIPTION = 200;
 
 /**
+ * Length caps on the operator-supplied variable-length fields.
+ *
+ * These are a CORRECTNESS property of the store, not cosmetics. `listCustomFlavors` reads ONE
+ * DynamoDB query page and `MAX_CUSTOM_FLAVORS_PER_INSTALLATION` (64) is what makes that page
+ * provably the whole set — an argument that only holds if a row has a bounded size. DynamoDB's
+ * item limit is 400 KiB, so without these caps three rows carrying a few hundred KiB of ARN
+ * suffix would exceed a 1 MiB page: later `valid` flavors would silently vanish from the read,
+ * dropping their labels out of ingest's claim allowlist (jobs never claimed, no error anywhere)
+ * and letting the registration cap itself be bypassed, since it counts only the returned page.
+ *
+ * Every value is well above what the underlying service actually permits — a microVM image name
+ * is far shorter than 256, and GitHub bounds an owner at 39 characters and a repo at 100 — so
+ * these refuse abuse without constraining any legitimate registration.
+ */
+export const MAX_IMAGE_ARN_LENGTH = 512;
+export const MAX_SMOKE_REPO_LENGTH = 140;
+export const MAX_SMOKE_WORKFLOW_PATH_LENGTH = 200;
+
+/**
  * Validate a `POST /api/flavors` body (custom-flavor registration, ADR-040).
  *
  * Collects every error rather than short-circuiting, so an operator fixing a form sees the whole
@@ -529,10 +548,13 @@ export function validateCustomFlavor(
 
   let smokeRepoFullName: string | undefined;
   if (input.smokeRepoFullName !== undefined) {
-    if (typeof input.smokeRepoFullName !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(input.smokeRepoFullName.trim())) {
-      errors.push('smokeRepoFullName must be "owner/repo"');
+    const r = typeof input.smokeRepoFullName === 'string' ? input.smokeRepoFullName.trim() : '';
+    if (!/^[\w.-]+\/[\w.-]+$/.test(r) || r.length > MAX_SMOKE_REPO_LENGTH) {
+      errors.push(
+        `smokeRepoFullName must be "owner/repo" and at most ${MAX_SMOKE_REPO_LENGTH} characters`,
+      );
     } else {
-      smokeRepoFullName = input.smokeRepoFullName.trim();
+      smokeRepoFullName = r;
     }
   }
 
@@ -541,8 +563,14 @@ export function validateCustomFlavor(
     const p = typeof input.smokeWorkflowPath === 'string' ? input.smokeWorkflowPath.trim() : '';
     // Confined to the workflows directory: this path is handed to GitHub's
     // `workflow_dispatch` API, and a traversal-ish value is a request we should never send.
-    if (!p || !/^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(p)) {
-      errors.push('smokeWorkflowPath must be a .github/workflows/*.yml path');
+    if (
+      !p ||
+      !/^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(p) ||
+      p.length > MAX_SMOKE_WORKFLOW_PATH_LENGTH
+    ) {
+      errors.push(
+        `smokeWorkflowPath must be a .github/workflows/*.yml path of at most ${MAX_SMOKE_WORKFLOW_PATH_LENGTH} characters`,
+      );
     } else {
       smokeWorkflowPath = p;
     }
@@ -575,9 +603,17 @@ export function advertisesVcpuShape(description: string): boolean {
   return /\b\d+(\.\d+)?\s*(v?cpus?|vcpu|cores?|threads?)\b/i.test(description);
 }
 
-/** Whether a string looks like a microVM image ARN. */
+/**
+ * Whether a string looks like a microVM image ARN.
+ *
+ * Length-capped as well as shape-checked: the ARN is persisted on the flavor row, and an unbounded
+ * one would break the single-page `listCustomFlavors` invariant — see {@link MAX_IMAGE_ARN_LENGTH}.
+ */
 export function isMicrovmImageArn(arn: string): boolean {
-  return /^arn:[a-z0-9-]+:lambda:[a-z0-9-]+:\d{12}:microvm-image\/[\w.-]+$/.test(arn);
+  return (
+    arn.length <= MAX_IMAGE_ARN_LENGTH &&
+    /^arn:[a-z0-9-]+:lambda:[a-z0-9-]+:\d{12}:microvm-image\/[\w.-]+$/.test(arn)
+  );
 }
 
 /** Validate a `POST /api/flavors/{name}/revalidate` body (optionally repointing the image). */

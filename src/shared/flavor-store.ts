@@ -68,6 +68,25 @@ export const FLAVOR_SK_PREFIX = 'FLAVOR#';
  */
 export const MAX_CUSTOM_FLAVORS_PER_INSTALLATION = 64;
 
+/**
+ * Max length of the stored `reason`.
+ *
+ * The last variable-length field on the row that is not already bounded by the registration
+ * validator. A reason is normally ours (a static-gate failure list, a smoke verdict), but it can
+ * embed an AWS error message of unbounded length — and an unbounded field breaks the same
+ * single-page invariant {@link MAX_CUSTOM_FLAVORS_PER_INSTALLATION} exists to guarantee. Truncated
+ * rather than refused: a verdict must always be recordable, and a clipped explanation is strictly
+ * better than a write that fails and leaves the flavor stuck in `validating`.
+ */
+export const MAX_FLAVOR_REASON_LENGTH = 1024;
+
+/** Clip a reason to {@link MAX_FLAVOR_REASON_LENGTH} characters, marking that it was cut. */
+export function clampReason(reason: string): string {
+  return reason.length <= MAX_FLAVOR_REASON_LENGTH
+    ? reason
+    : `${reason.slice(0, MAX_FLAVOR_REASON_LENGTH - 1)}…`;
+}
+
 // ---- validation state machine (ADR-041) ------------------------------------
 
 /**
@@ -380,25 +399,32 @@ export async function listCustomFlavors(
 }
 
 /**
- * The routable custom flavors for an installation, or `[]` on ANY fault (ADR-040 fail-open).
+ * The routable custom flavors for an installation, plus whether the read DEGRADED (ADR-040
+ * fail-open).
  *
  * The fault behavior is safe only in combination with the provisioner's refusal, and the two must
  * be read together. Because callers gate this read on `needsCustomFlavors`, EVERY job that reaches
  * it has named a custom flavor — so returning `[]` here cannot quietly downgrade an ordinary job
- * (an ordinary job never gets this far). What it does mean is that a store fault is indistinguish-
- * able from "the flavor is gone", and `resolveFlavor` reports either as `unresolvedCustom`, which
- * the provisioner turns into a refused (and hence retried) launch rather than a silent fallback to
- * `base`. That is the whole point: falling through would put the job on a REAL built-in image while
- * its runner still advertised the custom label, so it would succeed on the wrong image.
+ * (an ordinary job never gets this far). What it does mean is that `resolveFlavor` reports the
+ * flavor as `unresolvedCustom`, which the provisioner turns into a refused launch rather than a
+ * silent fallback to `base`. That is the whole point: falling through would put the job on a REAL
+ * built-in image while its runner still advertised the custom label, so it would succeed on the
+ * wrong image.
  *
- * So this returns `[]` rather than throwing to keep the failure in ONE place — the resolution
- * result — instead of splitting it across an exception path and a routing path.
+ * `degraded` is what lets the caller pick the RIGHT refusal. A deleted / no-longer-`valid` flavor
+ * is deterministic — retrying cannot fix it, so the run should be failed with a readable reason —
+ * while a store fault is transient and must be retried. Collapsing the two makes a transient blip
+ * indistinguishable from a permanent misconfiguration, and the run row then sticks in
+ * `provisioning` with nothing explaining why.
  */
-export async function loadRoutableCustomFlavors(
+export async function loadRoutableCustomFlavorsResult(
   installationId: number,
-): Promise<CatalogFlavor[]> {
+): Promise<{ flavors: CatalogFlavor[]; degraded: boolean }> {
   try {
-    return routableCustomFlavors(await listCustomFlavors(installationId));
+    return {
+      flavors: routableCustomFlavors(await listCustomFlavors(installationId)),
+      degraded: false,
+    };
   } catch (err) {
     console.warn(
       JSON.stringify({
@@ -407,8 +433,23 @@ export async function loadRoutableCustomFlavors(
         error: err instanceof Error ? err.message : String(err),
       }),
     );
-    return [];
+    return { flavors: [], degraded: true };
   }
+}
+
+/**
+ * The routable custom flavors for an installation, or `[]` on ANY fault (ADR-040 fail-open).
+ *
+ * The fault-tolerant half of {@link loadRoutableCustomFlavorsResult}, for callers that only build a
+ * PREVIEW and have no launch to refuse — discovery's stored routing analysis, for instance, where a
+ * degraded read simply produces the same preview an installation with no custom flavors gets.
+ * A caller that is about to act on the result (i.e. launch a VM) must use the `Result` form so it
+ * can distinguish a vanished flavor from an unreadable table.
+ */
+export async function loadRoutableCustomFlavors(
+  installationId: number,
+): Promise<CatalogFlavor[]> {
+  return (await loadRoutableCustomFlavorsResult(installationId)).flavors;
 }
 
 /** Read one custom flavor. */
@@ -468,7 +509,7 @@ export async function transitionFlavorValidation(input: {
   if (input.reason !== undefined) {
     sets.push('#reason = :reason');
     names['#reason'] = 'reason';
-    values[':reason'] = input.reason;
+    values[':reason'] = clampReason(input.reason);
   } else {
     removes.push('#reason');
     names['#reason'] = 'reason';
