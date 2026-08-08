@@ -295,13 +295,17 @@ so a description advertising a vCPU shape is refused.
 A custom flavor is **not routable until it has demonstrably run a job** (ADR-041):
 `pending → validating → valid | invalid(reason)`, and only `valid` flavors are selectable in a
 `FlavorMap`/`defaultFlavor` or resolvable from a label. The **state machine and every refusal are
-implemented** — transitions are enforced in the DynamoDB condition expression so concurrent runs
-cannot both launch a VM and both write a verdict, and non-`valid` is refused in three independent
-places (catalog composition, config validation, and immediately before launch, since resolution and
+implemented** — transitions are enforced in the DynamoDB condition expression, so only one run can
+win `pending → validating` and a stale verdict cannot overwrite a newer one — and non-`valid` is
+refused in three independent places (catalog composition, config validation, and immediately before
+launch, since resolution and
 launch are separate reads). Validation is (1) static checks — arm64, image ARN resolves and is
 readable by the provisioner, capabilities drawn from the closed vocabulary (`docker`, `node`,
-`python`, `java`, `go`, `rust`), memory bounds-checked — **implemented, including a real image-state
-probe**, though the memory bound is currently a fixed sanity ceiling rather than the region's live
+`python`, `java`, `go`, `rust`), memory bounds-checked — **the gate is implemented, but no deployed
+path probes an image yet**: the probe (`getMicroVMImageState`) and the gate's handling of its three
+outcomes are implemented and tested, while the gate's only caller today is the no-write preview
+endpoint, which deliberately probes nothing — so the probe runs for the first time when the
+smoke-run λ lands. The memory bound is likewise a fixed sanity ceiling rather than the region's live
 microVM quota: nothing reads that quota yet, so an obvious typo is caught but a request that merely
 exceeds the account's real headroom is not (ADR-040); and (2) a **smoke run**: one microVM launched
 from the image with a synthetic JIT-registered runner that must register, execute a trivial job, and

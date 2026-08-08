@@ -2144,8 +2144,13 @@ the static gates; the smoke run itself is verified against a live environment.
 rule true rather than advisory:
 
 - The state machine lives in `src/shared/flavor-store.ts`. Legal transitions are enforced **in the
-  DynamoDB condition expression**, not in a read-then-write, so two concurrent validation runs
-  cannot both launch a VM and both write a verdict. `valid → validating` and `invalid → validating`
+  DynamoDB condition expression**, not in a read-then-write, so only one of two concurrent runs can
+  win `pending → validating`, and a run whose row moved underneath it cannot write a stale verdict.
+  That is narrower than "two runs can never both launch a VM": a manual re-validate deliberately
+  moves `validating → pending`, which re-opens the transition, so an operator who re-validates a run
+  in flight can have two VMs alive at once. The loser's verdict is still refused, so the *record*
+  stays correct; bounding the duplicate LAUNCH belongs to the λ that owns the run's deadline, and is
+  called out on the successor card. `valid → validating` and `invalid → validating`
   are deliberately absent: re-validation must pass through `pending` so a flavor stops being
   routable the moment its evidence is withdrawn.
 - Only `valid` rows are composed into the catalog (`routableCustomFlavors`), so an unvalidated
@@ -2160,7 +2165,11 @@ rule true rather than advisory:
   ANSWER (`ABSENT`/`FORBIDDEN`) from a probe that could not run, and `staticGate` preserves the
   distinction as `image-probe-failed` + an `inconclusive` flag, with `staticFailureVerdict` mapping
   it to `pending`. Collapsing them would let one throttled `GetMicrovmImage` permanently condemn a
-  working image.
+  working image. Note what this does NOT yet mean in a deployed environment: the gate's only
+  production caller is the no-write preview endpoint, which deliberately passes no `image`, so
+  `getMicroVMImageState` has **no production caller** and the image half of the gate first executes
+  when the λ below lands. It is tested directly against all three outcomes so that it is a
+  contract rather than an assumption.
 - The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
   re-validate trigger; a new image ARN atomically repoints and resets to `pending`.
 
@@ -2178,7 +2187,9 @@ JIT/RUN row pair, in the shapes the broker already reads) and the broker's `isSm
 extension. Neither has a production caller yet — nothing writes a `SMOKE#` row, so the widened
 grammar admits a ref that resolves to no item, and the store is tree-shaken out of every bundle.
 The cross-module ref contract between them is pinned by test, because a drift there would otherwise
-only surface during the live smoke run.
+only surface during the live smoke run. `getMicroVMImageState` is in the same category: implemented
+and tested against all three of its outcomes, but with no production caller until the λ passes its
+result to `staticGate`.
 
 > **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
 > to **042..046** to vacate a collision, following the same convention as the 038..041 block

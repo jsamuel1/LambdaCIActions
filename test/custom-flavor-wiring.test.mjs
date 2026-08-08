@@ -456,6 +456,26 @@ test('the store reports a degraded read distinguishably from an empty one', asyn
   assert.deepEqual(routableCustomFlavors([{ name: 'custom-x', state: 'pending' }]), []);
 });
 
+test('the Flavors API keeps that distinction too, instead of showing an empty catalog', async () => {
+  const { readFileSync } = await import('node:fs');
+  // The console surface is deferred, but the API it will read must not collapse "this installation
+  // has no custom flavors" into "we could not read them". An operator who has just registered one
+  // would otherwise see it vanish during a DynamoDB blip and register it again — and the screen's
+  // entire purpose here, reporting validation progress, would silently report nothing to report.
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const src = strip(readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8'));
+  const at = src.indexOf("case 'listFlavors'");
+  assert.ok(at > 0, 'listFlavors route is gone');
+  const block = src.slice(at, at + 1200);
+  // The read is NOT swallowed into a default empty array...
+  assert.ok(
+    !/listCustomFlavors\(scoped\)\.catch\(\(\) => \[\]\)/.test(block),
+    'a failed custom-flavor read is being reported as an empty catalog',
+  );
+  // ...and the response says which of the two happened.
+  assert.match(block, /customFlavorsRead: custom \? 'ok' : 'degraded'/);
+});
+
 test('the provisioner marks the run failed on a confirmed-unroutable flavor, and retries a degraded read', async () => {
   const { readFileSync } = await import('node:fs');
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');

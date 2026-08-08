@@ -646,9 +646,25 @@ async function route_(
       const scoped = asPositiveInt(q.installation);
       if (scoped !== undefined) {
         if (!canAdminInstallation(session, scoped)) return problem(403, 'forbidden');
-        const custom = await listCustomFlavors(scoped).catch(() => []);
+        // A failed read is NOT an empty catalog, and the response must not let a client conflate
+        // them. Collapsing both to `[]` would show an operator who just registered a flavor an
+        // empty list during a DynamoDB blip — inviting them to register it again (a 409 at best,
+        // and a second image to reason about at worst) and making the console's whole purpose here,
+        // reporting validation progress, silently report "nothing to report".
+        let custom: CustomFlavorRecord[] | undefined;
+        try {
+          custom = await listCustomFlavors(scoped);
+        } catch (err) {
+          console.error(
+            JSON.stringify({ msg: 'custom flavor list read failed', installationId: scoped, error: errMsg(err) }),
+          );
+        }
         return json(200, {
-          flavors: buildFlavorViews(await imageAvailability(), custom),
+          flavors: buildFlavorViews(await imageAvailability(), custom ?? []),
+          // `ok` = the installation's custom rows were read (possibly genuinely none);
+          // `degraded` = they could not be read, so the rows above are built-ins ONLY and the
+          // absence of a custom flavor here is not evidence that it does not exist.
+          customFlavorsRead: custom ? 'ok' : 'degraded',
           smokeWorkflow: smokeWorkflowYaml(),
         });
       }

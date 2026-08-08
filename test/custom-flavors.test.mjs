@@ -64,6 +64,10 @@ import {
   MAX_SMOKE_WORKFLOW_PATH_LENGTH,
 } from '../dist/src/mgmt/validate.js';
 import { analyzeCompat } from '../dist/src/ingest/compat.js';
+import { getMicroVMImageState } from '../dist/src/shared/microvm.js';
+
+/** A well-formed microVM image ARN, for probe tests. */
+const ARN = 'arn:aws:lambda:us-west-2:123456789012:microvm-image/operator-gpu';
 
 /** A registered-and-valid custom flavor, as the resolver would receive it. */
 function validCustom(over = {}) {
@@ -536,6 +540,117 @@ test('an unprobed image runs every cheap check without inventing an image verdic
   const bad = staticGate({ flavor: { ...record(), arch: 'x86_64' } });
   assert.equal(bad.ok, false);
   assert.ok(!bad.failures.some((f) => f.code.startsWith('image-')));
+});
+
+// The gate tests above hand-build the `image` argument, which proves how the gate REACTS to each
+// outcome but nothing about which outcome the probe actually produces. That mapping is the half
+// that has no production caller yet (the only `staticGate` caller is the no-write preview, which
+// deliberately probes nothing), so it is the half most likely to drift unnoticed before the
+// smoke-run λ consumes it — and getting it wrong is not a cosmetic bug: mapping AccessDenied or a
+// throttle onto "absent" would spend terminal `invalid` on a working image, while mapping a genuine
+// ResourceNotFound onto "unknown" would retry a typo'd ARN forever.
+
+function fakeLambdaClient(behavior) {
+  return { send: async () => behavior() };
+}
+
+function awsError(name) {
+  const err = new Error(name);
+  err.name = name;
+  return err;
+}
+
+test('the image probe reports a real image as usable only in a launchable state', async () => {
+  for (const state of ['CREATED', 'UPDATED']) {
+    const res = await getMicroVMImageState(
+      fakeLambdaClient(() => ({ imageArn: ARN, state, latestActiveImageVersion: '3' })),
+      ARN,
+    );
+    assert.equal(res.usable, true, `${state} must be launchable`);
+    assert.equal(res.state, state);
+    assert.equal(res.error, undefined);
+    // `UPDATED` is where a REBUILT image lands, so omitting it would report every rebuilt
+    // flavor as broken.
+    assert.equal(staticGate({ flavor: record(), image: res }).ok, true);
+  }
+  for (const state of ['CREATING', 'CREATE_FAILED', 'UPDATING', 'UPDATE_FAILED', 'DELETING', 'DELETED']) {
+    const res = await getMicroVMImageState(fakeLambdaClient(() => ({ state })), ARN);
+    assert.equal(res.usable, false, `${state} must not be launchable`);
+    assert.equal(res.error, undefined, 'a state we could read is an ANSWER, not a probe failure');
+    const gate = staticGate({ flavor: record(), image: res });
+    assert.ok(gate.failures.some((f) => f.code === 'image-unusable'));
+    // A state we successfully read is evidence about the image, so it may be terminal.
+    assert.equal(gate.inconclusive, false);
+    assert.equal(staticFailureVerdict(gate.failures).state, 'invalid');
+  }
+});
+
+test('ONLY ResourceNotFound is absence — every other fault is "could not find out"', async () => {
+  const absent = await getMicroVMImageState(
+    fakeLambdaClient(() => {
+      throw awsError('ResourceNotFoundException');
+    }),
+    ARN,
+  );
+  assert.equal(absent.state, 'ABSENT');
+  assert.equal(absent.usable, false);
+  assert.equal(absent.error, undefined, 'absence is an answer, so it carries no probe error');
+  assert.equal(staticFailureVerdict(staticGate({ flavor: record(), image: absent }).failures).state, 'invalid');
+
+  // AccessDenied is also an answer to the question the gate asks ("is this readable by our
+  // role?"), but it must be reported distinctly so the operator is told to fix a GRANT rather
+  // than rebuild an image.
+  const forbidden = await getMicroVMImageState(
+    fakeLambdaClient(() => {
+      throw awsError('AccessDeniedException');
+    }),
+    ARN,
+  );
+  assert.equal(forbidden.state, 'FORBIDDEN');
+  assert.ok(forbidden.error, 'a grant failure names itself so the remedy is unambiguous');
+  const forbiddenGate = staticGate({ flavor: record(), image: forbidden });
+  assert.ok(forbiddenGate.failures.some((f) => f.code === 'image-unreadable'));
+  assert.equal(forbiddenGate.inconclusive, false);
+
+  // Everything else — throttle, timeout, an unmodelled service error — is UNKNOWN, and must route
+  // to `pending` rather than condemning the image.
+  for (const name of ['ThrottlingException', 'TimeoutError', 'InternalServerException']) {
+    const unknown = await getMicroVMImageState(
+      fakeLambdaClient(() => {
+        throw awsError(name);
+      }),
+      ARN,
+    );
+    assert.equal(unknown.state, 'UNKNOWN', `${name} must not be reported as a verdict`);
+    assert.equal(unknown.usable, false);
+    assert.match(unknown.error, new RegExp(name));
+    const gate = staticGate({ flavor: record(), image: unknown });
+    assert.equal(gate.inconclusive, true);
+    assert.equal(staticFailureVerdict(gate.failures).state, 'pending');
+  }
+});
+
+test('a successful but shapeless probe response is unknown, not absent', async () => {
+  // A 200 the SDK could not interpret (API-shape drift, a stubbed response) says nothing about the
+  // image. `state ?? null`-style handling would turn it into `image_missing` and, once the λ wires
+  // this up, permanently invalidate a healthy flavor on a service-model change.
+  const res = await getMicroVMImageState(fakeLambdaClient(() => ({})), ARN);
+  assert.equal(res.state, 'UNKNOWN');
+  assert.equal(res.usable, false);
+  assert.equal(staticFailureVerdict(staticGate({ flavor: record(), image: res }).failures).state, 'pending');
+});
+
+test('the probe never throws — a caller cannot be broken by an unexpected fault', async () => {
+  // The gate collects failures; it has no throw path. A probe that threw would escape into the
+  // validator and leave the flavor stuck in `validating` with no verdict at all.
+  const res = await getMicroVMImageState(
+    fakeLambdaClient(() => {
+      throw 'not even an Error';
+    }),
+    ARN,
+  );
+  assert.equal(res.state, 'UNKNOWN');
+  assert.match(res.error, /not even an Error/);
 });
 
 test('a stored name/label that disagrees with its base is refused', () => {
