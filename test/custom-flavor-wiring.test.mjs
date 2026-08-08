@@ -716,3 +716,52 @@ test('the handler wires the seam rather than keeping a second inline copy', asyn
     'the inline augmentation is still present alongside the extracted seam',
   );
 });
+
+// ---- auto-rewrite must not touch a job that already targets a custom flavor ---------------
+
+test('a job already carrying a custom LCA label needs no rewrite', async () => {
+  const { rewriteTargets, planFileRewrite, labelForFlavor } = await import(
+    '../dist/src/mgmt/rewrite.js'
+  );
+  const jobs = [{ id: 'build', runs_on: ['ubuntu-latest', 'lambda-ci-custom-gpu'] }];
+
+  // The operator already targeted LCA with that label, so there is no hosted label we are
+  // entitled to replace — regardless of what the STORED route says the job resolved to.
+  for (const flavor of ['custom-gpu', 'base']) {
+    assert.deepEqual(
+      rewriteTargets(jobs, { build: { flavor } }),
+      [],
+      `a custom-labelled job became a rewrite target (stored route '${flavor}')`,
+    );
+  }
+
+  // Authoring stays built-in only (a custom label is revocable, so we must never commit one):
+  // `labelForFlavor` still refuses to name a custom flavor.
+  assert.equal(labelForFlavor('custom-gpu'), undefined);
+
+  // And the write path re-checks independently of `rewriteTargets`, because it plans against the
+  // CURRENT file while the target list came from a possibly stale stored analysis. This is the
+  // branch that actually authored the bad edit: with the route degraded to a built-in — discovery's
+  // custom-flavor read fails open (ADR-040) — it produced
+  // `[self-hosted, lambda-ci-custom-gpu, lambda-ci]`, a second LCA label in a customer's file.
+  const yaml = [
+    'name: ci',
+    'on: push',
+    'jobs:',
+    '  build:',
+    '    runs-on: [ubuntu-latest, lambda-ci-custom-gpu]',
+    '      steps:',
+    '        - run: echo hi',
+    '',
+  ].join('\n');
+  for (const flavor of ['custom-gpu', 'base']) {
+    const plan = planFileRewrite('.github/workflows/ci.yml', yaml, [{ jobId: 'build', flavor }]);
+    assert.deepEqual(plan.edits, [], `an edit was authored for stored route '${flavor}'`);
+    assert.equal(plan.skipped.length, 1);
+    assert.match(
+      plan.skipped[0].reason,
+      /already carries an LCA label/,
+      `skip reason should name the real cause, got: ${plan.skipped[0].reason}`,
+    );
+  }
+});

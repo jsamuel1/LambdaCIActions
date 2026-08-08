@@ -210,15 +210,21 @@ export interface MicroVMImageState {
 /**
  * Probe one microVM image: does this ARN resolve to a real image, and is it launchable?
  *
- * Two callers need exactly this, which is why it lives here rather than in either of them:
+ * **No production caller yet** (ADR-041). This is scaffolding for the deferred smoke-validator λ,
+ * and is stated here so nobody reads its existence as deployed image verification: `staticGate`
+ * ACCEPTS a `MicroVMImageState` but never produces one, and its only current caller is the no-write
+ * preview endpoint, which deliberately passes no image. The flavor reconcile/drift report derives
+ * image state separately. It is tested directly against all three of its outcomes so the contract
+ * holds when the λ lands.
+ *
+ * It lives here, rather than in either intended consumer, because both need exactly this and ONE
+ * derivation is the point: a CLI and a console health item that each decided separately what
+ * "usable" means would eventually disagree about the same image. The intended consumers are:
  *   - the ADR-041 static gate, which must refuse to smoke-test an ARN that resolves to nothing
  *     (`imageAvailability()` in the Mgmt API only proves an SSM PARAMETER exists — a parameter
  *     holding a stale ARN reports the flavor as available while every launch fails);
  *   - the operator-facing flavor reconcile/drift report, which needs "real image state" as a
  *     column distinct from "ARN param present".
- *
- * ONE derivation on purpose: a CLI and a console health item that each decided separately what
- * "usable" means would eventually disagree about the same image.
  *
  * Never throws. A missing image is a VERDICT (`usable: false`, `state: 'ABSENT'`); a probe that
  * could not run (throttle, permissions, SDK gap) is reported with `error` set and `usable: false`,

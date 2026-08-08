@@ -81,14 +81,20 @@ const FLAVORS: readonly FlavorDef[] = builtinFlavors();
 const DEFAULT_FLAVOR = 'base';
 
 /**
- * Compile-time proof that `FlavorDef` and the catalog seam's `CatalogFlavor` stay the same shape.
+ * Compile-time check that `FlavorDef` and the catalog seam's `CatalogFlavor` keep the same
+ * REQUIRED fields.
  *
  * `FlavorDef` is declared in full above rather than aliased to `CatalogFlavor` because
  * `test/image-content.test.mjs` asserts, by reading this file's TEXT, that every key present in
  * `microvm/flavors.json` appears in the `FlavorDef` declaration — an alias would satisfy the
- * type checker while letting a newly added catalog key silently bypass the routing type. These
- * two assignments make the duplication safe: if either type gains or loses a field, this file
- * stops compiling.
+ * type checker while letting a newly added catalog key silently bypass the routing type.
+ *
+ * The two assignments below bound what that duplication can cost: adding, removing or retyping a
+ * REQUIRED field on either type stops this file compiling. They do NOT catch divergence in
+ * OPTIONAL fields, and deliberately so — `CatalogFlavor` already carries `custom?` /
+ * `installationId?`, which describe a stored row's provenance and have no meaning for a routing
+ * definition. A new optional field on either side therefore compiles silently; the catalog-key
+ * guard in `test/image-content.test.mjs` is what covers a new key arriving from the JSON.
  */
 const _flavorDefIsCatalogFlavor: CatalogFlavor = undefined as unknown as FlavorDef;
 const _catalogFlavorIsFlavorDef: FlavorDef = undefined as unknown as CatalogFlavor;

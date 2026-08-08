@@ -556,8 +556,12 @@ export interface CustomFlavorInput {
  * Build the Flavors-screen rows: built-ins, then this installation's custom flavors (ADR-040).
  *
  * `custom` is OPTIONAL and trailing, so every existing caller — and the environment-scoped
- * Settings view, which has no single installation — keeps compiling and behaving identically.
- * Omitting it yields exactly the pre-ADR-040 payload.
+ * Settings view, which has no single installation — keeps compiling and behaving identically:
+ * omitting it yields built-in rows only, and never reads the store.
+ *
+ * Note it is not the byte-identical pre-ADR-040 payload: every row now carries `routable`, which
+ * is additive (no consumer reads it yet — the Flavors screen is deferred) and is what lets the
+ * console list a non-routable custom flavor instead of hiding it.
  *
  * Unlike the resolver, this deliberately lists custom flavors in EVERY state: the console's whole
  * job here is to show an operator that a flavor is `pending`/`validating`/`invalid` and why. The
