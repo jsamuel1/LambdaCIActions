@@ -1,0 +1,420 @@
+// Installation GSI1 indexing + reconcile-on-read (src/shared/install-store.ts, ADR-037).
+//
+// The bug this pins: `listInstallations` enumerates installations from the GSI1 `INSTALLS`
+// partition. An INSTALL row written before M4 has no `gsi1pk`, so it is invisible to that
+// query — the console rendered "no installations" while the platform was claiming and
+// running that very installation's jobs. Two invariants:
+//   1. every installation WRITE stamps the GSI1 keys (so no new row is born invisible);
+//   2. a legacy unindexed row still surfaces through the management read path, and gets
+//      repaired on the way out.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import {
+  buildInstallUpsert,
+  byGsi1sk,
+  installGsi1Keys,
+  missingInstallationIds,
+  needsIndexRepair,
+  reconcileInstallations,
+  installPk,
+  listInstallations,
+  INSTALL_SK,
+  INSTALLS_GSI1PK,
+} from '../dist/src/shared/install-store.js';
+import { canAdminInstallation, grantedInstallationIds } from '../dist/src/mgmt/session.js';
+
+const NOW = new Date('2026-07-29T00:00:00.000Z');
+
+function install(over = {}) {
+  return {
+    entity: 'INSTALL',
+    installationId: 146431062,
+    accountLogin: 'jsamuel1',
+    accountId: 3156090,
+    suspended: false,
+    deleted: false,
+    createdAt: '2026-07-14T03:44:16.881Z',
+    updatedAt: '2026-07-14T03:44:16.881Z',
+    ...over,
+  };
+}
+
+// ---- invariant 1: writes always carry the index keys ------------------------
+
+test('installation index keys are the fixed partition + account login', () => {
+  assert.deepEqual(installGsi1Keys('jsamuel1'), {
+    gsi1pk: 'INSTALLS',
+    gsi1sk: 'jsamuel1',
+  });
+  assert.equal(INSTALLS_GSI1PK, 'INSTALLS');
+});
+
+test('upsertInstallation ALWAYS writes both gsi1 keys', () => {
+  const cmd = buildInstallUpsert(
+    { installationId: 146431062, accountLogin: 'jsamuel1', accountId: 3156090 },
+    NOW,
+  );
+  assert.deepEqual(cmd.Key, { pk: installPk(146431062), sk: INSTALL_SK });
+  // The literal regression: a SET clause that omits these makes the row invisible.
+  assert.match(cmd.UpdateExpression, /gsi1pk = :gpk/);
+  assert.match(cmd.UpdateExpression, /gsi1sk = :gsk/);
+  assert.equal(cmd.ExpressionAttributeValues[':gpk'], 'INSTALLS');
+  assert.equal(cmd.ExpressionAttributeValues[':gsk'], 'jsamuel1');
+});
+
+test('the upsert stamps the index for every flag combination', () => {
+  for (const flags of [
+    {},
+    { suspended: true },
+    { deleted: true },
+    { suspended: false, deleted: false },
+  ]) {
+    const cmd = buildInstallUpsert(
+      { installationId: 1, accountLogin: 'acme', accountId: 2, ...flags },
+      NOW,
+    );
+    assert.equal(cmd.ExpressionAttributeValues[':gpk'], 'INSTALLS', JSON.stringify(flags));
+    assert.equal(cmd.ExpressionAttributeValues[':gsk'], 'acme', JSON.stringify(flags));
+  }
+});
+
+test('the upsert never resets createdAt (re-install keeps first-seen)', () => {
+  const cmd = buildInstallUpsert({ installationId: 1, accountLogin: 'a', accountId: 2 }, NOW);
+  assert.match(cmd.UpdateExpression, /createdAt = if_not_exists\(createdAt, :now\)/);
+});
+
+test('the repair gate keys off the missing stamp, not the optional entity attribute', () => {
+  // A row fetched by primary key (`INSTALL#<id>` / `INSTALL`) is an installation by
+  // construction. `entity` is optional on the record type, so gating the repair on it would
+  // leave such a row invisible to the console forever. The backfill script selects on the
+  // same signal (key shape), so both paths repair the same row set.
+  const row = install();
+  delete row.entity;
+  assert.equal(needsIndexRepair(row), true, 'an entity-less legacy row is still repairable');
+  assert.equal(needsIndexRepair(install()), true); // no gsi1pk — the live dev row
+  assert.equal(needsIndexRepair(install({ gsi1pk: 'INSTALLS' })), false, 'already stamped');
+  const noLogin = install();
+  delete noLogin.accountLogin;
+  assert.equal(needsIndexRepair(noLogin), false, 'gsi1sk would be undefined');
+});
+
+test('the backfill scan selects installations by key shape, not by the entity attribute', () => {
+  // Regression guard for the two repair paths diverging: if this scan filtered on
+  // `entity = INSTALL` it would skip exactly the entity-less rows the read path repairs,
+  // leaving them unfixable for any account nobody logs in for.
+  const src = readFileSync(new URL('../scripts/backfill-installs.mjs', import.meta.url), 'utf8');
+  assert.match(src, /begins_with\(pk, :pkprefix\) AND sk = :sk AND attribute_not_exists\(gsi1pk\)/);
+  assert.doesNotMatch(src, /entity = :e/, 'must not gate the scan on the optional attribute');
+});
+
+// ---- invariant 2: the read path surfaces unindexed rows ---------------------
+
+test('nothing to reconcile when the index already returned every grant', () => {
+  const indexed = [install({ installationId: 11 }), install({ installationId: 22 })];
+  assert.deepEqual(missingInstallationIds(indexed, [11, 22]), []);
+});
+
+test('a granted id absent from the index is a reconcile candidate, de-duplicated', () => {
+  const indexed = [install({ installationId: 11 })];
+  assert.deepEqual(missingInstallationIds(indexed, [11, 22, 22, 33]), [22, 33]);
+});
+
+test('an empty index with no grants reconciles nothing (no unbounded fan-out)', () => {
+  assert.deepEqual(missingInstallationIds([], []), []);
+});
+
+test('a legacy unindexed installation surfaces through the read path and is repaired', async () => {
+  const legacy = install(); // installation 146431062 / jsamuel1, no gsi1pk
+  const gets = [];
+  const repairs = [];
+  const out = await reconcileInstallations([], [146431062], {
+    get: async (id) => {
+      gets.push(id);
+      return id === 146431062 ? legacy : undefined;
+    },
+    repair: async (input) => {
+      repairs.push(input);
+      return true;
+    },
+  });
+
+  assert.equal(out.length, 1, 'the installation the platform is serving must be listed');
+  assert.equal(out[0].accountLogin, 'jsamuel1');
+  assert.deepEqual(gets, [146431062], 'exactly one GetItem — bounded by the grant list');
+  assert.deepEqual(repairs, [{ installationId: 146431062, accountLogin: 'jsamuel1' }]);
+});
+
+test('reconcile is additive — indexed rows are preserved alongside recovered ones', async () => {
+  const modern = install({ installationId: 22, accountLogin: 'acme', gsi1pk: 'INSTALLS' });
+  const legacy = install({ installationId: 11, accountLogin: 'legacy' });
+  const out = await reconcileInstallations([modern], [22, 11], {
+    get: async (id) => (id === 11 ? legacy : undefined),
+    repair: async () => true,
+  });
+  assert.deepEqual(
+    out.map((i) => i.installationId).sort(),
+    [11, 22],
+    'a partially-indexed table must return BOTH rows',
+  );
+});
+
+test('the merged list is ordered by account login, like the index itself', async () => {
+  // Once the repair lands, a later read is served entirely FROM the index, i.e. in gsi1sk
+  // (account login) order. Appending recovered rows raw would list a legacy account last on
+  // this response and mid-list on the next one — the console row visibly jumps on reload.
+  const indexed = [
+    install({ installationId: 22, accountLogin: 'bravo', gsi1pk: 'INSTALLS' }),
+    install({ installationId: 33, accountLogin: 'delta', gsi1pk: 'INSTALLS' }),
+  ];
+  const out = await reconcileInstallations(indexed, [22, 33, 11], {
+    get: async (id) => (id === 11 ? install({ installationId: 11, accountLogin: 'charlie' }) : undefined),
+    repair: async () => true,
+  });
+  assert.deepEqual(
+    out.map((i) => i.accountLogin),
+    ['bravo', 'charlie', 'delta'],
+    'a recovered row sorts into place rather than being appended',
+  );
+});
+
+test('the merge order is DynamoDB byte order, not locale collation', async () => {
+  // gsi1sk is the account login and DynamoDB sorts String sort keys by UTF-8 bytes: `Acme`
+  // (uppercase A = 0x41) precedes `abc` (0x61). `localeCompare` reverses that pair, so a
+  // locale sort here would put the recovered row in a DIFFERENT slot than a later fully
+  // index-served read — the row-jump this sort exists to prevent, just harder to spot.
+  const indexed = [install({ installationId: 22, accountLogin: 'abc', gsi1pk: 'INSTALLS' })];
+  const out = await reconcileInstallations(indexed, [22, 11], {
+    get: async (id) => (id === 11 ? install({ installationId: 11, accountLogin: 'Acme' }) : undefined),
+    repair: async () => true,
+  });
+  assert.deepEqual(out.map((i) => i.accountLogin), ['Acme', 'abc']);
+  assert.equal(
+    ['abc', 'Acme'].sort((a, b) => a.localeCompare(b))[0],
+    'abc',
+    'sanity: locale collation really does disagree with the index for this pair',
+  );
+});
+
+test('byGsi1sk matches DynamoDB string sort-key ordering', () => {
+  const bytes = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  for (const [x, y] of [
+    ['Acme', 'abc'],
+    ['Zed', 'apple'],
+    ['a-b', 'aB'],
+    ['jsamuel1', 'jsamuel1'],
+    ['a', 'aa'],
+  ]) {
+    assert.equal(
+      Math.sign(byGsi1sk({ accountLogin: x }, { accountLogin: y })),
+      Math.sign(bytes(x, y)),
+      `${x} vs ${y}`,
+    );
+  }
+  // A row with no accountLogin sorts first rather than throwing.
+  assert.equal(byGsi1sk({}, { accountLogin: 'a' }), -1);
+});
+
+test('a grant for an installation we never stored is skipped, not faked', async () => {
+  const out = await reconcileInstallations([], [999], {
+    get: async () => undefined,
+    repair: async () => {
+      throw new Error('must not repair a row that does not exist');
+    },
+  });
+  assert.deepEqual(out, []);
+});
+
+test('a failed repair still returns the row (read must not fail on a write fault)', async () => {
+  const out = await reconcileInstallations([], [11], {
+    get: async () => install({ installationId: 11 }),
+    repair: async () => {
+      throw new Error('AccessDeniedException');
+    },
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].installationId, 11);
+});
+
+test('a lost repair race is not an error (idempotent conditional write)', async () => {
+  const out = await reconcileInstallations([], [11], {
+    get: async () => install({ installationId: 11 }),
+    repair: async () => false, // ConditionalCheckFailed → someone else stamped it
+  });
+  assert.equal(out.length, 1);
+});
+
+test('an already-indexed row reached by reconcile is returned but never rewritten', async () => {
+  // A truncated/eventually-consistent index page can put an already-stamped row in the
+  // candidate set. Repairing it would be a pointless conditional write per poll.
+  const out = await reconcileInstallations([], [11], {
+    get: async () => install({ installationId: 11, gsi1pk: 'INSTALLS', gsi1sk: 'mine' }),
+    repair: async () => {
+      throw new Error('must not repair an already-indexed row');
+    },
+  });
+  assert.equal(out.length, 1, 'the row is still surfaced to the console');
+  assert.equal(out[0].installationId, 11);
+});
+
+test('a row with no accountLogin is surfaced but not stamped with an undefined sort key', async () => {
+  // `gsi1sk` IS the account login; writing it undefined would fail the write (or index the
+  // row under a meaningless key). The backfill script skips the same case.
+  const out = await reconcileInstallations([], [11], {
+    get: async () => {
+      const row = install({ installationId: 11 });
+      delete row.accountLogin;
+      return row;
+    },
+    repair: async () => {
+      throw new Error('must not repair a row with no accountLogin');
+    },
+  });
+  assert.equal(out.length, 1);
+});
+
+test('an entity-less legacy row is still repaired through the read path', async () => {
+  // Regression: an earlier revision gated the repair on `entity === 'INSTALL'`. A row keyed
+  // `INSTALL#<id>`/`INSTALL` is an installation whether or not it carries that attribute.
+  const legacy = install({ installationId: 11 });
+  delete legacy.entity;
+  const repairs = [];
+  const out = await reconcileInstallations([], [11], {
+    get: async () => legacy,
+    repair: async (input) => {
+      repairs.push(input);
+      return true;
+    },
+  });
+  assert.equal(out.length, 1);
+  assert.deepEqual(repairs, [{ installationId: 11, accountLogin: 'jsamuel1' }]);
+});
+
+test('reconcile cannot widen authorization beyond the session grants', async () => {
+  // The handler passes session grants as candidates AND filters the result. A row recovered
+  // for a foreign id would still be dropped — but it must never be fetched in the first place.
+  const session = {
+    login: 'operator',
+    installations: [{ installationId: 11, accountLogin: 'mine' }],
+    iat: 0,
+    exp: 2 ** 40,
+  };
+  const fetched = [];
+  const out = await reconcileInstallations(
+    [],
+    session.installations.map((i) => i.installationId),
+    {
+      get: async (id) => {
+        fetched.push(id);
+        return install({ installationId: id, accountLogin: 'mine' });
+      },
+      repair: async () => true,
+    },
+  );
+  assert.deepEqual(fetched, [11], 'only granted ids are read by primary key');
+  assert.ok(out.every((i) => canAdminInstallation(session, i.installationId)));
+});
+
+test('listInstallations requires an explicit grant list (no silent zero-arg regression)', () => {
+  // A default of [] would let a future caller write `listInstallations()` and get the exact
+  // pre-ADR-037 behaviour back — index-only, legacy rows invisible — with no compile error.
+  // Pinned on the source because the arity is the contract, not runtime behaviour.
+  const src = readFileSync(
+    new URL('../src/shared/install-store.ts', import.meta.url),
+    'utf8',
+  );
+  const sig =
+    /export async function listInstallations\(\s*reconcileIds: readonly number\[\](\s*=[^,)]*)?,?\s*\)/.exec(
+      src,
+    );
+  assert.ok(sig, 'listInstallations signature not found');
+  assert.equal(sig[1], undefined, 'reconcileIds must NOT have a default value');
+  assert.equal(listInstallations.length, 1, 'the grant list is a required parameter');
+});
+
+// ---- invariant 3: the ROUTE actually passes the grants ----------------------
+
+test('grantedInstallationIds is the session grant set, in order, ids only', () => {
+  const session = {
+    login: 'operator',
+    installations: [
+      { installationId: 146431062, accountLogin: 'jsamuel1' },
+      { installationId: 22, accountLogin: 'acme' },
+    ],
+    iat: 0,
+    exp: 2 ** 40,
+  };
+  assert.deepEqual(grantedInstallationIds(session), [146431062, 22]);
+  // No grants → nothing to reconcile, and nothing to fetch by primary key.
+  assert.deepEqual(grantedInstallationIds({ ...session, installations: [] }), []);
+});
+
+test('the installations route passes the session grants, not an empty candidate set', () => {
+  // The arity check above cannot catch the OTHER half of the regression: a caller that keeps
+  // the required parameter but hands it `[]` (or drops the argument during a refactor) is
+  // back to index-only enumeration, and the live dev symptom returns with every test green.
+  // The route must resolve its candidates through the named helper.
+  const src = readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  // Match to end of line, not to the first `)` — the argument itself is a call.
+  const call = /await listInstallations\((.*)\);/.exec(src);
+  assert.ok(call, 'the listInstallations route call was not found');
+  assert.equal(
+    call[1].trim(),
+    'grantedInstallationIds(session)',
+    'the route must reconcile against the session grants (ADR-037)',
+  );
+  assert.match(src, /grantedInstallationIds,?\n/, 'the helper must be imported, not shadowed');
+});
+
+test('EVERY listInstallations caller supplies a real candidate set, not an empty one', () => {
+  // The pin above resolves only the FIRST call site. Settings added two more (the settings
+  // screen's store read and the label-change impact preview), and a source pin that stops at
+  // the first match silently stops protecting the ones added after it. Enumerate all of them.
+  //
+  // Both new sites matter for a different reason than the installations route: the settings
+  // screen decides `known` per installation, and the label impact preview is the operator's
+  // only warning about jobs a label change will stop claiming. An empty candidate set makes
+  // the first render a false "unknown installation" and the second under-report the blast
+  // radius of a platform-wide change — both silent, both index blindness wearing a new hat.
+  const src = readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  const calls = [...src.matchAll(/listInstallations\(([^;]*?)\)\s*(?:\.catch|[,;)])/g)].map((m) =>
+    m[1].trim(),
+  );
+  assert.ok(calls.length >= 3, `expected at least 3 call sites, found ${calls.length}`);
+  for (const arg of calls) {
+    assert.notEqual(arg, '', 'a zero-arg listInstallations call restores index blindness');
+    assert.ok(
+      !/^\[\s*\]$/.test(arg),
+      'passing [] is the pre-ADR-037 index-only read with the type error silenced',
+    );
+  }
+  // Positive control: the regex must actually be capable of catching the prohibited spellings,
+  // otherwise every assertion above is a no-op that passes on any source.
+  const synthetic = 'await listInstallations();\nawait listInstallations([]).catch(() => []);';
+  const bad = [...synthetic.matchAll(/listInstallations\(([^;]*?)\)\s*(?:\.catch|[,;)])/g)].map(
+    (m) => m[1].trim(),
+  );
+  assert.deepEqual(bad, ['', '[]'], 'the call-site matcher must detect both prohibited forms');
+});
+
+test('an operator with a grant sees a legacy row through the route composition', async () => {
+  // End-to-end over the pure seam the route uses: grants → reconcile → visibility filter.
+  // This is the acceptance criterion in prose: installation 146431062 is served by the
+  // platform and MUST NOT be absent from the console, even on an un-backfilled table.
+  const session = {
+    login: 'jsamuel1',
+    installations: [{ installationId: 146431062, accountLogin: 'jsamuel1' }],
+    iat: 0,
+    exp: 2 ** 40,
+  };
+  const out = await reconcileInstallations([], grantedInstallationIds(session), {
+    get: async (id) => (id === 146431062 ? install() : undefined),
+    repair: async () => true,
+  });
+  const visible = out.filter((i) => canAdminInstallation(session, i.installationId));
+  assert.deepEqual(
+    visible.map((i) => i.accountLogin),
+    ['jsamuel1'],
+    'the empty-state bug would show up here as []',
+  );
+});

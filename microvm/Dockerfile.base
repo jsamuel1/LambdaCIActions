@@ -16,6 +16,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Common toolchain + the runner agent's runtime deps. Node is needed both for the
 # run-hook server and for the GitHub Actions runner's node-based actions.
+#
+# `awscli` here is Ubuntu 22.04's apt package: aws-cli **v1** (1.22.34 / botocore 1.23.34).
+# That is deliberate and sufficient — the guest only calls `lambda invoke` on the base
+# service. The `>= 2.35.17` floor in docs/specs/05-infrastructure.md is a DEPLOYER
+# requirement (it needs the `lambda-microvms` service model), not a guest one.
+# It is also the CLI whose COLD start ADR-028 sizes the boot broker budget against, and the
+# `warmed` detection in run-hook.mjs matches this botocore's connect-error wording. Changing
+# this line to CLI v2 (or another base image) re-opens both: re-measure the cold cost and
+# re-check those error strings before doing so.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo \
       libicu70 lsb-release awscli \

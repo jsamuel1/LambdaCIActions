@@ -69,6 +69,13 @@ export interface ProvisionRequest {
   jobName?: string;
   /** Enclosing workflow name from the webhook (matches stored analyses; M3-S4). */
   workflowName?: string | null;
+  /**
+   * How Ingest came to claim this job (M5, ADR-030): `'label'` = explicit LCA label,
+   * `'adopt'` = standard GitHub-hosted label under adopt mode. Provision uses it to route
+   * (adopt-mode label map) and to emit the right metric dimension; absent on messages
+   * enqueued before M5, which are treated as `'label'`.
+   */
+  claimVia?: 'label' | 'adopt';
 }
 
 /**
@@ -100,6 +107,21 @@ export interface DiscoveryRequest {
   repo: string;
   /** Why the scan fired (logging / debugging only). */
   reason: 'push' | 'installation' | 'manual';
+}
+
+/**
+ * The message the Management API enqueues to request an auto-rewrite PR (spec 03 §
+ * Auto-rewrite, ADR-031). Consumed by the rewrite λ, which holds the App credentials the
+ * management plane deliberately lacks (ADR-025).
+ */
+export interface RewriteRequest {
+  installationId: number;
+  repoId: number;
+  repoFullName: string; // owner/repo
+  owner: string;
+  repo: string;
+  /** GitHub login of the operator who requested it (audit trail). */
+  actor: string;
 }
 
 /**
@@ -184,10 +206,36 @@ export interface RunRecord {
    * (AGENTS.md — no secret values in the UI/API).
    */
   hookTokenHash?: string;
+  /**
+   * Workflow display name from the `workflow_job` event (reports group by workflow).
+   *
+   * Absent for two independent reasons, only one of which is about age: the row predates M5
+   * persisting it, **or** the event carried no `workflow_name` — it is optional and nullable on
+   * the wire (see `WorkflowJobEvent` above), Ingest's `putQueuedRun` call coalesces a null to
+   * absent, and `buildQueuedItem` omits a falsy value. That call is the only writer of this
+   * field, so Reports must label the gap, not date it.
+   */
+  workflowName?: string;
+  /** Job display name from the `workflow_job` event. */
+  jobName?: string;
   labels: string[];
   /** Reason string for failed / timed_out. */
   reason?: string;
   createdAt: string; // ISO8601
+  /**
+   * Phase watermarks, stamped once on first entry to each phase (ADR-042 / spec 04 OQ-5).
+   * Write-once (`if_not_exists`) so a duplicate/late webhook can't move them, and ABSENT on
+   * rows created before M5 — every report that consumes them reports coverage rather than
+   * silently treating a missing watermark as zero.
+   *
+   * Also absent on a job whose TERMINAL webhook beat the `running` transition: `provisioning
+   * → completed` is a legal forward move, after which `completed → running` is rejected, so
+   * that row never gains a `runningAt` at all. Such rows are the FAST ones, so consumers must
+   * not describe a missing watermark as merely "old data".
+   */
+  provisioningAt?: string; // ISO8601
+  /** First entry into `running`: the queue-to-start boundary and the billing start. */
+  runningAt?: string; // ISO8601
   updatedAt: string; // ISO8601
   /** Epoch seconds — DynamoDB TTL to age out terminal rows per retention policy. */
   ttl?: number;
@@ -208,11 +256,21 @@ export interface InstallationRecord {
   deleted: boolean;
   createdAt: string;
   updatedAt: string;
+  /** Row discriminator (`INSTALL`). Optional: pre-M2 rows may predate it. */
+  entity?: string;
+  /**
+   * GSI1 enumeration keys (`INSTALLS` / account login), written since M4. ABSENT on rows
+   * written by M2-era code — which is exactly what reconcile-on-read repairs (ADR-037), so
+   * the read path must be able to see whether they are there.
+   */
+  gsi1pk?: string;
+  gsi1sk?: string;
 }
 
 /**
  * Onboarding mode for a repo (spec 03). `label` = workflows opt in with explicit LCA
- * labels (v1 default). `adopt` = standard-label mapping, M5. `off` = never claim.
+ * labels (v1 default). `adopt` = standard-label mapping (M5, ADR-030) — jobs carrying
+ * GitHub's standard `ubuntu-*` labels are claimed with no YAML edits. `off` = never claim.
  */
 export type RepoMode = 'label' | 'adopt' | 'off';
 
@@ -231,6 +289,13 @@ export interface RepoRecord {
    * the management UI (M4); consumed by Provision when resolving a job's flavor.
    */
   flavorMap?: Record<string, string>;
+  /**
+   * Per-repo opt-in to the auto-rewrite PR (M5, ADR-031). Absent ⇒ OFF. Even when true the
+   * platform only opens a PR when the deployment also enabled the feature — two independent
+   * gates, because auto-rewrite is the one capability that writes to a customer repo
+   * (AGENTS.md hard rule: `contents:write` off by default).
+   */
+  rewriteEnabled?: boolean;
   /** GitHub login of the operator who last changed config (M4 audit, spec 04). */
   updatedBy?: string;
   createdAt: string;
@@ -271,6 +336,15 @@ export interface ParsedJob {
    * `{ group, labels }` contributes its `labels` (where LCA routing labels live).
    */
   runs_on: string[];
+  /**
+   * The runner GROUP requested by the object form `runs-on: { group: X, labels: [...] }`,
+   * else null. Recorded because it is part of the job's routing requirement, not decoration:
+   * GitHub only dispatches a job to a runner that is BOTH in the requested group AND carries
+   * every requested label. We register JIT runners in the repo-level default group
+   * (`runner_group_id: 1`, spec 01 OQ-1), so a job naming any other group can never be served
+   * by us and must not be claimed (ADR-030) — it would queue forever.
+   */
+  runner_group: string | null;
   /** `job.container.image` (accepts string or `{ image }` object form); null if absent. */
   container: string | null;
   /** Keys of `job.services`; empty if none. */
@@ -309,6 +383,13 @@ export interface CompatMessage {
   level: 'warn' | 'risk' | 'block';
   code: string;
   text: string;
+  /**
+   * Actionable remedy the operator can apply (M5, spec 03 § Compatibility analysis —
+   * "surfaced in the UI with actionable fixes"). Separated from `text` (which states the
+   * problem) so the console can render the two differently and a fix can be reworded
+   * without changing a finding's meaning.
+   */
+  fix?: string;
 }
 
 /**

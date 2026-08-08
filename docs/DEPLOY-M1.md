@@ -65,12 +65,22 @@ The webhook secret + App PEM are SecureStrings that CloudFormation can't create.
 GitHub App bootstrap script (phase 3) writes them. Nothing to do here yet — just know CDK
 only *references* `/lca/<env>/github/*`.
 
-Also seed the claimed-labels config the Ingest λ reads:
+Also seed the claimed-labels config the Ingest λ reads. This is the **claim allowlist**:
+`shouldClaim` (`src/ingest/filter.ts`) drops any `workflow_job` whose `runs-on` contains none
+of these labels, *before* flavor resolution runs. A flavor label that is missing here is a
+silent dead end — the job is acked 202 `claimed:false`, no runner is ever provisioned, and the
+job just sits queued on GitHub with no error anywhere. So seed **every** flavor label from
+`microvm/flavors.json`, not just `lambda-ci` (pinned by `test/filter.test.mjs`):
 
 ```sh
 aws ssm put-parameter --name /lca/dev/config/runner-labels \
-  --type String --value 'lambda-ci' --overwrite --region us-west-2
+  --type String --overwrite --region us-west-2 \
+  --value 'lambda-ci,lambda-ci-node,lambda-ci-python,lambda-ci-java,lambda-ci-go,lambda-ci-rust,lambda-ci-docker'
 ```
+
+Add any non-LCA label you intend to claim via a repo `FlavorMap` (e.g. `ubuntu-latest`) to
+this list too — the map is consulted during *resolution*, which the claim gate runs before.
+Re-run this command after adding a flavor to the catalog; nothing publishes it automatically.
 
 ## Phase 1 — infra (image build bucket + role)
 
@@ -134,6 +144,11 @@ node scripts/create-github-app.mjs \
   --webhook-url https://<id>.execute-api.us-west-2.amazonaws.com/webhook \
   --env dev --region us-west-2
 ```
+
+`--console-url` is only the App's homepage link, not the OAuth callback (that is registered
+in [DEPLOY-M4](DEPLOY-M4.md) Phase 4). If you already know the console's vanity hostname
+([ADR-036](DECISIONS.md#adr-036) — it is config, so it is knowable before any console
+resource exists), pass it here so the App never advertises a placeholder.
 
 Install the App on the test repo (the script prints the exact URL).
 

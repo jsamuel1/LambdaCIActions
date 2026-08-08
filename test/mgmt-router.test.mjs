@@ -60,6 +60,15 @@ test('every /api route requires auth', () => {
   }
 });
 
+test('report routes resolve, and ask is POST-only', () => {
+  assert.equal(matchRoute('GET', '/api/reports/catalog').match.route.id, 'reportCatalog');
+  assert.equal(matchRoute('GET', '/api/reports/run').match.route.id, 'runReport');
+  assert.equal(matchRoute('GET', '/api/reports/export').match.route.id, 'exportReport');
+  assert.equal(matchRoute('POST', '/api/reports/ask').match.route.id, 'askReport');
+  // A model invocation costs money — it must not be reachable as a prefetchable GET.
+  assert.equal(matchRoute('GET', '/api/reports/ask').kind, 'method-not-allowed');
+});
+
 test('asPositiveInt rejects non-numeric, zero, and negatives', () => {
   assert.equal(asPositiveInt('42'), 42);
   assert.equal(asPositiveInt('0'), undefined);

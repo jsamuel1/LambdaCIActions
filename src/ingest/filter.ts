@@ -1,15 +1,20 @@
 import type { WorkflowJobEvent, ProvisionRequest, RepoRecord } from '../shared/types.js';
+import type { ClaimVia } from './adopt.js';
 
 /**
- * Decide whether a `workflow_job` event is one LambdaCIActions should provision a runner
- * for (spec 01 label contract, ADR-005 `label` mode).
+ * Decide whether a `workflow_job` event carries an explicit LCA label (spec 01 label
+ * contract, ADR-005 `label` mode).
  *
- * A job is claimed iff:
+ * A job matches iff:
  *   - action === 'queued' (the hot-path trigger; other actions are status updates), AND
  *   - the job's `runs-on` labels include at least one of our claimed labels.
  *
  * `claimedLabels` comes from config (`/lca/<env>/config/runner-labels`), defaulting to the
  * base flavor label. Matching is case-insensitive to match GitHub's label handling.
+ *
+ * NOTE: since M5 this is no longer the whole claim decision — `adopt` mode also claims
+ * standard GitHub-hosted labels. `decideClaim` (src/ingest/adopt.ts) is the full gate and is
+ * what the handler calls; this function remains the label-mode primitive.
  */
 export function shouldClaim(
   event: Pick<WorkflowJobEvent, 'action' | 'workflow_job'>,
@@ -37,7 +42,7 @@ export function isRepoOptedOut(repo: RepoRecord | undefined): boolean {
 }
 
 /** Project a claimed webhook event into the SQS provisioning message. */
-export function toProvisionRequest(event: WorkflowJobEvent): ProvisionRequest {
+export function toProvisionRequest(event: WorkflowJobEvent, via?: ClaimVia): ProvisionRequest {
   return {
     installationId: event.installation.id,
     repoId: event.repository.id,
@@ -49,6 +54,7 @@ export function toProvisionRequest(event: WorkflowJobEvent): ProvisionRequest {
     labels: event.workflow_job.labels,
     jobName: event.workflow_job.name,
     workflowName: event.workflow_job.workflow_name ?? null,
+    ...(via ? { claimVia: via } : {}),
   };
 }
 

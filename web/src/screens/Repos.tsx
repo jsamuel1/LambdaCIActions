@@ -120,9 +120,11 @@ export function Repos({
         </table>
       </div>
       <p className="muted">
-        Disabling a repo (or setting mode `off`) stops LambdaCIActions claiming its jobs — GitHub
-        runs them on its own runners instead. `adopt` mode (standard-label mapping) lands in M5:
-        selecting it now records intent but routing still requires explicit LCA labels.
+        Disabling a repo (or setting mode <code>off</code>) stops LambdaCIActions claiming its jobs
+        — GitHub runs them on its own runners instead. <code>adopt</code> mode claims jobs that use
+        standard GitHub-hosted labels (<code>ubuntu-latest</code> and friends) with no YAML edits;
+        those runners are <strong>arm64 only</strong>, so check each repo's compatibility findings
+        before switching it on.
       </p>
     </div>
   );

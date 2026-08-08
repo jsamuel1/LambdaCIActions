@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { redactLiterals } from './redact.js';
 
 /**
  * GitHub App authentication chain (spec 01):
@@ -46,10 +47,74 @@ interface CachedToken {
 }
 const tokenCache = new Map<number, CachedToken>();
 
+/**
+ * A non-2xx response from the GitHub REST API, carrying the status as DATA.
+ *
+ * The message shape is stable (`GitHub <path> failed HTTP <status>: <detail>`) because several
+ * callers still match on that text (`isNotFound`, `classifyMintFailure`, the `ensureBranch`
+ * existence probe). What `<detail>` CONTAINS narrowed in ADR-034: it is GitHub's own `message`
+ * field, literal-redacted and capped, plus the request id — never the raw response body, which
+ * a 4xx can quote a submitted credential back into. The phrases those callers match on live in
+ * `message`, so the narrowing is behaviour-preserving for them.
+ *
+ * The typed `status` exists so the auto-rewrite λ can tell a benign "no commits between base
+ * and head" 422 apart from a 403 (missing `pull_requests:write`), a 429 (rate limited) or a
+ * 5xx — those must fail loudly and retry rather than be reported to the operator as "nothing
+ * to do" (ADR-031).
+ */
+export class GithubApiError extends Error {
+  readonly status: number;
+  readonly responseText: string;
+  /**
+   * Parsed response body. Left UNSET by `githubJson` (ADR-034): the body is the leak vector
+   * this class's redaction exists to close, so nothing populates it today. The field remains
+   * for callers that construct the error themselves with a body they know to be safe.
+   */
+  readonly responseBody: unknown;
+  constructor(path: string, status: number, responseText: string, responseBody?: unknown) {
+    super(`GitHub ${path} failed HTTP ${status}: ${responseText}`);
+    this.name = 'GithubApiError';
+    this.status = status;
+    this.responseText = responseText;
+    this.responseBody = responseBody;
+  }
+}
+
+/** The HTTP status of a GitHub API failure, or undefined when it was not an API response. */
+export function githubErrorStatus(err: unknown): number | undefined {
+  if (err instanceof GithubApiError) return err.status;
+  // Errors that crossed a module/bundle boundary lose `instanceof`; fall back to the marker.
+  const m = err instanceof Error ? /failed HTTP (\d{3})\b/.exec(err.message) : null;
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Whether a 422 is GitHub's "No commits between <base> and <head>" — the ONE PR-open failure
+ * that genuinely means there is no pull request to open (the head branch is already merged
+ * into, or identical to, the base).
+ */
+export function isNoCommitsBetween(err: unknown): boolean {
+  if (githubErrorStatus(err) !== 422) return false;
+  const text = err instanceof Error ? err.message : String(err);
+  return /no commits between/i.test(text);
+}
+
 async function githubJson<T>(
   path: string,
-  init: { method?: string; token: string; tokenType: 'Bearer' | 'token'; body?: unknown },
+  init: {
+    method?: string;
+    token: string;
+    tokenType: 'Bearer' | 'token';
+    body?: unknown;
+    /**
+     * Plaintext secrets present in THIS request, redacted by literal value from any error
+     * text. GitHub (or a proxy in front of it) can quote a rejected request value back, and an
+     * opaque secret like a webhook secret has no shape the pattern guard can recognize.
+     */
+    redactValues?: readonly (string | undefined)[];
+  },
 ): Promise<{ status: number; body: T }> {
+  const clean = (text: string): string => redactLiterals(text, init.redactValues ?? []);
   const res = await fetch(`${GITHUB_API}${path}`, {
     method: init.method ?? 'GET',
     headers: {
@@ -63,15 +128,40 @@ async function githubJson<T>(
   });
   const text = await res.text();
   let body: T;
+  let parsed = true;
   try {
     body = text ? (JSON.parse(text) as T) : ({} as T);
   } catch {
-    throw new Error(`GitHub ${path} returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+    parsed = false;
+    body = {} as T;
+  }
+  if (!parsed) {
+    // Do NOT echo the raw body: a non-JSON response comes from an intermediary (proxy, WAF,
+    // error page) which may reflect the request — including a submitted credential.
+    throw new Error(
+      `GitHub ${path} returned non-JSON (HTTP ${res.status}, ${text.length} bytes)` +
+        requestIdOf(res),
+    );
   }
   if (res.status >= 400) {
-    throw new Error(`GitHub ${path} failed HTTP ${res.status}: ${text.slice(0, 300)}`);
+    // Only GitHub's own `message` field, never the raw body, and literal-redacted on top:
+    // 422 validation errors quote the offending request value back.
+    //
+    // Thrown as trunk's `GithubApiError` so `githubErrorStatus` / `isNoCommitsBetween` keep
+    // working off `status`, but `responseText` carries ONLY the redacted message and
+    // `responseBody` is deliberately omitted — passing `text`/`body` through would restore
+    // exactly the raw-body leak this redaction exists to close.
+    const message = (body as { message?: unknown }).message;
+    const detail = typeof message === 'string' ? clean(message).slice(0, 200) : '';
+    throw new GithubApiError(path, res.status, `${detail}${requestIdOf(res)}`);
   }
   return { status: res.status, body };
+}
+
+/** GitHub's request id, so an operator-facing error is still traceable in a support ticket. */
+function requestIdOf(res: { headers: { get(name: string): string | null } }): string {
+  const id = res.headers?.get?.('x-github-request-id');
+  return id ? ` (request ${id.replace(/[^\x20-\x7e]/g, '').slice(0, 64)})` : '';
 }
 
 /**
@@ -213,6 +303,199 @@ export async function listUserInstallations(
   }));
 }
 
+// ---- App identity + webhook introspection (spec 04 Settings, ADR-034) --------
+
+/** Identity of the App the environment's stored credentials actually authenticate as. */
+export interface AppIdentity {
+  appId: number;
+  name: string;
+  slug: string;
+  htmlUrl: string;
+  ownerLogin: string;
+  events: string[];
+  permissions: Record<string, string>;
+}
+
+/**
+ * `GET /app` with an App JWT — the live proof that the stored `app-id` + `app-pem` pair is
+ * valid and which App it belongs to. The Settings screen shows THIS rather than parroting
+ * SSM back, so "App linked" can never be green while the credentials are broken.
+ */
+export async function getAppIdentity(appId: string, pem: string): Promise<AppIdentity> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<{
+    id: number;
+    name: string;
+    slug: string;
+    html_url: string;
+    owner?: { login?: string };
+    events?: string[];
+    permissions?: Record<string, string>;
+  }>('/app', { token: jwt, tokenType: 'Bearer' });
+  return {
+    appId: body.id,
+    name: body.name,
+    slug: body.slug,
+    htmlUrl: body.html_url,
+    ownerLogin: body.owner?.login ?? '',
+    events: body.events ?? [],
+    permissions: body.permissions ?? {},
+  };
+}
+
+/** Every installation of the App, from GitHub (not our store) — App JWT scoped. */
+export async function listAppInstallations(
+  appId: string,
+  pem: string,
+): Promise<{ installationId: number; accountLogin: string; suspended: boolean }[]> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<
+    { id: number; account?: { login?: string }; suspended_at?: string | null }[]
+  >('/app/installations?per_page=100', { token: jwt, tokenType: 'Bearer' });
+  if (!Array.isArray(body)) return [];
+  return body.map((i) => ({
+    installationId: i.id,
+    accountLogin: i.account?.login ?? '',
+    suspended: Boolean(i.suspended_at),
+  }));
+}
+
+/**
+ * The App's webhook configuration (`GET /app/hook/config`, App JWT).
+ *
+ * GitHub returns the webhook `secret` field as a masked placeholder, never the real value —
+ * we drop the field entirely anyway and report only whether one is configured, so no code
+ * path can carry it toward the UI (AGENTS.md hard rule).
+ */
+export interface AppHookConfig {
+  url: string;
+  contentType: string;
+  insecureSsl: boolean;
+  secretConfigured: boolean;
+}
+
+export async function getAppHookConfig(appId: string, pem: string): Promise<AppHookConfig> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<{
+    url?: string;
+    content_type?: string;
+    insecure_ssl?: string | number;
+    secret?: string;
+  }>('/app/hook/config', { token: jwt, tokenType: 'Bearer' });
+  return {
+    url: body.url ?? '',
+    contentType: body.content_type ?? '',
+    insecureSsl: String(body.insecure_ssl ?? '0') !== '0',
+    secretConfigured: typeof body.secret === 'string' && body.secret.length > 0,
+  };
+}
+
+/**
+ * Point the App's webhook at this deployment and set the signing secret
+ * (`PATCH /app/hook/config`, App JWT).
+ *
+ * This is REQUIRED for a relink to be coherent, not a convenience. Storing a new
+ * `webhook-secret` in SSM without telling GitHub means GitHub keeps signing with the old one
+ * and Ingest's HMAC check rejects every subsequent delivery (401) — a rotation would silently
+ * take the environment offline. Same for the URL: a freshly created App points wherever its
+ * manifest said, which is not necessarily this deployment.
+ *
+ * The secret travels OUT to GitHub only; nothing is read back (GitHub masks it anyway) and
+ * this function returns no value.
+ */
+export async function updateAppHookConfig(
+  appId: string,
+  pem: string,
+  config: { url?: string; secret?: string },
+): Promise<void> {
+  const body: Record<string, string> = { content_type: 'json', insecure_ssl: '0' };
+  if (config.url) body.url = config.url;
+  if (config.secret) body.secret = config.secret;
+  const jwt = createAppJwt(appId, pem);
+  await githubJson<unknown>('/app/hook/config', {
+    method: 'PATCH',
+    token: jwt,
+    tokenType: 'Bearer',
+    body,
+    // The webhook secret is the one plaintext we send to GitHub on this path; if GitHub
+    // rejects the request and quotes it back, it must not survive into `hookError`.
+    redactValues: [config.secret],
+  });
+}
+
+/** One row of GitHub's own delivery log for the App's webhook. */
+export interface AppHookDelivery {
+  id: number;
+  guid: string;
+  event: string;
+  action: string | null;
+  status: string;
+  statusCode: number;
+  deliveredAt: string;
+  durationMs: number;
+  redelivery: boolean;
+}
+
+/**
+ * `GET /app/hook/deliveries` — GitHub's view of whether it can actually reach us. This is
+ * the only *external* evidence of webhook health: our own heartbeat row proves deliveries
+ * that arrived, this proves the ones that did not (wrong URL after a redeploy, 5xx, TLS).
+ */
+export async function listAppHookDeliveries(
+  appId: string,
+  pem: string,
+  perPage = 20,
+): Promise<AppHookDelivery[]> {
+  const jwt = createAppJwt(appId, pem);
+  const { body } = await githubJson<
+    {
+      id: number;
+      guid: string;
+      event: string;
+      action: string | null;
+      status: string;
+      status_code: number;
+      delivered_at: string;
+      duration: number;
+      redelivery: boolean;
+    }[]
+  >(`/app/hook/deliveries?per_page=${Math.min(Math.max(perPage, 1), 100)}`, {
+    token: jwt,
+    tokenType: 'Bearer',
+  });
+  if (!Array.isArray(body)) return [];
+  return body.map((d) => ({
+    id: d.id,
+    guid: d.guid,
+    event: d.event,
+    action: d.action ?? null,
+    status: d.status,
+    statusCode: d.status_code,
+    deliveredAt: d.delivered_at,
+    // GitHub reports duration in seconds (float).
+    durationMs: Math.round((d.duration ?? 0) * 1000),
+    redelivery: Boolean(d.redelivery),
+  }));
+}
+
+/**
+ * Ask GitHub to re-deliver a past delivery (`POST /app/hook/deliveries/{id}/attempts`).
+ * This is the "Test webhook delivery" round-trip: GitHub re-sends a real, signature-signed
+ * payload, so a success proves URL + TLS + our webhook secret all still agree.
+ */
+export async function redeliverAppHook(
+  appId: string,
+  pem: string,
+  deliveryId: number,
+): Promise<void> {
+  const jwt = createAppJwt(appId, pem);
+  await githubJson<unknown>(`/app/hook/deliveries/${deliveryId}/attempts`, {
+    method: 'POST',
+    token: jwt,
+    tokenType: 'Bearer',
+  });
+}
+
 // ---- workflow discovery (spec 03 § Discovery) -------------------------------
 
 /** A workflow file listed under `.github/workflows` (subset of the contents API shape). */
@@ -253,6 +536,10 @@ export async function listWorkflowFiles(params: {
 /**
  * Fetch one file's raw contents (contents:read). The contents API returns base64 for
  * files ≤ 1 MB — plenty for workflow YAML.
+ *
+ * `ref` (branch, tag or commit sha) selects which version to read. It matters for the
+ * rewrite flow: the blob sha returned here is what guards the subsequent write, so reading
+ * the default branch while writing to an existing rewrite branch would always 409.
  */
 export async function getFileContent(params: {
   appId: string;
@@ -261,14 +548,231 @@ export async function getFileContent(params: {
   owner: string;
   repo: string;
   path: string;
+  ref?: string;
 }): Promise<{ content: string; sha: string }> {
   const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const query = params.ref ? `?ref=${encodeURIComponent(params.ref)}` : '';
   const { body } = await githubJson<{ content?: string; encoding?: string; sha: string }>(
-    `/repos/${params.owner}/${params.repo}/contents/${encodeURI(params.path)}`,
+    `/repos/${params.owner}/${params.repo}/contents/${encodeContentPath(params.path)}${query}`,
     { token, tokenType: 'token' },
   );
   if (body.encoding !== 'base64' || typeof body.content !== 'string') {
     throw new Error(`GitHub contents for '${params.path}' not base64 (encoding=${body.encoding})`);
   }
   return { content: Buffer.from(body.content, 'base64').toString('utf8'), sha: body.sha };
+}
+
+// ---- auto-rewrite PR (spec 03 § Auto-rewrite, ADR-031, M5) -------------------
+//
+// These are the ONLY functions in the codebase that write to a customer repository, and they
+// need the App's elevated `contents:write` + `pull_requests:write` permissions. They are
+// therefore:
+//   - reachable only from the dedicated rewrite λ (never the management API),
+//   - gated by a deployment flag AND a per-repo opt-in (ADR-031),
+//   - branch + PR only: no direct commit to the default branch, never a force-push.
+
+/** Repo metadata we need to branch from (`default_branch`). */
+export async function getRepoDefaultBranch(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+}): Promise<string> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{ default_branch?: string }>(
+    `/repos/${params.owner}/${params.repo}`,
+    { token, tokenType: 'token' },
+  );
+  if (!body.default_branch) throw new Error('GitHub repo response has no default_branch');
+  return body.default_branch;
+}
+
+/**
+ * Encode a ref for use in a URL PATH, keeping `/` as a literal separator.
+ *
+ * `encodeURIComponent` on the whole ref is wrong here: `GET /repos/{o}/{r}/git/ref/{ref}`
+ * matches the ref as literal path segments and does NOT decode `%2F` back into a separator,
+ * so `heads/lambda-ci-actions%2Fadopt-labels-dev` 404s even though the branch exists. Our
+ * rewrite branch always contains a slash (`rewriteBranchName`), so this was the normal case,
+ * not an edge one:
+ *   - the existence probe 404s, which `ensureBranch` reads as "branch absent",
+ *   - the create then fails `422 Reference already exists` (its BODY is unencoded, so the
+ *     first run really did create the branch),
+ *   - the whole rewrite request errors, SQS redelivers, and it DLQs — i.e. the second
+ *     "Open rewrite PR" click could never succeed, and `planRef` would have read the wrong
+ *     ref even if it had.
+ * Per-segment encoding keeps a `#`/`?`/space in a branch name escaped while leaving the
+ * hierarchy intact.
+ */
+function encodeRefPath(ref: string): string {
+  return ref.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * Percent-encode a repository file path for the contents API, per SEGMENT.
+ *
+ * `encodeURI` is wrong here: it deliberately leaves `#` and `?` unescaped, so a workflow
+ * legitimately named `release#arm.yml` would be sent as a URL fragment (silently dropped
+ * from the request path) and `release?arm.yml` would start a query string — the read 404s
+ * and is misreported as a deleted workflow, and the write targets the wrong resource.
+ * Encode each segment and rejoin on `/`, which must stay a separator.
+ */
+function encodeContentPath(filePath: string): string {
+  return filePath.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * The tip sha of a branch, or undefined when it does not exist.
+ *
+ * Separate from `ensureBranch` because the rewrite λ must know whether the branch exists
+ * WITHOUT creating it: creating a branch is a visible, permanent change to the customer's
+ * repository, and it must not happen for a request that turns out to have nothing to rewrite.
+ */
+export async function getBranchSha(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+}): Promise<string | undefined> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  try {
+    const { body } = await githubJson<{ object?: { sha?: string } }>(
+      `/repos/${params.owner}/${params.repo}/git/ref/heads/${encodeRefPath(params.branch)}`,
+      { token, tokenType: 'token' },
+    );
+    return body.object?.sha;
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('HTTP 404')) return undefined;
+    throw err;
+  }
+}
+
+/**
+ * Ensure a branch exists at the tip of `fromBranch`.
+ *
+ * If the branch already exists it is left ALONE (not reset): the operator may have pushed
+ * review fixes onto our PR branch, and resetting it would be a force-push — explicitly out
+ * of bounds (spec 03: "never force-pushed").
+ */
+export async function ensureBranch(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  fromBranch: string;
+}): Promise<{ created: boolean; sha: string }> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const base = `/repos/${params.owner}/${params.repo}`;
+
+  try {
+    const { body } = await githubJson<{ object?: { sha?: string } }>(
+      `${base}/git/ref/heads/${encodeRefPath(params.branch)}`,
+      { token, tokenType: 'token' },
+    );
+    if (body.object?.sha) return { created: false, sha: body.object.sha };
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes('HTTP 404'))) throw err;
+  }
+
+  const { body: from } = await githubJson<{ object?: { sha?: string } }>(
+    `${base}/git/ref/heads/${encodeRefPath(params.fromBranch)}`,
+    { token, tokenType: 'token' },
+  );
+  const sha = from.object?.sha;
+  if (!sha) throw new Error(`cannot resolve '${params.fromBranch}' tip`);
+
+  await githubJson(`${base}/git/refs`, {
+    method: 'POST',
+    token,
+    tokenType: 'token',
+    body: { ref: `refs/heads/${params.branch}`, sha },
+  });
+  return { created: true, sha };
+}
+
+/** Commit one file's new content onto a branch (contents:write). */
+export async function putFileOnBranch(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  path: string;
+  content: string;
+  /** Blob sha of the version we rewrote — GitHub rejects the write if the file moved on. */
+  sha: string;
+  message: string;
+}): Promise<void> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  await githubJson(`/repos/${params.owner}/${params.repo}/contents/${encodeContentPath(params.path)}`, {
+    method: 'PUT',
+    token,
+    tokenType: 'token',
+    body: {
+      message: params.message,
+      content: Buffer.from(params.content, 'utf8').toString('base64'),
+      branch: params.branch,
+      // Optimistic concurrency: the sha is the blob we planned against. If someone edited the
+      // workflow between plan and apply, GitHub 409s instead of us clobbering their change.
+      sha: params.sha,
+    },
+  });
+}
+
+/**
+ * The open PR from `branch`, if any. Extracted so both `ensurePullRequest` and the rewrite
+ * λ's no-change path can use it: a second apply legitimately produces no edits (the first one
+ * already rewrote every job), and the operator still needs the link to the PR that is waiting
+ * for them.
+ */
+export async function findOpenPullRequest(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+}): Promise<{ url: string; number: number } | undefined> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{ number: number; html_url: string }[]>(
+    `/repos/${params.owner}/${params.repo}/pulls?state=open&head=${encodeURIComponent(`${params.owner}:${params.branch}`)}`,
+    { token, tokenType: 'token' },
+  );
+  if (!Array.isArray(body) || body.length === 0) return undefined;
+  return { url: body[0].html_url, number: body[0].number };
+}
+
+/**
+ * Open a PR from `branch` into `base`, or return the existing open one. Idempotent: a second
+ * apply for the same repo updates the branch and reuses the PR rather than opening a dupe.
+ */
+export async function ensurePullRequest(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  base: string;
+  title: string;
+  body: string;
+}): Promise<{ url: string; number: number; created: boolean }> {
+  const existing = await findOpenPullRequest(params);
+  if (existing) return { ...existing, created: false };
+
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const repoPath = `/repos/${params.owner}/${params.repo}`;
+  const { body: pr } = await githubJson<{ number: number; html_url: string }>(`${repoPath}/pulls`, {
+    method: 'POST',
+    token,
+    tokenType: 'token',
+    body: { title: params.title, body: params.body, head: params.branch, base: params.base },
+  });
+  return { url: pr.html_url, number: pr.number, created: true };
 }

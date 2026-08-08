@@ -30,8 +30,26 @@ const doc = client ? DynamoDBDocumentClient.from(client) : undefined;
 
 const TABLE = process.env.TABLE_NAME;
 
-/** Terminal run age-out (DynamoDB TTL): 90 days. */
-const TERMINAL_TTL_SECONDS = 90 * 24 * 60 * 60;
+/**
+ * Terminal run age-out (DynamoDB TTL), in seconds.
+ *
+ * Per-environment (ADR-033): the writers are given `RUN_RETENTION_DAYS` by CDK from
+ * `envConfig` (dev 30 / prod 90). Falls back to 90 days when unset so a pre-M5 deployment,
+ * or a caller that doesn't set the var, keeps today's behaviour rather than silently
+ * shortening retention on existing run history.
+ *
+ * Read per call rather than captured at module load: the Lambda runtime sets env vars before
+ * the handler runs either way, but this keeps the value testable and makes a misconfigured
+ * value (`0`, `abc`) fall back instead of poisoning every write in the container's lifetime.
+ */
+export const DEFAULT_RUN_RETENTION_DAYS = 90;
+
+export function terminalTtlSeconds(): number {
+  const raw = process.env.RUN_RETENTION_DAYS;
+  const days = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  const effective = Number.isSafeInteger(days) && days > 0 ? days : DEFAULT_RUN_RETENTION_DAYS;
+  return effective * 24 * 60 * 60;
+}
 
 // ---- pure helpers (no AWS) -------------------------------------------------
 
@@ -46,6 +64,17 @@ const STATUS_RANK: Record<RunStatus, number> = {
 };
 
 const TERMINAL: ReadonlySet<RunStatus> = new Set(['completed', 'failed', 'timed_out']);
+
+/**
+ * Run-row attribute that records first entry into a phase (ADR-042). Only the two phases
+ * reporting needs are stamped: `provisioningAt` (claim → launch) and `runningAt` (the
+ * queue-to-start boundary AND the start of billable microVM time). `createdAt` already
+ * marks `queued` and `updatedAt` the terminal transition, so no third attribute is needed.
+ */
+const PHASE_WATERMARK: Partial<Record<RunStatus, string>> = {
+  provisioning: 'provisioningAt',
+  running: 'runningAt',
+};
 
 export function isTerminal(status: RunStatus): boolean {
   return TERMINAL.has(status);
@@ -91,7 +120,14 @@ export function repoGsiKeys(repoId: number, createdAt: string): {
 export function buildQueuedItem(
   input: Pick<
     RunRecord,
-    'repoId' | 'repoFullName' | 'installationId' | 'runId' | 'jobId' | 'labels'
+    | 'repoId'
+    | 'repoFullName'
+    | 'installationId'
+    | 'runId'
+    | 'jobId'
+    | 'labels'
+    | 'workflowName'
+    | 'jobName'
   >,
   now: Date = new Date(),
 ): Record<string, unknown> {
@@ -109,6 +145,11 @@ export function buildQueuedItem(
     runId: input.runId,
     jobId: input.jobId,
     labels: input.labels,
+    // Tenant-controlled strings, stored so reports can group by workflow/job without a
+    // second GitHub call. Omitted when absent rather than written as undefined (a DynamoDB
+    // validation error), so pre-M5 rows and rows from an event without them stay valid.
+    ...(input.workflowName ? { workflowName: input.workflowName } : {}),
+    ...(input.jobName ? { jobName: input.jobName } : {}),
     createdAt: iso,
     updatedAt: iso,
   };
@@ -132,7 +173,14 @@ function requireDoc(): DynamoDBDocumentClient {
 export async function putQueuedRun(
   input: Pick<
     RunRecord,
-    'repoId' | 'repoFullName' | 'installationId' | 'runId' | 'jobId' | 'labels'
+    | 'repoId'
+    | 'repoFullName'
+    | 'installationId'
+    | 'runId'
+    | 'jobId'
+    | 'labels'
+    | 'workflowName'
+    | 'jobName'
   >,
 ): Promise<boolean> {
   const item = buildQueuedItem(input);
@@ -163,15 +211,18 @@ export interface TransitionInput {
 }
 
 /**
- * Advance a run to a new status, guarded so it can only move forward (or idempotently
- * re-write the same status). Returns true if the row moved (or a same-status idempotent
- * write applied), false if the guard rejected a regression / the row is missing.
- *
- * We express the forward-only rule as a condition on the stored status: the write applies
- * only if the current status is one from which `to` is reachable.
+ * Build the guarded transition write (pure, so the forward-only condition and the ADR-042
+ * watermark semantics are unit-testable without AWS).
  */
-export async function transitionRun(input: TransitionInput): Promise<boolean> {
-  const now = new Date();
+export function buildTransitionUpdate(
+  input: TransitionInput,
+  now: Date = new Date(),
+): {
+  updateExpression: string;
+  condition: string;
+  names: Record<string, string>;
+  values: Record<string, unknown>;
+} {
   const iso = now.toISOString();
 
   // Statuses from which `to` is a legal transition (per canTransition).
@@ -186,6 +237,17 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
     ':now': iso,
     ':gpk': `RUNSTATUS#${input.to}`,
   };
+
+  // Phase watermarks (ADR-042): stamped on the FIRST entry to a phase and never moved.
+  // `if_not_exists` rather than a plain SET because a status can be re-written idempotently
+  // (duplicate webhook delivery), and a moving watermark would corrupt both the
+  // queue-to-start latency report and the billable-minutes cost basis. Written inside the
+  // same guarded UpdateItem as the transition, so a watermark can never exist for a phase
+  // the run did not actually enter.
+  const phaseAttr = PHASE_WATERMARK[input.to];
+  if (phaseAttr) {
+    setParts.push(`${phaseAttr} = if_not_exists(${phaseAttr}, :now)`);
+  }
 
   if (input.flavor !== undefined) {
     setParts.push('flavor = :flavor');
@@ -202,7 +264,7 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
   if (TERMINAL.has(input.to)) {
     setParts.push('#ttl = :ttl');
     names['#ttl'] = 'ttl';
-    values[':ttl'] = Math.floor(now.getTime() / 1000) + TERMINAL_TTL_SECONDS;
+    values[':ttl'] = Math.floor(now.getTime() / 1000) + terminalTtlSeconds();
   }
 
   // Build the allowed-status IN (...) list for the condition.
@@ -210,14 +272,32 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
   allowedFrom.forEach((s, i) => {
     values[`:from${i}`] = s;
   });
-  const condition = `attribute_exists(pk) AND #s IN (${inNames.join(', ')})`;
+
+  return {
+    updateExpression: `SET ${setParts.join(', ')}`,
+    condition: `attribute_exists(pk) AND #s IN (${inNames.join(', ')})`,
+    names,
+    values,
+  };
+}
+
+/**
+ * Advance a run to a new status, guarded so it can only move forward (or idempotently
+ * re-write the same status). Returns true if the row moved (or a same-status idempotent
+ * write applied), false if the guard rejected a regression / the row is missing.
+ *
+ * We express the forward-only rule as a condition on the stored status: the write applies
+ * only if the current status is one from which `to` is reachable.
+ */
+export async function transitionRun(input: TransitionInput): Promise<boolean> {
+  const { updateExpression, condition, names, values } = buildTransitionUpdate(input);
 
   try {
     await requireDoc().send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: runPk(input.repoId, input.runId, input.jobId), sk: RUN_SK },
-        UpdateExpression: `SET ${setParts.join(', ')}`,
+        UpdateExpression: updateExpression,
         ConditionExpression: condition,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,

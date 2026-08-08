@@ -15,29 +15,76 @@ FROM --platform=linux/arm64 ubuntu:22.04
 
 ARG RUNNER_VERSION=2.335.1
 ARG NODE_MAJOR=24
+# Pinned Node LTS for the tool-cache entry (must be full semver — tool-cache skips a version
+# dir that isn't valid semver). Keep the major in sync with NODE_MAJOR.
+ARG NODE_VERSION=24.18.0
+# Package managers are pinned for the same reason the runtimes are (ADR-039): `pnpm@latest` /
+# `yarn@stable` / `npm@latest` resolve at BUILD time, so two builds of this same commit ship
+# different toolchains and a job that breaks on a new major cannot be reproduced from the
+# Dockerfile. Bump deliberately on patch day, like every other pin here.
+ARG PNPM_VERSION=11.18.0
+ARG YARN_VERSION=4.18.0
+ARG NPM_VERSION=12.0.1
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_DIR=/opt/actions-runner \
-    RUN_HOOK_PORT=8080
+    RUN_HOOK_PORT=8080 \
+    # The runner resolves its tool cache from RUNNER_TOOL_CACHE and otherwise falls back to
+    # `_work/_tool` (actions/runner HostContext.cs WellKnownDirectory.Tools) — a self-hosted
+    # runner does NOT default to /opt/hostedtoolcache. Setting it here is what makes the
+    # prebaked cache below the cache the agent actually consults.
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+    AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 
 # Common toolchain + the runner agent's runtime deps. Node is needed both for the
 # run-hook server and for the GitHub Actions runner's node-based actions.
+# `awscli` is apt's aws-cli **v1** — the CLI ADR-028 measures the cold boot cost against.
+# See Dockerfile.base for why v1 is correct here and what to re-check before changing it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo \
       libicu70 lsb-release awscli \
+      # Node IS a compile-from-source path, for the same reason python is: npm/pnpm/yarn fall
+      # back to **node-gyp** whenever a dependency ships no prebuilt binary for this platform,
+      # and node-gyp shells out to `g++`, `make` and `ld`. Verified in a container that a bare
+      # ubuntu:22.04 plus the line above has NONE of those (only `python3`, which node-gyp also
+      # needs), so such an `npm ci` fails mid-job with "gyp ERR! ... not found: make" after the
+      # checkout is already paid for. arm64 is precisely where prebuilds are most often absent,
+      # so the node flavor needs this at least as much as python does.
+      build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # --- node flavor extras -----------------------------------------------------------------
-# Enable Corepack (ships with Node) and pin pnpm + yarn so Node jobs get a ready toolchain.
-# arm64 wheels/binaries are used throughout (no x86 assumptions). NODE_MAJOR tracks the
-# current Node LTS (24) so the latest npm/pnpm/yarn install cleanly — do not pin to an EOL
-# major; the toolchain's `@latest`/`@stable` now require a modern Node runtime.
+# Enable Corepack (ships with Node) and install PINNED pnpm + yarn so Node jobs get a ready,
+# reproducible toolchain. arm64 wheels/binaries are used throughout (no x86 assumptions).
+# NODE_MAJOR tracks the current Node LTS (24) so these versions install cleanly — do not pin to
+# an EOL major; modern pnpm/yarn/npm require a modern Node runtime.
+#
+# A workflow that declares `packageManager` in its package.json still wins: corepack honors
+# that field per-project, so pinning here sets the default without overriding a repo's choice.
 RUN corepack enable \
-    && corepack prepare pnpm@latest --activate \
-    && corepack prepare yarn@stable --activate \
-    && npm install -g npm@latest \
+    && corepack prepare pnpm@${PNPM_VERSION} --activate \
+    && corepack prepare yarn@${YARN_VERSION} --activate \
+    && npm install -g npm@${NPM_VERSION} \
     && node --version && npm --version && pnpm --version && yarn --version
+
+# Prebake the runner tool cache so `actions/setup-node@v4` short-circuits instead of
+# re-downloading Node on every job (ADR-039). Without this the apt-installed Node above only
+# helps jobs that use no setup-node step at all. setup-node caches under toolName `node` and
+# arch `arm64` (base-distribution.ts `findVersionInHostedToolCacheDirectory` →
+# tc.find('node', spec, translateArchToDistUrl(arch)); arm64 passes through unchanged), and
+# the entry root holds the CONTENTS of the release tarball — hence --strip-components=1.
+RUN mkdir -p ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64 \
+    && curl -fsSL -o /tmp/node.tar.gz \
+       "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.gz" \
+    && tar -xzf /tmp/node.tar.gz -C ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64 --strip-components=1 \
+    # The completion marker is a SIBLING of the arch dir, not a file inside it
+    # (@actions/tool-cache `_completeToolPath`). Without it the entry is invisible and every
+    # job re-downloads Node.
+    && touch ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64.complete \
+    && rm /tmp/node.tar.gz \
+    # Fail the BUILD (not a job) if the layout is wrong.
+    && ${RUNNER_TOOL_CACHE}/node/${NODE_VERSION}/arm64/bin/node --version
 # ----------------------------------------------------------------------------------------
 
 # GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
@@ -56,7 +103,7 @@ COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
 # the runner dir and can sudo for job steps that need it.
 RUN useradd -m -s /bin/bash runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
-    && chown -R runner:runner ${RUNNER_DIR}
+    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE}
 
 USER runner
 WORKDIR ${RUNNER_DIR}

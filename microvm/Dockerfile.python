@@ -1,0 +1,112 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.python — the `python` flavor microVM image (docs/specs/02-microvm-runners.md,
+# capabilities: ["python"]). Base runner + a pinned CPython toolchain, installed INTO the
+# runner tool cache so `actions/setup-python@v5` resolves from cache instead of downloading
+# (ADR-039).
+#
+# This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
+# staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
+# layers the extra toolchain on top. Keep the base layers in sync with Dockerfile.base.
+#
+# HARD RULE (AGENTS.md): arm64 ONLY. Lambda microVMs are Graviton-only — the base image,
+# the runner agent tarball, and every binary below must be arm64. Do NOT switch to an
+# x86_64 base or the snapshot build will produce an unbootable image.
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ARG RUNNER_VERSION=2.335.1
+ARG NODE_MAJOR=24
+# Pinned CPython. This is the SAME artifact actions/setup-python downloads (the
+# actions/python-versions release matching this runner OS + arch), which is what makes the
+# prebaked cache entry indistinguishable from one the action installed itself. Bump
+# deliberately; `latest` would make image rebuilds non-reproducible (ADR-039).
+ARG PYTHON_VERSION=3.12.13
+ARG PYTHON_RELEASE=3.12.13-27650778726
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_DIR=/opt/actions-runner \
+    RUN_HOOK_PORT=8080 \
+    # The runner resolves its tool cache from RUNNER_TOOL_CACHE and otherwise falls back to
+    # `_work/_tool` (actions/runner HostContext.cs WellKnownDirectory.Tools) — a self-hosted
+    # runner does NOT default to /opt/hostedtoolcache. Setting it here is what makes the
+    # prebaked cache below the cache the agent actually consults.
+    RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+    AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+
+# Common toolchain + the runner agent's runtime deps. Node is needed both for the
+# run-hook server and for the GitHub Actions runner's node-based actions.
+# `awscli` is apt's aws-cli **v1** — the CLI ADR-028 measures the cold boot cost against.
+# See Dockerfile.base for why v1 is correct here and what to re-check before changing it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git jq unzip tar gzip sudo \
+      libicu70 lsb-release awscli \
+      # A C toolchain, for the same reason the go/rust flavors carry one: any `pip install`
+      # that has to build a source-only sdist (no arm64 manylinux wheel — still common on
+      # aarch64) shells out to `cc`, and the shared apt line above ships none. Verified: a bare
+      # ubuntu:22.04 plus that line has no gcc/cc/make/ld, so such a build fails with
+      # "error: command 'gcc' failed: No such file or directory" — after the download, deep
+      # inside a job. The prebuilt CPython ships its own headers (include/python3.12/Python.h),
+      # so python3-dev is NOT needed on top of this.
+      build-essential pkg-config \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- python flavor extras ---------------------------------------------------------------
+# Install the pinned CPython into the tool cache using the tarball's OWN setup.sh. That
+# script is what actions/python-versions ships for exactly this purpose: it lays out
+# ${RUNNER_TOOL_CACHE}/Python/<version>/arm64/, creates the `python` symlinks setup-python
+# expects, upgrades pip, and writes the `<arch>.complete` marker. Reimplementing it by hand
+# is how a cache entry ends up subtly wrong (a missing sibling `arm64.complete` marker makes
+# tool-cache `find()` return empty and every job silently re-downloads).
+RUN mkdir -p ${RUNNER_TOOL_CACHE} /tmp/py \
+    && curl -fsSL -o /tmp/python.tar.gz \
+       "https://github.com/actions/python-versions/releases/download/${PYTHON_RELEASE}/python-${PYTHON_VERSION}-linux-22.04-arm64.tar.gz" \
+    && tar -xzf /tmp/python.tar.gz -C /tmp/py \
+    && cd /tmp/py && bash ./setup.sh \
+    && rm -rf /tmp/py /tmp/python.tar.gz \
+    # Fail the BUILD (not a job) if the cache entry is not in the exact shape tool-cache
+    # find() requires: the arch dir plus its SIBLING completion marker.
+    && test -d ${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64 \
+    && test -f ${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64.complete \
+    && ${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64/bin/python3 --version
+# Put the cached interpreter on PATH so plain `python3`/`pip3` steps work with no setup-*
+# action at all (a job that just runs `python3 -m pytest` should not need one). Derived from
+# ${PYTHON_VERSION} rather than repeated as a literal — a hardcoded copy silently points at a
+# nonexistent directory the moment the pin is bumped.
+ENV PATH=${RUNNER_TOOL_CACHE}/Python/${PYTHON_VERSION}/arm64/bin:$PATH
+#
+# KNOWN GAP (deliberate): this prebuilt CPython's extension modules link against shared libs
+# from the image it was built on. Checked the actual tarball's DT_NEEDED entries against a bare
+# ubuntu:22.04 plus the apt line above: every one resolves EXCEPT libtcl8.6 / libtk8.6, so
+# `import tkinter` fails while the rest of the stdlib (ssl, sqlite3, lzma, bz2, readline,
+# ctypes, curses, gdbm, uuid...) works. Left uninstalled on purpose — tkinter needs an X
+# toolchain no headless CI job uses, and `apt-get install python3-tk` would pull it in for
+# every python job's snapshot. If a workload ever needs tkinter, add `libtcl8.6 libtk8.6` to
+# the apt line above rather than swapping the interpreter build.
+# ----------------------------------------------------------------------------------------
+
+# GitHub Actions runner agent (arm64). Pinned version — bump deliberately on patch day.
+RUN mkdir -p ${RUNNER_DIR} \
+    && curl -fsSL -o /tmp/runner.tar.gz \
+       https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz \
+    && tar -xzf /tmp/runner.tar.gz -C ${RUNNER_DIR} \
+    && rm /tmp/runner.tar.gz \
+    && ${RUNNER_DIR}/bin/installdependencies.sh
+
+# The lifecycle-hook server (ADR-012). It receives the JIT config via POST /run and
+# launches the runner agent for exactly one job, then self-terminates.
+COPY bootstrap/run-hook.mjs ${RUNNER_DIR}/run-hook.mjs
+
+# The runner must NOT run as root (agent refuses); create an unprivileged user that owns
+# the runner dir and can sudo for job steps that need it. The tool cache is owned by the
+# runner user so a `pip install` into the cached interpreter works without sudo.
+RUN useradd -m -s /bin/bash runner \
+    && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner \
+    && chown -R runner:runner ${RUNNER_DIR} ${RUNNER_TOOL_CACHE}
+
+USER runner
+WORKDIR ${RUNNER_DIR}
+
+EXPOSE 8080
+# Entrypoint is the run-hook server; it blocks until /run then supervises the single job.
+ENTRYPOINT ["node", "/opt/actions-runner/run-hook.mjs"]

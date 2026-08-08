@@ -8,9 +8,9 @@ import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as ddb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
-import { RemovalPolicy } from 'aws-cdk-lib';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { EnvConfig } from './env-config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(__dirname, '..', '..', 'src');
@@ -27,13 +27,42 @@ export interface MgmtStackProps extends StackProps {
   discoveryQueueUrl?: string;
   discoveryQueueArn?: string;
   /**
-   * Public origin of the console (the CloudFront domain), used to build the OAuth
-   * redirect URI and post-login redirects. Set after WebStack's first deploy — see
-   * docs/DEPLOY-M4.md; until then login returns 500 by design rather than guessing an
-   * origin (an attacker-controlled redirect target would be worse).
+   * Public origin of the console, used to build the OAuth redirect URI and post-login
+   * redirects. With a vanity domain configured (ADR-036) this is known at synth time from
+   * config. Without one it is CloudFront's generated domain, which only exists after
+   * WebStack's first deploy — see the two-pass path in docs/DEPLOY-M4.md. Until it is set,
+   * login returns 500 by design rather than guessing an origin (an attacker-controlled
+   * redirect target would be worse).
    */
   publicOrigin?: string;
+  /**
+   * App-config broker (ControlStack, ADR-034). The console λ invokes it to verify the GitHub
+   * App linkage, read webhook delivery evidence, and apply relink / runner-label changes — it
+   * holds NO App PEM read and NO `ssm:PutParameter` grant of its own.
+   */
+  appcfgBrokerName?: string;
+  appcfgBrokerArn?: string;
+  /** Deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
+  webhookUrl?: string;
+  /**
+   * Rewrite queue coordinates (ControlStack, M5). The console enqueues an auto-rewrite
+   * request here; the rewrite λ (which holds the App credential the management plane
+   * deliberately lacks — ADR-025) does the writing.
+   */
+  rewriteQueueUrl?: string;
+  rewriteQueueArn?: string;
+  /** Per-env sizing / retention config (ADR-033). */
+  config: EnvConfig;
 }
+
+/**
+ * Default Reports assistant model. Re-exported from `env-config` (where it is the default for
+ * the `reportsModelId` knob) so importers of this stack keep a single name for it, and mirrored
+ * by `DEFAULT_MODEL_ID` in src/mgmt/nl-report.ts — the λ cannot import a CDK module, so
+ * `test/mgmt-stack.test.mjs` asserts the two agree instead. A drift is a runtime 403: IAM would
+ * authorize one model while the handler invoked another.
+ */
+export { DEFAULT_REPORTS_MODEL_ID } from './env-config.js';
 
 /**
  * MgmtStack — the management plane (spec 04, M4).
@@ -42,15 +71,21 @@ export interface MgmtStackProps extends StackProps {
  *
  * Plane boundary (docs/ARCHITECTURE.md, ADR-025): this stack deliberately grants the Mgmt λ
  * a **narrow, mostly-read** posture:
- *   - DynamoDB: table-wide read; writes limited to `UpdateItem` (config patches). No
- *     `PutItem`/`DeleteItem`, so it cannot forge run rows or delete history.
+ *   - DynamoDB: table-wide read; writes limited to `UpdateItem` (config patches, plus the
+ *     ADR-037 installation index repair — both `SET`s of specific attributes on an existing
+ *     row). No `PutItem`/`DeleteItem`, so it cannot forge run rows or delete history.
  *   - SSM: reads ONLY its own OAuth client id/secret + session key. Every other parameter
  *     is checked for presence via `DescribeParameters` (a metadata action that returns no
  *     values) — so no code path can leak a SecureString (spec 04 hard rule).
  *   - CloudWatch Logs: read-only on the per-env run log group.
+ *   - Bedrock: `InvokeModel` on exactly ONE model id (the Reports assistant, ADR-044) — no
+ *     wildcard, no streaming, no other Bedrock action.
  *   - NO `lambda:RunMicrovm` / `TerminateMicrovm`, NO GitHub App PEM. It cannot launch
  *     compute or mint installation tokens; the only GitHub calls it makes are OAuth
  *     (its own client creds) and `/user/*` with the operator's token.
+ *   - NO `ssm:PutParameter` — not even for non-secret config. Platform config writes and
+ *     every App-PEM-requiring GitHub call go through the App-config broker in the control
+ *     plane, reachable only via `lambda:InvokeFunction` on that one ARN (ADR-034).
  */
 export class MgmtStack extends Stack {
   public readonly httpApi: apigw.HttpApi;
@@ -59,14 +94,14 @@ export class MgmtStack extends Stack {
   constructor(scope: Construct, id: string, props: MgmtStackProps) {
     super(scope, id, props);
 
-    const { envName, ssmPrefix, table } = props;
+    const { envName, ssmPrefix, table, config } = props;
     const paramArn = (name: string) =>
       `arn:${this.partition}:ssm:${this.region}:${this.account}:parameter${name}`;
 
     const logGroup = new logs.LogGroup(this, 'MgmtLogGroup', {
       logGroupName: `/aws/lambda/lca-${envName}-mgmt`,
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy: RemovalPolicy.DESTROY,
+      retention: config.lambdaLogRetention,
+      removalPolicy: config.logRemovalPolicy,
     });
 
     const runLogGroupName = `/aws/lambda/microvms/runs/lca-${envName}`;
@@ -80,6 +115,7 @@ export class MgmtStack extends Stack {
       timeout: Duration.seconds(29), // HTTP API integration cap
       memorySize: 512,
       logGroup,
+      tracing: config.tracing ? lambda.Tracing.ACTIVE : lambda.Tracing.DISABLED,
       bundling: {
         minify: true,
         sourceMap: false,
@@ -94,16 +130,34 @@ export class MgmtStack extends Stack {
         OAUTH_CLIENT_SECRET_PARAM: `${ssmPrefix}/github/client-secret`,
         RUN_LOG_GROUP: runLogGroupName,
         TABLE_NAME: table.tableName,
+        // Terminal-row retention (ADR-033). The control plane's writers already get this to
+        // set the TTL; Reports needs the SAME number to cap a report window, or the console
+        // offers a 90-day report in an environment that ages rows out at 30 and the result
+        // reads a partly aged-out window while reporting itself complete (ADR-043).
+        RUN_RETENTION_DAYS: String(config.runRetentionDays),
         DISCOVERY_QUEUE_URL: props.discoveryQueueUrl ?? '',
+        REWRITE_QUEUE_URL: props.rewriteQueueUrl ?? '',
+        REWRITE_ENABLED: config.rewriteEnabled ? 'true' : 'false',
         PUBLIC_ORIGIN: props.publicOrigin ?? '',
+        RUNNER_LABELS_PARAM: `${ssmPrefix}/config/runner-labels`,
+        PLATFORM_ADMINS_PARAM: `${ssmPrefix}/config/platform-admins`,
+        APPCFG_BROKER_NAME: props.appcfgBrokerName ?? '',
+        WEBHOOK_URL: props.webhookUrl ?? '',
+        // Reports assistant (ADR-044). Enabled by default; `-c reportsNl=false` turns the NL
+        // path off (and drops the Bedrock grant below), and the console degrades to the manual
+        // report picker rather than erroring. Both values come from EnvConfig so the knob is
+        // reachable without a code edit — ADR-033's wiring note.
+        REPORTS_NL_ENABLED: String(config.reportsNlEnabled),
+        REPORTS_MODEL_ID: config.reportsModelId,
       },
     });
 
     // Reads across all entities (runs, installs, repos, workflow analyses).
     table.grantReadData(fn);
     // Config writes ONLY: UpdateItem on the table. No Put/Delete → cannot forge or destroy
-    // run history, only patch existing config rows (which its handler further restricts to
-    // enabled/mode/defaultFlavor/flavorMap).
+    // run history, only patch existing rows. The handler restricts what it patches: repo
+    // config (enabled/mode/defaultFlavor/flavorMap) and the ADR-037 installation GSI1 index
+    // repair (gsi1pk/gsi1sk on an installation the session is already authorized for).
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'PatchRepoConfig',
@@ -112,7 +166,11 @@ export class MgmtStack extends Stack {
       }),
     );
 
-    // Its OWN secrets only (OAuth client creds + session signing key).
+    // Its OWN secrets only (OAuth client creds + session signing key), plus the two
+    // NON-secret config parameters the Settings screen reports as effective values.
+    // `runner-labels` and `platform-admins` are String (not SecureString) by design: labels
+    // appear in every workflow file and the admin list is a set of GitHub logins — neither is
+    // a secret, and showing the effective value is the point (spec 04 § Settings).
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: 'ReadOwnAuthSecrets',
@@ -121,6 +179,8 @@ export class MgmtStack extends Stack {
           paramArn(`${ssmPrefix}/github/client-id`),
           paramArn(`${ssmPrefix}/github/client-secret`),
           paramArn(`${ssmPrefix}/mgmt/session-secret`),
+          paramArn(`${ssmPrefix}/config/runner-labels`),
+          paramArn(`${ssmPrefix}/config/platform-admins`),
         ],
       }),
     );
@@ -150,6 +210,45 @@ export class MgmtStack extends Stack {
     if (props.discoveryQueueArn) {
       const queue = sqs.Queue.fromQueueArn(this, 'DiscoveryQueueRef', props.discoveryQueueArn);
       queue.grantSendMessages(fn);
+    }
+    // Auto-rewrite request: enqueue only. The management plane never gets `contents:write`
+    // or the App PEM — SendMessage is the entire extent of its involvement (ADR-031).
+    if (props.rewriteQueueArn) {
+      const queue = sqs.Queue.fromQueueArn(this, 'RewriteQueueRef', props.rewriteQueueArn);
+      queue.grantSendMessages(fn);
+    }
+
+    // App-config broker (ADR-034): the console's ONLY route to App-PEM-requiring GitHub calls
+    // and to platform config writes. One action, one ARN — the console cannot read the PEM, and
+    // cannot write any parameter directly.
+    if (props.appcfgBrokerArn) {
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeAppConfigBroker',
+          actions: ['lambda:InvokeFunction'],
+          resources: [props.appcfgBrokerArn],
+        }),
+      );
+    }
+
+    // Reports assistant (ADR-044): InvokeModel on EXACTLY the configured model, in this
+    // region only. `InvokeModelWithResponseStream` is deliberately NOT granted — the NL path
+    // wants one small JSON spec, not a stream. Foundation-model ARNs are account-less.
+    // Same `config` value the λ receives as env, so the policy and the runtime cannot disagree.
+    if (config.reportsNlEnabled) {
+      const reportsModel = config.reportsModelId;
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeReportsModel',
+          actions: ['bedrock:InvokeModel'],
+          resources: [
+            `arn:${this.partition}:bedrock:${this.region}::foundation-model/${reportsModel}`,
+            // Cross-region inference profiles resolve to a regional profile ARN in the
+            // caller's account; needed if the model id is switched to an `xx.` profile.
+            `arn:${this.partition}:bedrock:${this.region}:${this.account}:inference-profile/${reportsModel}`,
+          ],
+        }),
+      );
     }
 
     this.httpApi = new apigw.HttpApi(this, 'MgmtApi', {

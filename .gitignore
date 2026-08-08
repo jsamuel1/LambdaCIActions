@@ -25,3 +25,6 @@ web/dist/
 # ide
 .idea/
 .vscode/
+
+# agent scratch space (notes, probe scripts, captured logs — never a deliverable)
+.agents/

@@ -2,7 +2,8 @@
 #
 # Dockerfile.docker — the `docker` flavor microVM image (docs/specs/02-microvm-runners.md,
 # capabilities: ["docker"]). Base runner + the Docker engine so container:/services: jobs
-# and `docker build/run` steps work inside the microVM. Larger footprint (4 vCPU / 8 GB).
+# and `docker build/run` steps work inside the microVM. Larger footprint (8 GB requested; the
+# catalog's 4 vCPU is descriptive only — the API exposes no vCPU knob, see ADR-038).
 #
 # This Dockerfile is self-contained (create-microvm-image builds a snapshot from a single
 # staged `Dockerfile`, not from a registry image), so it mirrors Dockerfile.base and then
@@ -23,6 +24,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # run-hook server and for the GitHub Actions runner's node-based actions.
 # `util-linux` provides setpriv, which run-hook.mjs uses to drop root → runner (sudo cannot
 # escalate in-guest: the microVM kernel sets no_new_privs).
+# `awscli` is apt's aws-cli **v1** — the CLI ADR-028 measures the cold boot cost against.
+# See Dockerfile.base for why v1 is correct here and what to re-check before changing it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq unzip tar gzip sudo util-linux \
       libicu70 lsb-release awscli \

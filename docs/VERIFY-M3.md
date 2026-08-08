@@ -112,9 +112,9 @@ Measured from the same run, correlating `/aws/lambda/lca-dev-provision` (`microV
 | `RunMicrovm` → agent exit (**useful VM lifetime**) | 15 s | 20 s | 95 s |
 
 ¹ the `docker` flavor's pre-run hook starts `dockerd` before handing over to the agent;
-cold daemon init measured **39 s** on this run and **32 s** on the confirming re-run, on
-4 vCPU Graviton (see the caveat below). Its larger boot figure is the same effect — the
-4 vCPU / 8 GB snapshot is bigger.
+cold daemon init measured **39 s** on this run and **32 s** on the confirming re-run (see the
+caveat below — the shape those runs actually got is not established). Its larger boot figure is
+the same effect — the `docker` snapshot is bigger.
 
 Per-job cost at the reference Graviton rate (2 vCPU / 4 GB ≈ **$0.0044/min**, 4 vCPU / 8 GB
 ≈ **$0.0088/min**), billed per second. **These are useful-lifetime figures and therefore a
@@ -128,6 +128,14 @@ the images are rebuilt.
 | `base` (2/4) | 15 s | $0.0044/min | ≈ **$0.0011** |
 | `node` (2/4) | 20 s | $0.0044/min | ≈ **$0.0015** |
 | `docker` (4/8) | 95 s | $0.0088/min | ≈ **$0.0139** |
+
+> **Correction (ADR-038, M5).** The vCPU/memory shapes above were never requested. `run-microvm`
+> has no sizing parameter and `create-microvm-image` accepts memory only
+> (`--resources minimumMemoryInMiB`, no vCPU knob) — and the build script passed neither at the
+> time of this run, so every flavor here was built at the **service default shape**. The
+> measured latencies and `dockerd` init times are real; the "4 vCPU / 8 GB" attribution and the
+> rate-per-shape arithmetic are not established. The build script now sends the catalog's memory
+> floor, which re-baselines these numbers — re-measure rather than carrying them forward.
 
 Snapshot boot is not the dominant term for the small flavors (single-digit seconds to the
 in-guest hook); agent handshake and (for `docker`) daemon init are.
