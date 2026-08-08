@@ -273,19 +273,43 @@ test('tool-cache entries use the exact toolName the setup action looks up', () =
     'setup-node looks up "node"',
   );
   assert.match(instructions('Dockerfile.go'), /\/go\/\$\{GO_VERSION\}/, 'setup-go looks up "go"');
+  // `Java_<distribution>_<packageType>`, where <distribution> is the INSTALLER CLASS name,
+  // not the `distribution:` workflow input: temurin's installer is
+  // `super(`Temurin-${jvmImpl}`, ...)` with jvmImpl defaulting to hotspot. Baking the input's
+  // spelling (`Java_temurin_jdk`) is a silent cache MISS — proven live on lca-dev-java in run
+  // 31261348449, where setup-java logged `Trying to download...` and installed to
+  // Java_Temurin-Hotspot_jdk/21.0.12-8.0.LTS/arm64, ignoring the baked JDK entirely.
   assert.match(
     instructions('Dockerfile.java'),
+    /Java_Temurin-Hotspot_jdk/,
+    'setup-java looks up Java_<installer-class>_<pkg>, i.e. Java_Temurin-Hotspot_jdk',
+  );
+  assert.doesNotMatch(
+    instructions('Dockerfile.java'),
     /Java_temurin_jdk/,
-    'setup-java looks up Java_<distro>_<pkg>',
+    'Java_temurin_jdk is the workflow-input spelling and is never scanned',
   );
 });
 
 test('the java tool-cache version dir uses - not + for the build separator', () => {
   // setup-java stores 21.0.12+8 as `21.0.12-8` (a '+' in JAVA_HOME breaks toolchains) and maps
-  // it back when scanning. A '+' on disk means findAllVersions never sees the entry.
+  // it back when scanning via replace('-', '+'). A '+' on disk means findAllVersions never sees
+  // the entry. The path is assembled from ${JDK_TOOLCACHE_NAME}, so assert on that ARG and
+  // separately assert the ARG's value, rather than on a literal folder name spliced into a path.
   const df = instructions('Dockerfile.java');
-  assert.match(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/);
-  assert.doesNotMatch(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}\+/);
+  assert.match(df, /ARG JDK_TOOLCACHE_NAME=Java_Temurin-Hotspot_jdk/);
+  assert.match(df, /\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/);
+  assert.doesNotMatch(df, /\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}\+/);
+  // The completion marker is a SIBLING of the arch dir; without it the entry is invisible.
+  assert.match(
+    df,
+    /touch \$\{RUNNER_TOOL_CACHE\}\/\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64\.complete/,
+  );
+  // JAVA_HOME must be derived from the same ARGs, so a version bump cannot leave it dangling.
+  assert.match(
+    df,
+    /ENV JAVA_HOME=\$\{RUNNER_TOOL_CACHE\}\/\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/,
+  );
 });
 
 test('toolchain versions are pinned, not latest (reproducible rebuilds)', () => {

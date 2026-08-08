@@ -42,22 +42,23 @@ jobs:
       - name: Prove the baked cache entry exists before setup-java runs
         run: |
           set -eux
-          ls -d "${RUNNER_TOOL_CACHE}/Java_temurin_jdk/21.0.12-8/arm64"
-          test -f "${RUNNER_TOOL_CACHE}/Java_temurin_jdk/21.0.12-8/arm64.complete"
+          ls -d "${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64"
+          test -f "${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64.complete"
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      # A cache HIT leaves JAVA_HOME inside RUNNER_TOOL_CACHE. A download would place it
-      # elsewhere (or under a different version), so this is the load-bearing assertion.
+      # A cache HIT leaves JAVA_HOME inside RUNNER_TOOL_CACHE at the baked entry. A download
+      # lands under the resolved upstream version instead (e.g. 21.0.12-8.0.LTS), so this is the
+      # load-bearing assertion — and it is what caught the original Java_temurin_jdk defect.
       - name: Assert setup-java hit the prebaked cache (no download)
         run: |
           set -eux
           echo "JAVA_HOME=${JAVA_HOME}"
           case "${JAVA_HOME}" in
-            "${RUNNER_TOOL_CACHE}/Java_temurin_jdk/21.0.12-8/arm64") ;;
+            "${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64") ;;
             *) echo "::error::JAVA_HOME is not the prebaked entry — setup-java downloaded a JDK"; exit 1 ;;
           esac
           java -version 2>&1 | tee /tmp/java-version

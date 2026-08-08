@@ -41,8 +41,10 @@ Gotchas (all three are silent failures — the job just re-downloads at full spe
   `/opt/hostedtoolcache`; without the env var the agent uses `_work/_tool` and never sees the
   prebaked cache.
 - **The `.complete` marker is a sibling of the arch dir**, not a file inside it.
-- **`toolName` is a case-sensitive path**: `Python`, `node`, `go`, `Java_temurin_jdk`. Java's
-  version dir uses `-` where the version uses `+` (`21.0.12-8`).
+- **`toolName` is a case-sensitive path**: `Python`, `node`, `go`, `Java_Temurin-Hotspot_jdk`.
+  Java's is the INSTALLER CLASS name (`Temurin-${jvmImpl}`), not the `distribution: temurin`
+  input — `Java_temurin_jdk` is never scanned and produces a silent re-download every job.
+  Java's version dir uses `-` where the version uses `+` (`21.0.12-8`).
 
 `python` installs via the upstream `setup.sh` inside the `actions/python-versions` tarball —
 the same artifact `setup-python` downloads — rather than hand-rolling the layout.

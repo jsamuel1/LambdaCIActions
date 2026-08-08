@@ -44,30 +44,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- java flavor extras -----------------------------------------------------------------
 # Lay the JDK out exactly where setup-java looks: it reads
 # ${RUNNER_TOOL_CACHE}/Java_<distribution>_<packageType>/<version>/<arch> (base-installer.ts
-# `toolcacheFolderName` + util.ts `getToolcachePath`), so the folder name is
-# `Java_temurin_jdk` and the arch is `arm64` (os.arch() on Graviton).
+# `toolcacheFolderName` + util.ts `getToolcachePath`), and the arch is `arm64` (os.arch() on
+# Graviton).
+#
+# `<distribution>` is NOT the `distribution:` workflow input. It is the installer class's own
+# name, and temurin's constructor is `super(`Temurin-${jvmImpl}`, ...)` with jvmImpl defaulting
+# to `hotspot`, so the folder is `Java_Temurin-Hotspot_jdk`. Baking the input's spelling
+# (`Java_temurin_jdk`) puts the JDK somewhere findAllVersions() never scans: setup-java then
+# logs `Trying to download...` and re-fetches the whole JDK on EVERY job while the job still
+# goes green — the exact silent failure this cache exists to prevent. Verified live on
+# lca-dev-java before this fix (run 31261348449): setup-java ignored the baked entry and
+# installed to .../Java_Temurin-Hotspot_jdk/21.0.12-8.0.LTS/arm64.
+ARG JDK_TOOLCACHE_NAME=Java_Temurin-Hotspot_jdk
 #
 # The version DIRECTORY uses `-` where the JDK version uses `+` (setup-java stores
-# `21.0.12+8` as `21.0.12-8` and maps it back when scanning, because a `+` in JAVA_HOME
-# breaks some toolchains). Getting this wrong means findAllVersions() skips the entry — it
-# must also be valid semver or it is ignored outright.
-RUN mkdir -p ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64 /tmp/jdk \
+# `21.0.12+8` as `21.0.12-8` and maps it back when scanning with `replace('-', '+')`, because a
+# `+` in JAVA_HOME breaks some toolchains). Getting this wrong means findAllVersions() skips
+# the entry — it must also be valid semver or it is ignored outright.
+RUN mkdir -p ${RUNNER_TOOL_CACHE}/${JDK_TOOLCACHE_NAME}/${JDK_VERSION}-${JDK_BUILD}/arm64 /tmp/jdk \
     && curl -fsSL -o /tmp/jdk.tar.gz \
        "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-${JDK_VERSION}%2B${JDK_BUILD}/OpenJDK21U-jdk_aarch64_linux_hotspot_${JDK_VERSION}_${JDK_BUILD}.tar.gz" \
     && tar -xzf /tmp/jdk.tar.gz -C /tmp/jdk --strip-components=1 \
-    && cp -R /tmp/jdk/. ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64/ \
+    && cp -R /tmp/jdk/. ${RUNNER_TOOL_CACHE}/${JDK_TOOLCACHE_NAME}/${JDK_VERSION}-${JDK_BUILD}/arm64/ \
     # The completion marker is a SIBLING of the arch dir, not a file inside it
     # (@actions/tool-cache `_completeToolPath`). Without it the entry is invisible and every
     # job re-downloads the JDK.
-    && touch ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64.complete \
+    && touch ${RUNNER_TOOL_CACHE}/${JDK_TOOLCACHE_NAME}/${JDK_VERSION}-${JDK_BUILD}/arm64.complete \
     && rm -rf /tmp/jdk /tmp/jdk.tar.gz \
     # Fail the BUILD (not a job) if the layout is wrong.
-    && ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64/bin/java -version
+    && ${RUNNER_TOOL_CACHE}/${JDK_TOOLCACHE_NAME}/${JDK_VERSION}-${JDK_BUILD}/arm64/bin/java -version
 # Make the cached JDK the default so plain `java`/`javac` steps work with no setup-*
 # action at all. setup-java sets these itself when it runs; these are the no-action defaults.
 # Derived from the pins rather than repeated as a literal — a hardcoded copy silently points
 # at a nonexistent directory the moment JDK_VERSION/JDK_BUILD is bumped.
-ENV JAVA_HOME=${RUNNER_TOOL_CACHE}/Java_temurin_jdk/${JDK_VERSION}-${JDK_BUILD}/arm64
+ENV JAVA_HOME=${RUNNER_TOOL_CACHE}/${JDK_TOOLCACHE_NAME}/${JDK_VERSION}-${JDK_BUILD}/arm64
 ENV PATH=${JAVA_HOME}/bin:$PATH
 # ----------------------------------------------------------------------------------------
 
