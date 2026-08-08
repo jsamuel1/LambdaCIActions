@@ -2914,14 +2914,13 @@ skipped report instead of failing the deploy.
 
 ---
 
-> **ADR numbering note.** This block takes **049..050**. 048 is the highest number on trunk, and
-> the one concurrent claim above it is `kermes/task-wintry-owl` / PR #31 ("A flavor is published
-> image-first, label-second"), which numbered itself **051** — so 049 and 050 are both free and are
-> the lowest available pair. An earlier revision of this block sat at 050..051 on the mistaken
-> belief that wintry-owl held 049; that collided with PR #31's actual 051. ADR numbers are a shared
-> mutable namespace across branches, and `test/adr-refs.test.mjs` only catches a duplicate once both
-> blocks are in one tree, so each branch renumbers to the lowest free pair rather than deferring to
-> whichever lands second.
+> **ADR numbering note.** This block takes **050..051**, the lowest free pair. `kermes/task-wintry-owl`
+> / PR #31 ("A flavor is published image-first, label-second") held the concurrent claim above 048
+> and has since landed on trunk as **ADR-049**, so 049 is taken and 050 is the first free number.
+> This block was authored at 049..050 and renumbered up by one to yield 049 to that branch. ADR
+> numbers are a shared mutable namespace across branches, and `test/adr-refs.test.mjs` only catches
+> a duplicate once both blocks are in one tree, so each branch renumbers to the lowest free pair
+> rather than deferring to whichever lands second — a gap is cheaper than a duplicate.
 
 ## ADR-050 — A refused claim is a first-class, visible record — not a discarded 202 body (M4 fix)
 **Status**: Accepted (v1) · fixes the observability gap in [ADR-030](#adr-030) (claim decision)
