@@ -33,6 +33,9 @@ import {
   PENDING_IMAGE_STATES,
 } from '../dist/src/shared/flavor-reconcile.js';
 import { shouldClaim } from '../dist/src/ingest/filter.js';
+// The CLI integration tests below resolve the deploy pin through the CLI's own loader, so the
+// stubbed identity cannot disagree with a contributor's machine-local `.env.local`.
+import { loadEnvLocal } from '../dist/lib/deploy-env.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BUILD_SCRIPT = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), 'utf8');
@@ -1084,18 +1087,63 @@ test('the CD deploy role can read config params but not secrets', () => {
 // consumer exactly one document matching the exit code. These tests run the CLI for real
 // against a stub `aws` and parse its stdout, which is the only way that claim can be checked.
 
+/**
+ * The pin the CLI will ACTUALLY resolve, by the CLI's own precedence: `<repoRoot>/.env.local`
+ * when it exists, else the process environment (ADR-047). Reused rather than reimplemented,
+ * because guessing wrong here does not fail the assertion under test — it fails the deploy-pin
+ * guard with an unrelated message.
+ *
+ * This matters because the pin is machine-local. Hardcoding a canonical account made these
+ * tests pass here and in CI (fresh clone, no `.env.local`, so the process pin below wins) while
+ * failing for any contributor whose `.env.local` names a different account, region, or
+ * `LCA_DEPLOY_ENV` — and failing with `Deploy-target mismatch:` rather than anything about the
+ * JSON contract. So the stub echoes back whatever account the CLI resolves, and the run selects
+ * the pinned env: the STS identity comparison is still exercised, it just cannot be the thing
+ * that breaks.
+ */
+const PIN = (() => {
+  const pin = loadEnvLocal(REPO_ROOT); // .env.local, else process env, else null
+  // Defaults apply ONLY when there is no pin at all (a checkout with neither a file nor exported
+  // variables). Where a pin EXISTS its values are used verbatim, even if incomplete: defaulting
+  // a missing field there would hide a pin the CLI is about to reject, and the test would fail
+  // on the guard's message instead of skipping with the reason.
+  if (!pin) return { account: '863638663908', region: 'us-west-2', env: '', supplied: false };
+  return {
+    account: (pin.LCA_DEPLOY_ACCOUNT || '').trim(),
+    region: (pin.LCA_DEPLOY_REGION || '').trim(),
+    // '' when unpinned: the CLI then defaults to `dev`, and passing no --env keeps that.
+    env: (pin.LCA_DEPLOY_ENV || '').trim(),
+    supplied: true,
+  };
+})();
+/** The env the CLI will run against, and therefore the SSM prefix the stub must answer on. */
+const PIN_ENV = PIN.env || 'dev';
+/**
+ * A pin the CLI would reject (half-written file, bad account/region/env) is not something these
+ * tests can work around, and silently passing would be worse than saying why they were skipped.
+ * Validated with the CLI's own rules so the verdict cannot drift from what it will accept.
+ */
+const PIN_USABLE =
+  /^\d{12}$/.test(PIN.account) &&
+  /^[a-z]{2}(-[a-z]+)+-\d$/.test(PIN.region) &&
+  /^(dev|prod)?$/.test(PIN.env);
+const PIN_SKIP = PIN_USABLE
+  ? false
+  : `unusable deploy pin (account=${PIN.account || '-'} region=${PIN.region || '-'} ` +
+    `env=${PIN.env || '-'}) — fix .env.local to run the CLI integration tests`;
+
 /** A stub `aws` on PATH, so the CLI's real spawnSync calls resolve to a scripted plane. */
 function stubAws(dir, { labels, imageStates, imageProbeFails = false }) {
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin, { recursive: true });
   const params = catalogFlavors().map((f) => ({
-    Name: `/lca/dev/config/image-arn-${f.name}`,
+    Name: `/lca/${PIN_ENV}/config/image-arn-${f.name}`,
     Value: `arn:fake:${f.name}`,
   }));
   const script = `#!/usr/bin/env node
 const a = process.argv.slice(2);
 const has = (s) => a.includes(s);
-if (a[0] === 'sts') { console.log(process.env.LCA_DEPLOY_ACCOUNT); process.exit(0); }
+if (a[0] === 'sts') { console.log(${JSON.stringify(PIN.account)}); process.exit(0); }
 if (a[0] === 'ssm' && a[1] === 'get-parameter') {
   const name = a[a.indexOf('--name') + 1];
   const m = /image-arn-(.+)$/.exec(name);
@@ -1124,25 +1172,31 @@ process.exit(1);
 }
 
 /**
- * Run the CLI with a stubbed plane. The pin is supplied through the process environment
- * (ADR-047) so the test does not depend on a gitignored `.env.local`; the stub echoes the same
- * account back from `sts get-caller-identity`, so the identity comparison is still exercised.
+ * Run the CLI with a stubbed plane, against the pin the CLI itself resolves (see `PIN`). The
+ * process-environment pin below is the fallback for a checkout with no `.env.local` (a CI
+ * runner, ADR-047); where a file pin exists it wins, and `PIN` already read it, so the two
+ * agree either way. `--env` is passed only when the pin names one, because binding a selected
+ * env to an unpinned run would be a different test.
  */
 function runReconcile(args, plane) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lca-reconcile-cli-'));
   const bin = stubAws(dir, plane);
-  const account = '863638663908';
-  const r = spawnSync(process.execPath, [path.join(REPO_ROOT, 'scripts', 'flavors-reconcile.mjs'), ...args], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
-      LCA_DEPLOY_ACCOUNT: account,
-      LCA_DEPLOY_REGION: 'us-west-2',
-      LCA_DEPLOY_ENV: '',
+  const envArgs = PIN.env ? ['--env', PIN.env] : [];
+  const r = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, 'scripts', 'flavors-reconcile.mjs'), ...envArgs, ...args],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+        LCA_DEPLOY_ACCOUNT: PIN.account,
+        LCA_DEPLOY_REGION: PIN.region,
+        LCA_DEPLOY_ENV: PIN.env,
+      },
+      cwd: REPO_ROOT,
     },
-    cwd: REPO_ROOT,
-  });
+  );
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
@@ -1150,7 +1204,7 @@ const ALL_LABELS = catalogFlavors()
   .map((f) => f.label)
   .join(',');
 
-test('--json: stdout is exactly one parseable document on a healthy plane (exit 0)', () => {
+test('--json: stdout is exactly one parseable document on a healthy plane (exit 0)', { skip: PIN_SKIP }, () => {
   const r = runReconcile(['--json'], { labels: ALL_LABELS, imageStates: {} });
   assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stderr}`);
   const doc = JSON.parse(r.stdout); // throws if anything else reached stdout
@@ -1161,7 +1215,7 @@ test('--json: stdout is exactly one parseable document on a healthy plane (exit 
   assert.doesNotMatch(r.stdout, /deploy target verified/);
 });
 
-test('--json --fix: one parseable document with an empty `fixed` when nothing is fixable', () => {
+test('--json --fix: one parseable document with an empty `fixed` when nothing is fixable', { skip: PIN_SKIP }, () => {
   // Exit 0 flavour of the no-op branch: healthy plane, so no row carries a safeFix.
   const r = runReconcile(['--json', '--fix'], { labels: ALL_LABELS, imageStates: {} });
   assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stderr}`);
@@ -1170,7 +1224,7 @@ test('--json --fix: one parseable document with an empty `fixed` when nothing is
   assert.equal(doc.drift, false);
 });
 
-test('--json --fix: one parseable document on the exit-1 no-op branch (build in flight)', () => {
+test('--json --fix: one parseable document on the exit-1 no-op branch (build in flight)', { skip: PIN_SKIP }, () => {
   // `image_building` is warn with safeFix null: drift, but nothing safe to do. Before the fix
   // this path printed prose and no document at all, so a consumer could not tell it from a
   // crash.
@@ -1187,7 +1241,7 @@ test('--json --fix: one parseable document on the exit-1 no-op branch (build in 
   assert.equal(rust.safeFix, null);
 });
 
-test('--json and --json --fix documents share one schema', () => {
+test('--json and --json --fix documents share one schema', { skip: PIN_SKIP }, () => {
   const plain = JSON.parse(runReconcile(['--json'], { labels: ALL_LABELS, imageStates: {} }).stdout);
   const fixed = JSON.parse(
     runReconcile(['--json', '--fix'], { labels: ALL_LABELS, imageStates: {} }).stdout,
@@ -1232,7 +1286,7 @@ test('--fix progress narration and the child build go to stderr under --json', (
   assert.doesNotMatch(runFn, /spawnSync\(cmd, cmdArgs, \{ stdio: 'inherit' \}\)/);
 });
 
-test('--json: an incomplete image probe exits 2 with NO document on stdout', () => {
+test('--json: an incomplete image probe exits 2 with NO document on stdout', { skip: PIN_SKIP }, () => {
   // Exit 2 means "do not trust this report", and the ADR/RUNBOOK/script header all say it
   // prints no document. This path printed one anyway: `probeFailures` is populated during
   // `observe`, but the emission ran before the guard that reads it, so an AccessDenied produced
@@ -1273,17 +1327,41 @@ test('the non-fix JSON emission is gated on there being no probe failure', () =>
   assert.match(pre, /printTable\(report, labels\)/);
 });
 
-test('the RUNBOOK pipes --json through `npm run --silent`', () => {
+test('every documented --json invocation pipes through `npm run --silent`', () => {
   // `npm run` banners `> lambda-ci-actions@0.0.0 flavors:reconcile` to STDOUT before the script
-  // runs, so the documented `npm run flavors:reconcile -- --json | jq` could never parse — the
-  // one-document contract holds for the script, and the wrapper broke it in the example that
-  // demonstrates it. Every `--json` invocation in the RUNBOOK must therefore use --silent.
-  const runbook = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'RUNBOOK.md'), 'utf8');
-  const jsonInvocations = [...runbook.matchAll(/npm run (--silent )?flavors:reconcile[^\n`]*/g)]
-    .map((m) => m[0])
-    .filter((cmd) => cmd.includes('--json'));
-  assert.ok(jsonInvocations.length > 0, 'no documented --json invocation found');
-  for (const cmd of jsonInvocations) {
-    assert.match(cmd, /npm run --silent/, `documented --json command must use --silent: ${cmd}`);
+  // runs, so a documented `npm run flavors:reconcile -- --json | jq` could never parse — the
+  // one-document contract holds for the script, and the wrapper broke it in the very examples
+  // that demonstrate it.
+  //
+  // Scanned across every authored file that documents the command, not just the RUNBOOK: the
+  // script's own header usage block had the unparseable form after the RUNBOOK was fixed, and a
+  // RUNBOOK-only guard could not see it. `node scripts/flavors-reconcile.mjs --json` is exempt
+  // because it has no npm wrapper to banner.
+  // Unlike the behavioural guards in this file, this one reads the RAW sources: a usage block IS
+  // a comment, so scanning `RECONCILE_CODE` (comment-stripped) would find nothing in the script
+  // and pass vacuously — which is how the header kept the unparseable form.
+  const sources = [
+    ['docs/RUNBOOK.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'RUNBOOK.md'), 'utf8')],
+    ['docs/DEPLOY-M1.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOY-M1.md'), 'utf8')],
+    ['docs/DECISIONS.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DECISIONS.md'), 'utf8')],
+    ['docs/specs/05-infrastructure.md', fs.readFileSync(path.join(REPO_ROOT, 'docs', 'specs', '05-infrastructure.md'), 'utf8')],
+    ['scripts/flavors-reconcile.mjs', RECONCILE_SCRIPT],
+    ['scripts/build-images.mjs', BUILD_SCRIPT],
+    ['README.md', fs.readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8')],
+  ];
+  let checked = 0;
+  for (const [file, text] of sources) {
+    for (const m of text.matchAll(/npm run (--silent )?flavors:reconcile[^\n`]*/g)) {
+      const cmd = m[0];
+      if (!cmd.includes('--json')) continue;
+      checked++;
+      assert.match(
+        cmd,
+        /npm run --silent/,
+        `${file}: a documented --json command must use --silent, or npm's banner precedes the ` +
+          `document: ${cmd}`,
+      );
+    }
   }
+  assert.ok(checked >= 3, `expected the documented --json invocations to be found, saw ${checked}`);
 });

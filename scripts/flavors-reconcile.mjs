@@ -40,7 +40,7 @@
  *
  * Usage:
  *   npm run flavors:reconcile                       # dev, full check (needs the deploy pin)
- *   npm run flavors:reconcile -- --env dev --json
+ *   npm run --silent flavors:reconcile -- --env dev --json   # --silent: npm banners to stdout
  *   npm run flavors:reconcile -- --no-image-check   # SSM params only, no microVM API calls
  *   npm run flavors:reconcile -- --fix              # deploy-touching; builds what is missing
  *
@@ -49,6 +49,11 @@
  * progress, `build-images`' own output — goes to stderr, because a single line ahead of the
  * document makes the whole stream unparseable. Exit 2 prints no document: there is no
  * trustworthy report to serialize.
+ *
+ * That contract is the SCRIPT's. `npm run` prints its own `> lambda-ci-actions@0.0.0 …` banner to
+ * stdout before this file executes, so any documented `--json` invocation through npm needs
+ * `--silent` — otherwise the example that demonstrates the contract is the one thing that breaks
+ * it. Invoking `node scripts/flavors-reconcile.mjs --json` directly needs no flag.
  */
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
