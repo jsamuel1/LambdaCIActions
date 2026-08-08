@@ -20,7 +20,8 @@
  * The cursor this returns is a `RawCursor`: it names the last row SCANNED, not the last row
  * RETURNED, so on a filtered walk it routinely identifies another tenant's row. It must be
  * sealed before it reaches a response body (ADR-052) — enforced by the declared body type on
- * each list route plus the source guards in `test/mgmt-cursor-scope.test.mjs`.
+ * each list route, the source guards in `test/mgmt-cursor-scope.test.mjs`, and a throwing
+ * `toJSON` on the cursor itself for the paths neither of those can see.
  */
 
 import type { RawCursor } from '../shared/cursor.js';

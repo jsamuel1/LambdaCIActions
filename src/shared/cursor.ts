@@ -48,6 +48,23 @@ import crypto from 'node:crypto';
  * on the next unpaginated fetch. Same blast radius as the session cookie, which is signed
  * with the same secret and already re-issued on rotation.
  *
+ * ## Three layers, and which one actually holds
+ *
+ * The boundary is defended three times over, in increasing order of how much they are worth:
+ *
+ *   1. a DECLARED response body (`RunListBody.nextCursor: string | null`) makes returning a
+ *      store cursor a compile error — but only for routes that declare one, and `json()` takes
+ *      `unknown`;
+ *   2. source guards (`test/mgmt-cursor-scope.test.mjs`) scan every file under `src/` for the
+ *      residue the types cannot see — but they match SPELLINGS, and a leak need not spell
+ *      anything (an object spread has no field name at all);
+ *   3. the raw cursor **throws if serialized** (see `UNSERIALIZABLE`), which is the only layer
+ *      that is a property of the value rather than of how the code was written.
+ *
+ * Layer 3 is why this is safe for routes nobody has written yet. Layers 1 and 2 fail *early*,
+ * at compile or test time, which is where a defect is cheap; layer 3 fails *closed*, at
+ * runtime, on the paths the first two cannot see.
+ *
  * ## What sealing does NOT hide
  *
  * AES-GCM is length-preserving, so the sealed blob's length still reveals the plaintext key's
@@ -67,19 +84,64 @@ import crypto from 'node:crypto';
  *
  * Deliberately **not** a branded `string`. A branded string is still assignable to `string`,
  * so a response contract of `string | null` would not reject it — which is how the original
- * leak was written. The wrapper is necessary but not sufficient: a route body typed `unknown`
- * (as `json()` takes) accepts a `RawCursor` happily and serializes the plaintext key one level
- * deeper, as `"nextCursor":{"raw":"eyJwayI6…"}`. The compile error arrives only once the body
- * is DECLARED with `nextCursor: string | null` (see `RunListBody` in `src/mgmt/handler.ts`);
- * the source guards in `test/mgmt-cursor-scope.test.mjs` cover routes that declare nothing.
+ * leak was written. But the wrapper's type is only the *outermost* of three layers, and it is
+ * the weakest — see `UNSERIALIZABLE` below for the one that actually holds.
  */
 export interface RawCursor {
   readonly raw: string;
 }
 
-/** Wrap a store-internal cursor string. Store-side only. */
+/**
+ * Why a raw cursor **throws** if anything tries to serialize it.
+ *
+ * The type layer bites only where a response body is DECLARED. `json()` takes `unknown`, so
+ * three ordinary ways of writing a route put the plaintext key on the wire while typechecking
+ * clean and passing every source guard — all three were probed, and the first two passed:
+ *
+ *   - spreading the page: `return json(200, { ...page, complete: false })`;
+ *   - renaming the field: `cursor: page.nextCursor ?? null`;
+ *   - ES shorthand: `const nextCursor = page.nextCursor ?? null; return { … nextCursor … }`.
+ *
+ * Each ships `{"nextCursor":{"raw":"eyJwayI6…"}}` or the same under another key. The source
+ * guards in `test/mgmt-cursor-scope.test.mjs` can only police SPELLINGS — a field name, a call
+ * shape — and a leak does not have to spell anything: `JSON.stringify` walks the object graph
+ * and serializes `{ raw }` wherever it finds it.
+ *
+ * So the value itself refuses. `toJSON` is consulted by `JSON.stringify` for any reachable
+ * value, at any depth, under any key, however it got there — which is precisely the set of
+ * paths a spelling-based guard cannot enumerate. Throwing there converts every such leak into
+ * a caught 500 (`handler.ts` serializes exactly once, at `JSON.stringify(reply.body)`, inside
+ * the top-level try/catch that logs to CloudWatch and returns a sanitized error). A loud
+ * server error on a route nobody sealed is the fail-closed outcome; silently correct plaintext
+ * is not.
+ *
+ * `toJSON` is **non-enumerable** so the wrapper still behaves like the plain `{ raw }` value it
+ * was: `deepEqual` compares equal, `Object.keys` sees one key, spreading copies only `raw`.
+ * Enumerability does not affect `JSON.stringify`, which looks the method up regardless — so the
+ * backstop costs nothing at the seams that legitimately handle cursors (`sealCursor`,
+ * `decodeCursor`, and the server-side report fan-out all read `.raw` directly).
+ */
+const UNSERIALIZABLE =
+  'a raw pagination cursor must be sealed before it reaches a response body (ADR-052): ' +
+  'call sealCursorOrNull(cursor, scope, secret) rather than returning the store cursor';
+
+/**
+ * Wrap a store-internal cursor string. Store-side only.
+ *
+ * The returned object is deliberately hostile to serialization — see `UNSERIALIZABLE`. It is
+ * otherwise an ordinary `{ raw }`.
+ */
 export function asRawCursor(s: string): RawCursor {
-  return { raw: s };
+  const cursor = { raw: s };
+  Object.defineProperty(cursor, 'toJSON', {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: () => {
+      throw new Error(UNSERIALIZABLE);
+    },
+  });
+  return cursor;
 }
 
 /**

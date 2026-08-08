@@ -2969,20 +2969,28 @@ Two supporting choices:
   categorically different: forged, replayed across scopes, or minted under a rotated secret.
   Restarting the walk would re-serve the head page under a "load older" click, surfacing as
   duplicate rows rather than as the refusal it is.
-- **The raw cursor is a wrapper type, and the source guards finish the job.** `RawCursor` is
-  `{ readonly raw: string }` rather than a branded `string`, because a branded string stays
-  assignable to `string` — which is exactly how the original leak was written. The wrapper is
-  necessary but **not sufficient**: `json()` takes `unknown`, so nothing about the wrapper
-  alone stops `nextCursor: page.nextCursor ?? null` from compiling. It would serialize the
-  same plaintext key one level deeper, as `"nextCursor":{"raw":"eyJwayI6…"}`. The compile
-  error is bought by DECLARING the body: `RunListBody.nextCursor` is `string | null`, so
-  `RawCursor | null` is not assignable. A paginated route with an undeclared body has no such
-  protection, so the source guards in `test/mgmt-cursor-scope.test.mjs` scan every file under
-  `src/` for the residue the types cannot see — reaching through `.raw`, minting a cursor
-  inside a route, dropping the 400, or returning a cursor from an untyped body. Those guards
-  match the *shape* of a call rather than one spelling of it (balanced-paren extents, and the
-  binding name the route actually chose), because a line-shaped regex missed ES shorthand, a
-  renamed binding, a scope argument containing a call, and a prettier-wrapped multi-line call.
+- **The raw cursor cannot be serialized, and the guards catch it earlier.** Three layers, in
+  increasing order of what they are worth. (1) `RawCursor` is `{ readonly raw: string }` rather
+  than a branded `string`, because a branded string stays assignable to `string` — which is
+  exactly how the original leak was written — so a **declared** body rejects it:
+  `RunListBody.nextCursor` is `string | null`, and `RawCursor | null` is not assignable. That
+  covers only routes that declare a body; `json()` takes `unknown`. (2) The source guards in
+  `test/mgmt-cursor-scope.test.mjs` scan every file under `src/` for the residue the types
+  cannot see — reaching through `.raw`, minting a cursor inside a route, dropping the 400,
+  spreading a store page into a body, or putting a cursor in a field under any name. They match
+  the *shape* of a call rather than one spelling of it (balanced-paren extents; the binding name
+  the route actually chose; the RHS's cursor *reads* rather than the field's name), because
+  line-shaped and name-keyed rules were each defeated in review — by ES shorthand, a renamed
+  binding, a scope argument containing a call, a prettier-wrapped multi-line call, an object
+  **spread** of the page, and a field renamed from `nextCursor` to `cursor`. (3) Because a leak
+  need not *spell* anything — a spread has no field name at all — the value itself refuses:
+  `asRawCursor` installs a non-enumerable `toJSON` that throws. `JSON.stringify` consults it for
+  any reachable value at any depth under any key, which is precisely the set of paths a
+  spelling-based scan cannot enumerate. The mgmt handler serializes exactly once
+  (`JSON.stringify(reply.body)`) inside the try/catch that logs to CloudWatch and returns a
+  sanitized error, so an unsealed cursor on some future route is a caught 500 — loud and
+  fail-closed — rather than silent plaintext. Layers 1 and 2 fail early, where a defect is
+  cheap; layer 3 is the one that holds for code nobody has written yet.
 
 **Alternatives rejected.**
 
@@ -3008,9 +3016,16 @@ Two supporting choices:
 - Sealing costs one HKDF and one AES-GCM pass over ~200 bytes per page — unmeasurable next to
   the DynamoDB query it accompanies. Cursors grow by the 12-byte nonce, 16-byte tag, and
   version prefix.
-- A future paginated route inherits the requirement from two places, and both matter: it
-  cannot return a store cursor from a **declared** body, because `RawCursor` is not
-  assignable to `string | null`; and the source guards scan the whole `src/` tree, so a route
-  that skips the declared body is caught by the test rather than by the compiler. The
-  unclaimed-jobs list is the first such route, needs a `view` of its own when it lands, and
-  should declare its body the way `RunListBody` does.
+- A future paginated route inherits the requirement from three places, and the last is the one
+  that does not depend on how the route is written: it cannot return a store cursor from a
+  **declared** body, because `RawCursor` is not assignable to `string | null`; the source guards
+  scan the whole `src/` tree, so a route that skips the declared body is caught by the test
+  rather than by the compiler; and if it evades both, serializing the cursor **throws**, so the
+  response fails closed instead of shipping plaintext. The unclaimed-jobs list is the first such
+  route, needs a `view` of its own when it lands, and should declare its body the way
+  `RunListBody` does.
+- Sealing is one AES-GCM pass; the backstop is one non-enumerable property per cursor. Neither
+  is measurable next to the DynamoDB query. The backstop is invisible to the store-side seams
+  that legitimately handle raw cursors — `sealCursor`, `decodeCursor`, and the report fan-out all
+  read `.raw` directly, and `toJSON` being non-enumerable keeps the wrapper `deepEqual` to a
+  plain `{ raw }`.

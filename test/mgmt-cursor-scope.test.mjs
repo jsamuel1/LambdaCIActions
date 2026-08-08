@@ -9,11 +9,13 @@
 // authenticated operator could decode. (A `REFUSAL#…` row is the same shape; that list is
 // still unlanded — see PR #34 — so only the run keys are exercised here.)
 //
-// Four invariants:
+// Five invariants:
 //   1. a sealed cursor carries no readable identifier, in any encoding a client can apply;
 //   2. a cursor is inert outside the scope it was minted for (view / grants / repo / status);
 //   3. forged, tampered, and pre-ADR-052 plaintext cursors are REFUSED, not restarted;
-//   4. the routes actually seal — no `nextCursor` reaches a body straight off a store page.
+//   4. the routes actually seal — no `nextCursor` reaches a body straight off a store page;
+//   5. and if one ever did, it would THROW rather than serialize — the invariant that does not
+//      depend on a route being written the way the guards expect.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -199,7 +201,8 @@ test('openCursor never throws on hostile input', () => {
 
 // ---- route wiring ----------------------------------------------------------
 //
-// Two layers hold the boundary, and it is worth being exact about which does what:
+// THREE layers hold the boundary, and it is worth being exact about which does what, because
+// the first two are weaker than they look:
 //
 //   - The TYPE layer works only where a response body is declared. `json()` takes `unknown`,
 //     so the `RawCursor` wrapper alone would NOT stop `nextCursor: page.nextCursor ?? null`
@@ -207,17 +210,23 @@ test('openCursor never throws on hostile input', () => {
 //     `"nextCursor":{"raw":"eyJwayI6…"}`. `RunListBody` declares `nextCursor: string | null`,
 //     which is what makes that line a type error (`RawCursor | null` is not assignable).
 //   - The SOURCE layer below covers what the types cannot see: reaching through `.raw`,
-//     minting a cursor inside a route, dropping the 400, or adding a paginated route with an
-//     UNTYPED body — where the compiler has no contract to enforce.
+//     minting a cursor inside a route, dropping the 400, spreading a store page into a body,
+//     or adding a paginated route with an UNTYPED body — where the compiler has no contract.
+//   - The RUNTIME layer is the only one that is a property of the VALUE: `asRawCursor` installs
+//     a throwing `toJSON`, so a raw cursor that reaches `JSON.stringify` fails closed however
+//     it got there. That is what makes the seam safe for routes nobody has written yet, and it
+//     is pinned by `cursor.test`-style assertions in this file rather than by a scan.
 //
-// The source scan therefore walks every route-bearing source file, not just `handler.ts`: a
-// new list route in a new file is exactly the case the type layer cannot catch on its own.
+// The source scan walks every route-bearing source file, not just `handler.ts`: a new list
+// route in a new file is exactly the case the type layer cannot catch on its own.
 //
-// These guards match SHAPES, not spellings. That distinction was earned: an earlier revision
-// keyed them on `nextCursor: <expr>` and on the literal line `const opened = openCursor(…);`,
-// and four ordinary ways of writing a route walked past all of them — ES shorthand
-// (`{ runs, nextCursor }`), a renamed binding, a scope argument containing a call, and a
-// prettier-wrapped multi-line call. Each is probed below the assertion that now catches it.
+// These guards match SHAPES, not spellings — twice earned. An earlier revision keyed them on
+// `nextCursor: <expr>` and on the literal line `const opened = openCursor(…);`, and four
+// ordinary ways of writing a route walked past all of them: ES shorthand, a renamed binding, a
+// scope argument containing a call, and a prettier-wrapped multi-line call. A later revision
+// still keyed the seal rule on the FIELD NAME `nextCursor`, and two more walked past: an object
+// SPREAD of the page (no field name exists to match) and a field simply renamed to `cursor`.
+// Each is probed below the assertion that now catches it.
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
 
@@ -246,14 +255,22 @@ function stripComments(src) {
  * Strip TYPE declarations, so the value-assignment guard cannot confuse a type member with a
  * response field. `RunListBody` legitimately contains `nextCursor: string | null;`.
  *
- * The tempting shortcut — skipping any right-hand side that ends in `;` — is wrong and was
- * caught by probing it: a single-line object literal ends in `;` as well
- * (`return { body: { nextCursor: page.nextCursor ?? null } };`), so that rule silently stops
- * guarding the exact leak it exists to catch. Remove the declarations instead, and judge every
- * remaining `nextCursor:` as a value.
+ * Two wrong ways to write this, both probed:
+ *
+ *   - Skipping any right-hand side that ends in `;` also skips a single-line object literal
+ *     closing `} };` — which silently stops guarding the exact leak this exists to catch.
+ *   - Matching to the next COLUMN-0 `}` mis-handles a single-line declaration
+ *     (`interface Tiny { a: string }`): the scan runs past its own closing brace to the next
+ *     top-level one, taking real code with it. One injected single-line interface stripped
+ *     2893 bytes of `handler.ts` instead of 28. It did not blind the guards *today*, which is
+ *     the problem — coverage would depend on where a future type happened to be declared.
+ *
+ * So match a same-line closing brace first, and only then fall back to a column-0 one.
  */
 function stripTypeDecls(src) {
-  return src.replace(/^(?:export )?(?:interface|type)\s+\w+[^{]*\{[\s\S]*?^\}/gm, '');
+  return src
+    .replace(/^(?:export )?(?:interface|type)\s+\w+[^{\n]*\{[^{}\n]*\}[^\n]*$/gm, '')
+    .replace(/^(?:export )?(?:interface|type)\s+\w+[^{]*\{[\s\S]*?^\}/gm, '');
 }
 
 /**
@@ -304,21 +321,109 @@ test('the scan actually covers the route sources', () => {
   assert.ok(HANDLER.includes('sealCursorOrNull('), 'code must survive stripping');
 });
 
-test('every route seals its outgoing cursor', () => {
-  let found = 0;
+test('every route seals a cursor it puts in a body, whatever the field is called', () => {
+  // Judged by what the RHS READS, not by what the field is named. The previous rule matched
+  // `nextCursor:` specifically, so `cursor: page.nextCursor ?? null` — an ordinary rename —
+  // walked straight past it and shipped the same plaintext key. Any field whose value reads a
+  // raw cursor (`….nextCursor`, `opened.cursor`) must either seal it, or reduce it to a boolean.
+  //
+  // The boolean escape is load-bearing, not a loophole: `anyIndexTruncated:
+  // pages.some((p) => p.nextCursor !== undefined)` legitimately asks whether an index was
+  // truncated. A comparison yields `true`/`false`, which carries no identifier.
+  const readsCursor = /(?:\.nextCursor|\bopened\.cursor)\b/;
+  let sealed = 0;
   for (const [rel, src] of SOURCES) {
-    for (const m of stripTypeDecls(src).matchAll(/nextCursor:\s*([^,\n]+)/g)) {
-      // Trailing punctuation belongs to the enclosing literal, not the expression: a
-      // single-line body closes with `} };`. Judge the expression itself.
-      const rhs = m[1].trim().replace(/[\s;}]+$/, '');
-      found++;
-      assert.ok(
-        rhs === 'null' || rhs.startsWith('sealCursorOrNull(') || rhs.startsWith('sealCursor('),
-        `${rel}: nextCursor must be sealed or explicitly null, got: ${rhs}`,
+    for (const m of stripTypeDecls(src).matchAll(/(\w+):\s*([^,\n]+(?:\n[^,\n]*)??)(?=,|\n\s*[}\])])/g)) {
+      const [field, rhsRaw] = [m[1], m[2]];
+      const rhs = rhsRaw.trim().replace(/[\s;}]+$/, '');
+      if (!readsCursor.test(rhs)) continue;
+      if (/seal(?:Cursor|CursorOrNull)\(/.test(rhs)) {
+        sealed++;
+        continue;
+      }
+      // A comparison reduces the cursor to a boolean before it can be serialized.
+      assert.match(
+        rhs,
+        /(?:!==|===|!=|==)\s*(?:undefined|null)|\.nextCursor\s*(?:!==|===)/,
+        `${rel}: field \`${field}\` reads a raw cursor without sealing it: ${rhs}`,
       );
     }
   }
-  assert.ok(found >= 3, 'expected the runs routes to be found');
+  assert.ok(sealed >= 2, `expected both runs branches to seal, found ${sealed}`);
+});
+
+test('a route cannot spread a store page into a response body', () => {
+  // `return json(200, { ...page, complete: false })` has NO field name for the rule above to
+  // judge, typechecks clean against `json(body: unknown)`, and ships
+  // `{"nextCursor":{"raw":"eyJwayI6…"}}`. It was probed against the previous guard set and
+  // passed every one of them.
+  //
+  // A store page is not a response body — they differ by exactly the field that must not be
+  // copied — so spreading one is never the right call in route code. Name the fields.
+  const pageBindings = /(?:const|let)\s+(\w+)\s*(?::[^=]+)?=\s*await\s+(?:collectVisible|listRunsBy\w+|fetchPage)\b/g;
+  for (const [rel, src] of SOURCES) {
+    const bound = [...src.matchAll(pageBindings)].map((m) => m[1]);
+    for (const name of bound) {
+      assert.doesNotMatch(
+        src,
+        new RegExp(`\\.\\.\\.\\s*${name}\\b`),
+        `${rel}: spreading \`${name}\` copies its raw cursor into the body — name the fields ` +
+          `and seal the cursor`,
+      );
+    }
+  }
+  // Guard the guard: the binding pattern must actually find the routes' pages, or the loop
+  // above iterates nothing and the assertion is vacuous.
+  const found = [...HANDLER.matchAll(pageBindings)].map((m) => m[1]);
+  assert.deepEqual(found, ['page', 'page'], `expected both collectVisible pages, got ${found}`);
+});
+
+test('a raw cursor refuses to serialize, however it reaches a body', () => {
+  // The layer that does not depend on how the route was written. `toJSON` is consulted by
+  // `JSON.stringify` for any reachable value at any depth under any key — which is the set of
+  // paths a spelling-based scan cannot enumerate. `handler.ts` serializes exactly once
+  // (`JSON.stringify(reply.body)`), inside the try/catch that logs and returns a sanitized
+  // error, so a leak on an unsealed route is a caught 500 rather than plaintext.
+  const raw = encodeCursor(OTHER_TENANT_KEY);
+  const bodies = [
+    // The three shapes probed against the source guards, two of which passed them.
+    { runs: [], nextCursor: raw, complete: false }, // named field / untyped body
+    { runs: [], cursor: raw, complete: false }, // renamed field
+    { runs: [], nextCursor: raw }, // spread of a store page
+    // …and depth, which no field-name rule could reach at all.
+    { page: { nextCursor: raw } },
+    { list: [{ c: raw }] },
+  ];
+  for (const body of bodies) {
+    assert.throws(
+      () => JSON.stringify(body),
+      /must be sealed before it reaches a response body/,
+      `serializing ${Object.keys(body).join(',')} must fail closed`,
+    );
+  }
+  // A sealed cursor is an ordinary string and serializes normally — the backstop must not
+  // break the correct path.
+  const ok = JSON.stringify({ nextCursor: sealCursorOrNull(raw, MINE, SECRET) });
+  assert.match(ok, /^\{"nextCursor":"c1\./);
+  for (const s of SECRETS) assert.ok(!ok.includes(s), `sealed body must not expose ${s}`);
+});
+
+test('the backstop does not change how a raw cursor otherwise behaves', () => {
+  // Non-enumerable, so the wrapper is still the plain `{ raw }` value every store-side seam
+  // treats it as. If `toJSON` were enumerable, `deepEqual` would compare unequal and the
+  // round-trip assertions above would be testing something else.
+  const raw = encodeCursor(OTHER_TENANT_KEY);
+  assert.deepEqual(Object.keys(raw), ['raw']);
+  assert.deepEqual({ ...raw }, { raw: raw.raw });
+  assert.equal(Object.prototype.propertyIsEnumerable.call(raw, 'toJSON'), false);
+  // And it cannot be defused by overwriting it.
+  assert.throws(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    /** @type {any} */ (raw).toJSON = () => 'defused';
+  });
+  assert.throws(() => JSON.stringify(raw));
+  // `asRawCursor` (used by `decodeCursor`'s round trip) carries the same protection.
+  assert.throws(() => JSON.stringify(asRawCursor('abc')));
 });
 
 test('a route cannot smuggle a cursor into a body by shorthand', () => {

@@ -173,8 +173,10 @@ const CURSOR_REFUSED = 'cursor is not valid for this query; reload the list';
  * `nextCursor: page.nextCursor ?? null` from compiling — it would just serialize the
  * plaintext key one level deeper, as `"nextCursor":{"raw":"eyJwayI6…"}`. Declaring
  * `nextCursor` as `string | null` and returning the body through `runList` is what turns
- * that line into a type error. A new paginated route must adopt the same pattern: its own
- * typed body, or the wrapper buys nothing at the boundary.
+ * that line into a type error. A new paginated route should adopt the same pattern: its own
+ * typed body, so the mistake is caught at compile time. If it does not, a raw cursor still
+ * cannot reach the wire — `asRawCursor` installs a throwing `toJSON`, so serializing one is a
+ * caught 500 rather than a leak — but that is the backstop, not the contract.
  */
 interface RunListBody {
   runs: RunView[];
