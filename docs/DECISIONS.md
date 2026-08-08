@@ -1985,7 +1985,7 @@ GitHub with a 202 `claimed:false` and nothing logged as an error. That seed is n
 against the catalog by `test/filter.test.mjs`.
 
 ## ADR-040 — Custom flavors live in the store and are merged over the built-in catalog (M5)
-**Status**: Accepted (v1) · shapes work deferred from this milestone
+**Status**: Accepted (v1) · **implemented**
 **Context**: An operator cannot bring their own image. The catalog is `import
 flavorsCatalog from '../../microvm/flavors.json'` in `src/provision/flavor.ts`,
 `src/mgmt/views.ts` and `src/ingest/compat.ts` — compiled into each Lambda bundle at build
@@ -2021,12 +2021,49 @@ out of the key rather than needing an authorization filter.
 **Consequences**: flavor resolution gains a table read on the provision hot path — it must
 degrade to built-in-only on a DynamoDB fault (fail open, matching ADR-027's gates) rather
 than failing the launch. `flavorNames()` (used by `validateFlavorMap`/`validateRepoPatch`) and
-`buildFlavorViews` become async/installation-scoped, which changes the Mgmt API's validation
-surface. Deferred to a follow-up card; this ADR fixes the shape so the standard-set work
-(ADR-039) does not have to guess it.
+`buildFlavorViews` become installation-scoped, which changes the Mgmt API's validation surface.
+
+**As implemented.** The single catalog seam is `src/shared/flavor-catalog.ts` — the only module
+that imports `microvm/flavors.json` — and `src/shared/flavor-store.ts` owns the rows. Four static
+imports moved behind it (`src/provision/flavor.ts`, `src/mgmt/views.ts`, `src/ingest/compat.ts`,
+`src/mgmt/rewrite.ts`); `rewrite.ts` deliberately stays **built-in only**, because it plans a YAML
+edit to a customer's workflow file and a per-installation label can be revoked, which would leave a
+committed `runs-on` nobody claims. The optional `custom`/`customFlavors` parameters are trailing on
+every seam, so omitting them is the pre-ADR-040 behavior exactly, and `composeCatalog([])` returns
+the built-in array *itself* — no copy, no re-sort, satisfying (5) in code rather than by convention.
+The hot-path read is gated by `needsCustomFlavors()`, a pure test for whether the job could name a
+custom flavor at all, so an installation with no custom flavors performs **no I/O**.
+
+Two details the decision above did not anticipate:
+
+- **Image ARNs cannot share a lookup.** A built-in's ARN comes from SSM
+  (`/lca/<env>/config/image-arn-<flavor>`, published by `scripts/build-images.mjs`); a custom
+  flavor's is the operator's own, on its row. `resolveImageArn` in `src/provision/handler.ts`
+  branches on the namespace, and re-reads the row immediately before launch so a flavor
+  invalidated between resolution and launch does not get one last VM (`launchableCustomImageArn`).
+- **Fail-open needed a refusal to be safe.** "Degrade to built-in-only" is the right posture for a
+  job that never named a custom flavor — but because the read is gated by `needsCustomFlavors`,
+  every job that performs it *did* name one, so degrading silently would land the job on a real
+  built-in image ARN while its JIT runner still advertised the original `lambda-ci-custom-*` label
+  from the claim. GitHub would assign it and it would **succeed on the wrong image**. `resolveFlavor`
+  therefore reports an unresolvable named custom flavor as `unresolvedCustom` (covering a custom
+  label, a FlavorMap value, and a custom `defaultFlavor` once the fallback is actually taken), and
+  the provisioner refuses the launch — no runner is minted, so the job stays visibly queued rather
+  than invisibly wrong, and a transient fault is retried by SQS. This is also the claim→provision
+  race: ingest claims while the flavor is `valid`, and a delete or re-validate in the interval must
+  not silently reroute the job.
+- **Custom labels are NOT added to `/lca/<env>/config/runner-labels`.** That parameter is
+  environment-scoped while a custom flavor is per-installation, so seeding it would make
+  installation A's label claimable for installation B's jobs — B would resolve nothing, fall
+  through to `base`, and run the job on the wrong image having already given up the
+  GitHub-hosted fallback. `src/ingest/handler.ts` instead resolves custom labels against the
+  job's **own** installation at claim time, gated on the job carrying a `lambda-ci-custom-*`
+  label, and fails **closed** (unlike the repo-config gate) because claiming a job whose flavor
+  we could not confirm strands it.
 
 ## ADR-041 — A custom flavor is not routable until a smoke run proves it (M5)
-**Status**: Accepted (v1) · depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
+**Status**: Accepted (v1) · **enforcement implemented; smoke-run orchestrator deferred** ·
+depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
 **Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
 published its image ARN, resolved correctly from its label, and then failed every single job
 because nothing in the guest could start `dockerd`. `imageAvailability()` probes only that an
@@ -2060,8 +2097,36 @@ failure reason, so validation needs its own status surface (a Flavors screen or 
 extension). The smoke run **launches a real microVM and registers a real (throwaway) runner**,
 so it consumes quota, costs money, and needs a repo to register against; it is therefore
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
-the static gates; the smoke run itself is verified against a live environment. Deferred to a
-follow-up card together with ADR-040.
+the static gates; the smoke run itself is verified against a live environment.
+
+**As implemented — and what is NOT yet.** The *enforcement* half is complete and is what makes the
+rule true rather than advisory:
+
+- The state machine lives in `src/shared/flavor-store.ts`. Legal transitions are enforced **in the
+  DynamoDB condition expression**, not in a read-then-write, so two concurrent validation runs
+  cannot both launch a VM and both write a verdict. `valid → validating` and `invalid → validating`
+  are deliberately absent: re-validation must pass through `pending` so a flavor stops being
+  routable the moment its evidence is withdrawn.
+- Only `valid` rows are composed into the catalog (`routableCustomFlavors`), so an unvalidated
+  flavor resolves as if absent. This is enforced again at two later points, because omission alone
+  is not sufficient: `launchableCustomImageArn` refuses a non-`valid` row immediately before the
+  launch, and `validateFlavorMap`/`validateRepoPatch` refuse an unvalidated name so the console
+  cannot save a choice the resolver would ignore.
+- The static gate (`src/flavorval/validate-core.ts`) and the smoke *classifier*
+  (`classifySmoke`) are implemented and unit-tested, including the three-outcome rule that an
+  orchestration failure returns to `pending` rather than spending terminal `invalid` on our own
+  transient fault. `src/shared/microvm.ts` can probe an image's real state, distinguishing
+  `ABSENT`/`FORBIDDEN` (answers) from a failed probe (not an answer).
+- The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
+  re-validate trigger; a new image ARN atomically repoints and resets to `pending`.
+
+**Not implemented:** the λ that actually *runs* a smoke run — launching the microVM, dispatching the
+nonce-bound workflow and observing registration/conclusion/self-termination — and its CDK wiring.
+Until it lands, `FLAVORVAL_FUNCTION_NAME` is unset, so registration honestly reports that validation
+could not be started and the flavor stays `pending`; **nothing can reach `valid`, therefore nothing
+custom is routable.** That is the safe direction, and it is the state this ADR mandates for a flavor
+without evidence. The console surface is deferred with it, since its main job is showing validation
+progress. Both are tracked as the successor card to this one, and both are **deploy-touching**.
 
 > **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
 > to **042..046** to vacate a collision, following the same convention as the 038..041 block

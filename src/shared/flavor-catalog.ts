@@ -166,20 +166,32 @@ export function composeCatalog(
 }
 
 /**
- * Every runner label that MUST be present in `/lca/<env>/config/runner-labels` for the
- * composed catalog to be reachable.
+ * Every runner label that must be present in `/lca/<env>/config/runner-labels` for the BUILT-IN
+ * catalog to be reachable.
  *
  * Ingest's claim gate (`shouldClaim` → `decideClaim`) runs BEFORE flavor resolution and only
  * accepts labels on that allowlist, so a label absent from it produces a successful webhook
  * response with `claimed:false` and a job that stays queued with no actionable error. This is
- * the single derivation both the operator-facing reconcile CLI and the console health item are
- * expected to consume, so the two cannot disagree about which labels are required.
+ * the single derivation the operator-facing seed regression consumes (`test/filter.test.mjs`), so
+ * the documented seed command and the catalog cannot disagree.
  *
- * ORDERING (following the image-first/label-second rule the flavor build tooling establishes):
- * only `valid` custom flavors contribute a label, because `composeCatalog` only admits valid
- * ones. Adding an unproven flavor's label would convert a silently-queued job into a CLAIMED
- * job that then fails in provisioning — strictly worse, because a claimed job can no longer
- * fall back to GitHub-hosted.
+ * ## Why custom labels are NOT put in that parameter (ADR-040)
+ *
+ * The parameter is ENVIRONMENT-scoped; a custom flavor is per-installation. Adding
+ * `lambda-ci-custom-gpu` here would make installation A's label claimable for installation B's
+ * jobs, and B's resolution would find no such flavor and fall through to `base` — so B's job would
+ * be claimed and run on the wrong image, having already given up the GitHub-hosted fallback.
+ *
+ * `src/ingest/handler.ts` therefore resolves custom labels against the JOB'S OWN installation at
+ * claim time, gated on the job actually carrying a `lambda-ci-custom-*` label so an installation
+ * with no custom flavors performs no extra I/O. A custom label is claimable exactly where it is
+ * resolvable, and only while its flavor is `valid`.
+ *
+ * The optional `custom` argument is retained for callers that want the composed label set (e.g. a
+ * console health view), NOT for seeding the parameter. Only `valid` flavors contribute, because
+ * `composeCatalog` only admits valid ones: advertising an unproven flavor's label would convert a
+ * silently-queued job into a CLAIMED job that then fails in provisioning — strictly worse, because
+ * a claimed job can no longer fall back to GitHub-hosted.
  */
 export function requiredClaimLabels(custom?: readonly CatalogFlavor[]): string[] {
   return composeCatalog(custom).map((f) => f.label);

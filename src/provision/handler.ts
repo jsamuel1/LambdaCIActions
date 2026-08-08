@@ -12,7 +12,9 @@ import { getRepo } from '../shared/install-store.js';
 import { matchJobAnalysis } from '../ingest/job-match.js';
 import { incompatibleRunnerLabel } from '../ingest/adopt.js';
 import type { ProvisionRequest, RunHookPayload } from '../shared/types.js';
-import { resolveFlavor, type ResolveOptions } from './flavor.js';
+import { resolveFlavor, needsCustomFlavors, type ResolveOptions } from './flavor.js';
+import { loadRoutableCustomFlavors, getCustomFlavor } from '../shared/flavor-store.js';
+import { isCustomFlavorName } from '../shared/flavor-catalog.js';
 import { jitRunnerLabels, classifyMintFailure, NoRunnerLabelsError, TooManyRunnerLabelsError, IncompatibleRunnerLabelError, MAX_JIT_LABELS } from './labels.js';
 import { emitMetrics, isQuotaError } from '../shared/metrics.js';
 
@@ -103,9 +105,33 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     console.error(JSON.stringify({ msg: 'resolve-options lookup failed (label-only)', error: errMsg(err) }));
     return {} as ResolveOptions;
   });
-  const { flavor, reason: flavorReason } = resolveFlavor(req.labels, resolveOpts);
+  const resolution = resolveFlavor(req.labels, resolveOpts);
+  const { flavor, reason: flavorReason } = resolution;
   console.log(JSON.stringify({ msg: 'flavor resolved', runId: req.runId, jobId: req.jobId, flavor, reason: flavorReason }));
-  const imageArn = await getParam(`${IMAGE_ARN_PARAM_PREFIX}${flavor}`);
+
+  // REFUSE a job that named a custom flavor we can no longer resolve, instead of letting it fall
+  // through the normal chain (ADR-040/041).
+  //
+  // Ingest claimed this job because the flavor was `valid`; by now it may have been deleted, reset
+  // to `pending` by a re-validate, or simply be unreadable. The fall-through is silent and lands on
+  // a REAL built-in image ARN, while `jitRunnerLabels(req.labels)` still advertises the original
+  // `lambda-ci-custom-*` label — so GitHub would assign the job and it would SUCCEED on an image
+  // the workflow never asked for. That is worse than any failure: it is a wrong answer that looks
+  // right.
+  //
+  // Throwing routes the message to SQS redelivery and ultimately the DLQ. No runner is ever minted,
+  // so the job simply stays queued from GitHub's side — visibly not-run rather than invisibly wrong
+  // — and a genuinely transient store fault is retried. This is also why the gated custom-flavor
+  // read failing open to `[]` is safe: every job that reaches that read named a custom flavor, so
+  // an empty catalog is caught here rather than silently downgrading the launch.
+  if (resolution.unresolvedCustom) {
+    throw new Error(
+      `job named custom flavor '${resolution.unresolvedCustom}' which is not currently routable ` +
+        `(deleted, or validation not \`valid\`) — refusing to launch on fallback '${flavor}'`,
+    );
+  }
+
+  const imageArn = await resolveImageArn(req.installationId, flavor);
   const via = req.claimVia ?? 'label';
   const metricDims = { env: LCA_ENV, flavor, via };
   const metricProps = {
@@ -330,6 +356,57 @@ function errMsg(err: unknown): string {
  * (stored workflow analysis, matched by rendered name). Any part may be absent —
  * resolveFlavor treats missing opts as label-only.
  */
+/**
+ * Decide whether a custom flavor row may be launched, and with which image (ADR-040/041).
+ *
+ * Pure and exported so the LAST gate before a real VM boots from an operator-supplied image is
+ * unit-testable without DynamoDB. Throws rather than returning a union because every caller must
+ * treat a refusal as a failed provision, not a fallback: silently degrading to `base` here would
+ * run the job on an image the workflow did not ask for.
+ */
+export function launchableCustomImageArn(
+  flavor: string,
+  rec: { state?: string; imageArn?: string } | undefined,
+  installationId: number,
+): string {
+  if (!rec) {
+    throw new Error(`custom flavor '${flavor}' has no record for installation ${installationId}`);
+  }
+  if (rec.state !== 'valid') {
+    // Unreachable via resolution (only `valid` rows are composed into the catalog) but enforced
+    // here too: resolution and launch are separate reads, so a flavor invalidated or deleted in
+    // between must not get one last VM.
+    throw new Error(
+      `custom flavor '${flavor}' is not validated (state: ${rec.state ?? 'unknown'}) — refusing to launch`,
+    );
+  }
+  if (!rec.imageArn) throw new Error(`custom flavor '${flavor}' has no imageArn`);
+  return rec.imageArn;
+}
+
+/**
+ * Resolve a flavor name to the microVM image ARN to launch.
+ *
+ * The two namespaces come from genuinely different places and cannot share a lookup (ADR-040):
+ *
+ *   - a BUILT-IN's ARN is published to SSM (`/lca/<env>/config/image-arn-<flavor>`) by
+ *     `scripts/build-images.mjs`, because we build that image;
+ *   - a CUSTOM flavor's ARN is the operator's own, supplied at registration and stored on the
+ *     flavor row. There is no SSM parameter for it and there must not be: the control plane
+ *     never builds an operator image, and minting a parameter per custom flavor would put a
+ *     per-installation value in an environment-scoped namespace.
+ *
+ * The custom row is read back HERE, immediately before the launch, rather than carried through
+ * resolution — see {@link launchableCustomImageArn} for why that re-read is the point.
+ */
+async function resolveImageArn(installationId: number, flavor: string): Promise<string> {
+  if (!isCustomFlavorName(flavor)) {
+    return await getParam(`${IMAGE_ARN_PARAM_PREFIX}${flavor}`);
+  }
+  const rec = await getCustomFlavor(installationId, flavor);
+  return launchableCustomImageArn(flavor, rec, installationId);
+}
+
 async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptions> {
   const opts: ResolveOptions = {};
 
@@ -348,6 +425,15 @@ async function lookupResolveOptions(req: ProvisionRequest): Promise<ResolveOptio
       jobName: req.jobName,
     });
     if (match) opts.signals = match.job.step_signals;
+  }
+
+  // Custom flavors (ADR-040), gated on the job actually NAMING one. `needsCustomFlavors` is pure
+  // and reads the labels/FlavorMap/defaultFlavor we already have, so an installation that uses
+  // only built-ins performs NO extra I/O here — the ADR's "byte-identical, no I/O" requirement.
+  // The load itself fails OPEN (returns `[]` and logs), so a DynamoDB fault degrades this job to
+  // built-in-only routing rather than failing a launch that `base` could have served.
+  if (needsCustomFlavors(req.labels, opts)) {
+    opts.customFlavors = await loadRoutableCustomFlavors(req.installationId);
   }
 
   return opts;

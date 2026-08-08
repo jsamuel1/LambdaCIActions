@@ -3,7 +3,9 @@ import { getParam } from '../shared/ssm.js';
 import { getFileContent, listWorkflowFiles } from '../shared/github-app.js';
 import { parseWorkflow } from '../ingest/workflow-parser.js';
 import { analyzeWorkflowCompat } from '../ingest/compat.js';
-import { resolveFlavor } from '../provision/flavor.js';
+import { resolveFlavor, needsCustomFlavors } from '../provision/flavor.js';
+import { loadRoutableCustomFlavors } from '../shared/flavor-store.js';
+import type { CatalogFlavor } from '../shared/flavor-catalog.js';
 import { putWorkflowAnalysis } from '../shared/workflow-store.js';
 import { getRepo } from '../shared/install-store.js';
 import {
@@ -76,6 +78,25 @@ async function discoverOne(record: SQSRecord): Promise<void> {
   // inserts (ADR-031), so a fallback-derived flavor would leak into the customer's PR.
   const mode = repoRecord?.mode;
 
+  // Custom flavors (ADR-040), loaded AT MOST ONCE per scan and only if some job in this repo
+  // could actually resolve to one. Discovery writes the stored routing preview the console
+  // renders and the auto-rewrite planner reads (ADR-031), so it has to compose the same catalog
+  // Provision will: without this, a job labelled `lambda-ci-custom-gpu` would be previewed as
+  // `fallback to base` while Provision routed it to the custom flavor — the preview contradicting
+  // the behavior, which is the specific failure the `mode` note above documents.
+  //
+  // Memoized rather than eager so an installation with no custom flavors performs no I/O, and
+  // rather than per-job so a 40-job repo does not issue 40 identical queries.
+  let customFlavors: readonly CatalogFlavor[] | undefined;
+  let customLoaded = false;
+  const loadCustom = async (): Promise<readonly CatalogFlavor[] | undefined> => {
+    if (!customLoaded) {
+      customLoaded = true;
+      customFlavors = await loadRoutableCustomFlavors(req.installationId);
+    }
+    return customFlavors;
+  };
+
   const files = await listWorkflowFiles(auth);
   console.log(
     JSON.stringify({ msg: 'discovery scan', repo: req.repoFullName, reason: req.reason, files: files.length }),
@@ -100,9 +121,25 @@ async function discoverOne(record: SQSRecord): Promise<void> {
     let analysis: WorkflowAnalysisRecord;
     try {
       const parsed = parseWorkflow(file.path, content);
+      // Resolve the read BEFORE building `resolveFn`, because resolution is pure/synchronous.
+      //
+      // Detection is deliberately limited to labels + FlavorMap, matching what this preview
+      // already consumes. Discovery does not pass `defaultFlavor` to the resolver (it never has),
+      // so a repo whose `defaultFlavor` is a custom flavor is no more and no less visible here
+      // than one whose default is a built-in. Threading `defaultFlavor` in would change stored
+      // previews for repos with NO custom flavors, which this card must not do; the pre-existing
+      // preview/Provision divergence for `defaultFlavor` is noted for its own card.
+      const custom = parsed.jobs.some((job) => needsCustomFlavors(job.runs_on, { flavorMap }))
+        ? await loadCustom()
+        : undefined;
       const resolveFn = (job: ParsedJob) =>
-        resolveFlavor(job.runs_on, { flavorMap, signals: job.step_signals, mode });
-      const compat = analyzeWorkflowCompat(parsed, resolveFn);
+        resolveFlavor(job.runs_on, {
+          flavorMap,
+          signals: job.step_signals,
+          mode,
+          customFlavors: custom,
+        });
+      const compat = analyzeWorkflowCompat(parsed, resolveFn, custom);
       const routes: WorkflowAnalysisRecord['routes'] = {};
       for (const job of parsed.jobs) routes[job.id] = resolveFn(job);
       analysis = {

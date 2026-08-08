@@ -62,7 +62,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
 | `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
 | `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
-| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **planned, not implemented** — must pass validation before it is routable (ADR-040/041) |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **registration + routing implemented, smoke-run λ not** — must pass validation before it is routable, so none is routable yet (ADR-040/041) |
 
 † descriptive only — see the sizing note above.
 
@@ -270,31 +270,51 @@ The biggest reference win was baking dependencies into the snapshot:
 
 ## Custom flavors (bring-your-own image)
 
-> **Status: designed, NOT implemented.** This section is the agreed shape from ADR-040/041, not
-> a description of shipped behavior. Nothing in `src/` reads a custom flavor today: the three
-> catalog consumers (`src/provision/flavor.ts`, `src/mgmt/views.ts`, `src/ingest/compat.ts`)
-> still import `microvm/flavors.json` statically, there is no `FLAVOR#` row writer or reader,
-> and no validation state machine exists. Implementation is tracked as its own card. Read what
-> follows as the contract that work must satisfy — do not cite it as an existing capability.
+> **Status: storage + routing implemented; the smoke-run λ is not.** Registration, storage,
+> installation-scoped resolution, claim-time label resolution and every routability *refusal* are
+> shipped — see ADR-040/041 for the exact seams. What is NOT shipped is the λ that performs a smoke
+> run, and its CDK wiring. Because a flavor only becomes routable by passing one, **no custom flavor
+> can currently reach `valid`, so none is routable in a deployed environment.** Registration honestly
+> reports that validation could not be started and leaves the flavor `pending`. The console surface
+> is deferred with the λ. Do not cite custom flavors as an end-to-end capability yet; the paragraphs
+> below describe the contract, with per-sentence status where they differ.
 
-An operator may register a `custom-*` flavor for their own installation (ADR-040). Storage is
-a per-installation row in the shared table (`pk=INSTALL#<id>`, `sk=FLAVOR#<name>`) — the
-static JSON is compiled into the Lambdas and stays read-only. Resolution composes
-`builtin ++ custom`; built-in names always win, and a custom flavor that collides with one is
-rejected at registration rather than silently shadowing (or being shadowed by) it. Custom
-flavors are visible only to their own installation, and their requested memory is bounds-checked
-against the region's microVM quota with the derived per-minute rate surfaced before save.
+An operator may register a `custom-*` flavor for their own installation (ADR-040) — **implemented**:
+`POST /api/flavors?installation=<id>`, stored as a per-installation row in the shared table
+(`pk=INSTALL#<id>`, `sk=FLAVOR#<name>`), since the static JSON is compiled into the Lambdas and stays
+read-only. Resolution composes `builtin ++ custom` through the single seam
+`src/shared/flavor-catalog.ts`; built-in names always win, and a custom flavor that collides with one
+(on **name or label**) is rejected at registration rather than silently shadowing (or being shadowed
+by) it. Custom flavors are visible only to their own installation — a cross-tenant read is not
+"denied" but unaddressable, because the scope is the partition key. Requested memory is
+bounds-checked and the derived per-minute rate is surfaced before save via a no-write preview
+endpoint; per ADR-038 that rate is an **estimate** for the requested shape and `vcpu` is descriptive,
+so a description advertising a vCPU shape is refused.
 
 A custom flavor is **not routable until it has demonstrably run a job** (ADR-041):
 `pending → validating → valid | invalid(reason)`, and only `valid` flavors are selectable in a
-`FlavorMap`/`defaultFlavor` or resolvable from a label. Validation is (1) static checks — arm64,
-image ARN resolves and is readable by the provisioner, capabilities drawn from the closed
-vocabulary (`docker`, `node`, `python`, `java`, `go`, `rust`), memory within quota — and (2) a
-**smoke run**: one microVM launched from the image with a synthetic JIT-registered runner that
-must register, execute a trivial job, and self-terminate through the hook broker. Static checks
-alone are not sufficient evidence: the `docker` flavor built fine, published its ARN and routed
-correctly while failing *every* job because nothing could start `dockerd` (ADR-019/020).
-Re-validation is automatic when the image ARN changes and manually triggerable from the console.
+`FlavorMap`/`defaultFlavor` or resolvable from a label. The **state machine and every refusal are
+implemented** — transitions are enforced in the DynamoDB condition expression so concurrent runs
+cannot both launch a VM and both write a verdict, and non-`valid` is refused in three independent
+places (catalog composition, config validation, and immediately before launch, since resolution and
+launch are separate reads). Validation is (1) static checks — arm64, image ARN resolves and is
+readable by the provisioner, capabilities drawn from the closed vocabulary (`docker`, `node`,
+`python`, `java`, `go`, `rust`), memory within quota — **implemented, including a real image-state
+probe**; and (2) a **smoke run**: one microVM launched from the image with a synthetic JIT-registered
+runner that must register, execute a trivial job, and self-terminate through the hook broker — the
+verdict *classifier* is implemented and unit-tested, **the orchestrator that performs the run is
+not**. Static checks alone are not sufficient evidence: the `docker` flavor built fine, published its
+ARN and routed correctly while failing *every* job because nothing could start `dockerd`
+(ADR-019/020) — which is why a static pass is never reported as validation. Re-validation is
+automatic when the image ARN changes (atomically repointing and resetting to `pending`) and manually
+triggerable — **both implemented**; each merely starts a run the λ cannot yet perform.
+
+Custom labels are deliberately **not** added to `/lca/<env>/config/runner-labels`: that parameter is
+environment-scoped while a custom flavor is per-installation, so seeding it would let one
+installation's label be claimed for another's jobs and routed to the wrong image. Ingest resolves
+custom labels against the job's own installation at claim time instead, gated on the job carrying a
+`lambda-ci-custom-*` label so installations using only built-ins pay nothing, and failing closed so
+a job whose flavor cannot be confirmed stays runnable on GitHub-hosted.
 
 ## Constraints
 

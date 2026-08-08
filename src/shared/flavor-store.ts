@@ -318,10 +318,17 @@ export async function listCustomFlavors(
 /**
  * The routable custom flavors for an installation, or `[]` on ANY fault (ADR-040 fail-open).
  *
- * Flavor resolution is on the provision hot path, and a DynamoDB blip must degrade to
- * built-in-only routing rather than failing the launch — the same posture as ADR-027's gates.
- * The failure is logged, never thrown: a job that could have run on `base` must not die
- * because a custom-flavor read timed out.
+ * The fault behavior is safe only in combination with the provisioner's refusal, and the two must
+ * be read together. Because callers gate this read on `needsCustomFlavors`, EVERY job that reaches
+ * it has named a custom flavor — so returning `[]` here cannot quietly downgrade an ordinary job
+ * (an ordinary job never gets this far). What it does mean is that a store fault is indistinguish-
+ * able from "the flavor is gone", and `resolveFlavor` reports either as `unresolvedCustom`, which
+ * the provisioner turns into a refused (and hence retried) launch rather than a silent fallback to
+ * `base`. That is the whole point: falling through would put the job on a REAL built-in image while
+ * its runner still advertised the custom label, so it would succeed on the wrong image.
+ *
+ * So this returns `[]` rather than throwing to keep the failure in ONE place — the resolution
+ * result — instead of splitting it across an exception path and a routing path.
  */
 export async function loadRoutableCustomFlavors(
   installationId: number,

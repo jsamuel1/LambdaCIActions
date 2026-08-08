@@ -194,10 +194,57 @@ export interface FlavorResolution {
    * the pre-upgrade name makes the loss visible regardless of which rule selected it.
    */
   replaced?: string;
+  /**
+   * A `custom-*` flavor this job explicitly NAMED that is not in the composed catalog — because it
+   * was deleted, or its validation lapsed from `valid`, between the claim and this resolution.
+   *
+   * Load-bearing for the provisioner, which must REFUSE such a job rather than launch it. Without
+   * this the fall-through is silent and actively dangerous: resolution lands on `base`, that name
+   * resolves to a perfectly good built-in image ARN in SSM, and the JIT runner still advertises the
+   * original `lambda-ci-custom-*` label from the claim — so GitHub assigns the job and it SUCCEEDS
+   * on an image the workflow never asked for.
+   *
+   * Absent whenever no custom flavor was named, so a job that never mentions one is unaffected.
+   */
+  unresolvedCustom?: string;
 }
 
 function byName(catalog: readonly FlavorDef[], name: string): FlavorDef | undefined {
   return catalog.find((f) => f.name === name);
+}
+
+/**
+ * A `custom-*` flavor THIS job named that the composed catalog does not contain.
+ *
+ * "Named" is deliberately narrow — only routes this job could actually have taken:
+ *   - a `lambda-ci-custom-*` label on the job itself, and
+ *   - a FlavorMap entry keyed by one of THIS job's labels whose value is a `custom-*` name.
+ *
+ * `defaultFlavor` is handled at the fallback instead, because a custom default is only a request
+ * when no other rule matched; treating it as one unconditionally would refuse jobs that
+ * legitimately resolved through an explicit built-in label.
+ *
+ * Pure, and undefined whenever no custom flavor is named — which is what keeps the
+ * zero-custom-flavor path byte-identical.
+ */
+function unresolvedNamedCustom(
+  catalog: readonly FlavorDef[],
+  lower: readonly string[],
+  opts: ResolveOptions,
+): string | undefined {
+  for (const label of lower) {
+    if (isCustomFlavorLabel(label) && !catalog.some((f) => f.label.toLowerCase() === label)) {
+      return label;
+    }
+  }
+  if (opts.flavorMap) {
+    const mapLower = new Map(Object.entries(opts.flavorMap).map(([k, v]) => [k.toLowerCase(), v]));
+    for (const label of lower) {
+      const mapped = mapLower.get(label);
+      if (mapped && isCustomFlavorName(mapped) && !byName(catalog, mapped)) return mapped;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -323,6 +370,13 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
   // `builtin ++ custom` for this resolution only; the built-in array itself when none.
   const catalog = effectiveFlavors(opts.customFlavors);
 
+  // Computed BEFORE the rules, because it must be reported no matter which rule ends up winning:
+  // a job naming an absent custom flavor may still match a built-in label and resolve "fine",
+  // and that silent substitution is exactly what the provisioner has to refuse.
+  const unresolvedCustom = unresolvedNamedCustom(catalog, lower, opts);
+  const stamp = (r: FlavorResolution): FlavorResolution =>
+    unresolvedCustom ? { ...r, unresolvedCustom } : r;
+
   // 1. Repo FlavorMap override — explicit label → flavor. Case-insensitive on the label key.
   if (opts.flavorMap) {
     const mapLower = new Map(
@@ -331,10 +385,12 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     for (const label of lower) {
       const mapped = mapLower.get(label);
       if (mapped && byName(catalog, mapped)) {
-        return applySignalUpgrade(
-          catalog,
-          { flavor: mapped, reason: `FlavorMap override: '${label}' → '${mapped}'` },
-          opts.signals,
+        return stamp(
+          applySignalUpgrade(
+            catalog,
+            { flavor: mapped, reason: `FlavorMap override: '${label}' → '${mapped}'` },
+            opts.signals,
+          ),
         );
       }
     }
@@ -349,13 +405,15 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
           .map((l) => `'${l}'`)
           .join(', ')} also present; resolved by flavor name)`
       : '';
-    return applySignalUpgrade(
-      catalog,
-      {
-        flavor: explicit.def.name,
-        reason: `explicit LCA label '${explicit.def.label}'${ambiguity}`,
-      },
-      opts.signals,
+    return stamp(
+      applySignalUpgrade(
+        catalog,
+        {
+          flavor: explicit.def.name,
+          reason: `explicit LCA label '${explicit.def.label}'${ambiguity}`,
+        },
+        opts.signals,
+      ),
     );
   }
 
@@ -364,10 +422,12 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     for (const label of lower) {
       const mapped = adoptFlavorForLabel(label);
       if (mapped && byName(catalog, mapped)) {
-        return applySignalUpgrade(
-          catalog,
-          { flavor: mapped, reason: `adopt-mode standard label '${label}' → '${mapped}'` },
-          opts.signals,
+        return stamp(
+          applySignalUpgrade(
+            catalog,
+            { flavor: mapped, reason: `adopt-mode standard label '${label}' → '${mapped}'` },
+            opts.signals,
+          ),
         );
       }
     }
@@ -377,11 +437,17 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
   //    record a warning. Signal upgrade still applies (e.g. docker needed).
   const repoDefault =
     opts.defaultFlavor && byName(catalog, opts.defaultFlavor) ? opts.defaultFlavor : undefined;
-  return applySignalUpgrade(
+  // A custom `defaultFlavor` only counts as a request once we are actually taking the fallback —
+  // above this point some other rule matched and the default was never consulted.
+  const unresolvedDefault =
+    !repoDefault && isCustomFlavorName(opts.defaultFlavor) ? opts.defaultFlavor : undefined;
+  const fallback = applySignalUpgrade(
     catalog,
     repoDefault
       ? { flavor: repoDefault, reason: `fallback to repo defaultFlavor '${repoDefault}' (no matching label)` }
       : { flavor: DEFAULT_FLAVOR, reason: 'fallback to base (no matching label)' },
     opts.signals,
   );
+  const unresolved = unresolvedCustom ?? unresolvedDefault;
+  return unresolved ? { ...fallback, unresolvedCustom: unresolved } : fallback;
 }

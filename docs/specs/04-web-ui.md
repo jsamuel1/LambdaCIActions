@@ -48,6 +48,11 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
 | **Reports** | Spend + utilisation + run analytics over a window, and an NL report assistant | spend/billable compute minutes/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
+
+> Custom flavors (ADR-040/041) are exposed by the API rows below but the Flavors **screen** does not
+> yet render or register them: its main job would be showing validation progress, and the smoke-run
+> λ that produces that progress is not deployed, so no custom flavor can reach `valid`. Screen work
+> is deferred to the same successor card as the λ.
 | **Settings** | GitHub App linkage, runner labels, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
 
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has
@@ -162,7 +167,11 @@ adding an endpoint is not a CloudFormation change and the whole table is unit-te
 | `GET /api/runs` | Filter runs (`repo`, `status`, `limit`, `cursor`; `repo`+`status` compose); returns `complete` (were any job rows dropped from this response?) | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}` | Run detail + derived duration/cost | ✅ |
 | `GET /api/runs/{repoId}/{runId}/{jobId}/logs` | Tail CloudWatch logs (`nextToken` or `since`) | ✅ |
-| `GET /api/flavors` | Catalog + per-flavor image availability | ✅ |
+| `GET /api/flavors` | Catalog + per-flavor image availability. With `?installation=<id>`: also the installation's custom flavors in every state (each row carries `routable`) plus the smoke workflow YAML the operator must commit | ✅ |
+| `POST /api/flavors?installation=<id>` | Register a custom flavor (ADR-040). Body carries the **base** name; the `custom-` prefix is server-added. Refuses a built-in name/label collision and a description advertising a vCPU shape (ADR-038). Registers as `pending` — never routable on creation | ✅ M5 |
+| `POST /api/flavors/preview?installation=<id>` | Static-gate + rate **preview** for a proposed flavor — writes nothing, probes nothing. A pass is explicitly **not** validation | ✅ M5 |
+| `DELETE /api/flavors/{name}?installation=<id>` | Remove a custom flavor | ✅ M5 |
+| `POST /api/flavors/{name}/revalidate?installation=<id>` | Manual re-validate (ADR-041); an `imageArn` in the body atomically repoints the image and resets to `pending`. Returns `validationTriggered: false` while the smoke-run λ is undeployed | ✅ M5 · trigger only |
 | `GET /api/health` | Dashboard aggregates + stuck-run detection + cost sample (`cost.jobs` — run rows are per-job, so a matrix workflow contributes one each; the denominator and mean are per job, not per workflow run) | ✅ |
 | `GET /api/settings` | Env identity, verified App linkage, runner labels, webhook health | ✅ |
 | `PUT /api/settings/runner-labels` | Replace the claimed runner labels (`dryRun` returns impact only) | ✅ |

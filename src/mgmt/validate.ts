@@ -1,4 +1,8 @@
 import { flavorNames } from './views.js';
+import { customFlavorBaseNameError } from '../shared/flavor-catalog.js';
+import { KNOWN_CAPABILITIES, areCapabilitiesKnown } from '../provision/flavor.js';
+import { MIN_MEMORY_MB, DEFAULT_MAX_MEMORY_MB } from '../flavorval/validate-core.js';
+import type { RegisterFlavorInput } from '../shared/flavor-store.js';
 import type { RepoMode } from '../shared/types.js';
 import type { RepoConfigPatch } from '../shared/install-store.js';
 
@@ -26,11 +30,19 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * Validate a `label → flavor` map: keys are non-empty runner labels, values must name a
  * flavor that exists in the catalog (a typo'd flavor would silently fall back to `base`
  * at provision time, which is exactly the surprise the UI should prevent).
+ *
+ * `customFlavors` (ADR-040/041) is the installation's ROUTABLE custom flavors. It is optional and
+ * trailing so every existing caller behaves identically; the caller must pass only `valid` ones,
+ * because accepting a `pending`/`invalid` name here would save config the resolver then ignores —
+ * the job would silently land on `base` while the console showed the operator's choice.
  */
-export function validateFlavorMap(input: unknown): ValidationResult<Record<string, string>> {
+export function validateFlavorMap(
+  input: unknown,
+  customFlavors?: readonly { name: string }[],
+): ValidationResult<Record<string, string>> {
   if (!isPlainObject(input)) return { ok: false, errors: ['flavorMap must be an object'] };
   const errors: string[] = [];
-  const known = new Set(flavorNames());
+  const known = new Set(flavorNames(customFlavors));
   const entries = Object.entries(input);
   if (entries.length > MAX_FLAVOR_MAP_ENTRIES) {
     errors.push(`flavorMap has ${entries.length} entries (max ${MAX_FLAVOR_MAP_ENTRIES})`);
@@ -51,8 +63,15 @@ export function validateFlavorMap(input: unknown): ValidationResult<Record<strin
   return errors.length ? { ok: false, errors } : { ok: true, value: out };
 }
 
-/** Validate a `PATCH /api/repos/{repoId}` body. Rejects unknown fields outright. */
-export function validateRepoPatch(input: unknown): ValidationResult<RepoConfigPatch> {
+/**
+ * Validate a `PATCH /api/repos/{repoId}` body. Rejects unknown fields outright.
+ *
+ * `customFlavors` — see {@link validateFlavorMap}: routable custom flavors only.
+ */
+export function validateRepoPatch(
+  input: unknown,
+  customFlavors?: readonly { name: string }[],
+): ValidationResult<RepoConfigPatch> {
   if (!isPlainObject(input)) return { ok: false, errors: ['body must be a JSON object'] };
   const errors: string[] = [];
   const patch: RepoConfigPatch = {};
@@ -79,14 +98,19 @@ export function validateRepoPatch(input: unknown): ValidationResult<RepoConfigPa
     // validator rejects everything but known flavor names.
     if (input.defaultFlavor === null) {
       patch.defaultFlavor = null;
-    } else if (typeof input.defaultFlavor !== 'string' || !flavorNames().includes(input.defaultFlavor)) {
-      errors.push(`defaultFlavor must be a known flavor (${flavorNames().join(', ')}) or null to clear`);
+    } else if (
+      typeof input.defaultFlavor !== 'string' ||
+      !flavorNames(customFlavors).includes(input.defaultFlavor)
+    ) {
+      errors.push(
+        `defaultFlavor must be a known flavor (${flavorNames(customFlavors).join(', ')}) or null to clear`,
+      );
     } else {
       patch.defaultFlavor = input.defaultFlavor;
     }
   }
   if (input.flavorMap !== undefined) {
-    const fm = validateFlavorMap(input.flavorMap);
+    const fm = validateFlavorMap(input.flavorMap, customFlavors);
     if (!fm.ok) errors.push(...fm.errors);
     else patch.flavorMap = fm.value;
   }
@@ -405,4 +429,172 @@ export function parseEpochMs(raw: string | undefined): number | undefined {
   if (!/^\d{1,15}$/.test(raw)) return undefined;
   const n = Number(raw);
   return Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+}
+
+// ---- custom flavors (ADR-040/041) ------------------------------------------
+
+/** Max length of a custom flavor's operator-facing description. Bounds the item + the UI. */
+export const MAX_CUSTOM_FLAVOR_DESCRIPTION = 200;
+
+/**
+ * Validate a `POST /api/flavors` body (custom-flavor registration, ADR-040).
+ *
+ * Collects every error rather than short-circuiting, so an operator fixing a form sees the whole
+ * list. Deliberately does NOT check the built-in name collision or probe the image: the collision
+ * is enforced by `buildFlavorRecord` (the single writer, so it holds for every path) and the image
+ * is probed by the ADR-041 static gate. This validator's job is shape + bounds.
+ *
+ * `vcpu` IS accepted but is DESCRIPTIVE ONLY (ADR-038): the microVM API takes a memory floor and
+ * exposes no vCPU knob, so this figure drives the rate ESTIMATE and the smallest-flavor sort, and
+ * must never be presented as provisioned capacity.
+ */
+export function validateCustomFlavor(
+  input: unknown,
+  opts: { maxMemoryMb?: number } = {},
+): ValidationResult<Omit<RegisterFlavorInput, 'installationId' | 'actor'>> {
+  if (!isPlainObject(input)) return { ok: false, errors: ['body must be a JSON object'] };
+  const errors: string[] = [];
+  const allowed = new Set([
+    'name',
+    'vcpu',
+    'memoryMb',
+    'capabilities',
+    'description',
+    'imageArn',
+    'smokeRepoFullName',
+    'smokeWorkflowPath',
+  ]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) errors.push(`unknown field "${key}"`);
+  }
+
+  // The operator supplies the BASE name; `custom-` is added by the store, never by the client.
+  const base = typeof input.name === 'string' ? input.name.trim() : input.name;
+  const nameError = customFlavorBaseNameError(base);
+  if (nameError) errors.push(`name: ${nameError}`);
+
+  const vcpu = input.vcpu;
+  if (typeof vcpu !== 'number' || !Number.isFinite(vcpu) || vcpu < 1 || vcpu > 16) {
+    errors.push('vcpu must be a number between 1 and 16 (descriptive only — ADR-038)');
+  }
+
+  const max = opts.maxMemoryMb ?? DEFAULT_MAX_MEMORY_MB;
+  const memoryMb = input.memoryMb;
+  if (
+    typeof memoryMb !== 'number' ||
+    !Number.isInteger(memoryMb) ||
+    memoryMb < MIN_MEMORY_MB ||
+    memoryMb > max
+  ) {
+    errors.push(`memoryMb must be an integer between ${MIN_MEMORY_MB} and ${max}`);
+  }
+
+  let capabilities: string[] = [];
+  if (input.capabilities === undefined) {
+    capabilities = [];
+  } else if (
+    !Array.isArray(input.capabilities) ||
+    input.capabilities.some((c) => typeof c !== 'string')
+  ) {
+    errors.push('capabilities must be an array of strings');
+  } else {
+    capabilities = (input.capabilities as string[]).map((c) => c.trim()).filter(Boolean);
+    if (!areCapabilitiesKnown(capabilities)) {
+      const unknown = capabilities.filter((c) => !KNOWN_CAPABILITIES.includes(c));
+      errors.push(
+        `capabilities must be drawn from the closed vocabulary (${KNOWN_CAPABILITIES.join(', ')}); unknown: ${unknown.join(', ')}`,
+      );
+    }
+  }
+
+  const description = typeof input.description === 'string' ? input.description.trim() : '';
+  if (!description) errors.push('description is required');
+  else if (description.length > MAX_CUSTOM_FLAVOR_DESCRIPTION) {
+    errors.push(`description is longer than ${MAX_CUSTOM_FLAVOR_DESCRIPTION} characters`);
+  } else if (advertisesVcpuShape(description)) {
+    // ADR-038: only memory is requestable, so a description promising "2 vCPU" advertises a shape
+    // the API cannot be asked for. The source-level guard forbids this for built-in descriptions;
+    // a custom description reaches the same console table and must not be able to say it either.
+    errors.push(
+      'description must not advertise a vCPU shape — only memory is requestable (ADR-038); ' +
+        'describe the toolchain instead',
+    );
+  }
+
+  const imageArn = typeof input.imageArn === 'string' ? input.imageArn.trim() : '';
+  if (!imageArn) errors.push('imageArn is required');
+  else if (!isMicrovmImageArn(imageArn)) {
+    errors.push('imageArn must be a microVM image ARN (arn:<partition>:lambda:<region>:<account>:microvm-image/<name>)');
+  }
+
+  let smokeRepoFullName: string | undefined;
+  if (input.smokeRepoFullName !== undefined) {
+    if (typeof input.smokeRepoFullName !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(input.smokeRepoFullName.trim())) {
+      errors.push('smokeRepoFullName must be "owner/repo"');
+    } else {
+      smokeRepoFullName = input.smokeRepoFullName.trim();
+    }
+  }
+
+  let smokeWorkflowPath: string | undefined;
+  if (input.smokeWorkflowPath !== undefined) {
+    const p = typeof input.smokeWorkflowPath === 'string' ? input.smokeWorkflowPath.trim() : '';
+    // Confined to the workflows directory: this path is handed to GitHub's
+    // `workflow_dispatch` API, and a traversal-ish value is a request we should never send.
+    if (!p || !/^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(p)) {
+      errors.push('smokeWorkflowPath must be a .github/workflows/*.yml path');
+    } else {
+      smokeWorkflowPath = p;
+    }
+  }
+
+  if (errors.length) return { ok: false, errors };
+  return {
+    ok: true,
+    value: {
+      base: base as string,
+      vcpu: vcpu as number,
+      memoryMb: memoryMb as number,
+      capabilities,
+      description,
+      imageArn,
+      ...(smokeRepoFullName ? { smokeRepoFullName } : {}),
+      ...(smokeWorkflowPath ? { smokeWorkflowPath } : {}),
+    },
+  };
+}
+
+/**
+ * Whether a description advertises a vCPU shape (ADR-038 honesty rule).
+ *
+ * Matches the spirit of the repo's source-level guard over `microvm/flavors.json` descriptions:
+ * a count next to a vCPU/core word. `test/image-content.test.mjs` enforces it for built-ins;
+ * this enforces it for operator-supplied text, which lands in the same table.
+ */
+export function advertisesVcpuShape(description: string): boolean {
+  return /\b\d+(\.\d+)?\s*(v?cpus?|vcpu|cores?|threads?)\b/i.test(description);
+}
+
+/** Whether a string looks like a microVM image ARN. */
+export function isMicrovmImageArn(arn: string): boolean {
+  return /^arn:[a-z0-9-]+:lambda:[a-z0-9-]+:\d{12}:microvm-image\/[\w.-]+$/.test(arn);
+}
+
+/** Validate a `POST /api/flavors/{name}/revalidate` body (optionally repointing the image). */
+export function validateRevalidateBody(
+  input: unknown,
+): ValidationResult<{ imageArn?: string }> {
+  if (input === undefined || input === null) return { ok: true, value: {} };
+  if (!isPlainObject(input)) return { ok: false, errors: ['body must be a JSON object'] };
+  const errors: string[] = [];
+  for (const key of Object.keys(input)) {
+    if (key !== 'imageArn') errors.push(`unknown field "${key}"`);
+  }
+  let imageArn: string | undefined;
+  if (input.imageArn !== undefined) {
+    const arn = typeof input.imageArn === 'string' ? input.imageArn.trim() : '';
+    if (!arn || !isMicrovmImageArn(arn)) errors.push('imageArn must be a microVM image ARN');
+    else imageArn = arn;
+  }
+  return errors.length ? { ok: false, errors } : { ok: true, value: imageArn ? { imageArn } : {} };
 }

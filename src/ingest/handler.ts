@@ -13,6 +13,8 @@ import {
 } from '../discover/filter.js';
 import { putQueuedRun, transitionRun } from '../shared/run-store.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
+import { listCustomFlavors, routableCustomFlavors } from '../shared/flavor-store.js';
+import { isCustomFlavorLabel } from '../shared/flavor-catalog.js';
 import {
   upsertInstallation,
   setInstallationFlags,
@@ -343,9 +345,51 @@ async function handleWorkflowJob(
     );
   }
 
+  const jobLabels = wf.workflow_job?.labels ?? [];
+
+  // Custom-flavor labels (ADR-040) are per-INSTALLATION, so they are resolved here rather than
+  // added to `/lca/<env>/config/runner-labels`.
+  //
+  // That parameter is environment-scoped: putting `lambda-ci-custom-gpu` in it would make
+  // installation A's label claimable for installation B's jobs too. B's resolution would find no
+  // such flavor and fall through to `base`, so B's job would be CLAIMED and silently run on the
+  // wrong image — and a claimed job can no longer fall back to GitHub-hosted. Keeping the check
+  // installation-scoped means a custom label is claimable exactly where it is resolvable.
+  //
+  // Cost is gated on the job actually carrying a custom label, a pure string test, so an
+  // installation using only built-ins performs no extra I/O here (ADR-040).
+  //
+  // Fails CLOSED, unlike the repo-config gate above: on a store fault the job is not claimed and
+  // stays runnable on GitHub-hosted. The alternative — claiming a job whose flavor we could not
+  // confirm — strands it, because participation removes the hosted fallback.
+  let effectiveClaimedLabels = claimedLabels;
+  if (jobLabels.some((l) => isCustomFlavorLabel(l))) {
+    try {
+      const custom = routableCustomFlavors(await listCustomFlavors(wf.installation.id));
+      if (custom.length > 0) {
+        effectiveClaimedLabels = [...claimedLabels, ...custom.map((f) => f.label)];
+      }
+      console.log(
+        JSON.stringify({
+          msg: 'custom flavor labels resolved for claim',
+          installationId: wf.installation.id,
+          routable: custom.length,
+        }),
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          msg: 'custom flavor lookup failed — custom label not claimable for this delivery',
+          installationId: wf.installation.id,
+          error: errMsg(err),
+        }),
+      );
+    }
+  }
+
   const decision = decideClaim({
-    jobLabels: wf.workflow_job?.labels ?? [],
-    claimedLabels,
+    jobLabels,
+    claimedLabels: effectiveClaimedLabels,
     mode: repoMode,
   });
   if (!decision.claim) {
