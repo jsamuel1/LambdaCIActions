@@ -71,10 +71,9 @@ of these labels, *before* flavor resolution runs. A flavor label that is missing
 silent dead end — the job is acked 202 `claimed:false`, no runner is ever provisioned, and the
 job just sits queued on GitHub with no error anywhere.
 
-Seed the labels for the flavors you are actually going to **build in phase 2**, starting with
-`lambda-ci` (base). The parameter must exist before phase 2, because `build:images` appends to
-it and deliberately will not create it (creating it from one flavor would drop everything else
-an operator had seeded):
+Seed **exactly one label, `lambda-ci`** — and nothing else. The parameter has to exist before
+phase 2, because `build:images` appends to it and deliberately will not create it (creating it
+from one flavor would drop everything else an operator had seeded):
 
 ```sh
 aws ssm put-parameter --name /lca/dev/config/runner-labels \
@@ -85,9 +84,19 @@ aws ssm put-parameter --name /lca/dev/config/runner-labels \
 **Do not pre-seed a label for a flavor you have not built** (ADR-049). It is not a harmless
 head start: ingest would CLAIM those jobs and then fail in provisioning, and a claimed job has
 already lost its GitHub-hosted fallback — strictly worse than staying queued. From phase 2 on,
-`build:images` adds each label itself, only after that flavor's image verifies. The full set,
-for reference (`test/filter.test.mjs` pins this list against the catalog, so a new flavor fails
-there rather than in a queued-forever job):
+`build:images` adds each label itself, only after that flavor's image verifies.
+
+That rule makes this one-label seed look like an exception, so be clear about why it is not a
+precedent to generalise from: on a **fresh** environment there is no ingest λ yet. The webhook
+endpoint and the GitHub App do not exist until phase 3, so between phase 0 and phase 2 there is
+nothing that can claim a job and no repo that could send one. The bootstrap value is inert until
+long after phase 2 has built the base image behind it. On a **live** environment that reasoning
+is gone — every label in this parameter is claimable the moment it is written, so never add one
+by hand for a flavor that is not already built. Use `npm run build:images -- --flavor <name>`
+(or `--publish-label-only` for an image that already verified), which enforces the ordering.
+
+The full set, for reference — **not** a value to seed (`test/filter.test.mjs` pins this list
+against the catalog, so a new flavor fails there rather than in a queued-forever job):
 
 ```
 lambda-ci,lambda-ci-node,lambda-ci-python,lambda-ci-java,lambda-ci-go,lambda-ci-rust,lambda-ci-docker
