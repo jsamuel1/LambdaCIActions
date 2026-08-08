@@ -3135,3 +3135,94 @@ allowlist is an operator-managed plain `String` whose value IS the thing being r
   management plane deliberately lacks (ADR-025) — so it belongs to the `flavors:reconcile` CLI
   command, which runs with an operator's own credentials and reports image state rather than
   parameter presence.
+
+---
+
+## ADR-053 — A prebaked tool cache is unproven until a real job resolves it (M5 fix)
+**Status**: Accepted (v1) · amends [ADR-039](#adr-039) (prebaked tool caches) · completes
+[ADR-049](#adr-049) (the catalog's last three flavors)
+
+**Context**: `java`, `go` and `rust` were built and published into dev, closing ADR-049's drift
+(`flavors:reconcile` went from `4 ok · 3 blocked` to `7 ok`). The first smoke run then failed on
+`java`, and what it found had been latent since the flavor was written.
+
+`actions/setup-java` derives its cache folder as `Java_<distribution>_<packageType>`. The obvious
+reading of `<distribution>` is the `distribution:` workflow input — `temurin` — and
+`Dockerfile.java` baked `Java_temurin_jdk` accordingly. But `<distribution>` is the installer
+CLASS's own name: `temurin/installer.ts` calls ``super(`Temurin-${jvmImpl}`, installerOptions)``
+with `jvmImpl` defaulting to `hotspot`, so the folder setup-java scans is
+**`Java_Temurin-Hotspot_jdk`**. The baked JDK sat in a directory `findAllVersions()` never looks
+at.
+
+Run 31261348449 on `lca-dev-java`:
+
+```
+Resolved latest version as 21.0.12+8.0.LTS
+Trying to download...
+Downloading Java 21.0.12+8.0.LTS (Temurin-Hotspot) from https://github.com/adoptium/...
+Java configuration:
+  Path: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/21.0.12-8.0.LTS/arm64
+```
+
+Nothing was red. The image built, the VM booted, the runner registered, and the job would have
+reported success — while re-downloading a JDK on every run, which is the one thing the flavor
+exists to avoid. The version directory was never at fault and is unchanged: `21.0.12-8` is valid
+semver (prerelease `8`), `findInToolcache` maps it back with `replace('-', '+')`, and
+`semver.satisfies('21.0.12+8', '21')` is true.
+
+The existing guard test passed throughout, because it asserted the Dockerfile contained
+`Java_temurin_jdk` — the same wrong name the Dockerfile had. A test that pins an implementation
+detail to the value already in the file only proves the file has not changed. Spec 02 and
+`microvm/README.md` documented the wrong name as their example too, so all four artefacts agreed
+with each other and disagreed with the runner.
+
+**Decision**:
+
+**1. A flavor is not done until a live job proves its cache resolved.** Unit tests and `cdk
+synth` cannot observe a cache hit — the failure mode *is* a green job. Every tool-cache flavor
+gets a job in `.github/workflows/flavor-smoke.yml` that runs its own `actions/setup-*` and
+**asserts** the resolution, so a miss exits non-zero instead of printing a line somebody has to
+notice:
+
+- `java` — `JAVA_HOME` must equal the baked entry exactly.
+- `go` — `which go` must be the baked entry and `go env GOROOT` must derive from it, which is
+  what makes ADR-039's deliberately-unbaked `GOROOT` observable rather than merely intended.
+- `rust` — no tool cache is involved, so it proves the real contract instead: `cargo build` as
+  uid `runner` with a genuine crates.io fetch, which is exactly what a root-owned `CARGO_HOME`
+  breaks.
+
+The java job also asserts `gcc` is **absent**, keeping the deliberate no-`build-essential`
+contract (Temurin consumes published JARs) pinned from the runtime side as well as from
+`test/image-content.test.mjs`.
+
+**2. A cache path is derived from one ARG, never repeated.** `ARG JDK_TOOLCACHE_NAME` feeds the
+`mkdir`, the copy, the `.complete` marker, the build-time `java -version` check and `JAVA_HOME`.
+Five literals can drift; one ARG cannot.
+
+**3. A test that pins an upstream tool name cites the expression that produces it.** These names
+are undocumented internals — `Java_Temurin-Hotspot_jdk`, `Python`'s capitalisation — and none is
+inferable from the workflow input a reader has in front of them. Pinning the value alone
+reproduces the bug this ADR is about, so the guard names `toolcacheFolderName` and the temurin
+constructor, letting the next reader re-derive the name instead of trusting a spelling. The guard
+asserts the ARG and its value separately from the path that consumes it, and is mutation-tested:
+restoring `Java_temurin_jdk` fails it by name.
+
+**4. Smoke evidence compares GitHub's `runner_name` to the minted agent name.** A JIT runner is
+registered by label, not bound to the job that caused it to be minted, so a green check is not by
+itself evidence that this flavor ran this job while identically-labelled jobs are queued. Each
+smoke job echoes `RUNNER_NAME`, and the recorded evidence pairs it with GitHub's own
+`runner_name` for that job id.
+
+**Consequences**:
+- `lca-dev-java` was rebuilt (`UPDATED`) and re-smoked: `Resolved Java 21.0.12+8 from
+  tool-cache`, `Path: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64`, no
+  download. `go` reports `Found in cache @ …`; `rust` fetches and links a real dependency.
+- The smoke workflow is deliberately outside `ci.yml`: these labels only became claimable once
+  their images existed, and a queued smoke job must never gate ordinary CI. It triggers on a push
+  touching itself, so re-proving a rebuilt image is a one-line change.
+- **`python` and `node` predate this rule and have no live cache-hit assertion.** Their tool
+  names are pinned by tests and `python` installs via the upstream `setup.sh` (so its layout is
+  the artifact's, not ours), but neither has been shown to hit its cache on a real job. That is
+  open debt, not a claim.
+- A rebuild is an image swap, so it needs the ADR-049 quiesce gate like any other; the label
+  stays claimed throughout, because a rebuild repoints an ARN and never unpublishes.
