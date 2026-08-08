@@ -1,9 +1,21 @@
 # Deploy verification — ADR-021 brokered run-hook + M4 management plane
 
-**Verdict: ADR-021 posture PASSED live. M4 stacks UP; the OAuth callback is now registered
-and verified, with the login flow confirmed working up to the credential prompt — the
-authenticated phase-5 screens still need an interactive human sign-in (see
-[OAuth callback](#oauth-callback--registered-and-verified-decisively)).**
+> **This is a dated historical deploy record, not a current-state claim.** Everything below
+> is the `dev` environment exactly as observed on **2026-07-28 / 2026-07-29** against
+> `main` @ `63069ff`, and is left unedited as the evidence for that cutover. The dev
+> environment has been redeployed several times since (ADR-047 CD, ADR-048, and later M4
+> work), so live values here — stack timestamps, image versions, run/GSI2 counts, the
+> `PUBLIC_ORIGIN` value, the defect state — describe that tree at that moment. Read
+> [docs/VERIFY-M4.md](VERIFY-M4.md) for the later operator walkthrough of the deployed
+> console, and `docs/DECISIONS.md` for decisions that superseded parts of this record.
+> Deliberately **not** re-run to refresh it: that would consume the shared dev environment
+> slot, and the value of this note is that it pins what the broker cutover actually did.
+
+**Verdict as of 2026-07-29: ADR-021 posture PASSED live. M4 stacks UP; the OAuth callback
+was registered and verified, with the login flow confirmed working up to the credential
+prompt — the authenticated phase-5 screens still needed an interactive human sign-in (see
+[OAuth callback](#oauth-callback--registered-and-verified-decisively)); those were
+subsequently walked in [docs/VERIFY-M4.md](VERIFY-M4.md).**
 
 Deployed and verified against the live `dev` environment on **2026-07-28**. Both PR #14
 (ADR-021 brokered run-hook, `409aba9`) and PR #15 (M4 console + management API, `63069ff`)
@@ -45,9 +57,10 @@ were merged and CI-green but had never been deployed — the running control pla
 
 The run-hook payload contract is baked into the image. ADR-021 replaced `{ref, region,
 table}` with `{ref, region, broker, token}`, so images and control plane must move in the
-same window with no in-flight jobs (docs/DEPLOY-M1.md § Phase 2 — that note cites the
-decision as ADR-020; it is ADR-021, one of the stale cross-references the ADR-021 renumber
-left behind, tracked on its own card and deliberately not touched here). Sequence used:
+same window with no in-flight jobs (docs/DEPLOY-M1.md § Phase 2 — at the time of this
+deploy that note cited the decision as ADR-020; it is ADR-021, one of the stale
+cross-references the ADR-021 renumber left behind. Repointing those was tracked on its own
+card and deliberately not done here). Sequence used:
 
 1. Confirmed the window was quiet: zero open PRs, zero non-`TERMINATED` microVMs
    (`list-microvms` → 12/12 `TERMINATED`, read across **all** pages — see the pagination
@@ -192,7 +205,11 @@ and/or pre-warm the CLI in the image so the first call is not cold).
 
 ## M4 evidence
 
-| Output | Value |
+Deploy-time evidence only — outputs, the GSI2 index gap, and the `publicOrigin` deploy
+hazard. For the authenticated console itself, see
+[docs/VERIFY-M4.md](VERIFY-M4.md) rather than duplicating it here.
+
+| Output | Value (as of 2026-07-28) |
 |---|---|
 | `LCA-Web-dev.ConsoleUrl` | `https://d2x4qcl1ibd2ax.cloudfront.net` |
 | `LCA-Web-dev.DistributionId` | `EI6WSGHFSQUCX` |
@@ -255,7 +272,9 @@ fail-loud-rather-than-guess behaviour working as designed, but the runbook descr
 first-deploy state only; DEPLOY-M4 Phase 3 now flags it as a standing requirement with a
 post-deploy assertion. A persistent default (SSM lookup) belongs with M5 custom domains.
 
-The live value is currently correct: `PUBLIC_ORIGIN=https://d2x4qcl1ibd2ax.cloudfront.net`.
+The live value was correct at the time of this record:
+`PUBLIC_ORIGIN=https://d2x4qcl1ibd2ax.cloudfront.net`. (Still the same origin as of the
+2026-08-03 walkthrough — see [docs/VERIFY-M4.md](VERIFY-M4.md) § Prerequisites.)
 
 Verified live:
 
@@ -329,13 +348,21 @@ to `/auth/login`. Only console errors are the expected unauthenticated `401 /api
 GitHub resolved the client id to our App and staged the authorize — the flow is intact up
 to the credential prompt.
 
-### Still not verified: authenticated console screens
+### Not verified here: authenticated console screens
 
 DEPLOY-M4 phase-5 steps 1–7 (Setup / Repos / Repo detail / Dashboard / Run detail /
 Settings) need a real sign-in as a user who administers installation `146431062` — an
-interactive human credential entry, deliberately not automated. The pre-auth boundary IS
-verified: `/api/repos`, `/api/runs`, `/api/settings` all return
+interactive human credential entry, deliberately not automated in this pass. The pre-auth
+boundary IS verified here: `/api/repos`, `/api/runs`, `/api/settings` all return
 `401 {"error":"not authenticated"}` without a session cookie.
+
+> **Walked later, separately.** [docs/VERIFY-M4.md](VERIFY-M4.md) is the operator
+> walkthrough of those authenticated screens (2026-08-03, 6 of 9 steps observed passing).
+> It found one product defect — the run-detail log pane matched the microVM id as a stream
+> **prefix** when it is a suffix — since fixed under
+> [ADR-048](DECISIONS.md#adr-048). That walkthrough is the authority for authenticated
+> console behaviour; this note stays scoped to the deploy/cutover evidence and does not
+> restate it.
 
 ## Follow-up cards filed
 
