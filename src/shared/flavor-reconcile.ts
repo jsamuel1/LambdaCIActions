@@ -1,4 +1,4 @@
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { builtinFlavors } from './flavor-catalog.js';
 import { parseRunnerLabels as parse, serializeRunnerLabels as serialize } from '../mgmt/validate.js';
 
 /**
@@ -38,9 +38,15 @@ export interface ReconcileFlavorDef {
   capabilities: string[];
 }
 
-const FLAVORS: ReconcileFlavorDef[] = (
-  flavorsCatalog as { flavors: ReconcileFlavorDef[] }
-).flavors;
+/**
+ * Read through the ADR-040 catalog seam (`flavor-catalog.ts`), not `microvm/flavors.json`
+ * directly. That module is the single place the static JSON is read, so this CLI-facing
+ * derivation and the routing/pricing/compat layers cannot end up disagreeing about what a
+ * built-in flavor is. Deliberately BUILT-IN only: a custom flavor's image is the operator's own
+ * and is never published to `image-arn-<flavor>` in SSM, and its label is per-installation, so
+ * neither half of this catalog-vs-live reconciliation applies to it (ADR-040).
+ */
+const FLAVORS: readonly ReconcileFlavorDef[] = builtinFlavors();
 
 /** Catalog flavor definitions, in catalog order. */
 export function catalogFlavors(): ReconcileFlavorDef[] {

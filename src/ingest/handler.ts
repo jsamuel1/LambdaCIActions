@@ -13,6 +13,8 @@ import {
 } from '../discover/filter.js';
 import { putQueuedRun, transitionRun } from '../shared/run-store.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
+import { listCustomFlavors, routableCustomFlavors, type CustomFlavorRecord } from '../shared/flavor-store.js';
+import { isCustomFlavorLabel } from '../shared/flavor-catalog.js';
 import {
   upsertInstallation,
   setInstallationFlags,
@@ -238,6 +240,62 @@ export function looksLikeGithubDelivery(
   return Boolean(ghEvent && ghEvent.trim().length > 0);
 }
 
+/**
+ * Augment the environment-scoped claim allowlist with this INSTALLATION's routable custom labels
+ * (ADR-040/041).
+ *
+ * Extracted and exported because this is a safety boundary with three independent properties that
+ * are worth pinning by test rather than by reading: the read is skipped entirely when the job names
+ * no custom label, only `valid` flavors contribute a label, and a store fault fails CLOSED.
+ *
+ * Custom labels are resolved here rather than added to `/lca/<env>/config/runner-labels` because
+ * that parameter is environment-scoped: putting `lambda-ci-custom-gpu` in it would make
+ * installation A's label claimable for installation B's jobs too. B's resolution would find no such
+ * flavor and fall through to `base`, so B's job would be CLAIMED and silently run on the wrong
+ * image — and a claimed job can no longer fall back to GitHub-hosted. Keeping the check
+ * installation-scoped means a custom label is claimable exactly where it is resolvable.
+ *
+ * Cost is gated on the job actually carrying a custom label, a pure string test, so an installation
+ * using only built-ins performs no extra I/O here (ADR-040) — `read: 'skipped'` reports that.
+ *
+ * Fails CLOSED, unlike the repo-config gate: on a store fault the allowlist is returned UNCHANGED,
+ * so the job is not claimed and stays runnable on GitHub-hosted. The alternative — claiming a job
+ * whose flavor we could not confirm — strands it, because participation removes the hosted fallback.
+ */
+export async function claimLabelsWithCustom(
+  jobLabels: readonly string[],
+  claimedLabels: string[],
+  installationId: number,
+  load: (id: number) => Promise<CustomFlavorRecord[]> = listCustomFlavors,
+): Promise<{ labels: string[]; read: 'skipped' | 'ok' | 'degraded' }> {
+  if (!jobLabels.some((l) => isCustomFlavorLabel(l))) {
+    return { labels: claimedLabels, read: 'skipped' };
+  }
+  try {
+    const custom = routableCustomFlavors(await load(installationId));
+    console.log(
+      JSON.stringify({
+        msg: 'custom flavor labels resolved for claim',
+        installationId,
+        routable: custom.length,
+      }),
+    );
+    return {
+      labels: custom.length > 0 ? [...claimedLabels, ...custom.map((f) => f.label)] : claimedLabels,
+      read: 'ok',
+    };
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        msg: 'custom flavor lookup failed — custom label not claimable for this delivery',
+        installationId,
+        error: errMsg(err),
+      }),
+    );
+    return { labels: claimedLabels, read: 'degraded' };
+  }
+}
+
 /** Route a signature-verified delivery to its handler. */
 async function dispatch(
   rawBody: string,
@@ -343,9 +401,16 @@ async function handleWorkflowJob(
     );
   }
 
-  const decision = decideClaim({
-    jobLabels: wf.workflow_job?.labels ?? [],
+  const jobLabels = wf.workflow_job?.labels ?? [];
+  const { labels: effectiveClaimedLabels } = await claimLabelsWithCustom(
+    jobLabels,
     claimedLabels,
+    wf.installation.id,
+  );
+
+  const decision = decideClaim({
+    jobLabels,
+    claimedLabels: effectiveClaimedLabels,
     mode: repoMode,
   });
   if (!decision.claim) {

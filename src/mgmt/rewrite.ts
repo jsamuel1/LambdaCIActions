@@ -25,16 +25,68 @@
  * and corrupting a workflow.
  */
 import { isAdoptLabel, incompatibleRunnerLabel, unreachableRunnerGroup } from '../ingest/adopt.js';
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { builtinFlavors, isCustomFlavorLabel, isCustomFlavorName } from '../shared/flavor-catalog.js';
 
 interface FlavorLabel {
   name: string;
   label: string;
 }
-const FLAVORS: FlavorLabel[] = (flavorsCatalog as { flavors: FlavorLabel[] }).flavors;
+/**
+ * BUILT-IN labels only, deliberately (ADR-040).
+ *
+ * This module PLANS A YAML EDIT to someone's workflow file, so the label it writes has to be one
+ * that will still resolve for as long as that file lives. A custom flavor's label is
+ * per-installation, mutable and revocable: deleting the flavor, or its validation lapsing to
+ * `invalid`, would leave a committed `runs-on: [self-hosted, lambda-ci-custom-x]` that ingest no
+ * longer claims — a job queued forever, in a file we edited. So `labelForFlavor` stays built-in
+ * only, and a stored route naming a `custom-*` flavor is skipped as an unknown flavor.
+ *
+ * That is only about AUTHORING a label. Deciding a job needs NO rewrite is a separate question,
+ * and it must recognize a custom label too — see {@link alreadyTargetsLca}.
+ */
+const FLAVORS: readonly FlavorLabel[] = builtinFlavors();
 
-/** LCA routing labels, lowercased — a job already carrying one needs no rewrite. */
+/** Built-in LCA routing labels, lowercased. */
 const LCA_LABELS = new Set(FLAVORS.map((f) => f.label.toLowerCase()));
+
+/**
+ * Whether a `runs-on` already targets LambdaCIActions, so this job needs no rewrite at all.
+ *
+ * Built-in labels come from the catalog; a `lambda-ci-custom-*` label counts by NAMESPACE, with no
+ * store read. The namespace is the right test precisely because the alternative is unsound: whether
+ * an installation currently holds a `valid` row for that label is per-installation, mutable, and
+ * unknown here — but an operator who wrote `lambda-ci-custom-gpu` has already targeted LCA either
+ * way, so there is no hosted label left that we are "entitled to replace".
+ *
+ * Treating a custom label as un-targeted (which a built-in-only set does) is wrong in both
+ * directions. If the stored route names the custom flavor, the job surfaces in the operator's plan
+ * as a confusing `unknown flavor 'custom-gpu'` SKIP for a workflow that needs no edit at all. And
+ * if that route degraded to a built-in — discovery's custom-flavor read fails open (ADR-040) — the
+ * planner authors a REAL edit adding a second LCA label, e.g.
+ * `[ubuntu-latest, lambda-ci-custom-gpu]` → `[self-hosted, lambda-ci-custom-gpu, lambda-ci]`, in
+ * someone else's repository. Answering this question first avoids both.
+ */
+function alreadyTargetsLca(lowerLabels: readonly string[]): boolean {
+  return lowerLabels.some((l) => LCA_LABELS.has(l) || isCustomFlavorLabel(l));
+}
+
+/**
+ * Lower-cased inline `runs-on` labels, or `undefined` for a shape this module cannot parse
+ * (block sequence, `${{ }}` expression, runner-group object, comment-only value).
+ *
+ * A best-effort PRE-check, deliberately: it lets `planFileRewrite` answer "does this job already
+ * target LCA?" before it looks the flavor up, so a job carrying a custom label is not reported as
+ * `unknown flavor`. `undefined` simply defers to the full parse in `rewriteRunsOnValue`, which
+ * owns every unparseable-shape diagnosis and re-checks the LCA rule for the built-in case.
+ */
+function parseRunsOnLabels(rawValue: string): string[] | undefined {
+  const { value } = splitComment(rawValue);
+  if (!value || value.includes('${{') || value.startsWith('{')) return undefined;
+  const inner = value.startsWith('[') && value.endsWith(']') ? value.slice(1, -1) : value;
+  const tokens = splitInlineLabels(inner);
+  if (!tokens || !tokens.length) return undefined;
+  return tokens.map((t) => t.value.toLowerCase());
+}
 
 /** The routing label for a flavor name (`base` → `lambda-ci`). */
 export function labelForFlavor(flavor: string): string | undefined {
@@ -70,6 +122,12 @@ export interface RewriteTarget {
   jobId: string;
   /** Flavor name (`base` / `node` / `docker`) — its label is what gets inserted. */
   flavor: string;
+  /**
+   * Set when this job is a candidate by SHAPE but must not be rewritten, with the operator-facing
+   * reason. Carried on the target rather than dropped so the job still appears in the plan as a
+   * SKIP: a silently omitted job looks like a workflow we decided needed no change.
+   */
+  skip?: string;
 }
 
 /** `runs-on: <value>` on a single line, capturing indent + inline comment. */
@@ -556,7 +614,7 @@ export function rewriteRunsOnValue(
   }
   const labels = tokens.map((t) => t.value);
 
-  if (labels.some((l) => LCA_LABELS.has(l.toLowerCase()))) {
+  if (alreadyTargetsLca(labels.map((l) => l.toLowerCase()))) {
     return { ok: false, reason: 'job already carries an LCA label' };
   }
 
@@ -661,6 +719,23 @@ export function planFileRewrite(
       skipped.push({ jobId: target.jobId, reason: 'runs-on line did not match the expected shape' });
       continue;
     }
+    // BEFORE the flavor lookup, because this is the more truthful diagnosis when both apply. A job
+    // whose `runs-on` already carries a custom LCA label needs no rewrite at all; reporting it as
+    // `unknown flavor 'custom-gpu'` would tell the operator their registered flavor does not exist.
+    // `rewriteRunsOnValue` re-checks this too — it is the guard for the built-in case, which reaches
+    // it through a resolvable `lcaLabel`.
+    const currentLabels = parseRunsOnLabels(m[2]);
+    if (currentLabels && alreadyTargetsLca(currentLabels)) {
+      skipped.push({ jobId: target.jobId, reason: 'job already carries an LCA label' });
+      continue;
+    }
+    // A refusal decided from the stored ROUTE (a custom-flavor target, or one that could not be
+    // resolved) — see `customRouteSkip`. Checked before the flavor lookup because `labelForFlavor`
+    // would report a `custom-*` route as `unknown flavor`, which is both wrong and alarming.
+    if (target.skip) {
+      skipped.push({ jobId: target.jobId, reason: target.skip });
+      continue;
+    }
     const lcaLabel = labelForFlavor(target.flavor);
     if (!lcaLabel) {
       skipped.push({ jobId: target.jobId, reason: `unknown flavor '${target.flavor}'` });
@@ -697,12 +772,12 @@ export function planFileRewrite(
  */
 export function rewriteTargets(
   jobs: { id: string; runs_on: string[]; runner_group?: string | null }[],
-  routes: Record<string, { flavor: string }> = {},
+  routes: Record<string, { flavor: string; unresolvedCustom?: string }> = {},
 ): RewriteTarget[] {
   const out: RewriteTarget[] = [];
   for (const job of jobs) {
     const lower = job.runs_on.map((l) => l.trim().toLowerCase());
-    if (lower.some((l) => LCA_LABELS.has(l))) continue;
+    if (alreadyTargetsLca(lower)) continue;
     // `isAdoptLabel` (a Set lookup), NOT `l in ADOPT_LABEL_FLAVORS`: `in` walks the prototype
     // chain, so a job whose selector is literally `constructor` / `toString` counted as an
     // adopt candidate here while `decideClaim` and `views.ts` (both Set-based) refused it. The
@@ -716,9 +791,55 @@ export function rewriteTargets(
     // workflow for a job that still cannot run — and the file-level planner refuses the
     // object-form selector anyway, so counting it here only overstated the preview.
     if (unreachableRunnerGroup(job.runner_group)) continue;
-    out.push({ jobId: job.id, flavor: routes[job.id]?.flavor ?? 'base' });
+    const route = routes[job.id];
+    const skip = customRouteSkip(route);
+    out.push({ jobId: job.id, flavor: route?.flavor ?? 'base', ...(skip ? { skip } : {}) });
   }
   return out;
+}
+
+/**
+ * Why a job routed through a CUSTOM flavor must not be auto-rewritten (ADR-040).
+ *
+ * Both cases below are reached the same way — a repo whose FlavorMap points one of this job's
+ * hosted labels (`ubuntu-latest`) at a `custom-*` flavor — and in both the built-in label this
+ * module would author is the WRONG answer, because inserting it *removes the label the FlavorMap
+ * is keyed on*. `[ubuntu-latest]` → `[self-hosted, lambda-ci]` makes the map entry match nothing,
+ * so the job resolves by its new explicit label and is pinned to `base` forever. We would have
+ * edited a customer's file to silently discard their custom-flavor routing.
+ *
+ *   - `unresolvedCustom` — the job named a `custom-*` flavor that was not in the composed catalog
+ *     when Discovery ran. That is NOT proof it does not exist: the custom-flavor read fails OPEN
+ *     (ADR-040), so a DynamoDB fault stores exactly the same route as a genuinely deleted flavor,
+ *     with `flavor` holding the fall-through answer. Acting on it is acting on a possible false
+ *     absence — the reason the resolver reports it separately instead of only returning `base`.
+ *   - a `custom-*` route that DID resolve — the operator's intent is known and honored at
+ *     provision time, and `labelForFlavor` deliberately cannot author a custom label (a
+ *     per-installation label is revocable; see this module's header). Skipping says so, where
+ *     falling through to `unknown flavor 'custom-gpu'` would tell an operator their registered,
+ *     validated flavor does not exist.
+ *
+ * A job with no custom flavor anywhere returns undefined, so nothing about the built-in path
+ * changes.
+ */
+function customRouteSkip(
+  route: { flavor: string; unresolvedCustom?: string } | undefined,
+): string | undefined {
+  if (route?.unresolvedCustom) {
+    return (
+      `job routes through custom flavor '${route.unresolvedCustom}', which could not be resolved ` +
+      'when this workflow was scanned — rewriting would replace the label its FlavorMap entry is ' +
+      'keyed on. Re-scan once the flavor is registered and `valid`, or edit this job by hand.'
+    );
+  }
+  if (isCustomFlavorName(route?.flavor)) {
+    return (
+      `job routes to custom flavor '${route?.flavor}'; its label is per-installation and ` +
+      'revocable, so it is never inserted automatically — add the label by hand if you want this ' +
+      'job pinned to it.'
+    );
+  }
+  return undefined;
 }
 
 /**
@@ -752,7 +873,7 @@ export function planPreviewFromAnalyses(
   analyses: {
     path: string;
     parsed?: { jobs: { id: string; runs_on: string[] }[] };
-    routes?: Record<string, { flavor: string }>;
+    routes?: Record<string, { flavor: string; unresolvedCustom?: string }>;
   }[],
 ): RewritePreview {
   const jobs: RewritePreviewJob[] = [];
@@ -771,6 +892,12 @@ export function planPreviewFromAnalyses(
       // actually write (it reads the real file, quotes intact).
       const tokens = job.runs_on.map((l) => yamlLabelToken(l));
       const before = tokens.length === 1 ? tokens[0] : `[${tokens.join(', ')}]`;
+      // Same order as `planFileRewrite`: a route-level refusal is the truthful diagnosis, and
+      // reporting it as `unknown flavor 'custom-gpu'` would deny a registered flavor exists.
+      if (target.skip) {
+        jobs.push({ path: analysis.path, jobId: job.id, before, skipped: target.skip });
+        continue;
+      }
       const lcaLabel = labelForFlavor(target.flavor);
       if (!lcaLabel) {
         jobs.push({

@@ -1909,6 +1909,15 @@ there contradicts that screen's own footnote in the same view (the `docker` desc
 exactly this sweep miss). Revisit if the API later exposes a vCPU request, at which point `vcpu`
 becomes requestable and this ADR's point 2 is superseded.
 
+**Extended by ADR-040 (custom flavors).** An operator-supplied `description` renders in that same
+table, so `validateCustomFlavor` applies the same rule at registration — and it has to be the same
+*strength*, not merely the same intent. A digit-plus-unit regex is weaker than the built-in guard
+(`doesNotMatch(/vcpu/i)`, the word alone): "builder with two vCPUs" advertises capacity just as
+loudly as "2 vCPU", so operator text could make precisely the claim this ADR retracts while the
+catalog could not. `advertisesVcpuShape` therefore refuses `vCPU` in any form, plus a COUNT of
+cores/threads in digits or number words. Core/thread vocabulary without a count ("multi-core
+friendly") stays legal, since it claims no shape.
+
 ## ADR-039 — Expanded standard flavor set with prebaked runner tool cache (M5)
 **Status**: Accepted (v1) · extends the catalog established in [ADR-020](#adr-020)
 **Context**: The catalog shipped `base`, `node`, `docker`. Any other language runtime meant a
@@ -1985,7 +1994,7 @@ GitHub with a 202 `claimed:false` and nothing logged as an error. That seed is n
 against the catalog by `test/filter.test.mjs`.
 
 ## ADR-040 — Custom flavors live in the store and are merged over the built-in catalog (M5)
-**Status**: Accepted (v1) · shapes work deferred from this milestone
+**Status**: Accepted (v1) · **storage, resolution + claim implemented; the (4) bounds check is a fixed ceiling, not the live quota, and the console surface is deferred**
 **Context**: An operator cannot bring their own image. The catalog is `import
 flavorsCatalog from '../../microvm/flavors.json'` in `src/provision/flavor.ts`,
 `src/mgmt/views.ts` and `src/ingest/compat.ts` — compiled into each Lambda bundle at build
@@ -2021,12 +2030,112 @@ out of the key rather than needing an authorization filter.
 **Consequences**: flavor resolution gains a table read on the provision hot path — it must
 degrade to built-in-only on a DynamoDB fault (fail open, matching ADR-027's gates) rather
 than failing the launch. `flavorNames()` (used by `validateFlavorMap`/`validateRepoPatch`) and
-`buildFlavorViews` become async/installation-scoped, which changes the Mgmt API's validation
-surface. Deferred to a follow-up card; this ADR fixes the shape so the standard-set work
-(ADR-039) does not have to guess it.
+`buildFlavorViews` become installation-scoped, which changes the Mgmt API's validation surface.
+
+**As implemented.** The single catalog seam is `src/shared/flavor-catalog.ts` — the only module
+that imports `microvm/flavors.json` — and `src/shared/flavor-store.ts` owns the rows. All five
+static imports moved behind it (`src/provision/flavor.ts`, `src/mgmt/views.ts`,
+`src/ingest/compat.ts`, `src/mgmt/rewrite.ts`, `src/shared/flavor-reconcile.ts`); `rewrite.ts` and
+`flavor-reconcile.ts` deliberately stay **built-in only** — `rewrite.ts` because it plans a YAML
+edit to a customer's workflow file and a per-installation label can be revoked, which would leave a
+committed `runs-on` nobody claims; `flavor-reconcile.ts` because it reconciles the catalog against
+`image-arn-<flavor>` in SSM and the env-scoped label allowlist, neither of which a custom flavor
+participates in.
+
+Built-in-only *authoring* forced a matching refusal on the *deciding* side, which is not the same
+question. `rewriteTargets`/`planFileRewrite` now SKIP a job whose stored route involves a custom
+flavor, rather than authoring the built-in label for whatever the route happens to say:
+
+- A route that **resolved** to `custom-*` is honored at provision time, so a skip naming the flavor
+  is the truthful diagnosis — falling through to `labelForFlavor` reported it as
+  `unknown flavor 'custom-gpu'`, telling an operator their registered, validated flavor did not
+  exist.
+- A route carrying **`unresolvedCustom`** is the dangerous one, and it is a direct consequence of
+  the fail-open read: a DynamoDB fault during discovery stores the *identical* route a genuinely
+  deleted flavor would (`flavor: 'base'`), so acting on `flavor` alone acts on a possible **false
+  absence**. For the reachable case — a FlavorMap pointing a hosted label such as `ubuntu-latest`
+  at a custom flavor — the edit does not merely add a label, it *removes the label the map entry is
+  keyed on*: `[ubuntu-latest]` → `[self-hosted, lambda-ci]` pins that job to `base` permanently, in
+  the customer's own repository, discarding routing the operator configured. `WorkflowAnalysisRecord`
+  therefore declares `unresolvedCustom` on its stored routes, because a signal that a planner must
+  read is part of the record's contract rather than an incidental runtime field.
+
+That is a distinct route from the label case (a job already carrying `lambda-ci-custom-*`, which
+`alreadyTargetsLca` skips): there the operator had already targeted LCA, so there was no hosted
+label to replace at all. The optional `custom`/`customFlavors` parameters are trailing on
+every seam, so omitting them is the pre-ADR-040 behavior exactly, and `composeCatalog([])` returns
+the built-in array *itself* — no copy, no re-sort, satisfying (5) in code rather than by convention.
+The hot-path read is gated by `needsCustomFlavors()`, a pure test for whether the job could name a
+custom flavor at all, so an installation with no custom flavors performs **no I/O**.
+
+Three details the decision above did not anticipate:
+
+- **The 64-flavor cap needs a bounded ROW, not just a bounded count.** `listCustomFlavors` reads one
+  DynamoDB query page and the cap is what makes that page provably the whole set — an argument that
+  only holds if a row has a bounded size. A DynamoDB item may be 400 KiB, so three rows carrying a
+  few hundred KiB of ARN suffix would exceed a 1 MiB page: later `valid` flavors would silently
+  vanish from the read, dropping their labels out of ingest's claim allowlist (jobs never claimed,
+  no error anywhere) and letting the cap itself be bypassed, since it counts only the returned page.
+  Every operator-supplied variable-length field is therefore capped at registration
+  (`MAX_IMAGE_ARN_LENGTH`, `MAX_SMOKE_REPO_LENGTH`, `MAX_SMOKE_WORKFLOW_PATH_LENGTH`, alongside the
+  existing name/description bounds), and the control-plane-written `reason` is clamped at the store
+  (`clampReason`) rather than refused, because a verdict must always be recordable. The page-size
+  regression builds its worst-case row FROM those exported caps, so adding a new unbounded field
+  fails the test instead of silently widening the row.
+
+- **Image ARNs cannot share a lookup.** A built-in's ARN comes from SSM
+  (`/lca/<env>/config/image-arn-<flavor>`, published by `scripts/build-images.mjs`); a custom
+  flavor's is the operator's own, on its row. `resolveImageArn` in `src/provision/handler.ts`
+  branches on the namespace, and re-reads the row immediately before launch so a flavor
+  invalidated between resolution and launch does not get one last VM (`launchableCustomImageArn`).
+- **Fail-open needed a refusal to be safe.** "Degrade to built-in-only" is the right posture for a
+  job that never named a custom flavor — but because the read is gated by `needsCustomFlavors`,
+  every job that performs it *did* name one, so degrading silently would land the job on a real
+  built-in image ARN while its JIT runner still advertised the original `lambda-ci-custom-*` label
+  from the claim. GitHub would assign it and it would **succeed on the wrong image**. `resolveFlavor`
+  therefore reports an unresolvable named custom flavor as `unresolvedCustom` (covering a custom
+  label, a FlavorMap value, and a custom `defaultFlavor` once the fallback is actually taken), and
+  the provisioner refuses the launch — no runner is minted, so the job stays visibly queued rather
+  than invisibly wrong. This is also the claim→provision race: ingest claims while the flavor is
+  `valid`, and a delete or re-validate in the interval must not silently reroute the job.
+
+  The refusal is **classified**, not a bare throw, because the fail-open read makes "gone" and
+  "unreadable" look identical at the routing layer and they need opposite handling — the same
+  permanent/transient split the JIT mint already makes. `loadRoutableCustomFlavorsResult` reports
+  `degraded`, so a store fault (or a `lookupResolveOptions` that threw before the read ran) rethrows
+  for SQS redelivery and leaves the row `provisioning`, while a successful read that simply does not
+  contain the flavor marks the run **`failed` with an operator-readable reason** and consumes the
+  message. Throwing on the deterministic case would burn three redeliveries into the DLQ and leave
+  the row in `provisioning`, which the console renders as a healthy in-flight run — so the operator
+  would watch a job hang forever instead of reading why it was refused.
+Two parts of the decision are **not** fully met, recorded here rather than left to be discovered
+as bugs:
+
+- **(4) bounds — the memory check is a fixed sanity ceiling, not the region's quota.**
+  `validateCustomFlavor` / `staticGate` bound `memoryMb` to `DEFAULT_MAX_MEMORY_MB` (32768 MiB)
+  because nothing in the control plane reads the account+region microVM memory quota yet, and
+  `staticGate`'s `maxMemoryMb` parameter has **no production caller**. So an obvious typo
+  (`655360`) is caught, but a request that merely exceeds the account's real headroom is not — it
+  fails later, at launch. Closing this needs a quota read (there is no `getMicroVMQuota` helper in
+  `src/shared/microvm.ts`), so it belongs with the validator λ that would consume it.
+- **(4) rate before save — implemented in the API, not in the console.** `POST
+  /api/flavors/preview` returns `usdPerMinute` for the proposed shape with `rateIsEstimate: true`
+  (ADR-038), and `buildFlavorViews` carries it per row; no screen renders either yet. The Flavors
+  screen is deferred to the same successor card as the ADR-041 smoke-run λ, because a registration
+  form whose flavors can never reach `valid` would be a control with no outcome.
+
+- **Custom labels are NOT added to `/lca/<env>/config/runner-labels`.** That parameter is
+  environment-scoped while a custom flavor is per-installation, so seeding it would make
+  installation A's label claimable for installation B's jobs — B would resolve nothing, fall
+  through to `base`, and run the job on the wrong image having already given up the
+  GitHub-hosted fallback. `src/ingest/handler.ts` instead resolves custom labels against the
+  job's **own** installation at claim time, gated on the job carrying a `lambda-ci-custom-*`
+  label, and fails **closed** (unlike the repo-config gate) because claiming a job whose flavor
+  we could not confirm strands it.
 
 ## ADR-041 — A custom flavor is not routable until a smoke run proves it (M5)
-**Status**: Accepted (v1) · depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
+**Status**: Accepted (v1) · **enforcement implemented; smoke-run orchestrator deferred** ·
+depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
 **Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
 published its image ARN, resolved correctly from its label, and then failed every single job
 because nothing in the guest could start `dockerd`. `imageAvailability()` probes only that an
@@ -2060,8 +2169,66 @@ failure reason, so validation needs its own status surface (a Flavors screen or 
 extension). The smoke run **launches a real microVM and registers a real (throwaway) runner**,
 so it consumes quota, costs money, and needs a repo to register against; it is therefore
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
-the static gates; the smoke run itself is verified against a live environment. Deferred to a
-follow-up card together with ADR-040.
+the static gates; the smoke run itself is verified against a live environment.
+
+**As implemented — and what is NOT yet.** The *enforcement* half is complete and is what makes the
+rule true rather than advisory:
+
+- The state machine lives in `src/shared/flavor-store.ts`. Legal transitions are enforced **in the
+  DynamoDB condition expression**, not in a read-then-write, so only one of two concurrent runs can
+  win `pending → validating`, and a run whose row moved underneath it cannot write a stale verdict.
+  That is narrower than "two runs can never both launch a VM": a manual re-validate deliberately
+  moves `validating → pending`, which re-opens the transition, so an operator who re-validates a run
+  in flight can have two VMs alive at once. The loser's verdict is still refused, so the *record*
+  stays correct; bounding the duplicate LAUNCH belongs to the λ that owns the run's deadline, and is
+  called out on the successor card. `valid → validating` and `invalid → validating`
+  are deliberately absent: re-validation must pass through `pending` so a flavor stops being
+  routable the moment its evidence is withdrawn.
+- Only `valid` rows are composed into the catalog (`routableCustomFlavors`), so an unvalidated
+  flavor resolves as if absent. This is enforced again at two later points, because omission alone
+  is not sufficient: `launchableCustomImageArn` refuses a non-`valid` row immediately before the
+  launch, and `validateFlavorMap`/`validateRepoPatch` refuse an unvalidated name so the console
+  cannot save a choice the resolver would ignore.
+- The static gate (`src/flavorval/validate-core.ts`) and the smoke *classifier*
+  (`classifySmoke`) are implemented and unit-tested, including the three-outcome rule that an
+  orchestration failure returns to `pending` rather than spending terminal `invalid` on our own
+  transient fault. **Both** gates share that rule: `src/shared/microvm.ts` distinguishes an image
+  ANSWER (`ABSENT`/`FORBIDDEN`) from a probe that could not run, and `staticGate` preserves the
+  distinction as `image-probe-failed` + an `inconclusive` flag, with `staticFailureVerdict` mapping
+  it to `pending`. Collapsing them would let one throttled `GetMicrovmImage` permanently condemn a
+  working image. Note what this does NOT yet mean in a deployed environment: the gate's only
+  production caller is the no-write preview endpoint, which deliberately passes no `image`, so
+  `getMicroVMImageState` has **no production caller** and the image half of the gate first executes
+  when the λ below lands. It is tested directly against all three outcomes so that it is a
+  contract rather than an assumption.
+- The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
+  re-validate trigger; a new image ARN atomically repoints and resets to `pending`. Those routes
+  needed an IAM grant the Mgmt role deliberately did not have: `PatchRepoConfig` is `UpdateItem`
+  only, so registration (`PutItem`) and delete (`DeleteItem`) would have failed with
+  `AccessDeniedException` in a deployed environment while every unit test passed, because the tests
+  drive the store through injected seams and `cdk synth` does not evaluate a policy. The grant is
+  `LeadingKeys`-scoped to `INSTALL#*` (the appcfg broker's `CONFIG#*` precedent) — DynamoDB IAM has
+  no sort-key condition, so `FLAVOR#` cannot be expressed in policy, but run rows live in
+  `RUN#<repoId>#<runId>#<jobId>` partitions and therefore stay unaddressable: the Mgmt role still
+  cannot forge or delete a run, which is the property `test/mgmt-stack.test.mjs` pins.
+
+**Not implemented:** the λ that actually *runs* a smoke run — launching the microVM, dispatching the
+nonce-bound workflow and observing registration/conclusion/self-termination — and its CDK wiring.
+Until it lands, `FLAVORVAL_FUNCTION_NAME` is unset, so registration honestly reports that validation
+could not be started and the flavor stays `pending`; **nothing can reach `valid`, therefore nothing
+custom is routable.** That is the safe direction, and it is the state this ADR mandates for a flavor
+without evidence. The console surface is deferred with it, since its main job is showing validation
+progress. Both are tracked as the successor card to this one, and both are **deploy-touching**.
+
+Two pieces of that λ's scaffolding *did* land here, and are recorded so the successor card finds
+them instead of rebuilding them: `src/shared/smoke-store.ts` (the `SMOKE#<installationId>#<seq>`
+JIT/RUN row pair, in the shapes the broker already reads) and the broker's `isSmokeRef` grammar
+extension. Neither has a production caller yet — nothing writes a `SMOKE#` row, so the widened
+grammar admits a ref that resolves to no item, and the store is tree-shaken out of every bundle.
+The cross-module ref contract between them is pinned by test, because a drift there would otherwise
+only surface during the live smoke run. `getMicroVMImageState` is in the same category: implemented
+and tested against all three of its outcomes, but with no production caller until the λ passes its
+result to `staticGate`.
 
 > **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
 > to **042..046** to vacate a collision, following the same convention as the 038..041 block

@@ -2,7 +2,7 @@
 //
 // These assert the management plane's boundary in the SYNTHESIZED template, not just in
 // prose: the console λ must not be able to launch compute, read the GitHub App private key,
-// or Put/Delete DynamoDB items.
+// or reach a run row with a Put/Delete.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { App } from 'aws-cdk-lib';
@@ -12,6 +12,8 @@ import { MgmtStack, DEFAULT_REPORTS_MODEL_ID } from '../dist/lib/mgmt-stack.js';
 import { DEFAULT_MODEL_ID } from '../dist/src/mgmt/nl-report.js';
 import { ControlStack } from '../dist/lib/control-stack.js';
 import { envConfig } from '../dist/lib/env-config.js';
+import { runPk } from '../dist/src/shared/run-store.js';
+
 
 function synth(over = {}) {
   return Template.fromStack(stackFor('test', over));
@@ -104,12 +106,39 @@ test('mgmt λ cannot launch or terminate microVMs', () => {
   }
 });
 
-test('mgmt λ cannot Put or Delete DynamoDB items (no forged runs, no history loss)', () => {
-  const actions = allActions(synth());
-  for (const forbidden of ['dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:BatchWriteItem']) {
-    assert.equal(actions.includes(forbidden), false, `granted ${forbidden}`);
-  }
+test('mgmt λ Put/Delete cannot reach a run row (no forged runs, no history loss)', () => {
+  const t = synth();
+  const actions = allActions(t);
+  // `BatchWriteItem` stays forbidden outright: it is a multi-row write with no `LeadingKeys`
+  // scoping in the handler's vocabulary, and nothing needs it.
+  assert.equal(actions.includes('dynamodb:BatchWriteItem'), false, 'granted BatchWriteItem');
   assert.ok(actions.includes('dynamodb:UpdateItem'), 'config patches require UpdateItem');
+
+  // Put/Delete ARE granted, for custom-flavor rows (ADR-040) — the one entity the Mgmt API
+  // creates and destroys. What must remain true is that they cannot address a RUN row: run
+  // history is what Reports, cost and failure-rate aggregation are computed from, so a forged or
+  // deleted run is the failure this test exists to prevent.
+  const stmts = [];
+  for (const policy of Object.values(t.findResources('AWS::IAM::Policy'))) {
+    stmts.push(...policy.Properties.PolicyDocument.Statement);
+  }
+  const writeStmts = stmts.filter((s) => {
+    const a = Array.isArray(s.Action) ? s.Action : [s.Action];
+    return a.includes('dynamodb:PutItem') || a.includes('dynamodb:DeleteItem');
+  });
+  assert.equal(writeStmts.length, 1, 'exactly one statement may grant Put/Delete');
+  const keys = writeStmts[0].Condition?.['ForAllValues:StringLike']?.['dynamodb:LeadingKeys'];
+  assert.deepEqual(
+    keys,
+    ['INSTALL#*'],
+    'flavor writes must be confined to installation partitions, so a RUN# row is unaddressable',
+  );
+  // The scoping is only meaningful if a run row genuinely lives outside that prefix.
+  assert.equal(
+    runPk(1, 2, 3).startsWith('INSTALL#'),
+    false,
+    'run rows must not share the granted partition prefix',
+  );
 });
 
 test('mgmt λ GetParameter is scoped to its own auth secrets — never the App PEM', () => {

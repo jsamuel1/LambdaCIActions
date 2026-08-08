@@ -1,5 +1,5 @@
 import type { RunRecord, RunStatus, WorkflowAnalysisRecord, RepoRecord } from '../shared/types.js';
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { builtinFlavors, type CatalogFlavor } from '../shared/flavor-catalog.js';
 import { isAdoptLabel, incompatibleRunnerLabel, unreachableRunnerGroup } from '../ingest/adopt.js';
 
 /**
@@ -65,27 +65,56 @@ export interface RunView {
 export const VCPU_USD_PER_MINUTE = 0.0011;
 export const GB_USD_PER_MINUTE = 0.00055;
 
-interface FlavorDef {
-  name: string;
-  label: string;
-  arch: string;
-  /** DESCRIPTIVE only — the API exposes no vCPU request (ADR-038). */
-  vcpu: number;
-  memoryMb: number;
-  capabilities: string[];
-  description: string;
-}
-
-const FLAVORS: FlavorDef[] = (flavorsCatalog as { flavors: FlavorDef[] }).flavors;
+/** The BUILT-IN catalog (ADR-040: the single seam that reads `microvm/flavors.json`). */
+const FLAVORS: readonly CatalogFlavor[] = builtinFlavors();
 
 /** Our routing labels, lowercased — a job carrying one already opted in explicitly. */
 const LCA_LABELS = new Set(FLAVORS.map((f) => f.label.toLowerCase()));
 
-/** Per-minute price of a flavor, or undefined for an unknown flavor name. */
+/**
+ * Per-minute price of an arbitrary requested SHAPE, independent of any catalog entry.
+ *
+ * Exists so the console can show an operator the rate of a custom flavor they are about to
+ * register, BEFORE the row is written (ADR-040 bounds requirement) — at that moment there is no
+ * flavor record to look up by name, so a name-based rate cannot answer the question at all.
+ * Same arithmetic as `flavorRatePerMinute`, so the preview and a built-in's rate cannot drift.
+ *
+ * NOTE the scope limit this implies: a shape-derived rate is a REGISTRATION-TIME estimate. It
+ * does not reach run pricing — see `flavorRatePerMinute` for why that is deferred.
+ */
+export function shapeRatePerMinute(vcpu: number, memoryMb: number): number {
+  return vcpu * VCPU_USD_PER_MINUTE + (memoryMb / 1024) * GB_USD_PER_MINUTE;
+}
+
+/**
+ * Per-minute price of a flavor, or undefined for an unknown flavor name.
+ *
+ * **Built-in catalog only — a `custom-*` run is NOT priced, and that is a DEFERRAL, not a design
+ * position.**
+ *
+ * What the deferral costs, stated plainly so it is not later discovered as a bug: a custom flavor
+ * shows a per-minute rate on the Flavors screen (`buildFlavorViews`, derived from the shape the
+ * operator registered) while a RUN on that flavor reports no `costUsd` in Run detail, the
+ * dashboard rollup or Reports. `billableMinutes` still counts those runs — consumption is
+ * measured from timestamps and needs no price list (see `hasRunMicrovm`) — so the gap is confined
+ * to money. `test/mgmt-views.test.mjs` pins the divergence deliberately, so closing one half
+ * without the other fails a test instead of shipping.
+ *
+ * Why the fix is NOT "thread the installation's catalog through here": that would price a
+ * COMPLETED run from a MUTABLE per-installation record. A custom flavor's shape can be repointed
+ * by its operator, so a later `memoryMb` edit would retroactively reprice history, and deleting
+ * the flavor would silently un-price it. The correct fix is to denormalize — stamp the shape (or
+ * the resolved rate) onto the run row at provision time, making pricing a pure function of the
+ * row with no catalog lookup at all. That is strictly better than threading a catalog, and it
+ * also closes the PRE-EXISTING hole documented on `hasRunMicrovm` (renaming or removing a
+ * built-in orphans every historical row that stored the old name). It changes `RunRecord`, the
+ * provision write path and every pricing consumer, and needs a story for rows written before it
+ * — so it is its own card, not a rider on this one.
+ */
 export function flavorRatePerMinute(flavor: string | undefined): number | undefined {
   const def = FLAVORS.find((f) => f.name === flavor);
   if (!def) return undefined;
-  return def.vcpu * VCPU_USD_PER_MINUTE + (def.memoryMb / 1024) * GB_USD_PER_MINUTE;
+  return shapeRatePerMinute(def.vcpu, def.memoryMb);
 }
 
 export function durationSeconds(run: Pick<RunRecord, 'createdAt' | 'updatedAt'>): number {
@@ -491,10 +520,58 @@ export interface FlavorView {
   usdPerMinute: number;
   /** True when an image ARN for this flavor is published in SSM (i.e. it's buildable). */
   imageAvailable: boolean;
+  /** True for an operator-registered custom flavor (ADR-040). Absent for a built-in. */
+  custom?: boolean;
+  /** Validation state (ADR-041). Absent for a built-in — built-ins are not validated. */
+  validationState?: string;
+  /** Operator-facing reason for `invalid`, or progress detail while `validating`. */
+  validationReason?: string;
+  /**
+   * Whether this flavor may currently be routed to / selected in config.
+   *
+   * Always true for a built-in; for a custom flavor it is `state === 'valid'` (ADR-041). Exposed
+   * as its own field rather than left for the client to re-derive from `validationState`, so the
+   * console cannot disagree with the resolver about what is routable.
+   */
+  routable: boolean;
+  /** The operator's image ARN, for a custom flavor. Not a secret (an ARN is an identifier). */
+  imageArn?: string;
 }
 
-export function buildFlavorViews(available: Record<string, boolean>): FlavorView[] {
-  return FLAVORS.map((f) => ({
+/** A custom flavor as `buildFlavorViews` needs to see it (a projection of the stored row). */
+export interface CustomFlavorInput {
+  name: string;
+  label: string;
+  arch: string;
+  vcpu: number;
+  memoryMb: number;
+  capabilities: string[];
+  description: string;
+  imageArn?: string;
+  state?: string;
+  reason?: string;
+}
+
+/**
+ * Build the Flavors-screen rows: built-ins, then this installation's custom flavors (ADR-040).
+ *
+ * `custom` is OPTIONAL and trailing, so every existing caller — and the environment-scoped
+ * Settings view, which has no single installation — keeps compiling and behaving identically:
+ * omitting it yields built-in rows only, and never reads the store.
+ *
+ * Note it is not the byte-identical pre-ADR-040 payload: every row now carries `routable`, which
+ * is additive (no consumer reads it yet — the Flavors screen is deferred) and is what lets the
+ * console list a non-routable custom flavor instead of hiding it.
+ *
+ * Unlike the resolver, this deliberately lists custom flavors in EVERY state: the console's whole
+ * job here is to show an operator that a flavor is `pending`/`validating`/`invalid` and why. The
+ * routability rule is carried per-row (`routable`) instead of by omission.
+ */
+export function buildFlavorViews(
+  available: Record<string, boolean>,
+  custom?: readonly CustomFlavorInput[],
+): FlavorView[] {
+  const builtin = FLAVORS.map((f) => ({
     name: f.name,
     label: f.label,
     arch: f.arch,
@@ -504,12 +581,55 @@ export function buildFlavorViews(available: Record<string, boolean>): FlavorView
     description: f.description,
     usdPerMinute: flavorRatePerMinute(f.name) ?? 0,
     imageAvailable: available[f.name] === true,
+    // A built-in ships with the platform and is not subject to ADR-041 validation: its image is
+    // built by our own build script from a Dockerfile in this repo, and `imageAvailable` already
+    // reports whether that happened.
+    routable: true,
   }));
+  if (!custom || custom.length === 0) return builtin;
+  return [
+    ...builtin,
+    ...custom.map((c) => ({
+      name: c.name,
+      label: c.label,
+      arch: c.arch,
+      vcpu: c.vcpu,
+      memoryMb: c.memoryMb,
+      capabilities: c.capabilities,
+      description: c.description,
+      // A custom flavor's shape is known here, so its rate is computable directly — unlike
+      // `flavorRatePerMinute`, which is name-based and built-in-scoped. This is a
+      // REGISTRATION-TIME estimate for the requested shape; it deliberately does NOT flow into
+      // run pricing yet (see `flavorRatePerMinute`), so the console must label it as an estimate
+      // rather than imply the operator will see this figure in Reports.
+      usdPerMinute: shapeRatePerMinute(c.vcpu, c.memoryMb),
+      // The operator supplied the image, so "is there an ARN" is the only availability claim we
+      // can make without probing the microVM service. Whether that ARN resolves to a real,
+      // readable image is what the ADR-041 static gate checks, and its verdict is in `state`.
+      imageAvailable: Boolean(c.imageArn),
+      custom: true,
+      ...(c.state ? { validationState: c.state } : {}),
+      ...(c.reason ? { validationReason: c.reason } : {}),
+      routable: c.state === 'valid',
+      ...(c.imageArn ? { imageArn: c.imageArn } : {}),
+    })),
+  ];
 }
 
-/** Names of every catalog flavor — used to validate operator flavor-map writes. */
-export function flavorNames(): string[] {
-  return FLAVORS.map((f) => f.name);
+/**
+ * Names of every flavor an operator may reference in config — used to validate FlavorMap /
+ * `defaultFlavor` writes.
+ *
+ * `custom` is optional + trailing for the same compatibility reason as `buildFlavorViews`.
+ * **Only ROUTABLE custom flavors belong here**: accepting a `pending`/`invalid` name would let
+ * the console save config naming a flavor the resolver then ignores, so the job would silently
+ * land on `base` while the UI showed the operator's choice (ADR-041). The caller passes the
+ * already-filtered set.
+ */
+export function flavorNames(custom?: readonly { name: string }[]): string[] {
+  const names = FLAVORS.map((f) => f.name);
+  if (!custom || custom.length === 0) return names;
+  return [...names, ...custom.map((c) => c.name)];
 }
 
 export interface SecretStatus {

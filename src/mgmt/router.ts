@@ -35,6 +35,10 @@ export type RouteId =
   | 'getRun'
   | 'getRunLogs'
   | 'listFlavors'
+  | 'registerFlavor'
+  | 'previewFlavor'
+  | 'deleteFlavor'
+  | 'revalidateFlavor'
   | 'health'
   | 'settings'
   | 'putRunnerLabels'
@@ -71,6 +75,22 @@ export const ROUTES: readonly RouteDef[] = [
   { id: 'getRunLogs', method: 'GET', template: '/api/runs/{repoId}/{runId}/{jobId}/logs', authRequired: true },
   // --- platform ---
   { id: 'listFlavors', method: 'GET', template: '/api/flavors', authRequired: true },
+  // Custom flavors (ADR-040/041). Installation-scoped: a custom flavor is visible only to the
+  // installation that owns it, so every one of these carries `?installation=<id>` and is
+  // authorized with `canAdminInstallation` — NOT platform-admin, because a custom flavor is an
+  // installation's own resource, not environment-wide config like `runner-labels`.
+  { id: 'registerFlavor', method: 'POST', template: '/api/flavors', authRequired: true },
+  { id: 'deleteFlavor', method: 'DELETE', template: '/api/flavors/{name}', authRequired: true },
+  // POST, not GET: it launches a real microVM and dispatches a workflow (it spends money).
+  {
+    id: 'revalidateFlavor',
+    method: 'POST',
+    template: '/api/flavors/{name}/revalidate',
+    authRequired: true,
+  },
+  // Pure preview — runs the ADR-041 static gate + rate estimate on a PROPOSED flavor and writes
+  // nothing, so the console can show an operator the verdict and cost before they save.
+  { id: 'previewFlavor', method: 'POST', template: '/api/flavors/preview', authRequired: true },
   { id: 'health', method: 'GET', template: '/api/health', authRequired: true },
   { id: 'settings', method: 'GET', template: '/api/settings', authRequired: true },
   // --- settings mutations (spec 04 § Settings, ADR-034) ---

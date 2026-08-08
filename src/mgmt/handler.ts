@@ -48,13 +48,31 @@ import {
   parseEpochMs,
   parseRunnerLabels,
   serializeRunnerLabels,
+  validateCustomFlavor,
   validateFlavorMap,
   validateRelinkBody,
   validateRepoPatch,
+  validateRevalidateBody,
   validateRollbackBody,
   validateRunnerLabels,
   validateWebhookTestBody,
 } from './validate.js';
+import {
+  FlavorExistsError,
+  InvalidFlavorError,
+  TooManyFlavorsError,
+  buildFlavorRecord,
+  deleteCustomFlavor,
+  getCustomFlavor,
+  listCustomFlavors,
+  registerCustomFlavor,
+  repointFlavorImage,
+  routableCustomFlavors,
+  transitionFlavorValidation,
+  type CustomFlavorRecord,
+} from '../shared/flavor-store.js';
+import { staticGate, smokeWorkflowYaml } from '../flavorval/validate-core.js';
+import { shapeRatePerMinute } from './views.js';
 import { planPreviewFromAnalyses } from './rewrite.js';
 import { collectVisible } from './paging.js';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
@@ -153,6 +171,12 @@ const PLATFORM_ADMINS_PARAM =
  * nothing else — no App PEM read, no `ssm:PutParameter` on any secret path.
  */
 const APPCFG_BROKER_NAME = process.env.APPCFG_BROKER_NAME ?? '';
+/**
+ * Name of the flavor-validation λ (ADR-041). Empty when the function is not deployed, in which
+ * case registration still succeeds but the flavor stays `pending` (and therefore not routable) and
+ * the response says validation could not be started — never a silent `valid`.
+ */
+const FLAVORVAL_FUNCTION_NAME = process.env.FLAVORVAL_FUNCTION_NAME ?? '';
 /** The webhook receiver this deployment exposes, for configured-vs-deployed comparison. */
 const WEBHOOK_URL = process.env.WEBHOOK_URL ?? '';
 /**
@@ -431,7 +455,9 @@ async function route_(
       if ('reply' in repo) return repo.reply;
       const raw = bodyOf(event);
       if (raw === undefined) return problem(400, 'body is not valid JSON');
-      const parsed = validateRepoPatch(raw);
+      // Routable custom flavors are accepted as `defaultFlavor` / FlavorMap targets (ADR-040);
+      // unvalidated ones are not, or the console would save a choice the resolver ignores.
+      const parsed = validateRepoPatch(raw, await routableCustomFlavorsFor(repo.record.installationId));
       if (!parsed.ok) return problem(400, 'invalid body', parsed.errors);
       const updated = await patchRepoConfig(
         repo.record.installationId,
@@ -503,7 +529,10 @@ async function route_(
       const raw = bodyOf(event);
       if (raw === undefined) return problem(400, 'body is not valid JSON');
       const body = (raw ?? {}) as { flavorMap?: unknown };
-      const parsed = validateFlavorMap(body.flavorMap ?? raw);
+      const parsed = validateFlavorMap(
+        body.flavorMap ?? raw,
+        await routableCustomFlavorsFor(repo.record.installationId),
+      );
       if (!parsed.ok) return problem(400, 'invalid flavor map', parsed.errors);
       const updated = await patchRepoConfig(
         repo.record.installationId,
@@ -608,8 +637,64 @@ async function route_(
       });
     }
 
-    case 'listFlavors':
+    case 'listFlavors': {
+      // `installation` is OPTIONAL. Without it this is the environment-wide built-in catalog,
+      // byte-identical to the pre-ADR-040 response — which is what the Repos screen's flavor
+      // picker and any unscoped caller still get. With it, the installation's own custom flavors
+      // are appended in EVERY state, because the console's job is to show `pending`/`invalid` and
+      // why; per-row `routable` carries the ADR-041 rule instead of omission.
+      //
+      // ABSENT and MALFORMED are not the same request, and this is the one route where the
+      // difference is invisible in the reply. `asPositiveInt` maps both to `undefined`, so a
+      // `?installation=abc` typo would otherwise fall through to the unscoped branch and return a
+      // 200 with no custom rows AND no `customFlavorsRead` field — a client cannot tell its scope
+      // was dropped from an installation that genuinely has none. That is the same conflation the
+      // degraded-read handling below exists to prevent, one layer up: the console would report
+      // "no custom flavors" for an installation that has several. Every other installation-scoped
+      // route already 400s on a malformed value; only the ABSENCE of the param is a valid unscoped
+      // request.
+      if (q.installation !== undefined && asPositiveInt(q.installation) === undefined) {
+        return problem(400, 'installation must be a positive integer');
+      }
+      const scoped = asPositiveInt(q.installation);
+      if (scoped !== undefined) {
+        if (!canAdminInstallation(session, scoped)) return problem(403, 'forbidden');
+        // A failed read is NOT an empty catalog, and the response must not let a client conflate
+        // them. Collapsing both to `[]` would show an operator who just registered a flavor an
+        // empty list during a DynamoDB blip — inviting them to register it again (a 409 at best,
+        // and a second image to reason about at worst) and making the console's whole purpose here,
+        // reporting validation progress, silently report "nothing to report".
+        let custom: CustomFlavorRecord[] | undefined;
+        try {
+          custom = await listCustomFlavors(scoped);
+        } catch (err) {
+          console.error(
+            JSON.stringify({ msg: 'custom flavor list read failed', installationId: scoped, error: errMsg(err) }),
+          );
+        }
+        return json(200, {
+          flavors: buildFlavorViews(await imageAvailability(), custom ?? []),
+          // `ok` = the installation's custom rows were read (possibly genuinely none);
+          // `degraded` = they could not be read, so the rows above are built-ins ONLY and the
+          // absence of a custom flavor here is not evidence that it does not exist.
+          customFlavorsRead: custom ? 'ok' : 'degraded',
+          smokeWorkflow: smokeWorkflowYaml(),
+        });
+      }
       return json(200, { flavors: buildFlavorViews(await imageAvailability()) });
+    }
+
+    case 'registerFlavor':
+      return registerFlavorRoute(session, event, q);
+
+    case 'previewFlavor':
+      return previewFlavorRoute(session, event, q);
+
+    case 'deleteFlavor':
+      return deleteFlavorRoute(session, match, q);
+
+    case 'revalidateFlavor':
+      return revalidateFlavorRoute(session, event, match, q);
 
     case 'health':
       return healthRoute(session);
@@ -1332,6 +1417,333 @@ async function requirePlatformAdmin(session: SessionPayload): Promise<Reply | un
  *   - a non-dry-run STILL returns the impact of what it just did, so the audit trail and the
  *     operator see the same set of affected jobs.
  */
+/**
+ * The installation's ROUTABLE custom flavors, for config validation (ADR-040/041).
+ *
+ * Fails OPEN to `[]` on a store fault, matching the resolver: a DynamoDB blip then rejects a
+ * custom-flavor name rather than accepting an unverifiable one. Refusing a write the operator can
+ * retry is the safe direction — the unsafe one is persisting a flavor name we could not confirm.
+ */
+async function routableCustomFlavorsFor(installationId: number): Promise<{ name: string }[]> {
+  try {
+    return routableCustomFlavors(await listCustomFlavors(installationId));
+  } catch (err) {
+    console.warn(
+      JSON.stringify({ msg: 'custom flavor read failed during validation', error: errMsg(err) }),
+    );
+    return [];
+  }
+}
+
+/**
+ * Ask the flavor-validation λ to run the ADR-041 gates for one flavor.
+ *
+ * Fire-and-forget (`InvocationType: 'Event'`): a smoke run launches a microVM, dispatches a
+ * workflow and waits for a conclusion — minutes of wall clock, far beyond an API request. The
+ * flavor row is already `pending`, so the console has something truthful to render either way, and
+ * a lost invoke leaves the row `pending` rather than falsely `valid`.
+ *
+ * Returns false when the trigger could not be delivered, so the caller can say so instead of
+ * implying validation has begun.
+ */
+async function triggerFlavorValidation(input: {
+  installationId: number;
+  name: string;
+  actor: string;
+}): Promise<boolean> {
+  if (!FLAVORVAL_FUNCTION_NAME) return false;
+  try {
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: FLAVORVAL_FUNCTION_NAME,
+        InvocationType: 'Event',
+        Payload: Buffer.from(JSON.stringify(input), 'utf8'),
+      }),
+    );
+    return true;
+  } catch (err) {
+    console.error(
+      JSON.stringify({ msg: 'flavor validation trigger failed', name: input.name, error: errMsg(err) }),
+    );
+    return false;
+  }
+}
+
+/** Resolve + authorize the `?installation=<id>` scope every custom-flavor route requires. */
+function scopeInstallation(
+  session: SessionPayload,
+  q: Record<string, string | undefined>,
+): { installationId: number } | { reply: Reply } {
+  const installationId = asPositiveInt(q.installation);
+  if (!installationId) return { reply: problem(400, 'installation query param required') };
+  if (!canAdminInstallation(session, installationId)) return { reply: problem(403, 'forbidden') };
+  return { installationId };
+}
+
+/** Shape a stored custom-flavor row for an API response. */
+function toCustomFlavorResponse(rec: CustomFlavorRecord): Record<string, unknown> {
+  return {
+    name: rec.name,
+    label: rec.label,
+    arch: rec.arch,
+    vcpu: rec.vcpu,
+    memoryMb: rec.memoryMb,
+    capabilities: rec.capabilities,
+    description: rec.description,
+    imageArn: rec.imageArn,
+    smokeRepoFullName: rec.smokeRepoFullName ?? null,
+    smokeWorkflowPath: rec.smokeWorkflowPath ?? null,
+    state: rec.state,
+    reason: rec.reason ?? null,
+    evidence: rec.evidence ?? null,
+    routable: rec.state === 'valid',
+    usdPerMinute: shapeRatePerMinute(rec.vcpu, rec.memoryMb),
+    createdAt: rec.createdAt,
+    updatedAt: rec.updatedAt,
+  };
+}
+
+/**
+ * `POST /api/flavors/preview` — run the cheap half of the ADR-041 static gate on a PROPOSED
+ * flavor and return the rate estimate. Writes nothing and probes nothing, so the console can show
+ * an operator the verdict + cost BEFORE they commit to a registration.
+ *
+ * The image is deliberately not probed here: `staticGate` runs every check it can without the
+ * probe, and a preview that made AWS calls would let an unauthenticated-ish form keystroke drive
+ * describe traffic. A `pass` here is NOT validation and the response says so.
+ */
+async function previewFlavorRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  const scope = scopeInstallation(session, q);
+  if ('reply' in scope) return scope.reply;
+
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const parsed = validateCustomFlavor(raw);
+  if (!parsed.ok) return problem(400, 'invalid custom flavor', parsed.errors);
+
+  // Build the record to reuse the ONE writer's namespacing + built-in collision rules, so the
+  // preview cannot disagree with what registration will accept.
+  let candidate: CustomFlavorRecord;
+  try {
+    candidate = buildFlavorRecord({ ...parsed.value, installationId: scope.installationId });
+  } catch (err) {
+    return problem(400, 'invalid custom flavor', [errMsg(err)]);
+  }
+
+  const gate = staticGate({ flavor: candidate, requireSmokeRepo: false });
+  return json(200, {
+    name: candidate.name,
+    label: candidate.label,
+    // ADR-038: derived from the requested shape, and an ESTIMATE — only memory is requestable and
+    // `vcpu` is descriptive, so this is the rate for the shape, not a quoted price.
+    usdPerMinute: shapeRatePerMinute(candidate.vcpu, candidate.memoryMb),
+    rateIsEstimate: true,
+    staticGate: gate.ok ? { ok: true } : { ok: false, failures: gate.failures },
+    // Said explicitly so no client can present a static pass as validation (ADR-041).
+    note:
+      'static checks only — a flavor is not routable until a smoke run launches a microVM from ' +
+      'this image and proves a runner registers, runs a job and self-terminates',
+  });
+}
+
+/** `POST /api/flavors` — register a custom flavor (ADR-040) and start validation (ADR-041). */
+async function registerFlavorRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  const scope = scopeInstallation(session, q);
+  if ('reply' in scope) return scope.reply;
+
+  const raw = bodyOf(event);
+  if (raw === undefined) return problem(400, 'body is not valid JSON');
+  const parsed = validateCustomFlavor(raw);
+  if (!parsed.ok) return problem(400, 'invalid custom flavor', parsed.errors);
+
+  let rec: CustomFlavorRecord;
+  try {
+    rec = await registerCustomFlavor({
+      ...parsed.value,
+      installationId: scope.installationId,
+      actor: session.login,
+    });
+  } catch (err) {
+    if (err instanceof FlavorExistsError) return problem(409, err.message);
+    // The per-installation cap (`MAX_CUSTOM_FLAVORS_PER_INSTALLATION`) is what keeps the
+    // single-page flavor read whole, so exceeding it is a refusal the operator must SEE — 409, not
+    // a 500 that reads as our fault. Deleting an unused flavor is the remedy.
+    if (err instanceof TooManyFlavorsError) return problem(409, err.message);
+    // `buildFlavorRecord` throws on a malformed name or a built-in collision — both are the
+    // client's input, so 400 rather than 500 (ADR-040 refuses collisions at registration). Matched
+    // by TYPE: message text cannot distinguish these from a DynamoDB fault that happens to mention
+    // a "name", which would misreport a real outage as bad operator input.
+    if (err instanceof InvalidFlavorError) {
+      return problem(400, 'invalid custom flavor', [err.message]);
+    }
+    throw err;
+  }
+
+  const triggered = await triggerFlavorValidation({
+    installationId: scope.installationId,
+    name: rec.name,
+    actor: session.login,
+  });
+
+  console.log(
+    JSON.stringify({
+      msg: 'custom flavor registered',
+      actor: session.login,
+      installationId: scope.installationId,
+      flavor: rec.name,
+      validationTriggered: triggered,
+    }),
+  );
+  await appendAudit({
+    at: new Date().toISOString(),
+    actor: session.login,
+    action: 'custom-flavor-registered',
+    detail: scrubForOperator(
+      `${rec.name} (${rec.memoryMb} MiB, caps [${rec.capabilities.join(', ')}]) → pending validation`,
+    ),
+  }).catch((err) =>
+    console.error(JSON.stringify({ msg: 'flavor audit write failed', error: errMsg(err) })),
+  );
+
+  return json(201, {
+    flavor: toCustomFlavorResponse(rec),
+    validationTriggered: triggered,
+    // A registered flavor is NOT usable yet, and the response must not imply it is.
+    note: triggered
+      ? 'validation started — this flavor is not routable until it reaches state `valid`'
+      : 'validation could not be started; the flavor stays `pending` and is not routable. Use re-validate to retry.',
+    ...(rec.smokeRepoFullName ? {} : { smokeWorkflow: smokeWorkflowYaml() }),
+  });
+}
+
+/** `DELETE /api/flavors/{name}` — remove a custom flavor. */
+async function deleteFlavorRoute(
+  session: SessionPayload,
+  match: RouteMatch,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  const scope = scopeInstallation(session, q);
+  if ('reply' in scope) return scope.reply;
+  const name = match.params.name;
+  if (!name) return problem(400, 'flavor name required');
+
+  const existing = await getCustomFlavor(scope.installationId, name);
+  if (!existing) return problem(404, 'custom flavor not found');
+  await deleteCustomFlavor(scope.installationId, name);
+
+  console.log(
+    JSON.stringify({
+      msg: 'custom flavor deleted',
+      actor: session.login,
+      installationId: scope.installationId,
+      flavor: name,
+    }),
+  );
+  await appendAudit({
+    at: new Date().toISOString(),
+    actor: session.login,
+    action: 'custom-flavor-deleted',
+    detail: scrubForOperator(`${name} (was ${existing.state})`),
+  }).catch((err) =>
+    console.error(JSON.stringify({ msg: 'flavor audit write failed', error: errMsg(err) })),
+  );
+  return json(200, { deleted: name });
+}
+
+/**
+ * `POST /api/flavors/{name}/revalidate` — the manual re-validate trigger ADR-041 requires,
+ * optionally repointing the image ARN in the same call.
+ *
+ * Both paths return the flavor to `pending` FIRST, so it stops being routable the moment its
+ * evidence is withdrawn rather than staying `valid` while a run that may condemn it is in flight.
+ * This is also the only way out of terminal `invalid`.
+ */
+async function revalidateFlavorRoute(
+  session: SessionPayload,
+  event: APIGatewayProxyEventV2,
+  match: RouteMatch,
+  q: Record<string, string | undefined>,
+): Promise<Reply> {
+  const scope = scopeInstallation(session, q);
+  if ('reply' in scope) return scope.reply;
+  const name = match.params.name;
+  if (!name) return problem(400, 'flavor name required');
+
+  const raw = bodyOf(event);
+  const parsed = validateRevalidateBody(raw === undefined ? {} : raw);
+  if (!parsed.ok) return problem(400, 'invalid re-validate body', parsed.errors);
+
+  const existing = await getCustomFlavor(scope.installationId, name);
+  if (!existing) return problem(404, 'custom flavor not found');
+
+  if (parsed.value.imageArn && parsed.value.imageArn !== existing.imageArn) {
+    // A new ARN is a new artifact: `repointFlavorImage` swaps the ARN and resets to `pending`
+    // atomically, so there is no instant where a `valid` row points at an unproven image.
+    const res = await repointFlavorImage({
+      installationId: scope.installationId,
+      name,
+      imageArn: parsed.value.imageArn,
+      actor: session.login,
+    });
+    if (!res.changed) return problem(404, 'custom flavor not found');
+  } else if (existing.state !== 'pending') {
+    const moved = await transitionFlavorValidation({
+      installationId: scope.installationId,
+      name,
+      to: 'pending',
+      actor: session.login,
+    });
+    if (!moved) return problem(409, 'flavor state changed concurrently — retry');
+  }
+
+  const triggered = await triggerFlavorValidation({
+    installationId: scope.installationId,
+    name,
+    actor: session.login,
+  });
+  const after = await getCustomFlavor(scope.installationId, name);
+
+  console.log(
+    JSON.stringify({
+      msg: 'custom flavor re-validation requested',
+      actor: session.login,
+      installationId: scope.installationId,
+      flavor: name,
+      repointed: Boolean(parsed.value.imageArn && parsed.value.imageArn !== existing.imageArn),
+      validationTriggered: triggered,
+    }),
+  );
+  await appendAudit({
+    at: new Date().toISOString(),
+    actor: session.login,
+    action: 'custom-flavor-revalidate',
+    detail: scrubForOperator(
+      `${name}: ${existing.state} → pending` +
+        (parsed.value.imageArn && parsed.value.imageArn !== existing.imageArn
+          ? ' (image repointed)'
+          : ''),
+    ),
+  }).catch((err) =>
+    console.error(JSON.stringify({ msg: 'flavor audit write failed', error: errMsg(err) })),
+  );
+
+  return json(202, {
+    flavor: after ? toCustomFlavorResponse(after) : null,
+    validationTriggered: triggered,
+    note: triggered
+      ? 'validation restarted — not routable until it reaches state `valid`'
+      : 'validation could not be started; the flavor is `pending` and not routable',
+  });
+}
+
 async function putRunnerLabelsRoute(
   session: SessionPayload,
   event: APIGatewayProxyEventV2,

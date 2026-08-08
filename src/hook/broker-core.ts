@@ -73,7 +73,7 @@ export function parseHookRequest(raw: unknown): ParsedHookRequest {
     // content (or forged JSON log lines) into the control plane's log group.
     throw new Error(`unsupported action: ${safeForLog(action)}`);
   }
-  if (typeof req.ref !== 'string' || !isRunRef(req.ref)) {
+  if (typeof req.ref !== 'string' || !isBrokerRef(req.ref)) {
     throw new Error('malformed ref');
   }
   if (typeof req.token !== 'string' || req.token.length < 16) {
@@ -85,6 +85,35 @@ export function parseHookRequest(raw: unknown): ParsedHookRequest {
 /** `RUN#<repoId>#<runId>#<jobId>#JITCONFIG` with numeric ids and no extra segments. */
 export function isRunRef(ref: string): boolean {
   return new RegExp(`^RUN#\\d+#\\d+#\\d+#${JITCONFIG_SK}$`).test(ref);
+}
+
+/**
+ * `SMOKE#<installationId>#<seq>#JITCONFIG` — a custom-flavor validation smoke run (ADR-041).
+ *
+ * A smoke run has no GitHub `workflow_job`, so it has no `(repoId, runId, jobId)` triple and
+ * cannot be addressed as a `RUN#…` row. It gets its OWN partition namespace rather than synthetic
+ * run ids, for two reasons:
+ *
+ *   1. **A synthetic run row would pollute the product.** `RUN#` rows are what the console lists,
+ *      what the dashboard counts as active, and what Reports aggregates cost and failure rates
+ *      over. Minting fake ones would make a validation attempt show up as somebody's CI job, and
+ *      an invalid flavor's failed smoke run would inflate the execution failure rate.
+ *   2. **The isolation property is unchanged.** The broker derives the item key from the
+ *      token-bound ref (`keysFromRef`), so a smoke VM's capability token addresses exactly its own
+ *      `SMOKE#…` partition — it cannot name a `RUN#…` row, and a real job's VM cannot name a
+ *      `SMOKE#…` one. Widening the ref grammar does not widen any VM's authority.
+ *
+ * The guest is completely unaware of this: `run-hook.mjs` echoes back whatever `ref` it was handed
+ * in its launch payload, so a smoke run uses the byte-identical guest contract a real job does —
+ * which is the point, since validating a DIFFERENT contract would prove nothing about real jobs.
+ */
+export function isSmokeRef(ref: string): boolean {
+  return new RegExp(`^SMOKE#\\d+#\\d+#${JITCONFIG_SK}$`).test(ref);
+}
+
+/** Any ref shape the broker will serve: a real run, or a validation smoke run. */
+export function isBrokerRef(ref: string): boolean {
+  return isRunRef(ref) || isSmokeRef(ref);
 }
 
 /**
