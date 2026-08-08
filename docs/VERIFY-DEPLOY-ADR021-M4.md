@@ -1,0 +1,575 @@
+# Deploy verification — ADR-021 brokered run-hook + M4 management plane
+
+> **This is a dated historical deploy record, not a current-state claim.** Everything below
+> is the `dev` environment exactly as observed on **2026-07-28 / 2026-07-29** against
+> `main` @ `63069ff`, and is left unedited as the evidence for that cutover. The dev
+> environment has been redeployed several times since (ADR-047 CD, ADR-048, and later M4
+> work), so live values here — stack timestamps, image versions, run/GSI2 counts, the
+> `PUBLIC_ORIGIN` value, the defect state — describe that tree at that moment. Read
+> [docs/VERIFY-M4.md](VERIFY-M4.md) for the later operator walkthrough of the deployed
+> console, and `docs/DECISIONS.md` for decisions that superseded parts of this record.
+> Deliberately **not** re-run to refresh it: that would consume the shared dev environment
+> slot, and the value of this note is that it pins what the broker cutover actually did.
+
+**Verdict as of 2026-07-29: ADR-021 posture PASSED live. M4 stacks UP; the OAuth callback
+was registered and verified, with the login flow confirmed working up to the credential
+prompt — the authenticated phase-5 screens still needed an interactive human sign-in (see
+[OAuth callback](#oauth-callback--registered-and-verified-decisively)); those were
+subsequently walked in [docs/VERIFY-M4.md](VERIFY-M4.md).**
+
+Deployed and verified against the live `dev` environment on **2026-07-28**. Both PR #14
+(ADR-021 brokered run-hook, `409aba9`) and PR #15 (M4 console + management API, `63069ff`)
+were merged and CI-green but had never been deployed — the running control plane was
+`main` @ `945aa0e` + the M3 docker fix, and no `LCA-Mgmt-dev` / `LCA-Web-dev` existed.
+
+---
+
+## Environment under test
+
+| | |
+|---|---|
+| Account / region | `863638663908` / `us-west-2` (pinned via `.env.local`, ADR-018) |
+| Source | `main` @ `63069ff` |
+| Toolchain | AWS CLI **2.36.8** (`aws lambda-microvms` present — floor is ≥ 2.35.17) |
+| Preflight gate | `npm ci && npm run build && npm test` → **281/281 pass**; `npx cdk synth -c env=dev` clean |
+| GitHub App | `lambdaciactions-dev` (app id `4292494`, 1 installation, events `push` + `workflow_job`) |
+| Webhook | `https://w061napnkg.execute-api.us-west-2.amazonaws.com/webhook` (unchanged by this deploy) |
+
+### Stacks after the deploy
+
+| Stack | Status | Last updated (UTC) |
+|---|---|---|
+| `LCA-Data-dev` | UPDATE_COMPLETE | 2026-07-28T23:20:19Z (GSI2 added — see [below](#gsi2-is-sparse-and-was-not-backfilled)) |
+| `LCA-Image-dev` | UPDATE_COMPLETE | 2026-07-14T14:26:13Z (no diff) |
+| `LCA-Control-dev` | UPDATE_COMPLETE | 2026-07-28T23:21:12Z |
+| `LCA-Mgmt-dev` | UPDATE_COMPLETE | 2026-07-28T23:37:25Z |
+| `LCA-Web-dev` | CREATE_COMPLETE | 2026-07-28T23:31:49Z |
+
+### Images rebuilt from this tree
+
+| Flavor | Before | After | `additionalOsCapabilities` |
+|---|---|---|---|
+| `lca-dev-base` | v9.0 | **v10.0** (SUCCESSFUL, 23:08:22Z) | — |
+| `lca-dev-node` | v8.0 | **v9.0** (SUCCESSFUL, 23:11:46Z) | — |
+| `lca-dev-docker` | v9.0 | **v10.0** (SUCCESSFUL, 23:15:08Z) | `["ALL"]` (ADR-020) |
+
+## Ordering constraint: the version-skew window
+
+The run-hook payload contract is baked into the image. ADR-021 replaced `{ref, region,
+table}` with `{ref, region, broker, token}`, so images and control plane must move in the
+same window with no in-flight jobs (docs/DEPLOY-M1.md § Phase 2 — at the time of this
+deploy that note cited the decision as ADR-020; it is ADR-021, one of the stale
+cross-references the ADR-021 renumber left behind. Repointing those was tracked on its own
+card, deliberately out of scope here, and has since landed in `0d12638`, so the runbook now
+cites ADR-021 correctly). Sequence used:
+
+1. Confirmed the window was quiet: zero open PRs, zero non-`TERMINATED` microVMs
+   (`list-microvms` → 12/12 `TERMINATED`, read across **all** pages — see the pagination
+   gotcha below, which makes a first-page-only read an unsafe freeze gate).
+2. `npm run build:images -- --env dev --region us-west-2` (all three flavors).
+3. `npx cdk deploy LCA-Control-dev -c env=dev` — **74.8 s**, closing the window. This also
+   updated `LCA-Data-dev` (declared dependency, `bin/lca.ts`), which is where GSI2
+   (ADR-023) was actually created — the M4 stacks were not yet involved.
+
+### The window was still hit — and failed closed, as designed
+
+A concurrent kanban card opened PR #16 (`kermes/task-nimble-anemone`) at **23:20:42Z**,
+mid-window. Its two jobs launched with the OLD 97-byte payload against the NEW broker
+images, and the new run-hook rejected them:
+
+```json
+{"msg":"run payload missing ref/broker/token",
+ "raw":"{\"microvmId\":\"microvm-6cd670d9-…\",\"runHookPayload\":\"{\\\"ref\\\":\\\"RUN#1296388576#30407682591#90436690282#JITCONFIG\\\",\\\"region\\\":\\\"us-west-2\\\",\\\"table\\\":\\\"lca-dev\\\"}\"}"}
+```
+
+`/run` returned 400 and the jobs stayed `queued` — no partial or degraded execution, which
+is the documented intent. Recovery was `gh run cancel` + `gh run rerun` once both planes
+were consistent; run `30407682591` then went **green on both jobs**. Payload size moved
+97 → 164 bytes (cap 4096), visible in the Provision log.
+
+Operational note: "quiesce CI" cannot be established by observation alone in this repo —
+another agent can open a PR seconds later. A real freeze needs the other cards paused.
+
+## ADR-021 evidence
+
+### 1. Broker λ is live
+
+`lca-dev-hook-broker` — `nodejs22.x`, **arm64**, 30 s timeout, 256 MB,
+`ReservedConcurrentExecutions: 20` (confirmed via `get-function-concurrency`; note
+`get-function-configuration` reports `null` for this field). `TABLE_NAME=lca-dev` only.
+
+`lca-dev-provision` now carries `HOOK_BROKER_NAME=lca-dev-hook-broker` alongside
+`TABLE_NAME` / `IMAGE_ARN_PARAM_PREFIX` / `APP_ID_PARAM` / `APP_PEM_PARAM` /
+`RUNNER_ROLE_ARN`.
+
+### 2. microVM exec role — verified against the DEPLOYED role, not the template
+
+`aws iam get-role-policy --role-name lca-dev-microvm-exec` (one inline policy, zero
+attached managed policies):
+
+```json
+[
+ {"Sid":"MicrovmRuntimeLogs",
+  "Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
+  "Resource":"arn:aws:logs:us-west-2:863638663908:log-group:/aws/lambda/microvms/*"},
+ {"Sid":"InvokeHookBroker",
+  "Action":"lambda:InvokeFunction",
+  "Resource":"arn:aws:lambda:us-west-2:863638663908:function:lca-dev-hook-broker"}
+]
+```
+
+- **zero** `dynamodb:*` — the table-wide `grantReadData` is gone.
+- **zero** microVM control actions — `lambda:TerminateMicrovm` is gone.
+- exactly one invokable ARN: the single broker function.
+
+That closes the ADR-019 amplifier: a VM can no longer read another run's row, harvest its
+`microvmId`, or terminate anyone.
+
+Broker's own role is correspondingly narrow: `dynamodb:GetItem` on the table ARN only (no
+`/index/*`, no Query/Scan) and `lambda:TerminateMicrovm` gated by
+`aws:RequestedRegion == us-west-2`.
+
+### 3. Brokered boot + terminate, one green job per flavor
+
+Fixture: **`jsamuel1/lca-m3-verify`** (repo id `1313438232`), the M3 flavor-routing repo —
+three jobs whose only LCA-specific content is the `runs-on` label.
+`workflow_dispatch` → run **`30407823249`**, conclusion **success**, all three jobs green.
+
+| Job | Flavor | microVM | Job wall time | Run row |
+|---|---|---|---|---|
+| `node-job` | node | `microvm-fe0063f2-…` | 23:24:15→23:24:37 (22 s) | `completed` |
+| `base-job` | base | `microvm-ade0c34b-…` | 23:24:21→23:24:48 (27 s) | `completed` |
+| `docker-job` | docker | `microvm-85bde901-…` | 23:24:51→23:25:18 (27 s) | `completed` |
+
+Provision resolved each flavor from its explicit label and launched a distinct VM:
+
+```
+{"msg":"flavor resolved","runId":30407823249,"jobId":90437140849,"flavor":"node","reason":"explicit LCA label 'lambda-ci-node'"}
+{"msg":"run-hook payload size","totalBytes":164,"cap":4096,"runId":30407823249}
+{"msg":"microVM launched","microvmId":"microvm-fe0063f2-…","flavor":"node",…}
+```
+
+**Boot fetch via broker** — 6 broker invocations for 3 jobs: 3 × `jitconfig` (the handler
+logs nothing on the success path) + 3 × `terminate`. VM-side proof of the brokered boot is
+`job starting` following a successful `jitconfig` (the VM cannot start a job without the
+config the broker returned), with `asRoot:true` only on the docker flavor as ADR-020
+requires:
+
+```json
+{"msg":"job starting","runId":30407823249,"jobId":90437140849,"repoFullName":"jsamuel1/lca-m3-verify","asRoot":false}
+{"msg":"job starting","runId":30407823249,"jobId":90437140920,"repoFullName":"jsamuel1/lca-m3-verify","asRoot":true}
+```
+
+**Self-terminate via broker** — the broker resolved each VM id off the run row and
+terminated it; the VM never learns any microvmId:
+
+```json
+{"msg":"self-terminate brokered","pk":"RUN#1313438232#30407823249#90437140849","microvmId":"microvm-fe0063f2-…"}
+{"msg":"self-terminate brokered","pk":"RUN#1313438232#30407823249#90437140853","microvmId":"microvm-ade0c34b-…"}
+{"msg":"self-terminate brokered","pk":"RUN#1313438232#30407823249#90437140920","microvmId":"microvm-85bde901-…"}
+```
+
+`list-microvms` afterwards: zero non-`TERMINATED` VMs.
+
+### 4. No capability token leaked
+
+- **Run rows** carry `hookTokenHash` (sha256 hex) and no plaintext; no token in any
+  `reason`/status field.
+- **Log groups** scanned with `filter-log-events --filter-pattern '"token"'`. Over the
+  **E2E window** (`2026-07-28T23:23Z`–`23:27Z`) every group is 0, including
+  `microvms/runs/lca-dev`. Widening to the whole **deploy window** (`23:00Z`–`01:00Z`)
+  keeps `lca-dev-hook-broker` 0, `lca-dev-provision` 0,
+  `microvms/lca-dev-{base,node,docker}` 0, and surfaces 2 hits in
+  `microvms/runs/lca-dev` at `23:20:51Z` / `23:20:54Z` — both the *literal error string*
+  `"run payload missing ref/broker/token"` from the skew failure above, whose payloads
+  were the old contract and contained no token at all.
+
+### Defect found — boot broker call burns retries on cold-CLI timeout
+
+On all three fresh boots, attempts 1 and 2 of the `jitconfig` call failed:
+
+```json
+{"msg":"broker invoke failed","action":"jitconfig","attempt":1,"status":null,"error":"spawnSync aws ETIMEDOUT","stderr":""}
+{"msg":"broker invoke failed","action":"jitconfig","attempt":2,"status":null,"error":"spawnSync aws ETIMEDOUT","stderr":""}
+```
+
+Attempt 3 succeeded, so every job ran — but the boot path is running with **no retry
+margin**. `BOOT_CALL_TIMEOUT_MS = 6000` is too tight for a cold `aws` CLI invocation inside
+a freshly-snapshot-resumed guest (measured: >6 s on the first two tries, consistently).
+The comment in `run-hook.mjs` budgets `3 × 6 s + 2 s + 4 s = 24 s` against the 30 s
+`runTimeoutInSeconds`; observed usage was ~22 s of that 30 s to get one success. A single
+additional slow attempt would exhaust the platform hook deadline and strand the VM.
+
+This is a latent reliability bug, not a security finding, and it did not fail this
+verification. It is **not** fixed here — it needs its own card (raise the boot budget
+and/or pre-warm the CLI in the image so the first call is not cold).
+
+## M4 evidence
+
+Deploy-time evidence only — outputs, the GSI2 index gap, and the `publicOrigin` deploy
+hazard. For the authenticated console itself, see
+[docs/VERIFY-M4.md](VERIFY-M4.md) rather than duplicating it here.
+
+| Output | Value (as of 2026-07-28) |
+|---|---|
+| `LCA-Web-dev.ConsoleUrl` | `https://d2x4qcl1ibd2ax.cloudfront.net` |
+| `LCA-Web-dev.DistributionId` | `EI6WSGHFSQUCX` |
+| `LCA-Mgmt-dev.MgmtApiEndpoint` | `https://q2s2zkcji8.execute-api.us-west-2.amazonaws.com` |
+| `LCA-Mgmt-dev.RunLogGroup` | `/aws/lambda/microvms/runs/lca-dev` |
+
+### GSI2 is sparse and was not backfilled
+
+GSI2 (`REPORUNS#<repoId>` / `createdAt`, ADR-023) did not exist before this deploy — it
+landed with the `LCA-Data-dev` update at **23:20:47Z**. `gsi2pk`/`gsi2sk` are written once
+in `buildQueuedItem` (`src/shared/run-store.ts`), so DynamoDB only projects rows **queued
+after** that point. Measured immediately after the deploy (a point-in-time snapshot — dev
+traffic since grows both the total and the indexed count, never the 97-row unindexed gap):
+
+| RUN rows | count |
+|---|---|
+| total | 104 |
+| in GSI2 (`gsi2pk` present) | 7 — every run queued from 23:23:28Z onward |
+| not in GSI2 | 97 — `2026-07-14T13:29:04Z` … `2026-07-28T23:20:48Z` |
+
+Consequence for the console: `GET /api/runs?repo=<id>` and the Repo-detail history it
+backs (`listRunsByRepo` → `IndexName: 'gsi2'`) show **only post-deploy runs** for every
+repo. The unfiltered Dashboard view and `?status=` filter are unaffected — they read GSI1,
+which predates this deploy.
+
+This is expected sparse-index behaviour, not a defect: `createdAt` is immutable so a
+backfill is a pure one-off `UpdateItem` per row, and the pre-existing rows are dev-only
+traffic that ages out on the table's `ttl`. Recorded here so the M4 exit walkthrough is not
+read as broken when a repo's history looks short. Prod cutover has no such gap (GSI2 exists
+before the first run).
+
+Phases run per docs/DEPLOY-M4.md:
+
+- **Phase 0** — `/lca/dev/mgmt/session-secret` created out-of-band as a **SecureString**
+  (`openssl rand -base64 32`), version 1. Not created by CloudFormation (ADR-008).
+- **Phase 1** — `npm run build:web` → `web/dist` (index.html, main.css, main.js 167 kB).
+- **Phase 2** — `npx cdk deploy LCA-Mgmt-dev LCA-Web-dev -c env=dev` (292 s; CloudFront
+  distribution creation dominates).
+- **Phase 3** — `npx cdk deploy LCA-Mgmt-dev -c env=dev -c publicOrigin=https://d2x4qcl1ibd2ax.cloudfront.net`
+  → `PUBLIC_ORIGIN` now set on `lca-dev-mgmt` (19 s, Lambda env only).
+
+### `publicOrigin` is not persisted — a later flagless Mgmt deploy regresses login
+
+The Phase-3 value lives only in the CDK **context** of that one invocation. Nothing stores
+it: the repo has no `cdk.context.json`, `cdk.json`'s `context` block doesn't carry it, and
+`MgmtStack` defaults `PUBLIC_ORIGIN` to `''` (`lib/mgmt-stack.ts`). Synth proves both
+branches from this tree:
+
+```
+$ npx cdk synth LCA-Mgmt-dev -c env=dev                          | grep PUBLIC_ORIGIN
+          PUBLIC_ORIGIN: ""
+$ npx cdk synth LCA-Mgmt-dev -c env=dev -c publicOrigin=https://…  | grep PUBLIC_ORIGIN
+          PUBLIC_ORIGIN: https://d2x4qcl1ibd2ax.cloudfront.net
+```
+
+So any future `npx cdk deploy LCA-Mgmt-dev -c env=dev` without the flag — the form used
+throughout Phase 2 and in docs/VERIFY-M3.md's multi-stack deploys — silently empties the
+variable and puts login back at the Phase-2 500. That is ADR-024's deliberate
+fail-loud-rather-than-guess behaviour working as designed, but the runbook described it as a
+first-deploy state only; DEPLOY-M4 Phase 3 now flags it as a standing requirement with a
+post-deploy assertion. A persistent default (SSM lookup) belongs with M5 custom domains.
+
+The live value was correct at the time of this record:
+`PUBLIC_ORIGIN=https://d2x4qcl1ibd2ax.cloudfront.net`. (Still the same origin as of the
+2026-08-03 walkthrough — see [docs/VERIFY-M4.md](VERIFY-M4.md) § Prerequisites.)
+
+Verified live:
+
+- Console serves the SPA: `GET /` → **200**, `<title>LambdaCIActions Console</title>`.
+- `GET /auth/login` → **302** to
+  `https://github.com/login/oauth/authorize?client_id=Iv23liqxo1L0yFSPaYws&redirect_uri=https%3A%2F%2Fd2x4qcl1ibd2ax.cloudfront.net%2Fauth%2Fcallback&state=…`
+  — correct client id, correct callback, CSRF state present. So Phase 3 took effect and the
+  documented "login 500s until Phase 3" state is passed.
+- Management API rejects unauthenticated reads: `/api/repos`, `/api/runs`, `/api/settings`
+  all **401** `{"error":"not authenticated"}`.
+- A path like `/runs/123` returns **403** — expected, not a defect: the console is
+  hash-routed (`#/runs/…`) precisely because a distribution-wide CloudFront error rewrite
+  would corrupt the API's own 401/403/404 responses (ADR-024 / web-stack.ts class doc).
+
+## OAuth callback — registered, and verified decisively
+
+**Resolved 2026-07-29.** The operator added the callback URL by hand:
+
+- **Callback URL**: `https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback`
+
+This could not be automated. GitHub exposes no REST endpoint to modify a GitHub App's
+callback URLs (`PATCH /app` does not exist; `GET /app` is read-only), so it is browser-only.
+Root cause of the omission: `scripts/create-github-app.mjs` registers the app with
+`redirect_url: http://localhost:8976/callback` — the local one-shot listener it uses to
+capture credentials at bootstrap. The console origin did not exist then and was never added
+afterwards.
+
+### The pre-auth probe carries no signal (confirmed)
+
+As the review pass established, `GET /login/oauth/authorize` returns the **same**
+`302 → /login?return_to=…` for the console callback, for the App's registered
+`http://localhost:8976/callback`, and for a bogus `https://example.invalid/nope` — GitHub
+defers all `redirect_uri` validation until after sign-in. So the earlier note correctly
+refused to claim a refusal it had not observed.
+
+### The token exchange DOES discriminate — and it passes
+
+The `/login/oauth/access_token` step validates the `client_id` + `redirect_uri` pair
+without needing a signed-in browser. Driving our own callback with a real `state`/cookie
+pair and a deliberately invalid `code`:
+
+```sh
+curl -c jar -D - -o /dev/null https://d2x4qcl1ibd2ax.cloudfront.net/auth/login
+# → 302 to GitHub; capture `state` from Location and the lca_oauth_state cookie into `jar`
+curl -b jar "https://d2x4qcl1ibd2ax.cloudfront.net/auth/callback?code=bogus_probe_code&state=<state>"
+# → 500 {"error":"internal error"}   (generic by design — the detail is in the λ log)
+```
+
+The request got **past** state validation (no `400 invalid OAuth state`) into the exchange,
+and `/aws/lambda/lca-dev-mgmt` recorded GitHub's verdict:
+
+```json
+{"msg":"mgmt request failed","route":"authCallback","path":"/auth/callback",
+ "error":"GitHub OAuth token exchange failed: bad_verification_code — The code passed is incorrect or expired."}
+```
+
+`bad_verification_code` — **not** `redirect_uri_mismatch`. GitHub accepted the
+client_id + redirect_uri pair and rejected only the fake code, which is the response a
+correctly-registered callback gives and an unregistered one cannot. One request therefore
+exercised the signed-state check, the state-cookie round-trip, the SecureString
+client-secret read, and GitHub's acceptance of the redirect URI.
+
+### Browser confirmation (headless chromium)
+
+`GET /` renders the SPA — title `LambdaCIActions Console`, one `Sign in with GitHub` link
+to `/auth/login`. Only console errors are the expected unauthenticated `401 /api/me` and a
+`403 /favicon.ico` (no favicon shipped). Clicking through lands on GitHub showing:
+
+> Sign in to GitHub **to continue to LambdaCIActions-dev**
+
+GitHub resolved the client id to our App and staged the authorize — the flow is intact up
+to the credential prompt.
+
+### Not verified here: authenticated console screens
+
+DEPLOY-M4 phase-5 steps 1–7 (Setup / Repos / Repo detail / Dashboard / Run detail /
+Settings) need a real sign-in as a user who administers installation `146431062` — an
+interactive human credential entry, deliberately not automated in this pass. The pre-auth
+boundary IS verified here: `/api/repos`, `/api/runs`, `/api/settings` all return
+`401 {"error":"not authenticated"}` without a session cookie.
+
+> **Walked later, separately.** [docs/VERIFY-M4.md](VERIFY-M4.md) is the operator
+> walkthrough of those authenticated screens (2026-08-03, 6 of 9 steps observed passing).
+> It found one product defect — the run-detail log pane matched the microVM id as a stream
+> **prefix** when it is a suffix — since fixed under
+> [ADR-048](DECISIONS.md#adr-048). That walkthrough is the authority for authenticated
+> console behaviour; this note stays scoped to the deploy/cutover evidence and does not
+> restate it.
+
+## Follow-up cards filed
+
+| Card | Why |
+|---|---|
+| `task-1785282148-3aa2` | Boot `jitconfig` burns 2/3 retries on cold-CLI `ETIMEDOUT` (see [Defect found](#defect-found--boot-broker-call-burns-retries-on-cold-cli-timeout)) |
+| `task-1785294933-3462` | Vanity URL for the console — the raw CloudFront domain is load-bearing in `PUBLIC_ORIGIN`, in the OAuth callback (browser-only to change), and as the first-party cookie origin |
+
+## Reproduction
+
+```sh
+# NOTE: `list-microvms` paginates (page 1 caps at 10) and the CLI applies `--query` per
+# page, so a first-page read can miss a live VM. Read every page before declaring quiet.
+
+# preflight (worktree needs its own copy of the gitignored pin)
+cp ../../.env.local .env.local
+ada credentials update --account=863638663908 --provider=isengard --role=Admin \
+  --profile=sauhsoj+playground1-Admin --once
+npm ci && npm run build && npm test && npx cdk synth -c env=dev
+
+# skew window — verify quiet, then move both planes together
+aws lambda-microvms list-microvms --region us-west-2 \
+  --query 'items[?state!=`TERMINATED`].microvmId' --output text   # expect empty, ALL pages
+npm run build:images -- --env dev --region us-west-2
+npx cdk deploy LCA-Control-dev -c env=dev
+
+# posture check against the DEPLOYED role
+aws iam get-role-policy --role-name lca-dev-microvm-exec \
+  --policy-name "$(aws iam list-role-policies --role-name lca-dev-microvm-exec \
+                    --query 'PolicyNames[0]' --output text)"
+
+# E2E
+gh workflow run flavors.yml --repo jsamuel1/lca-m3-verify --ref main
+
+# M4
+aws ssm put-parameter --name /lca/dev/mgmt/session-secret --type SecureString \
+  --value "$(openssl rand -base64 32)" --region us-west-2
+npm run build:web
+npx cdk deploy LCA-Mgmt-dev LCA-Web-dev -c env=dev
+npx cdk deploy LCA-Mgmt-dev -c env=dev -c publicOrigin=https://d2x4qcl1ibd2ax.cloudfront.net
+```
+
+### Gotcha: stale static credentials shadow `credential_process`
+
+`aws sts get-caller-identity` failed with `ExpiredToken` even though the profile's
+`credential_process` (isengardcli) returned a valid, unexpired credential. Cause: stale
+`aws_access_key_id`/`aws_session_token` entries for the same profile name in
+`~/.aws/credentials`, which take precedence over the `credential_process` in
+`~/.aws/config`. `ada credentials update … --once` rewrites those entries and fixes it.
+
+### Gotcha: `list-microvms` paginates, and `--query` runs per page
+
+The account already holds more terminated VMs than one page: at review time
+`list-microvms` returns **17** VMs across 2 pages (page 1 caps at 10). The CLI
+auto-paginates but evaluates `--query` **per page** and prints one result per page, so
+`--query 'length(items)'` emits `10` then `7` rather than `17`, and any pipeline ending in
+`head` silently truncates. This matters because the pre-deploy freeze gate is "zero
+non-`TERMINATED` VMs": a first-page-only read can call the window quiet while a live VM
+sits on page 2. Filter for the non-terminated set and read every page.
+
+### Gotcha: `list-microvm-image-versions` wants an ARN, and its payload is `items`
+
+The image-inspection verbs are worth pinning, because the obvious guesses fail:
+`--image-identifier` rejects a bare image name (`Invalid ARN format: lca-dev-base`) and
+wants the full `arn:aws:lambda:<region>:<acct>:microvm-image:<name>`. The response key is
+`items` (not `MicrovmImageVersions`) and each entry's version field is `imageVersion`, so
+JMESPath written against the CLI's usual PascalCase shape silently returns `null`. For
+"what is live right now", `get-microvm-image` → `latestActiveImageVersion` is direct:
+
+```sh
+aws lambda-microvms get-microvm-image \
+  --image-identifier arn:aws:lambda:us-west-2:863638663908:microvm-image:lca-dev-docker \
+  --query '[name,latestActiveImageVersion,updatedAt]' --output text
+
+aws lambda-microvms list-microvm-image-versions \
+  --image-identifier arn:aws:lambda:us-west-2:863638663908:microvm-image:lca-dev-docker \
+  --query 'items[].[imageVersion,state,additionalOsCapabilities]' --output text
+```
+
+## Independent re-verification (review pass)
+
+Every live claim above was re-checked against AWS/GitHub afterwards from the same pinned
+account — as a review of this note, not a re-run of the deploy. All matched: stack
+statuses/timestamps, the six `lca-dev-*` functions, the deployed exec-role policy
+(statement-for-statement), Provision's `HOOK_BROKER_NAME`, the broker's own two-statement
+role, `ReservedConcurrentExecutions: 20`, per-flavor `latestActiveImageVersion`
+(10.0 / 9.0 / 10.0) with `additionalOsCapabilities: ["ALL"]` on docker **only**, run
+`30407823249`'s three green jobs and their labels, all three run rows (`completed`,
+`microvmId`, `hookTokenHash`, no plaintext), the three brokered `self-terminate` log lines,
+the six `ETIMEDOUT` jitconfig attempts, the 97 → 164 byte payload transition, the
+token-pattern log scan (2 hits, both the literal error string), M4's `PUBLIC_ORIGIN` / 302 /
+401s / 403, and `npm test` → 281/281 with a credential-less `cdk synth` clean.
+
+A **second independent review pass** (2026-07-29) re-ran the same checks from the pinned
+account and matched again: all five stack statuses/timestamps, the six `lca-dev-*`
+functions (all `nodejs22.x`/arm64), Provision's exact env-var set including
+`HOOK_BROKER_NAME`, the deployed exec-role policy statement-for-statement (one inline
+policy, zero attached), the broker role's two statements, `ReservedConcurrentExecutions:
+20`, per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with `ALL` on docker only, run
+`30407823249` green ×3 with matching job timings, the run row's 64-hex `hookTokenHash` and
+empty `reason`, three brokered `self-terminate` lines, exactly 6 broker `START` records,
+six `ETIMEDOUT` jitconfig attempts spanning `23:23:39`→`23:23:55` (~22 s to first success),
+`totalBytes: 164` vs a recomputed 97-byte old payload, `asRoot` true on docker only, GSI2
+counts (104 `sk=RUN` rows, 7 indexed, earliest `23:23:28.786Z`; the extra 5 `RUN#` rows are
+`JITCONFIG` items), table TTL enabled, M4 outputs/`PUBLIC_ORIGIN`/302/401s/403, and
+`npm test` 281/281 with a credential-less `cdk synth` clean. It corrected the token-scan
+window, the pagination gate, and the unverified GitHub-refusal claim above.
+
+Two refinements from the first pass:
+
+- **The 6-invocation count is right, and the evidence is stronger than stated.** The broker
+  log shows exactly 6 `START` lines in the E2E window (8 only if `INIT_START` is miscounted).
+  The six timed-out jitconfig attempts produced **no broker `START` at all** — independent
+  proof the timeout is spent in the guest's cold `aws` CLI rather than in broker latency,
+  which is precisely what the defect above asserts.
+- **GSI2's backfill gap** was unrecorded; now [documented above](#gsi2-is-sparse-and-was-not-backfilled).
+
+A **third independent review pass** (2026-07-29) re-verified every live claim from the pinned
+account and matched again: all five stack statuses/timestamps, the six `lca-dev-*` functions
+(`nodejs22.x`/arm64), Provision's exact env set including `HOOK_BROKER_NAME`, the broker's
+runtime/timeout/memory and `ReservedConcurrentExecutions: 20`, the deployed exec-role policy
+statement-for-statement (one inline policy, zero attached, zero `dynamodb:*`, zero microVM
+control actions), the broker role's two statements plus its `AWSLambdaBasicExecutionRole`
+attachment, per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with
+`additionalOsCapabilities: ["ALL"]` on docker and `null` on node, zero non-`TERMINATED` VMs,
+run `30407823249` `success` with all three jobs green at the stated timings, the three run
+rows (`completed`, per-flavor, distinct `microvmId`, 64-hex `hookTokenHash`, `reason` null),
+the three brokered `self-terminate` lines, the broker log's **6** `START RequestId` vs **2**
+`INIT_START` in the E2E window (confirming the parenthetical above), the six `ETIMEDOUT`
+jitconfig attempts (3 × attempt 1 at 23:23:39–42, 3 × attempt 2 at 23:23:47–50), the token
+scan (0 in every group except the 2 literal-error-string hits in `microvms/runs/lca-dev`),
+`gsi2` `ACTIVE` with its `TableCD117FA1` update completing 23:20:44Z inside the
+`LCA-Data-dev` 23:20:19–47Z window, both M4 stacks' outputs, `PUBLIC_ORIGIN`, the session
+secret (`SecureString` v1), and live `200` / `302` / three `401`s / `403`. Preflight re-run
+clean: `npm run build` + `npm test` → **281/281**, and a credential-less `cdk synth -c
+env=dev` (config/credential files and every `AWS_*`/`CDK_*` variable unset, IMDS disabled)
+exits 0 — the ADR-018 CI-exemption path.
+
+It corrected three items:
+
+- PR #16's creation time was stated as `23:20:46Z`; the GitHub API reports **`23:20:42Z`**
+  (`23:20:46Z` is a `LCA-Data-dev` stack event). The skew-window conclusion is unchanged —
+  the PR still landed mid-window, four seconds earlier than recorded.
+- The GSI2 row counts re-measure as 106 total / 9 indexed rather than 104 / 7, because dev
+  traffic continued after the deploy. They are now labelled a point-in-time snapshot; the
+  invariant that matters (97 unindexed legacy rows, all pre-`23:20:48Z`) is unchanged.
+- The "expected, not observed" GitHub-refusal claim now records what an unauthenticated probe
+  actually shows, so a later reader cannot mistake the pre-auth `302` for evidence either
+  way.
+
+One repo-hygiene fix landed in the same pass: `.agents/` — the AGENTS.md-mandated scratch
+directory, holding this deploy's captured logs and JSON — was not gitignored, so its contents
+were commit-eligible. It is ignored now.
+
+A **fourth independent review pass** (2026-07-29) re-verified every live claim once more from
+the pinned account and matched: five stack statuses/timestamps, the six `lca-dev-*` functions
+(`nodejs22.x`/arm64), Provision's exact env set including `HOOK_BROKER_NAME`, the deployed
+exec-role policy statement-for-statement (one inline, zero attached, zero `dynamodb:*`, zero
+microVM control actions), the broker's `nodejs22.x`/30 s/256 MB + `TABLE_NAME` only +
+`ReservedConcurrentExecutions: 20` + its two-statement role and `AWSLambdaBasicExecutionRole`,
+per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with `ALL` on docker and `null` on node,
+zero non-`TERMINATED` VMs, run `30407823249` `success` ×3, the three run rows (`completed`,
+per-flavor, distinct `microvmId`, 64-hex `hookTokenHash`, `reason` null), the three brokered
+`self-terminate` lines in the broker group, **6** `START RequestId` vs **2** `INIT_START`, the
+six `ETIMEDOUT` jitconfig attempts (23:23:39–42 and 23:23:47–50), `totalBytes: 164` ×3, the
+token scan (0 in the broker/Provision/all three flavor groups; the only 2 hits in
+`microvms/runs/lca-dev` are the literal `run payload missing ref/broker/token` error lines,
+whose raw payloads carry the old `table` contract and no token), PR #16 created `23:20:42Z`
+with skew run `30407682591` now green, GSI2 `ACTIVE` at 106/9/97 with the unindexed range
+ending `23:20:48.571Z` and the earliest indexed row `23:23:28.786Z`, `list-microvms`
+per-page `--query` still emitting `10` then `9`, both M4 stacks' outputs, `PUBLIC_ORIGIN`, the
+SecureString session secret v1, live `200`/`302` (correct `client_id` + callback + state)/three
+`401`s/`403`, and the preflight gate `npm run build` + `npm test` → **281/281** with a
+credential-less `cdk synth -c env=dev` exit 0.
+
+It corrected one docs claim: DEPLOY-M1 said the credential traps could make the pin check
+"pass against the wrong account". They cannot — `bin/lca.ts` compares `CDK_DEFAULT_ACCOUNT`
+and `assertDeployTarget` compares the STS caller against the pin, so both traps only ever
+*refuse*. Reworded to fail-closed.
+
+A **fifth independent review pass** (2026-07-29) matched every live claim again from the
+pinned account: five stack statuses/timestamps, the six `lca-dev-*` functions
+(`nodejs22.x`/arm64, broker included), the deployed exec-role policy statement-for-statement
+(one inline, zero attached, zero `dynamodb:*`, zero microVM control actions), Provision's
+exact six-variable env including `HOOK_BROKER_NAME`, the broker's `nodejs22.x`/30 s/256 MB
+with `TABLE_NAME` only and `ReservedConcurrentExecutions: 20`, the broker role's two
+statements (`GetItem` on the bare table ARN; region-conditioned `TerminateMicrovm`),
+per-flavor `latestActiveImageVersion` 10.0/9.0/10.0 with `additionalOsCapabilities: ["ALL"]`
+on every docker version and `null` on base/node, zero non-`TERMINATED` VMs, run
+`30407823249` `success` with all three jobs green, the three run rows (`completed`,
+per-flavor, distinct `microvmId`, 64-hex `hookTokenHash`, `reason` absent), a `"token"`
+log scan returning **0** across all six groups in the E2E window with exactly 6 broker
+`START` records, GSI2 `ACTIVE` with the three E2E rows queryable by `REPORUNS#1313438232`,
+both M4 stacks' outputs, `PUBLIC_ORIGIN`, the SecureString session secret v1, and live
+`200` / `302` (correct `client_id`, callback and CSRF state) / three `401`s. Gate re-run
+from this worktree: `npm run build` exit 0, `npm test` **281/281**, and a credential-less
+`cdk synth -c env=dev` exit 0 with config/credential files and every `AWS_*`/`CDK_*`
+variable unset and IMDS disabled.
+
+It found one new issue and one drift:
+
+- **`publicOrigin` is not sticky** — documented above, with DEPLOY-M4 Phase 3 + its
+  troubleshooting row updated. This is the only finding of the pass; it changes no live
+  state (the deployed value is correct today).
+- GSI2 re-measures **110 total / 13 indexed / 97 unindexed**, up from 106/9/97 — dev traffic
+  again. The invariant holds exactly: 97 legacy rows spanning
+  `2026-07-14T13:29:04.515Z`…`2026-07-28T23:20:48.571Z`, earliest indexed row
+  `23:23:28.786Z`. The snapshot table above is left as-measured and stays labelled
+  point-in-time.

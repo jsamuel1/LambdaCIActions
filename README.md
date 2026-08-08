@@ -110,6 +110,10 @@ handled (permanent-failure classification + an actionable reason on the run), an
 criterion closes it — see ADR-030. Deploy the console with
 [docs/DEPLOY-M4.md](docs/DEPLOY-M4.md); the platform bootstrap is
 [docs/DEPLOY-M1.md](docs/DEPLOY-M1.md). Specs 01–05 + ADRs remain the design source of truth.
+Deploy-time evidence for the `dev` environment lives in
+[docs/VERIFY-DEPLOY-ADR021-M4.md](docs/VERIFY-DEPLOY-ADR021-M4.md) (the ADR-021 broker + M4
+cutover, 2026-07-29) and [docs/VERIFY-M4.md](docs/VERIFY-M4.md) (operator walkthrough of the
+deployed console).
 
 ## License
 

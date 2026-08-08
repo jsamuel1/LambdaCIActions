@@ -164,7 +164,28 @@ post-login redirect. Only the Lambda's environment changes — no data migration
 `-c publicOrigin=` always wins over the domain config, which is also how you pin a
 transitional origin during a migration (see below).
 
+**On the no-domain path, `publicOrigin` is not sticky — pass it on every subsequent
+`LCA-Mgmt-<env>` deploy.** It is CDK *context*, read per-invocation (`bin/lca.ts`), and
+nothing persists it: there is no `cdk.context.json` in the repo and `cdk.json` doesn't carry
+it. `MgmtStack` defaults it to `''` (`lib/mgmt-stack.ts`), so a later flagless `npx cdk
+deploy LCA-Mgmt-<env> -c env=<env>` silently resets `PUBLIC_ORIGIN` to empty and regresses
+login to the Phase-2 500. A configured vanity domain (ADR-036) is the durable fix, because
+the origin is then derived from config rather than a per-invocation flag. Until one is
+configured, the flag is the contract — confirm after any Mgmt deploy:
+
+```sh
+aws lambda get-function-configuration --function-name lca-<env>-mgmt \
+  --query 'Environment.Variables.PUBLIC_ORIGIN' --output text   # must be the console URL
+```
+
 ## Phase 4 — register the OAuth callback on the GitHub App
+
+**This step is browser-only and cannot be automated.** GitHub exposes no REST endpoint to
+modify a GitHub App's callback URLs (`GET /app` is read-only; there is no `PATCH /app`), so
+no script or agent can do it. It is also not done for you at bootstrap:
+`scripts/create-github-app.mjs` registers the App with
+`redirect_url: http://localhost:<port>/callback` — the one-shot listener it uses to capture
+credentials — because the console origin does not exist yet at that point.
 
 In the App's settings (Developer settings → GitHub Apps → your app):
 
@@ -174,7 +195,39 @@ In the App's settings (Developer settings → GitHub Apps → your app):
 
 The callback URL must match exactly — GitHub rejects mismatches. This edit is **browser-only**:
 GitHub exposes no REST endpoint for App settings (`PATCH /app` does not exist), which is the
-whole reason the origin is worth pinning to a domain you control (ADR-036).
+whole reason the origin is worth pinning to a domain you control (ADR-036). Until the
+callback is registered, `/auth/login` correctly 302s to GitHub's authorize page and GitHub
+then refuses the redirect back, so Phase 5 cannot start.
+
+### Verifying the callback without signing in
+
+Do **not** try to confirm registration by fetching the authorize URL anonymously. GitHub
+defers all `redirect_uri` validation until after sign-in, so `GET /login/oauth/authorize`
+returns the same `302 → /login?return_to=…` whether the callback is registered, still the
+bootstrap `localhost` one, or complete nonsense. That probe proves nothing.
+
+The **token exchange** does discriminate, and needs no browser session. Drive your own
+callback with a genuine `state`/cookie pair and a deliberately invalid `code`:
+
+```sh
+curl -c jar -D - -o /dev/null https://<console-domain>/auth/login
+# capture `state` from the Location header; the lca_oauth_state cookie is now in `jar`
+curl -b jar "https://<console-domain>/auth/callback?code=bogus&state=<state>"
+# → 500 {"error":"internal error"} — the useful detail is in the λ log:
+aws logs filter-log-events --log-group-name /aws/lambda/lca-<env>-mgmt \
+  --start-time $(( ($(date +%s) - 300) * 1000 )) --query 'events[].message' --output text
+```
+
+Read the `authCallback` error line:
+
+| λ log says | Meaning |
+|---|---|
+| `bad_verification_code` | **Callback IS registered.** GitHub accepted the client_id + redirect_uri pair and rejected only the fake code. |
+| `redirect_uri_mismatch` | Callback is NOT registered (or does not match exactly). Redo Phase 4. |
+| `400 invalid OAuth state` | You lost the cookie/state pair — re-run both curls in the same shell with the same jar. |
+
+A `bad_verification_code` result also proves, in one request, that the signed-state check,
+the state-cookie round-trip, and the SecureString client-secret read all work.
 
 ## Phase 5 — verify (M4 exit criterion)
 
@@ -440,7 +493,9 @@ only — the hot path (webhook → ingest → provision) keeps running.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Login → 500 | `PUBLIC_ORIGIN` unset (no-domain path) | Phase 3 (re-deploy with `-c publicOrigin=...`), or configure a vanity domain (ADR-036) |
+| Login → 500 | `PUBLIC_ORIGIN` unset (no-domain path) — first deploy, **or** a later Mgmt deploy that omitted `-c publicOrigin` (context is not persisted) | Phase 3 (re-deploy with `-c publicOrigin=...`), or configure a vanity domain (ADR-036) |
+| GitHub refuses the redirect after authorize | callback URL not on the App | Phase 4 (browser-only; no API for it) — confirm with the [exchange probe](#verifying-the-callback-without-signing-in) |
+| Repo history shorter than expected | GSI2 is sparse — only runs queued after the index was created appear (ADR-023) | expected on an env upgraded in place; Dashboard/`?status=` views are unaffected |
 | `LCA-Cert-<env>` fails instantly: bootstrap version SSM parameter not found | account not bootstrapped in **us-east-1** (the cert stack's region) | `npx cdk bootstrap aws://<account>/us-east-1` — see Phase 2 |
 | Deploy hangs on `LCA-Cert-<env>` | ACM validation CNAME not resolving publicly | Check the `_<hash>` CNAME exists in the zone and that the zone is authoritative for the apex; a private zone can never validate |
 | `cdk deploy` fails on the distribution with a certificate error | cert not in us-east-1 | Cannot happen via `LCA-Cert-<env>` (it asserts the region) — a manually-supplied ARN must be us-east-1 |

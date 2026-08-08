@@ -55,6 +55,9 @@ Operator visibility + control. **Shipped** — see [spec 04](specs/04-web-ui.md)
   **re-walked against the deployed console**, **and** the interactive GitHub half of steps 1–2
   (registered Callback URL is owner-only, authorize screen is interactive) walked by a human —
   the 🎯's "installs the App" clause.
+  The M4 planes were first deployed to `dev` on 2026-07-28/29; that cutover's deploy-time
+  evidence (broker posture, GSI2 index gap, `publicOrigin` deploy hazard) is
+  [`docs/VERIFY-DEPLOY-ADR021-M4.md`](VERIFY-DEPLOY-ADR021-M4.md).
 
 ## M5 — Drop-in & polish
 True zero-edit adoption + hardening. **Mostly implemented** — see ADR-030..033,
