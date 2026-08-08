@@ -432,6 +432,53 @@ function RelinkForm({
 // ---- runner labels ---------------------------------------------------------
 
 /**
+ * What the allowlist means for the flavor catalog (ADR-050).
+ *
+ * The card below shows WHICH labels this environment claims. This says whether those labels
+ * actually let a job run: the claim gate consults the allowlist BEFORE routing, so a catalog
+ * flavor whose label is missing is one a job can name and never be claimed for — the state that
+ * left eight PRs `queued` for ~7 h with a fully green console.
+ *
+ * Rendered inside the runner-labels card rather than as a second card because it is a property
+ * OF the allowlist, not a separate setting — and because the operator's next action after seeing
+ * it is to edit the very field above it.
+ *
+ * `controlPlaneLive === false` means the allowlist read failed, so nothing here is evidence of
+ * anything: the reconciliation is withheld and named as unchecked rather than shown as broken.
+ */
+function AllowlistReconciliation({ data }: { data: SettingsData }): JSX.Element | null {
+  if (data.controlPlaneLive === false) {
+    return (
+      <p className="muted gap-top">
+        Could not read the live allowlist, so catalog runnability is unchecked — not green.
+      </p>
+    );
+  }
+  const unmatched = data.unmatchedAllowlistLabels ?? [];
+  const notRunnable = (data.readiness ?? []).filter((r) => !r.runnable);
+  if (!unmatched.length && !notRunnable.length) return null;
+  return (
+    <>
+      {unmatched.length > 0 && (
+        <p className="muted tight">
+          Not a catalog flavor label: <code>{unmatched.join(', ')}</code> — expected for adopt-mode
+          labels (<code>ubuntu-latest</code>) and repo FlavorMap labels; a near-miss of a catalog
+          label here is a typo.
+        </p>
+      )}
+      {notRunnable.length > 0 && (
+        <p className="error tight">
+          {notRunnable.length} catalog flavor{notRunnable.length === 1 ? '' : 's'} cannot run here —
+          the label is not allowlisted, or the image is not published. A job naming it is left{' '}
+          <code>queued</code> by GitHub with no error. See <a href="#/flavors">Flavors</a> for the
+          per-flavor fix, and <a href="#/unclaimed">Unclaimed</a> for jobs already refused.
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
  * Label editing is two-phase on purpose: a change takes effect on the very next
  * `workflow_job` delivery, so the operator previews the impact (which jobs stop/start being
  * claimed) and only then commits.
@@ -514,6 +561,7 @@ function RunnerLabelsCard({ data, reload }: { data: SettingsData; reload: () => 
           using them run here instead of on GitHub-hosted runners (adopt mode).
         </p>
       )}
+      <AllowlistReconciliation data={data} />
 
       {data.canAdminPlatform && (
         <>

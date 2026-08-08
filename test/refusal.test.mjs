@@ -38,6 +38,7 @@ import {
   toWorkflowViewWithReadiness,
 } from '../dist/src/mgmt/refusal-views.js';
 import { statusGsiKeys, repoGsiKeys } from '../dist/src/shared/run-store.js';
+import { headSeamIntact, noSeam, seamAfterHop } from '../dist/src/mgmt/run-rollup.js';
 import { ALL_STATUSES, ACTIVE_STATUSES, buildFlavorViews } from '../dist/src/mgmt/views.js';
 import { ROUTES } from '../dist/src/mgmt/router.js';
 
@@ -702,6 +703,86 @@ test('mgmt reconciles workflows and flavors against the live control plane', () 
   );
   assert.match(flavors, /reconcileFlavors\(/);
   assert.match(flavors, /allowlist/);
+  // A failed live read must NOT be reconciled: `controlPlaneSnapshot` degrades to an empty
+  // allowlist + empty image map, and `reconcileFlavors` takes no view on `live`, so passing the
+  // sentinel through derives every catalog flavor as `unroutable`. The screen would then announce
+  // "N flavors cannot run in this environment" because SSM blipped — the same false certainty as
+  // the misleading green, inverted. Every readiness site must gate on `live` first.
+  assert.match(
+    flavors,
+    /snapshot\.live \? reconcileFlavors\(/,
+    'listFlavors must gate readiness on snapshot.live, not reconcile the failure sentinel',
+  );
+});
+
+test('no readiness site reconciles the failure sentinel', () => {
+  // Guards the rule above across EVERY consumer rather than one route: the defect class is a new
+  // caller of `reconcileFlavors` that forgets the `live` gate, and the sentinel is indistinguishable
+  // from a genuinely empty control plane once it is inside the reconciler.
+  const handler = stripComments(src('src/mgmt/handler.ts'));
+  const calls = [...handler.matchAll(/reconcileFlavors\(/g)];
+  assert.ok(calls.length >= 2, 'expected the Flavors and Settings readiness sites');
+  for (const m of calls) {
+    // The 120 characters before the call must carry a liveness gate: either an explicit ternary
+    // on `live`, or an early return that already proved it (`flavorReadinessOrUndefined`).
+    const before = handler.slice(Math.max(0, m.index - 120), m.index);
+    assert.match(
+      before,
+      /(live \?|!snapshot\.live\) return undefined;)/,
+      `reconcileFlavors call at ${m.index} is not gated on a live control-plane read`,
+    );
+  }
+  const readiness = stripComments(src('src/shared/flavor-readiness.ts'));
+  assert.doesNotMatch(
+    readiness,
+    /snapshot\.live/,
+    'reconcileFlavors must stay agnostic of `live` — the GATE belongs to its callers, so that a ' +
+      'caller which forgets it fails this test rather than silently rendering every flavor broken',
+  );
+});
+
+test('the unclaimed window reports a head/older seam it cannot prove is gap-free', () => {
+  // `lastSeenAt` is the sort key AND is rewritten on every re-delivery, so the head page re-orders
+  // while older pages are held — a strictly worse case than the Runs screen, whose GSI2 key is the
+  // immutable `createdAt`. A row that moves out from under the held cursor is in neither half and
+  // `dedupe` cannot recover it, so the screen must say the window may be incomplete instead of
+  // presenting itself as the full list of refusals.
+  const screen = stripComments(src('web/src/screens/Unclaimed.tsx'));
+  assert.match(screen, /headSeamIntact\(/, 'the seam must be checked, not assumed');
+  assert.match(screen, /seamAfterHop\(/, 'a "Load older" hop must advance the seam state');
+  assert.match(screen, /setSeam\(noSeam\)/, 'a filter change must reset the seam');
+  assert.match(screen, /window may be incomplete/, 'an unprovable window must be visible as such');
+  // The boundary must be read from the SAME head snapshot the cursor came from: capturing it after
+  // the await pins a fresher head page than the resume point, and a real hole reports intact.
+  const hop = screen.slice(screen.indexOf('async function loadOlder('), screen.indexOf('function toggle('));
+  assert.ok(hop.length > 0, 'loadOlder not found — update this test');
+  assert.ok(
+    hop.indexOf('headTailKey') < hop.indexOf('await api.unclaimed'),
+    'the seam boundary must be captured before the await, not after it',
+  );
+});
+
+test('the seam helpers behave as the unclaimed screen relies on', () => {
+  // Behaviour, not just wiring: before any hop the head page IS the window, so intact.
+  assert.equal(headSeamIntact({ headKeys: ['1-2-3'], pagedPastHead: false }), true);
+  // After a hop, the boundary row still on the head page ⇒ the two halves are adjacent.
+  const afterHop = seamAfterHop(noSeam, '1-2-3');
+  assert.equal(afterHop.pagedPastHead, true);
+  assert.equal(afterHop.boundaryKey, '1-2-3');
+  assert.equal(
+    headSeamIntact({ boundaryKey: afterHop.boundaryKey, headKeys: ['9-9-9', '1-2-3'], pagedPastHead: true }),
+    true,
+  );
+  // A recurring refusal rewrote `lastSeenAt`, re-ordering the head page until the boundary fell
+  // off it — the hole this test exists for.
+  assert.equal(
+    headSeamIntact({ boundaryKey: '1-2-3', headKeys: ['9-9-9', '8-8-8'], pagedPastHead: true }),
+    false,
+  );
+  // A hop that appended nothing still advanced the cursor, and an empty head snapshot leaves the
+  // boundary unprovable — treated as partial, never as intact.
+  assert.equal(seamAfterHop(noSeam, undefined).pagedPastHead, true);
+  assert.equal(headSeamIntact({ boundaryKey: undefined, headKeys: [], pagedPastHead: true }), false);
 });
 
 test('mgmt reads the allowlist VALUE live, and only that one non-secret parameter', () => {
@@ -767,6 +848,28 @@ test('the console exposes Unclaimed as its own destination', () => {
   assert.match(dash, /label=\{[\s\S]*unclaimedWindowDays/, 'the stat must name its window');
   // The count must not be folded into a run aggregate.
   assert.ok(!/active.*unclaimed|unclaimed.*errorRate/.test(dash));
+});
+
+test('Settings surfaces the allowlist-vs-catalog reconciliation on the runner-labels card', () => {
+  // Scope item 3 landed on the SETTINGS screen, which a sibling card (PR #28) rewrote into its own
+  // module while this work was in flight. The reconciliation therefore has to live beside trunk's
+  // runner-label editor — the field an operator edits in response to it — and not in the screen's
+  // previous home, where it would render nowhere. Pinned because that is exactly the kind of hunk a
+  // rebase silently drops: the file is not otherwise part of this change.
+  const settings = stripComments(src('web/src/screens/Settings.tsx'));
+  assert.match(settings, /function AllowlistReconciliation\(/);
+  assert.match(settings, /<AllowlistReconciliation data=\{data\} \/>/, 'defined but never rendered');
+  // Withheld — not rendered as broken — when the live read failed.
+  assert.match(settings, /controlPlaneLive === false/);
+  assert.match(settings, /unchecked/);
+  // It must not re-render the allowlist itself: `runnerLabels.labels` already shows it, and two
+  // fields for one fact can disagree.
+  const card = settings.slice(
+    settings.indexOf('function AllowlistReconciliation('),
+    settings.indexOf('function RunnerLabelsCard('),
+  );
+  assert.ok(card.length > 0, 'AllowlistReconciliation not found before RunnerLabelsCard');
+  assert.doesNotMatch(card, /data\.allowlist/, 'runnerLabels.labels is the one allowlist field');
 });
 
 test('the dashboard badge is windowed, and says so instead of claiming the present tense', () => {

@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, type Unclaimed as UnclaimedJob } from '../api.js';
 import { allowlistChanged } from '../../../src/shared/allowlist.js';
+import { headSeamIntact, noSeam, seamAfterHop, type SeamState } from '../rollup.js';
 import { useApi } from '../hooks.js';
 import { ErrorBox, Loading, formatTime } from '../components.js';
 
 const PAGE = 50;
+
+/** Refusal identity — the (repo, run, job) triple the store keys a row on. */
+function refusalKey(r: UnclaimedJob): string {
+  return `${r.repoId}-${r.runId}-${r.jobId}`;
+}
 
 /**
  * Unclaimed — jobs the claim gate refused (ADR-049).
@@ -28,6 +34,16 @@ const PAGE = 50;
  * Older history is reachable through the cursor — without that button the rows past the first page
  * would exist in the store and be unreachable from the console, which is the same invisibility
  * this screen exists to end.
+ *
+ * The head/older join is watched with the SAME seam check the Runs screen uses (`headSeamIntact`),
+ * and it matters MORE here. Runs pages GSI2 on the immutable `createdAt`, so only a newly created
+ * row can push its head page down. A refusal's sort key is `lastSeenAt`, which is REWRITTEN every
+ * time the refusal recurs — so the head page re-orders on re-delivery as well as on arrival, and a
+ * row that was above the resume point can move out from under it. Either way the loaded window
+ * gains a hole the held cursor resumes past, and `dedupe` cannot recover a row that is in neither
+ * half. When the boundary row is gone the window says so instead of presenting itself as the
+ * complete list — on a screen whose entire purpose is that no refusal goes unseen, silently
+ * dropping one is the one outcome that must not happen.
  */
 export function Unclaimed({
   repoFilter,
@@ -60,32 +76,59 @@ export function Unclaimed({
    */
   const filterRef = useRef(repoFilter);
   filterRef.current = repoFilter;
+  /**
+   * Head/older seam bookkeeping (see the component doc). `pagedPastHead` flips on the first
+   * "Load older" hop — including one that appends nothing, because `collectVisible` can walk
+   * several index pages of another tenant's rows and still advance the cursor. `boundaryKey` is
+   * the oldest head row at that moment; while it is still on the head page the two halves are
+   * adjacent.
+   */
+  const [seam, setSeam] = useState<SeamState>(noSeam);
 
-  // A filter change invalidates every appended page and its cursor.
+  // A filter change invalidates every appended page, its cursor and the seam.
   useEffect(() => {
     setOlder([]);
     setCursor(undefined);
     setMoreErr(undefined);
+    setSeam(noSeam);
   }, [repoFilter]);
 
   if (page.error) return <ErrorBox message={page.error} />;
   if (!page.data) return <Loading what="unclaimed jobs" />;
 
-  const rows = dedupe([...(page.data.unclaimed ?? []), ...older]);
+  const headRows = page.data.unclaimed ?? [];
+  const rows = dedupe([...headRows, ...older]);
   const live = page.data.allowlist;
   const headCursor = page.data.nextCursor;
   const nextCursor = cursor === undefined ? headCursor : cursor;
+  /**
+   * Is the loaded window still gap-free? Only ever false after a "Load older" hop — before that
+   * the head page IS the window. A `false` is reported to the operator rather than silently
+   * tolerated, with Refresh as the recovery (it remounts the window from a single snapshot).
+   */
+  const seamOk = headSeamIntact({
+    boundaryKey: seam.boundaryKey,
+    headKeys: headRows.map(refusalKey),
+    pagedPastHead: seam.pagedPastHead,
+  });
 
   async function loadOlder(): Promise<void> {
     if (!nextCursor) return;
     setLoadingMore(true);
     setMoreErr(undefined);
     const requestedFor = repoFilter;
+    // Captured from the SAME head snapshot the cursor was read from — recording it after the
+    // await would pin a fresher head page than the resume point it is supposed to sit above,
+    // and a window with a real hole would then report itself intact.
+    const headTailKey = headRows.length ? refusalKey(headRows[headRows.length - 1]) : undefined;
     try {
       const next = await api.unclaimed({ repo: repoFilter, limit: PAGE, cursor: nextCursor });
       if (filterRef.current !== requestedFor) return; // window no longer exists
       setOlder((prev) => [...prev, ...next.unclaimed]);
       setCursor(next.nextCursor);
+      // Advanced even when the hop appended nothing: the cursor moved, so the head page is no
+      // longer adjacent to the resume point.
+      setSeam((prev) => seamAfterHop(prev, headTailKey));
     } catch (e) {
       if (filterRef.current !== requestedFor) return;
       setMoreErr(e instanceof Error ? e.message : String(e));
@@ -147,7 +190,7 @@ export function Unclaimed({
           </thead>
           <tbody>
             {rows.map((r) => {
-              const key = `${r.repoId}-${r.runId}-${r.jobId}`;
+              const key = refusalKey(r);
               return (
                 <UnclaimedRow
                   key={key}
@@ -171,6 +214,12 @@ export function Unclaimed({
           </tbody>
         </table>
         {moreErr && <p className="error">{moreErr}</p>}
+        {!seamOk && (
+          <p className="error tight">
+            Newer refusals arrived while older pages were loaded, so this window may be missing rows
+            between them — refresh to reload it from one snapshot.
+          </p>
+        )}
         <div className="row gap-top">
           {nextCursor && (
             <button onClick={() => void loadOlder()} disabled={loadingMore}>
@@ -179,6 +228,7 @@ export function Unclaimed({
           )}
           <span className="muted">
             {rows.length} refused job{rows.length === 1 ? '' : 's'} shown, most recent first
+            {seamOk ? '' : ' (window may be incomplete)'}
           </span>
         </div>
       </div>
@@ -195,7 +245,7 @@ export function Unclaimed({
 function dedupe(rows: UnclaimedJob[]): UnclaimedJob[] {
   const seen = new Set<string>();
   return rows.filter((r) => {
-    const key = `${r.repoId}-${r.runId}-${r.jobId}`;
+    const key = refusalKey(r);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

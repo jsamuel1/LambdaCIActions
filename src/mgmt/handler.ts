@@ -36,7 +36,6 @@ import {
   toRepoView,
   toRunView,
   toSecretStatus,
-  toWorkflowView,
   type AppInstallationView,
   type LabelImpactView,
   type SettingsView,
@@ -730,7 +729,16 @@ async function route_(
         // The live control-plane reconciliation (ADR-050). Kept a SEPARATE array rather than
         // merged into each FlavorView so the catalog projection stays a pure function of the
         // catalog, and a per-flavor axis added elsewhere cannot collide with this one.
-        readiness: reconcileFlavors(catalogForReadiness(), snapshot),
+        //
+        // EMPTY when the live read failed, never reconciled against the failure sentinel.
+        // `controlPlaneSnapshot` degrades to `{allowlist: [], imagePublished: {}, live: false}`,
+        // and `reconcileFlavors` takes no view on `live` — so passing that sentinel through would
+        // derive every catalog flavor as `unroutable` and make the screen announce "N flavors
+        // cannot run in this environment" on a transient SSM error. That is the same false
+        // certainty as the misleading green this ADR removes, only inverted, and an alarm that
+        // fires when nothing is wrong is one operators stop reading. Same rule as
+        // `flavorReadinessOrUndefined` and the Settings route: unknown ≠ broken.
+        readiness: snapshot.live ? reconcileFlavors(catalogForReadiness(), snapshot) : [],
         allowlist: snapshot.allowlist,
         unmatchedAllowlistLabels: unmatchedAllowlistLabels(catalogForReadiness(), snapshot.allowlist),
         controlPlaneLive: snapshot.live,
