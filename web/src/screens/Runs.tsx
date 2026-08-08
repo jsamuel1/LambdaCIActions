@@ -32,7 +32,7 @@ function lowerBound(seconds: number, partial: boolean): string {
  *
  * The head page polls every 5 s so live runs advance in place; expansion is component state
  * keyed by `repoId-runId`, so a poll never collapses an open run. "Load older" walks the
- * API's opaque cursor (ADR-021) and appends — deeper paging requires a repo or status filter,
+ * API's opaque cursor (ADR-023) and appends — deeper paging requires a repo or status filter,
  * because the unfiltered merged view has no coherent cursor.
  *
  * Cost is deliberately absent: a per-run cost total belongs on the Reports screen with a time

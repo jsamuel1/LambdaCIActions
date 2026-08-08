@@ -87,7 +87,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /*
  * Layout helpers. These exist as CLASSES rather than inline `style={{...}}` attributes
- * because the console is served with a `self`-only CSP (ADR-022) and no `'unsafe-inline'`
+ * because the console is served with a `self`-only CSP (ADR-024) and no `'unsafe-inline'`
  * in `style-src` — a browser drops inline style attributes outright, so any layout
  * expressed that way would silently disappear in production while working in dev.
  */

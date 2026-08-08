@@ -1,7 +1,7 @@
 // Visibility-filtered pagination + tenant scoping in the Management API's read model
 // (spec 04 § Authorization, M4 review fixes).
 //
-// Run indexes (GSI1 status/time, GSI2 repo/time — ADR-021) are NOT keyed by installation,
+// Run indexes (GSI1 status/time, GSI2 repo/time — ADR-023) are NOT keyed by installation,
 // so every list is filtered after the query. Two bugs live in that gap:
 //   1. a page that filters down to a handful of rows must keep paging, or an operator whose
 //      installation is a minority of traffic sees "no runs" plus a cursor;

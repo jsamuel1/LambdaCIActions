@@ -170,7 +170,7 @@ Build steps (per flavor):
 2. Upload to the microVM **code bucket**.
 3. Trigger microVM image build → snapshot, requesting the catalog's memory floor
    (`--resources minimumMemoryInMiB`) and `--cpu-configurations architecture=ARM_64`, plus
-   `--additional-os-capabilities` for flavors that declare `osCapabilities` (ADR-020/028).
+   `--additional-os-capabilities` for flavors that declare `osCapabilities` (ADR-020/038).
 4. Poll to completion; prune old image versions (keep last N).
 5. Write the resulting **image ARN** to config (SSM/DynamoDB): `MICROVM_IMAGE_ARN_<FLAVOR>`.
 

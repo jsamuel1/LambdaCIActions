@@ -105,7 +105,7 @@ npm run build:images -- --env dev --region us-west-2 --dry-run
 **arm64 only** (AGENTS.md / ADR-007) — the base image + runner tarball are Graviton.
 
 The run-hook payload contract is baked into the image, so on any change to it the image and
-the control plane must move together (ADR-020 replaced `table` with `broker` + `token`): on
+the control plane must move together (ADR-021 replaced `table` with `broker` + `token`): on
 an existing env, rebuild the images in the same window as the Phase 3 deploy, with no
 in-flight jobs. A version-skewed pair fails `/run` (400) instead of running degraded.
 

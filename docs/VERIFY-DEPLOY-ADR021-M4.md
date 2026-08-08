@@ -60,7 +60,8 @@ table}` with `{ref, region, broker, token}`, so images and control plane must mo
 same window with no in-flight jobs (docs/DEPLOY-M1.md § Phase 2 — at the time of this
 deploy that note cited the decision as ADR-020; it is ADR-021, one of the stale
 cross-references the ADR-021 renumber left behind. Repointing those was tracked on its own
-card and deliberately not done here). Sequence used:
+card, deliberately out of scope here, and has since landed in `0d12638`, so the runbook now
+cites ADR-021 correctly). Sequence used:
 
 1. Confirmed the window was quiet: zero open PRs, zero non-`TERMINATED` microVMs
    (`list-microvms` → 12/12 `TERMINATED`, read across **all** pages — see the pagination

@@ -1,5 +1,5 @@
 /**
- * Control-plane secret redaction (ADR-020, extended by ADR-034).
+ * Control-plane secret redaction (ADR-021, extended by ADR-034).
  *
  * Two related jobs live here, both serving the AGENTS.md hard rule that no secret VALUE ever
  * reaches the UI, an API response, or a log:

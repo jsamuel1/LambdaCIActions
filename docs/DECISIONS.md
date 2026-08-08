@@ -216,7 +216,7 @@ Also: `RunMicrovm` requires `lambda:PassNetworkConnector` on the aws-managed con
 **Decision**:
 - Provision stashes `{jitConfig, runId, jobId, repoFullName, labels}` in the shared table
   (item `pk=RUN#…, sk=JITCONFIG`, TTL 30 min) and passes only a small pointer (~200 B) as
-  the run-hook payload. **Amended by [ADR-020](#adr-020)**: the pointer is now
+  the run-hook payload. **Amended by [ADR-021](#adr-021)**: the pointer is now
   `{ref, region, broker, token}` and the `/run` hook resolves the ref by invoking the hook
   broker λ, not by calling DynamoDB itself — the **microVM execution role**
   (`lca-<env>-microvm-exec`, stamped on every launch via `--execution-role-arn`, which
@@ -228,9 +228,9 @@ Also: `RunMicrovm` requires `lambda:PassNetworkConnector` on the aws-managed con
 **Why**: The 4 KB cap makes by-reference the only option; the run store already holds the
 run↔VM mapping (ADR-015), so it is the natural side-store, and the TTL bounds JIT-config
 exposure. The exec role gives the VM a scoped identity (narrowed to broker-invoke-only by
-ADR-020).
+ADR-021).
 **Consequences**: The microVM image and the control plane now share a contract (the ref
-format, and — per ADR-020 — the broker name + capability token) delivered via the payload.
+format, and — per ADR-021 — the broker name + capability token) delivered via the payload.
 Rotating the hook-path prefix is AWS's
 call — the server tolerates both shapes. Terminal-state JIT items age out via TTL; a
 failed launch leaves an orphaned JITCONFIG item that TTLs away harmlessly.
@@ -360,7 +360,7 @@ writing the id to the JITCONFIG item (second write path for the same fact — th
 IS the mapping per ADR-015); shortening the Reaper sweep (still pays idle minutes, just
 fewer); per-VM endpoint hostname parsing (endpoint shape is undocumented/unstable and the
 hook never sees its own endpoint).
-**Consequences**: **Accepted cross-tenant risk — SUPERSEDED by [ADR-020](#adr-020), which
+**Consequences**: **Accepted cross-tenant risk — SUPERSEDED by [ADR-021](#adr-021), which
 removed both grants from the VM.** As originally shipped the grant was region-scoped, not
 VM-scoped, so *anything* executing inside a microVM could terminate *any* microVM in the
 account/region. The role lives inside VMs that run **untrusted workflow code** — a
@@ -370,12 +370,12 @@ denial-of-service primitive. Accepted at the time because (a) the GA `lambda-mic
 exposes no VM-level resource ARNs or tags to scope against (ADR-015), (b) the blast
 radius is bounded to job availability — no data access, since each VM is its own VM with
 its own single-use JIT credentials — and (c) the alternative (Reaper-only) costs ~5 min
-of idle billing on every job. **Amplifier (also closed by ADR-020)**: the exec role's
+of idle billing on every job. **Amplifier (also closed by ADR-021)**: the exec role's
 run-table grant was `grantReadData` (table-wide `GetItem`/`Query`/`Scan`, pre-dating this
 ADR), so a VM could read other runs' rows and harvest their `microvmId` — target ids were
 discoverable from inside a VM.
 
-**Amendment (ADR-020, M3)**: step 2 and step 3 above no longer describe the shipped system.
+**Amendment (ADR-021, M3)**: step 2 and step 3 above no longer describe the shipped system.
 The VM does **not** read the run row and does **not** hold `lambda:TerminateMicrovm`; it
 invokes the hook broker λ with a per-run capability token and the broker performs the
 readback + terminate inside the control plane. The readback *mechanism* of this ADR is
@@ -746,9 +746,9 @@ stream-name suffix, so the pane read nothing for any run. The stream is now reso
 exact name before it is read.
 
 ## ADR-027 — Console repo config is enforced in Ingest, not the management plane (M4)
-**Status**: Accepted (v1) · follows [ADR-023](#adr-023)
+**Status**: Accepted (v1) · follows [ADR-025](#adr-025)
 **Context**: M4 gave the console `PATCH /api/repos/{repoId}` over `enabled`, `mode` and
-`defaultFlavor`. ADR-023 deliberately restricts the Mgmt λ to config writes — it cannot
+`defaultFlavor`. ADR-025 deliberately restricts the Mgmt λ to config writes — it cannot
 touch the hot path. That leaves an obvious gap: writing config is not the same as *honoring*
 it. As first implemented, `enabled=false` / `mode='off'` and `defaultFlavor` were persisted
 and rendered, but no control-plane code read them, so the console's Disable button and

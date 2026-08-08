@@ -1,4 +1,4 @@
-// Provision's config guard ordering (ADR-020). `HOOK_BROKER_NAME` is required to build the
+// Provision's config guard ordering (ADR-021). `HOOK_BROKER_NAME` is required to build the
 // run-hook payload; without it every launched VM 400s its own /run. The guard therefore has
 // to fire BEFORE the single-use GitHub JIT config is minted — otherwise a misconfigured
 // deploy burns one registration credential per SQS delivery on VMs that can never start,
@@ -44,7 +44,7 @@ test('the payload broker name comes from the guarded value, not a bare env read'
   assert.equal(envReads.length, 1, 'HOOK_BROKER_NAME should be read exactly once');
 });
 
-// ADR-020: the two brokered actions authorize against different items, so the SAME hash has
+// ADR-021: the two brokered actions authorize against different items, so the SAME hash has
 // to reach both — the JIT config item (jitconfig, TTL'd) and the run row (terminate, durable).
 // Mint once, hash once, write the hash twice, and hand the PLAINTEXT only to the VM payload.
 test('one token is minted per run and its hash is written to both items', () => {
@@ -67,7 +67,7 @@ test('the plaintext token is never persisted, only shipped in the launch payload
   // more risks a write to the store.
   assert.equal(plaintextUses.length, 4, `unexpected hookToken uses: ${plaintextUses.length}`);
   assert.match(src, /token: hookToken,/);
-  // The 4th use must be exactly the redaction of the launch error (ADR-020): the control
+  // The 4th use must be exactly the redaction of the launch error (ADR-021): the control
   // plane holds the plaintext, and an SDK error echoes the payload back into the run row's
   // `reason`. See test/provision-redaction.test.mjs.
   assert.match(src, /redactSecret\(errMsg\(err\), hookToken\)/);
