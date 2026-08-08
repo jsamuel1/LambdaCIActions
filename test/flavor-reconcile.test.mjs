@@ -141,6 +141,41 @@ test('a mid-build image warns rather than blocking — it is transient', () => {
 
 // --- unknown must never read as healthy -------------------------------------
 
+test('an UNREAD allowlist is never reported as a claimed label', () => {
+  // The other half of the same rule. `labelClaimed: undefined` means the allowlist was not read;
+  // `ok` asserts "label claimed", so returning it here would state an unobserved fact as health —
+  // the identical false confidence this module removes from the image probe, one field over. A
+  // consumer reading `image-arn-*` without `runner-labels` must not be told the flavor is runnable.
+  const row = rowFor({ name: 'python', imageArn: ARN, imageState: 'CREATED' });
+  assert.equal(row.health, 'label_unverified');
+  assert.notEqual(row.health, 'ok', 'an unread allowlist must not read as a claimed label');
+  assert.equal(row.severity, 'ok', 'unknown is not an alarm...');
+  // ...and unknown is not drift either — only an observed disagreement is. Asserted over the WHOLE
+  // catalog, because `reconcileFlavors` always emits a row per flavor and an unobserved flavor is
+  // legitimately `not_built`/blocked; a single-observation report would be drift for that reason
+  // rather than this one.
+  const allUnread = catalogFlavors().map((f) => ({
+    name: f.name,
+    imageArn: `${ARN}-${f.name}`,
+    imageState: 'CREATED',
+  }));
+  const unreadReport = reconcileFlavors(allUnread);
+  assert.deepEqual(
+    [...new Set(unreadReport.rows.map((r) => r.health))],
+    ['label_unverified'],
+  );
+  assert.equal(unreadReport.drift, false);
+  assert.equal(row.safeFix, null, 'unknown must never authorise an unattended action');
+  assert.doesNotMatch(row.detail, /label claimed/, 'the detail must not assert the claim');
+  assert.match(row.detail, /allowlist was not read/);
+
+  // Both halves unobserved is still not `ok`.
+  assert.notEqual(rowFor({ name: 'python', imageArn: ARN }).health, 'ok');
+
+  // ...and `ok` remains reachable only when BOTH facts were actually observed.
+  assert.equal(rowFor(obs()).health, 'ok');
+});
+
 test('an unchecked image is image_unverified, never ok', () => {
   // The CD report step (and the console) read SSM only. Presence of a parameter is not
   // evidence the image exists — the dev `python` ARN would have passed a presence check while

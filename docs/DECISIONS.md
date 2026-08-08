@@ -2648,7 +2648,10 @@ console shows it green is the same class of bug as the one being fixed here, so 
 (label, ARN, image state) → status/severity/fix exists exactly once. The console surface is a
 separate card and does **not** consume it yet; this ADR fixes the derivation it must use, and
 pins (in `test/flavor-reconcile.test.mjs`) that the console's presence-only evidence projects to
-`image_unverified` rather than `ok`.
+`image_unverified` rather than `ok`. The symmetric case is pinned too: an observation that never
+read `runner-labels` projects to `label_unverified`, not `ok` — `ok` asserts *label claimed*, and a
+consumer that read only `image-arn-*` has not observed that. Neither unknown counts as drift; only
+an observed disagreement does.
 
 A probe that fails for any reason other than `ResourceNotFoundException` yields *unknown*, not
 *absent*: an AccessDenied or a pre-2.35.17 AWS CLI would otherwise report a healthy catalog as

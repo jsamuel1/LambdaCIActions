@@ -98,6 +98,11 @@ export interface FlavorObservation {
  *
  * - `ok`                  — label claimed, ARN published, image usable.
  * - `image_unverified`    — label + ARN present, image state not checked (console view).
+ * - `label_unverified`    — image usable, but the allowlist was never read, so whether the flavor
+ *                          is reachable is unknown. NOT `ok`: `ok` asserts a claimed label, and a
+ *                          consumer that did not read `runner-labels` has not observed that. This
+ *                          is the `image_unverified` rule applied to the other half of the live
+ *                          state — unknown is neither health nor drift.
  * - `image_building`      — ARN present, image mid-build. Transient.
  * - `label_missing`       — the label is not claimed, so the flavor can never be selected. Safe
  *                          to fix by adding the label ONLY when the image was verified usable;
@@ -112,6 +117,7 @@ export interface FlavorObservation {
 export type FlavorHealth =
   | 'ok'
   | 'image_unverified'
+  | 'label_unverified'
   | 'image_building'
   | 'label_missing'
   | 'image_missing'
@@ -152,7 +158,8 @@ export interface FlavorReconcileRow {
 
 export interface FlavorReconcileReport {
   rows: FlavorReconcileRow[];
-  /** True when any row is not `ok`/`image_unverified` — i.e. catalog and live state disagree. */
+  /** True when any row is not `ok`/`image_unverified`/`label_unverified` — i.e. catalog and live
+   *  state demonstrably disagree. An UNOBSERVED field is not disagreement, so it is not drift. */
   drift: boolean;
   counts: Record<FlavorSeverity, number>;
   /**
@@ -166,6 +173,9 @@ export interface FlavorReconcileReport {
 const SEVERITY: Record<FlavorHealth, FlavorSeverity> = {
   ok: 'ok',
   image_unverified: 'ok',
+  // Unknown is not an alarm and not drift — the same treatment `image_unverified` gets. What it
+  // must never be is `ok`, which claims a label this observation never looked at.
+  label_unverified: 'ok',
   image_building: 'warn',
   label_missing: 'warn',
   image_missing: 'blocked',
@@ -195,6 +205,10 @@ function healthOf(obs: FlavorObservation): FlavorHealth {
 
   // Image is usable (or presumed so). The remaining question is reachability.
   if (claimed === false) return 'label_missing';
+  // The allowlist was never read. `ok` would assert `label claimed` from an unobserved fact —
+  // exactly the false confidence this module exists to remove, one field over from the image
+  // probe. Report the ignorance instead; an unread allowlist is not a claimed one.
+  if (claimed === undefined) return 'label_unverified';
   if (state === undefined) return 'image_unverified';
   return 'ok';
 }
@@ -205,6 +219,11 @@ function detailOf(row: Omit<FlavorReconcileRow, 'detail' | 'fix' | 'safeFix'>): 
       return `runnable — label claimed, image ${row.imageState}`;
     case 'image_unverified':
       return 'label claimed and an image ARN is published; image state not checked from here';
+    case 'label_unverified':
+      return (
+        `image ${row.imageState ?? 'ARN published'} — but the live allowlist was not read, so ` +
+        `whether '${row.label}' is claimed (and the flavor therefore selectable) is unknown`
+      );
     case 'image_building':
       return `image is ${row.imageState} — not launchable until it reaches CREATED/UPDATED`;
     case 'label_missing':
