@@ -290,7 +290,12 @@ npm run build:images -- --env <env> --rebuild                 # whole set
 ```
 
 Quiesce first for either — the image-hook contract is a serialized skew window, so no job may
-be in flight (`aws lambda-microvms list-microvms`, all pages).
+be in flight. **`build:images` enforces this itself**: it enumerates all pages of
+`lambda-microvms list-microvms` and refuses while any microVM is non-terminated (`--publish-label-only`
+and `--dry-run` are exempt — neither touches an image). Observation is not a freeze, though:
+pause the other writers too (this repo dogfoods its own runners, so a merge mid-window strands
+its jobs). `--force-unquiesced` overrides the refusal for a VM wedged non-terminal that the
+Reaper has not yet collected — only after you have frozen the writers by hand.
 
 **Fix drift in the safe direction only:**
 
@@ -302,6 +307,11 @@ npm run flavors:reconcile -- --env <env> --fix
 label** — that would take routing away from jobs that may depend on it right now — and it
 refuses outright if any microVM is non-terminated. Removing a flavor is a deliberate act: drop
 it from `flavors.json` *and* edit the allowlist parameter by hand.
+
+Exit codes for `--fix` follow the same 1-vs-2 rule as a plain report: **1** means drift remains
+(including drift `--fix` will not touch, such as an in-flight build), **2** means something went
+wrong and this report should not be trusted — an unreadable fleet, or a remediation that failed
+part-way, which stops the run rather than continuing down the list.
 
 CD runs `flavors:reconcile --no-image-check` as a **report-only** step, so drift shows up in the
 deploy summary. It never builds: an image build is deploy-touching, and the CD job is itself a

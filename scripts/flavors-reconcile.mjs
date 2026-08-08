@@ -15,11 +15,16 @@
  * command that would tell you. This is that command.
  *
  * Exit codes:
- *   0 — catalog and live state agree (or every difference is a `warn` cleared by --fix)
- *   1 — drift
- *   2 — usage error / could not read live state (including an image probe we could not
- *       complete: an unreadable image is UNKNOWN, and reporting it as missing would be a
- *       confident verdict about a plane we never observed)
+ *   0 — catalog and live state agree, and nothing is left to do
+ *   1 — drift (including drift `--fix` could not safely remediate, e.g. an in-flight build or a
+ *       flavor whose only honest remedy is a human decision)
+ *   2 — usage error / could not read live state / a remediation failed. Includes an image probe
+ *       we could not complete: an unreadable image is UNKNOWN, and reporting it as missing would
+ *       be a confident verdict about a plane we never observed.
+ *
+ * The 1-vs-2 split is the whole point of this tool applied to itself: 1 means "I read the plane
+ * and it disagrees with the catalog", 2 means "do not trust this report". A failure to read the
+ * fleet or a failed build must never masquerade as ordinary drift.
  *
  * `--fix` moves in the SAFE direction ONLY:
  *   - `not_built` / `image_missing` / `image_failed` → build the image, then add the label
@@ -179,6 +184,9 @@ function imageState(imageArn) {
  * Enumerate ALL pages of non-terminated microVMs. `--fix` builds/updates images, and the
  * image-hook contract has a serialized skew window: a VM booting from an image being replaced
  * is the failure this refuses to race. Read-only reporting does not need this.
+ *
+ * Throws on a failed read — an unreadable fleet is not an empty one, and the caller maps that
+ * to exit 2 rather than letting "could not look" read as ordinary drift.
  */
 function nonTerminatedMicroVms() {
   const live = [];
@@ -306,6 +314,11 @@ async function main() {
     process.exit(2);
   }
   const actionable = report.rows.filter((r) => r.safeFix);
+  // Drift this tool will NOT touch: an in-flight build, or a state whose only honest remedy is a
+  // human decision (an unverifiable image, a catalog entry that should be deleted). It must
+  // still be reported as drift after a partial fix — exiting 0 because the fixable half was
+  // fixed would claim agreement the plane does not have.
+  const unfixable = report.rows.filter((r) => r.severity !== 'ok' && !r.safeFix);
   if (actionable.length === 0) {
     console.log('\n--fix: nothing safely fixable.');
     process.exit(report.drift ? 1 : 0);
@@ -314,7 +327,14 @@ async function main() {
   // Quiesce gate. Building/updating an image while VMs are booting from it races the
   // serialized image-hook window; adding a label is comparatively cheap but is still a live
   // routing change, so one gate covers both.
-  const live = nonTerminatedMicroVms();
+  let live;
+  try {
+    live = nonTerminatedMicroVms();
+  } catch (e) {
+    // An unreadable fleet is not a quiescent one, and it is not drift either.
+    console.error(`\nERROR: could not read the microVM fleet — ${e.message}`);
+    process.exit(2);
+  }
   if (live.length > 0) {
     console.error(
       `\nERROR: ${live.length} non-terminated microVM(s) — refusing to touch images or the ` +
@@ -329,9 +349,37 @@ async function main() {
     const flags = ['--env', ENV, '--region', REGION, '--flavor', r.name];
     if (r.safeFix === 'add-label') flags.push('--publish-label-only');
     console.log(`\n→ ${r.name} (${r.health}): build-images ${flags.join(' ')}`);
-    run(process.execPath, [path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), ...flags]);
+    try {
+      run(process.execPath, [path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), ...flags]);
+    } catch (e) {
+      // A half-applied fix leaves the plane in a state this report no longer describes, so stop
+      // and say so. Exit 2, not 1: the operator's next action is to read the failure, not to
+      // read a drift table.
+      console.error(`\nERROR: remediation for ${r.name} failed — ${e.message}`);
+      console.error(
+        'Stopping: later flavors were NOT attempted. Re-run `npm run flavors:reconcile` to see ' +
+          'the current state before retrying.',
+      );
+      process.exit(2);
+    }
   }
   console.log('\n--fix complete. Re-run `npm run flavors:reconcile` to confirm.');
+  // Only the fixable half is fixed. Anything left is still drift, and the exit code has to say
+  // so or a scheduled `--fix` run reports success while a flavor stays unrunnable.
+  if (unfixable.length > 0) {
+    console.error(
+      `\n${unfixable.length} flavor(s) still drifted and NOT safely fixable: ` +
+        `${unfixable.map((r) => `${r.name} (${r.health})`).join(', ')}.`,
+    );
+    process.exit(1);
+  }
 }
 
-await main();
+// A thrown error anywhere above is an operational failure, not drift: exit 2 so a caller can
+// tell "this report is untrustworthy" from "the plane disagrees with the catalog".
+try {
+  await main();
+} catch (e) {
+  console.error(`\nERROR: ${e?.message ?? e}`);
+  process.exit(2);
+}

@@ -5,6 +5,7 @@
  * `lambda-microvms` API (2025-09-09).
  *
  * For each flavor in microvm/flavors.json:
+ *   0. Refuse unless the fleet is quiescent (zero non-terminated microVMs, ALL pages).
  *   1. Stage the flavor's Dockerfile.<flavor> as `Dockerfile` in a temp build context.
  *   2. Zip the microvm/ context.
  *   3. Upload the zip to the image code bucket (from ImageStack; discovered via SSM).
@@ -45,6 +46,22 @@
  *   node scripts/build-images.mjs --env dev --flavor go --skip-label
  *   node scripts/build-images.mjs --env dev --flavor python --publish-label-only
  *   node scripts/build-images.mjs --dry-run                       # print plan, no side effects
+ *   node scripts/build-images.mjs --env dev --flavor node --rebuild --force-unquiesced
+ *
+ * ## The quiesce gate is enforced here, not left to the runbook (ADR-049)
+ *
+ * `update-microvm-image` replaces the image every runner in the environment boots from, and the
+ * image-hook contract is a serialized skew window: a VM resuming from a snapshot whose image is
+ * being replaced fails `/run` rather than running degraded (docs/DEPLOY-M1.md phase 2,
+ * docs/VERIFY-DEPLOY-ADR021-M4.md). `flavors:reconcile --fix` already refuses on a live fleet,
+ * and it fixes drift by shelling out to THIS script — so leaving the direct invocation ungated
+ * would mean the documented primary command (`npm run build:images -- --flavor <name>`) is the
+ * only path that can race, which is exactly backwards. The check reads every page: page 1 caps
+ * at 10, so a first-page-only read calls the window quiet while a live VM sits on page 2.
+ *
+ * Observation is not a freeze — pause the other writers too (this repo dogfoods its own
+ * runners, so a merge mid-window strands its jobs). The gate is the floor, not the whole
+ * procedure.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -95,6 +112,13 @@ const PUBLISH_LABEL_ONLY = Boolean(args['publish-label-only']);
  * drift, which `npm run flavors:reconcile` reports and can safely fix later.
  */
 const SKIP_LABEL = Boolean(args['skip-label']);
+/**
+ * Escape hatch for the quiesce gate, for the one case the gate cannot distinguish: a microVM
+ * wedged in a non-terminal state that the Reaper has not yet collected, when the operator has
+ * already frozen every writer by hand. Deliberately verbose and deliberately logged — it
+ * disables the only automated protection against a mid-boot image swap.
+ */
+const FORCE_UNQUIESCED = Boolean(args['force-unquiesced']);
 const SSM_PREFIX = `/lca/${ENV}`;
 const LABELS_PARAM = `${SSM_PREFIX}/config/runner-labels`;
 
@@ -146,6 +170,69 @@ function aws(cliArgs, { capture = true } = {}) {
     throw new Error(`aws ${full.slice(0, 2).join(' ')} failed: ${r.stderr || r.stdout}`);
   }
   return r;
+}
+
+/**
+ * Every non-terminated microVM, across ALL pages.
+ *
+ * Pagination is the sharp edge: `list-microvms` caps page 1 at 10 and the CLI applies `--query`
+ * per page, so the obvious one-liner can report an empty fleet while a live VM sits on page 2
+ * (docs/DEPLOY-M1.md phase 2). A partial read here would make the gate worse than no gate — it
+ * would license the swap it exists to prevent.
+ */
+function nonTerminatedMicroVms() {
+  const live = [];
+  let token = null;
+  for (;;) {
+    const cmd = ['lambda-microvms', 'list-microvms', '--output', 'json'];
+    if (token) cmd.push('--next-token', token);
+    const r = aws(cmd); // throws on failure: an unreadable fleet is not an empty one
+    const body = JSON.parse(r.stdout);
+    for (const vm of body.items ?? body.microvms ?? []) {
+      const state = String(vm.state ?? '').toUpperCase();
+      if (state !== 'TERMINATED' && state !== 'FAILED') live.push(vm);
+    }
+    token = body.nextToken ?? body.NextToken ?? null;
+    if (!token) return live;
+  }
+}
+
+/**
+ * Refuse to build or replace an image while any microVM is live.
+ *
+ * Only guards the BUILD path. `--publish-label-only` writes one label and touches no image, so
+ * gating it on an idle fleet would block the safe half of remediation during ordinary traffic
+ * — and a label add cannot skew a running VM: it changes only which future jobs are claimed.
+ */
+function assertQuiescentFleet() {
+  if (DRY_RUN) {
+    console.log('  [dry-run] would require zero non-terminated microVMs (all pages)');
+    return;
+  }
+  const live = nonTerminatedMicroVms();
+  if (live.length === 0) {
+    console.log('fleet:          quiescent (0 non-terminated microVMs, all pages)');
+    return;
+  }
+  const listed = live
+    .slice(0, 10)
+    .map((vm) => `  ${vm.microvmId ?? '?'} ${vm.state ?? '?'}`)
+    .join('\n');
+  if (FORCE_UNQUIESCED) {
+    console.warn(
+      `\n!! --force-unquiesced: proceeding with ${live.length} non-terminated microVM(s). A VM ` +
+        'booting from an image being replaced fails /run (ADR-049). Only correct if you have ' +
+        `frozen every writer by hand.\n${listed}`,
+    );
+    return;
+  }
+  throw new Error(
+    `${live.length} non-terminated microVM(s) — refusing to build or replace an image. The ` +
+      'image-hook contract is a serialized skew window: a VM resuming while its image is ' +
+      'replaced fails /run instead of running degraded. Wait for the fleet to drain (and pause ' +
+      'the other writers — this repo dogfoods its own runners), then re-run. ' +
+      `--force-unquiesced overrides, once you know why.\n${listed}`,
+  );
 }
 
 function ssmGet(name) {
@@ -538,6 +625,11 @@ async function main() {
     `${REBUILD ? 'Rebuilding' : 'Building'} ${flavors.length} flavor(s) for env=${ENV}` +
       `${DRY_RUN ? ' (dry-run)' : ''}`,
   );
+
+  // Quiesce BEFORE anything is staged, uploaded or triggered (ADR-049). Cheap, and refusing
+  // after a 200 MB upload would still have raced nothing — but refusing after
+  // `update-microvm-image` would be too late by definition.
+  assertQuiescentFleet();
 
   const bucket = DRY_RUN ? '<image-code-bucket>' : ssmGet(`${SSM_PREFIX}/config/image-code-bucket`);
   const buildRoleArn = DRY_RUN

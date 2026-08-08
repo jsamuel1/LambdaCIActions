@@ -497,6 +497,89 @@ test('a rebuild repoints the ARN and leaves the label alone', () => {
   assert.match(BUILD_CODE, /REBUILD/);
 });
 
+test('build-images refuses to build or replace an image on a live fleet', () => {
+  // `flavors:reconcile --fix` gates on an idle fleet and then fixes drift by shelling out to
+  // THIS script. Leaving the direct invocation ungated would make the DOCUMENTED primary
+  // command (`npm run build:images -- --flavor <name>`) the only path that can race a booting
+  // VM against the image being replaced — exactly backwards.
+  assert.match(BUILD_CODE, /function assertQuiescentFleet\(/);
+  assert.match(BUILD_CODE, /function nonTerminatedMicroVms\(/);
+
+  // ALL pages: page 1 caps at 10, so a first-page read calls the window quiet while a live VM
+  // sits on page 2 (docs/DEPLOY-M1.md phase 2). A partial read would license the swap.
+  const lister = BUILD_CODE.slice(
+    BUILD_CODE.indexOf('function nonTerminatedMicroVms('),
+    BUILD_CODE.indexOf('function assertQuiescentFleet('),
+  );
+  assert.ok(lister.length > 0, 'nonTerminatedMicroVms body not found');
+  assert.match(lister, /nextToken/, 'must follow the pagination token');
+  assert.match(lister, /aws\(cmd\)/, 'must use aws(), which throws — unreadable is not empty');
+
+  // The gate refuses; it does not warn and continue.
+  const gate = BUILD_CODE.slice(
+    BUILD_CODE.indexOf('function assertQuiescentFleet('),
+    BUILD_CODE.indexOf('function ssmGet('),
+  );
+  assert.ok(gate.length > 0, 'assertQuiescentFleet body not found');
+  assert.match(gate, /throw new Error\(/, 'a live fleet must refuse, not warn');
+
+  // ...and it runs before ANY image side effect: before the bucket/role reads, before staging,
+  // before create/update. Refusing after `update-microvm-image` would be too late by definition.
+  const mainBody = BUILD_CODE.slice(BUILD_CODE.indexOf('async function main('));
+  const gateCall = mainBody.indexOf('assertQuiescentFleet()');
+  const firstBuild = mainBody.indexOf('buildFlavor(flavor, ctx)');
+  const bucketRead = mainBody.indexOf('config/image-code-bucket');
+  assert.ok(gateCall > 0, 'main() must call the quiesce gate');
+  assert.ok(gateCall < firstBuild, 'the gate must precede any build');
+  assert.ok(gateCall < bucketRead, 'the gate must precede the first AWS read of the build path');
+});
+
+test('the quiesce gate exempts --dry-run and the label-only path, and nothing else', () => {
+  const gate = BUILD_CODE.slice(
+    BUILD_CODE.indexOf('function assertQuiescentFleet('),
+    BUILD_CODE.indexOf('function ssmGet('),
+  );
+  // A dry run makes no API call at all, so gating it would only make the preview need a
+  // credential.
+  assert.match(gate, /DRY_RUN/);
+
+  // `--publish-label-only` writes one label and touches no image. Gating it on an idle fleet
+  // would block the safe half of remediation during ordinary traffic, and a label add cannot
+  // skew a running VM — it only changes which FUTURE jobs are claimed.
+  //
+  // Slice within main(): the function DEFINITION appears earlier in the file than this branch,
+  // so a whole-file indexOf would find the definition and silently produce an empty range.
+  const mainOnly = BUILD_CODE.slice(BUILD_CODE.indexOf('async function main('));
+  const only = mainOnly.slice(
+    mainOnly.indexOf('if (PUBLISH_LABEL_ONLY) {'),
+    mainOnly.indexOf('assertQuiescentFleet()'),
+  );
+  assert.ok(only.length > 0, 'publish-label-only branch must precede the gate');
+  assert.doesNotMatch(only, /assertQuiescentFleet\(/);
+  assert.match(only, /return;/, 'the label-only path must return before the build path');
+});
+
+test('--force-unquiesced is an explicit, loud override rather than a silent default', () => {
+  // The one case the gate cannot distinguish: a VM wedged non-terminal that the Reaper has not
+  // collected, with every writer already frozen by hand. It must be opt-in and it must say so.
+  assert.match(BUILD_CODE, /force-unquiesced/);
+  const gate = BUILD_CODE.slice(
+    BUILD_CODE.indexOf('function assertQuiescentFleet('),
+    BUILD_CODE.indexOf('function ssmGet('),
+  );
+  const forced = gate.indexOf('FORCE_UNQUIESCED');
+  const refusal = gate.indexOf('throw new Error(');
+  assert.ok(forced > 0 && refusal > 0, 'expected both an override and a refusal');
+  assert.ok(forced < refusal, 'the override must be checked before refusing, not after');
+  assert.match(gate, /console\.warn\(/, 'an override must be logged, not silent');
+  // Default is refuse: the flag has to be passed.
+  assert.match(
+    BUILD_CODE,
+    /const FORCE_UNQUIESCED = Boolean\(args\['force-unquiesced'\]\)/,
+    'the override must default to false',
+  );
+});
+
 // --- reconcile CLI contract -------------------------------------------------
 
 test('the reconcile CLI is pinned to a deploy target with no dry-run exemption', () => {
@@ -524,6 +607,53 @@ test('--fix never removes a label and refuses a non-quiescent fleet', () => {
 test('--fix is rejected with --no-image-check', () => {
   // Adding a label on the strength of an unverified parameter is the ordering violation.
   assert.match(RECONCILE_CODE, /--fix requires the real image state/);
+});
+
+test('drift --fix could not remediate still exits non-zero', () => {
+  // Exiting 0 because the FIXABLE half was fixed would claim an agreement the plane does not
+  // have: an `image_building` row (or any state whose remedy is a human decision) carries no
+  // safeFix, so a scheduled `--fix` would report success while a flavor stayed unrunnable.
+  const fix = RECONCILE_CODE.slice(RECONCILE_CODE.indexOf('const actionable ='));
+  assert.ok(fix.length > 0, '--fix block not found');
+  assert.match(fix, /const unfixable = /, 'must compute the rows it will not touch');
+  assert.match(
+    fix,
+    /unfixable\.length > 0[\s\S]{0,600}?process\.exit\(1\)/,
+    'leftover drift must exit 1, not 0',
+  );
+  // And that check must come AFTER the remediation loop, or a fixable row would be counted
+  // against the run it is about to fix.
+  const loop = fix.indexOf('for (const r of actionable)');
+  const leftover = fix.indexOf('unfixable.length > 0');
+  assert.ok(loop > 0 && leftover > loop, 'the leftover check must follow the fix loop');
+});
+
+test('an operational failure exits 2, never 1 — it is not drift', () => {
+  // The 1-vs-2 split is this tool applied to itself: 1 means "I read the plane and it
+  // disagrees", 2 means "do not trust this report". An unreadable fleet or a failed build
+  // reported as drift sends the operator to a table instead of to the error.
+  assert.match(
+    RECONCILE_CODE,
+    /catch[\s\S]{0,200}?could not read the microVM fleet[\s\S]{0,200}?process\.exit\(2\)/,
+    'an unreadable fleet must exit 2',
+  );
+  assert.match(
+    RECONCILE_CODE,
+    /remediation for \$\{r\.name\} failed[\s\S]{0,400}?process\.exit\(2\)/,
+    'a failed remediation must exit 2 and stop',
+  );
+  // A throw anywhere else must not fall through to node's default exit 1.
+  assert.match(
+    RECONCILE_CODE,
+    /try \{\s*await main\(\);\s*\} catch[\s\S]{0,200}?process\.exit\(2\)/,
+    'main() must be wrapped so an unexpected throw exits 2',
+  );
+});
+
+test('a failed remediation stops rather than continuing down the list', () => {
+  // A half-applied fix leaves the plane in a state the printed report no longer describes.
+  const fix = RECONCILE_CODE.slice(RECONCILE_CODE.indexOf('for (const r of actionable)'));
+  assert.match(fix, /were NOT attempted/);
 });
 
 test('the CLI derives verdicts from the shared module, not its own copy', () => {

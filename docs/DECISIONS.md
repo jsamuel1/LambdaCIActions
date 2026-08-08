@@ -2622,10 +2622,25 @@ Checking that a parameter *exists* is not evidence the image does. The published
 **4. `--fix` moves in the safe direction only.** Build a missing image, or add a label for an
 image that verifies. It **never removes a label**: that takes routing away from jobs which may
 depend on it right now, and "advertised but unbuildable" is a decision (build it, or delete
-the catalog entry), not a cleanup. `--fix` additionally enumerates **all pages** of
-non-terminated microVMs and refuses on a non-quiescent fleet — the image-hook contract has a
-serialized skew window, and a VM booting from an image being replaced is the race that gate
-exists to prevent. `--fix` is rejected outright with `--no-image-check`.
+the catalog entry), not a cleanup. `--fix` is rejected outright with `--no-image-check`.
+
+**4b. The quiesce gate lives in `build-images`, not only in `--fix`.** Both commands refuse on a
+non-quiescent fleet, enumerating **all pages** of non-terminated microVMs — the image-hook
+contract has a serialized skew window, and a VM resuming from a snapshot whose image is being
+replaced fails `/run` instead of running degraded. Putting the gate only in `--fix` would have
+left the *documented primary command* (`npm run build:images -- --flavor <name>`) as the one path
+that could race, while its own wrapper was safe — and `--fix` remediates by shelling out to that
+very script. `--publish-label-only` is exempt: a label write cannot skew a running VM, it only
+changes which future jobs are claimed, and gating it would block the safe half of remediation
+during ordinary traffic. `--force-unquiesced` exists for a VM wedged non-terminal that the Reaper
+has not collected, and is logged loudly. The gate is a floor, not the whole procedure: pause the
+other writers too.
+
+**4c. Exit codes distinguish "the plane disagrees" from "do not trust this report."** 1 is drift
+— including drift `--fix` will not touch, so a partially-remediated run cannot exit 0 and claim
+agreement. 2 is an operational failure: unreadable live state, an incomplete image probe, an
+unreadable fleet, or a remediation that failed part-way (which stops rather than continuing).
+Collapsing the two would let "I could not look" render as an ordinary drift table.
 
 **5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
 a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the

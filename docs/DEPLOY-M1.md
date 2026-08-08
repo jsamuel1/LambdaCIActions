@@ -141,6 +141,13 @@ Other flags:
 | `--rebuild` | intent marker for a patch-day rebuild; repoints the ARN after the new version verifies and leaves the label in place |
 | `--skip-label` | publish the ARN but do not advertise the flavor yet (leaves `label_missing` drift) |
 | `--publish-label-only` | no build: verify an already-published image and add its label |
+| `--force-unquiesced` | override the quiesce refusal below. For a VM wedged non-terminal with every writer already frozen by hand |
+
+**The quiesce gate is enforced, not advisory.** Before staging or uploading anything, the
+script enumerates **all pages** of non-terminated microVMs and refuses if any exist — replacing
+an image that a resuming VM boots from fails `/run` rather than running degraded (see the freeze
+gate below). `--publish-label-only` is exempt: it writes one label and touches no image, so it
+cannot skew a running VM. `--dry-run` is exempt because it calls nothing.
 
 Confirm afterwards:
 
@@ -155,7 +162,8 @@ the control plane must move together (ADR-021 replaced `table` with `broker` + `
 an existing env, rebuild the images in the same window as the Phase 3 deploy, with no
 in-flight jobs. A version-skewed pair fails `/run` (400) instead of running degraded.
 
-The freeze gate is "zero non-`TERMINATED` microVMs", and it has one sharp edge:
+The freeze gate is "zero non-`TERMINATED` microVMs", `build:images` enforces it itself, and it
+has one sharp edge:
 `list-microvms` paginates (page 1 caps at 10) and the CLI evaluates `--query` **per page**,
 printing one result per page. A first-page-only read can call the window quiet while a live
 VM sits on page 2, so filter for the non-terminated set and read every page:
