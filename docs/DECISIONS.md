@@ -2662,7 +2662,11 @@ run against that snapshot reports success after adding no label at all — the w
 unrunnable, from a command that just said it fixed it. Re-observing costs a handful of API calls
 and generalises to any remediation that silently no-ops. An incomplete probe on that second read
 is exit 2 (unknown), not success. With `--json`, `--fix` emits exactly one document — the
-post-fix report — because two on one stdout parse as neither.
+post-fix report — because two on one stdout parse as neither. That holds on the paths where
+nothing was remediated too: `--json` suppresses the pre-fix document to keep the count at one, so
+a run with no safely-fixable row emits that report itself (with an empty `fixed`) rather than
+leaving a consumer prose and no document — reachable both on a healthy environment (exit 0) and
+with a build in flight (`image_building` is warn with no safe fix, exit 1).
 
 **5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
 a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the

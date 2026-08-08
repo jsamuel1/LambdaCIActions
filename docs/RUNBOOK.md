@@ -327,6 +327,8 @@ that it succeeded. Scored against the plane instead, that run exits 1 and names 
 the parameter (`docs/DEPLOY-M1.md` phase 0) and re-run.
 
 With `--json`, `--fix` prints exactly one document: the post-fix report, matching the exit code.
+A run that finds nothing safely fixable prints that same shape with an empty `fixed`, so the
+output is always parseable — never prose on stdout.
 
 CD runs `flavors:reconcile --no-image-check` as a **report-only** step, so drift shows up in the
 deploy summary. It never builds: an image build is deploy-touching, and the CD job is itself a

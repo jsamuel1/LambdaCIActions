@@ -342,7 +342,23 @@ async function main() {
   }
   const actionable = report.rows.filter((r) => r.safeFix);
   if (actionable.length === 0) {
-    console.log('\n--fix: nothing safely fixable.');
+    // Still exactly one document. Nothing was remediated, so the report already read above IS
+    // the post-fix state — but `--json` suppressed it on the way in (to avoid printing two), so
+    // emitting nothing here would leave a `--json --fix` caller with prose on stdout and no
+    // document to reconcile against the exit code. Reachable on a healthy environment (every
+    // row ok, exit 0) and on `image_building` (warn, no safe fix, exit 1) alike. Same key shape
+    // as the post-fix document, with an empty `fixed`, so a consumer parses one schema.
+    if (JSON_OUT) {
+      console.log(
+        JSON.stringify(
+          { env: ENV, region: REGION, fixed: [], labels: liveLabels, ...report, probeFailures },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log('\n--fix: nothing safely fixable.');
+    }
     process.exit(report.drift ? 1 : 0);
   }
 

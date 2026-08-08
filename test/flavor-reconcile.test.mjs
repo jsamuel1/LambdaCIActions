@@ -915,6 +915,34 @@ test('--fix emits exactly one JSON document, describing the post-fix state', () 
   assert.match(post, /JSON\.stringify\(/, 'the post-fix path must emit the JSON document');
 });
 
+test('--json --fix still emits a document when nothing is safely fixable', () => {
+  // `--json` suppresses the pre-fix document on the way in so that only one is printed. The
+  // no-op branch therefore has to print one itself, or a `--json --fix` caller gets prose on
+  // stdout and NO document to reconcile against the exit code — unparseable, and
+  // indistinguishable from a crash. Both exits are reachable without any drift being fixable: a
+  // healthy environment (every row `ok`, exit 0) and an in-flight build (`image_building` is
+  // warn with `safeFix: null`, exit 1).
+  const branch = /if \(actionable\.length === 0\) \{[\s\S]{0,1400}?process\.exit\(report\.drift \? 1 : 0\);/.exec(
+    RECONCILE_CODE,
+  );
+  assert.ok(branch, 'the nothing-fixable branch was not found');
+  // The document must be emitted INSIDE that branch, gated on --json...
+  assert.match(
+    branch[0],
+    /if \(JSON_OUT\) \{[\s\S]{0,400}?JSON\.stringify\(/,
+    'the no-op fix path must emit its own JSON document',
+  );
+  // ...and carry the same keys as the post-fix document, so a consumer parses one schema.
+  const doc = /JSON\.stringify\(\s*\{([\s\S]{0,400}?)\}/.exec(branch[0]);
+  assert.ok(doc, 'no JSON payload found in the no-op fix branch');
+  for (const key of ['env', 'region', 'fixed', 'labels', 'probeFailures']) {
+    assert.match(doc[1], new RegExp(`\\b${key}\\b`), `the no-op document omits ${key}`);
+  }
+  assert.match(doc[1], /fixed: \[\]/, 'nothing was fixed, so `fixed` must be empty');
+  // The human-readable line stays for a non-JSON run.
+  assert.match(branch[0], /nothing safely fixable/);
+});
+
 test('an operational failure exits 2, never 1 — it is not drift', () => {
   // The 1-vs-2 split is this tool applied to itself: 1 means "I read the plane and it
   // disagrees", 2 means "do not trust this report". An unreadable fleet or a failed build
