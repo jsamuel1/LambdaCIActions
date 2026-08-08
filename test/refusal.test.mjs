@@ -34,7 +34,6 @@ import { allowlistChanged } from '../dist/src/shared/allowlist.js';
 import { incompatibleRunnerLabel } from '../dist/src/ingest/adopt.js';
 import {
   countUnrunnableJobs,
-  rollupRefusals,
   routeReadiness,
   sortRefusalsNewestFirst,
   toRefusalView,
@@ -419,15 +418,6 @@ test('refusals sort by MOST RECENT occurrence, so a recurring one cannot sink', 
     sortRefusalsNewestFirst([old, recent]).map((r) => r.jobId),
     [2, 1],
   );
-});
-
-test('rollupRefusals counts by code', () => {
-  const roll = rollupRefusals(
-    [refusalRecord(), refusalRecord({ jobId: 2 }), refusalRecord({ jobId: 3, code: 'runner-group' })].map(
-      toRefusalView,
-    ),
-  );
-  assert.deepEqual(roll, { 'label-not-allowlisted': 2, 'runner-group': 1 });
 });
 
 // ---- live reconciliation (ADR-051) ----------------------------------------

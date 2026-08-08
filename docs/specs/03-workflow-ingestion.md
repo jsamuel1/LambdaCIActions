@@ -237,17 +237,25 @@ mode re-scans the repo, because the stored routing preview is resolved with the 
 
 ## Refused claims are visible
 
-A refusal is a decision the operator has to be able to see. Ingest emits a structured log line for
-**every** `claimed:false` path — repo opted out, `decideClaim` rejection, non-default runner group,
-compat block — carrying a stable `code`, the job's labels, **the live runner-label allowlist
-snapshot**, the repo mode, the reason and a fix (ADR-050). The 202 body's `reason` is not an
-observability mechanism: its only reader is GitHub, which discards it.
+A refusal is a decision the operator has to be able to see. Every `claimed:false` path — repo opted
+out, `decideClaim` rejection, non-default runner group, compat block — goes through one classifier
+that emits a structured line carrying a stable `code`, the job's labels, **the live runner-label
+allowlist snapshot**, the repo mode, the reason and a fix (ADR-050). The 202 body's `reason` is not
+an observability mechanism: its only reader is GitHub, which discards it.
 
 Refusals that are **actionable** are also persisted (`REFUSAL#<repoId>#<runId>#<jobId>`) and listed
 on the console's Unclaimed screen. Actionable means the job carries an LCA-shaped label — evidence
 someone meant it to run here — plus the two post-claim gates (runner group, compat block), which by
-definition only fire on a job we already agreed to take. The ordinary "no LCA label" answer to an
-un-onboarded repo's `ubuntu-latest` job is expected steady state: logged at debug, never stored.
+definition only fire on a job we already agreed to take. Actionable refusals are logged in full on
+every delivery.
+
+The ordinary "no LCA label" answer to an un-onboarded repo's `ubuntu-latest` job is expected steady
+state: never stored, and its log line is **sampled 1-in-100** (`REFUSAL_LOG_SAMPLE_RATE`), keyed
+deterministically on the job id. The `level: debug` tag alone would not reduce anything — these
+λs emit with `console.log`, so the tag lands at the same CloudWatch volume and cost as the
+actionable line it must be distinguishable from. The consequence to know when diagnosing: a
+specific ordinary refusal is usually NOT greppable, so an absent line is not evidence the webhook
+did not arrive.
 
 A refusal is deliberately **not** a run status. It has no microVM, duration or cost, so it never
 enters the active count, the error rate, cost eligibility, or reporting's status vocabulary.

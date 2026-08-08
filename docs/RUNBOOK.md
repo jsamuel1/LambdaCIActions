@@ -130,10 +130,18 @@ there, the answer is there — no AWS access needed.
 If it is NOT there, work the chain in order — the first missing link explains it:
 1. Is the webhook arriving? GitHub App → Advanced → Recent Deliveries (expect 202).
 2. Did we claim it? `aws logs filter-log-events --log-group-name /aws/lambda/lca-<env>-ingest
-   --filter-pattern '{ $.msg = "job claimed" }'`. For refusals, every gate now logs:
+   --filter-pattern '{ $.msg = "job claimed" }'`. For refusals:
    `--filter-pattern '{ $.msg = "job not claimed*" }'` — the line carries `code`, `jobLabels`,
    the live `claimedLabels` snapshot, `mode`, `reason` and `fix`. A `code` of
    `label-not-allowlisted` means the job named an LCA label the live allowlist does not have.
+
+   **An absent line here is not evidence the webhook never arrived.** A job that is not on
+   Unclaimed was refused for an ordinary reason (`no-lca-label` / `no-standard-label`), and that
+   lane is **sampled 1-in-100** by design — 99 of every 100 leave no log line at all (ADR-050).
+   So for the un-onboarded case, go to step 1 (Recent Deliveries) for arrival evidence, or
+   confirm the decision was correct by reading the repo's mode and the allowlist rather than by
+   grepping for a line that is probably not there. Only actionable refusals — the ones on
+   Unclaimed — are logged on every delivery.
 3. Did a runner register? The run row's `status` tells you how far it got:
    `queued` (never provisioned) → `provisioning` (launch attempted) → `running`.
 4. Did the VM boot? Run logs, stream = the run's `microvmId`.

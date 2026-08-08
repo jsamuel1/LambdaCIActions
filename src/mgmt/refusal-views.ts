@@ -82,13 +82,6 @@ export function sortRefusalsNewestFirst(refusals: RefusalRecord[]): RefusalRecor
   return [...refusals].sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
 }
 
-/** Refusals grouped by code, for the Dashboard/Unclaimed headline. */
-export function rollupRefusals(refusals: readonly RefusalView[]): Record<string, number> {
-  const roll: Record<string, number> = {};
-  for (const r of refusals) roll[r.code] = (roll[r.code] ?? 0) + 1;
-  return roll;
-}
-
 // ---- routing readiness overlay --------------------------------------------
 
 /**
