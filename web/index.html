@@ -5,6 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="same-origin" />
     <title>LambdaCIActions Console</title>
+    <!--
+      Inline data: URI on purpose, not a /favicon.ico object.
+
+      Browsers request /favicon.ico automatically when no icon is declared. The console
+      bucket is private behind OAC, and S3 answers a missing key with 403 AccessDenied
+      (not 404), so every page load logged a bare "403 ()" in the devtools console with no
+      initiator URL — noise that looks exactly like an auth failure while triaging.
+
+      Declaring the icon here costs no S3 object, no cache behavior, and no extra request:
+      the data: URI satisfies the browser before it ever asks the origin. Shipping a real
+      /favicon.ico would work too, but build-web.mjs copies only index.html, so it would
+      mean a new static-asset path for one decorative file.
+    -->
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23161b22'/%3E%3Cg fill='none' stroke='%23ff9900' stroke-width='7' stroke-linecap='round'%3E%3Cpath d='M27 14 L45 50'/%3E%3Cpath d='M33 28 L19 50'/%3E%3C/g%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="/main.css" />
   </head>
   <body>
