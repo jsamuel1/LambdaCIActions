@@ -64,7 +64,9 @@ export function Dashboard({
       </div>
       {(h.unclaimed ?? 0) > 0 && (
         <p className="error">
-          {h.unclaimed} job{h.unclaimed === 1 ? '' : 's'} were refused
+          {h.unclaimedExact === false ? 'At least ' : ''}
+          {h.unclaimed} job{h.unclaimed === 1 ? '' : 's'} {h.unclaimed === 1 ? 'was' : 'were'}{' '}
+          refused
           {h.unclaimedWindowDays ? ` in the last ${h.unclaimedWindowDays} days` : ''} and did not run
           anywhere on this platform — <a href="#/unclaimed">see why</a>.
         </p>

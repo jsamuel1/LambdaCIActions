@@ -1003,14 +1003,19 @@ async function healthRoute(session: SessionPayload): Promise<Reply> {
   const since = new Date(Date.now() - UNCLAIMED_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
   const refusals = await countRefusals({ sinceIso: since }).catch((err) => {
     // A refusal-count failure must not blank the whole dashboard; the badge degrades instead.
+    //
+    // UNKNOWN, not zero. `{ count: 0 }` would render a reassuring `0` on the one stat whose whole
+    // purpose is to stop the console reporting that nothing is wrong while jobs are stranded —
+    // the same false green as the stored `compat: ok`, moved to the headline. `undefined` omits
+    // the field, so the badge shows `—` and the banner (which triggers on a positive count) stays
+    // silent rather than claiming a count it does not have.
     console.error(JSON.stringify({ msg: 'countRefusals failed', error: errMsg(err) }));
-    return { count: 0, exact: false };
+    return undefined;
   });
   return json(200, {
     ...buildHealth(counts, active, new Date(), costRuns),
     countsExact: exact,
-    unclaimed: refusals.count,
-    unclaimedExact: refusals.exact,
+    ...(refusals ? { unclaimed: refusals.count, unclaimedExact: refusals.exact } : {}),
     unclaimedWindowDays: UNCLAIMED_WINDOW_DAYS,
   });
 }

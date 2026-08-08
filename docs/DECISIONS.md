@@ -3010,7 +3010,11 @@ list walks the cursor ("Load older"), because a row that exists in the store and
 from the console is the same invisibility this ADR is about; the polled head page is de-duplicated
 against held older pages by refusal identity, since a recurring row's sort key moves. The Dashboard
 shows an `Unclaimed (7d)` stat as a third axis (never folded into `active`/`errorRate`/cost),
-reported as a floor (`≥ N`) when the count hit its paging budget. That stat is **windowed on
+reported as a floor (`≥ N`) when the count hit its paging budget — in the banner beside it as well
+as in the stat, since a bare "N jobs were refused" states an exact figure the platform did not
+finish counting. A count that FAILED is reported as unknown (`—`, no banner), never as `0`: a
+reassuring zero on the one stat that exists to contradict a green console is the same false
+certainty as the stored `compat: ok`, relocated to the headline. That stat is **windowed on
 `lastSeenAt`** while the screen shows the full retained history: rows live for the ADR-033 retention
 (90 days by default), so an unwindowed headline would stay red for months after the fix, and a
 permanently-red indicator is one operators stop reading. The window is a sort-key range, so skipped

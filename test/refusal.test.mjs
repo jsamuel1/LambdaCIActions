@@ -903,8 +903,11 @@ test('the dashboard badge is windowed, and says so instead of claiming the prese
 
   // …and the banner must not assert, in the present tense, that the jobs are still stuck.
   const dash = stripComments(src('web/src/screens/Dashboard.tsx'));
-  const banner = dash.slice(dash.indexOf('were refused'), dash.indexOf('see why'));
+  // Anchored on the render CONDITION, not on the sentence's wording: the copy carries an inexact
+  // qualifier and a singular/plural verb, so no contiguous prose fragment is a stable marker.
+  const banner = dash.slice(dash.indexOf('(h.unclaimed ?? 0) > 0'), dash.indexOf('see why'));
   assert.ok(banner.length > 0, 'the unclaimed banner moved — update this test');
+  assert.match(banner, /refused/, 'the banner must still say the jobs were refused');
   assert.ok(
     !/are not running/.test(banner),
     'a windowed historical count must not claim the jobs are running nowhere right now',
@@ -1103,4 +1106,44 @@ test('the unclaimed window Refresh performs the recovery its seam warning advert
   // The filter-change path must share the same reset, so the two cannot drift.
   const effect = screen.slice(screen.indexOf('useEffect(() => {'), screen.indexOf('function resetWindow'));
   assert.match(effect, /resetWindow\(\);/);
+});
+
+test('a failed refusal count degrades to UNKNOWN, never to a reassuring zero', () => {
+  // The badge's whole purpose is to stop the console reporting that nothing is wrong while jobs
+  // are stranded. A `catch` returning `{ count: 0 }` renders `0` — the same false green as the
+  // stored `compat: ok`, relocated to the headline — so the failure path must omit the field and
+  // let the stat render `—`.
+  const mgmt = stripComments(src('src/mgmt/handler.ts'));
+  const health = mgmt.slice(
+    mgmt.indexOf('async function healthRoute('),
+    mgmt.indexOf('// ---- reports'),
+  );
+  assert.ok(health.length > 0, 'healthRoute not found — update this test');
+  const guard = health.slice(health.indexOf('countRefusals({ sinceIso: since })'));
+  assert.ok(
+    !/return \{ count: 0/.test(guard),
+    'a failed count must not be reported as zero unclaimed jobs',
+  );
+  assert.match(guard, /return undefined;/, 'the failure path must yield an absent count');
+  // …and the response must omit BOTH fields together, so a client cannot see `unclaimedExact`
+  // without the number it qualifies.
+  assert.match(
+    guard,
+    /\.\.\.\(refusals \? \{ unclaimed: refusals\.count, unclaimedExact: refusals\.exact \} : \{\}\)/,
+  );
+
+  // The stat already renders an absent count as an em dash; keep that reachable.
+  const dash = stripComments(src('web/src/screens/Dashboard.tsx'));
+  assert.match(dash, /h\.unclaimed === undefined\s*\n?\s*\?\s*'—'/);
+});
+
+test('the unclaimed banner carries the same floor qualifier as its stat', () => {
+  // `countRefusals` stops at its paging budget, so the number can be a floor. The stat says so
+  // (`≥ N`); a banner beside it asserting a bare "N jobs were refused" states an exact figure the
+  // platform did not finish counting — on the one surface that exists to be trusted when it warns.
+  const dash = stripComments(src('web/src/screens/Dashboard.tsx'));
+  const banner = dash.slice(dash.indexOf('(h.unclaimed ?? 0) > 0'), dash.indexOf('see why'));
+  assert.ok(banner.length > 0, 'the unclaimed banner moved — update this test');
+  assert.match(banner, /unclaimedExact === false \? 'At least ' : ''/);
+  assert.match(banner, /h\.unclaimed === 1 \? 'was' : 'were'/, 'the verb must agree after the prefix');
 });
