@@ -879,7 +879,7 @@ test('mgmt reads the allowlist VALUE live, and only that one non-secret paramete
     handler.indexOf('async function allowlistSnapshot('),
     handler.indexOf('async function controlPlaneSnapshot('),
   );
-  assert.match(allowlist, /getParam\(`\$\{SSM_PREFIX\}\/config\/runner-labels`, 0\)/);
+  assert.match(allowlist, /getParam\(RUNNER_LABELS_PARAM, 0\)/);
   assert.match(allowlist, /live: false/, 'the allowlist read must fail soft too');
   // The Unclaimed route renders no image state, so it must not pay a DescribeParameters per
   // catalog flavor on every page load.
@@ -940,6 +940,25 @@ test('the "live" allowlist is read UNCACHED, so a just-applied fix is visible', 
   for (const c of others) {
     assert.match(c, /,\s*0\)$/, `${c} must also be an uncached read`);
   }
+  // PATH parity, not just TTL parity. Pinning the uncached-ness of each reader independently still
+  // permits the divergence this asserts against: `allowlistSnapshot` originally rebuilt the path as
+  // a `${SSM_PREFIX}/config/runner-labels` literal while every sibling read the env-overridable
+  // `RUNNER_LABELS_PARAM`. Equal in the deployed stack, so no test noticed — but with the env var
+  // overridden, Settings edits one parameter while Unclaimed/Flavors/readiness reconcile against
+  // another (and outside the Mgmt grant, so it fails soft to "unknown"). Every allowlist read in
+  // this handler must name the constant, so there is exactly one path in play.
+  const viaConstant = handler.match(/getParam\(RUNNER_LABELS_PARAM[^)]*\)/g) ?? [];
+  const literalRead = /getParam\(`\$\{SSM_PREFIX\}\/config\/runner-labels`[^)]*\)/g;
+  const viaLiteral = handler.match(literalRead) ?? [];
+  assert.equal(
+    viaLiteral.length,
+    0,
+    'no allowlist read may rebuild the path as a literal — use RUNNER_LABELS_PARAM',
+  );
+  assert.ok(
+    viaConstant.length >= 3,
+    `expected settings + label-write + snapshot reads via the constant, got ${viaConstant.length}`,
+  );
 });
 
 test('older refusals past the head page are reachable from the console', () => {

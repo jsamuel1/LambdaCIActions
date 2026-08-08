@@ -2226,10 +2226,20 @@ function catalogForReadiness(): ReadinessFlavor[] {
  * Unclaimed, adds the label in Settings, comes back — and the same warm container serves the OLD
  * list for up to five minutes, so `config changed` stays dark and the screen asserts "still
  * broken" about a fix that already landed. The word rendered beside it is `Live`.
+ *
+ * Reads `RUNNER_LABELS_PARAM`, the SAME module constant every sibling allowlist reader uses
+ * (`settingsRoute`, `putRunnerLabelsRoute`), NOT a locally rebuilt `${SSM_PREFIX}/...` literal.
+ * The two are equal in the deployed stack (both derive from `ssmPrefix`), so this is not a live
+ * defect — but the constant exists because the path is env-overridable, and a second hard-coded
+ * copy is precisely the console-versus-control-plane divergence ADR-051 exists to remove: with
+ * `RUNNER_LABELS_PARAM` overridden, Settings would edit one parameter while Unclaimed, Flavors
+ * and workflow readiness reconciled against another, reporting `config changed` and `unroutable`
+ * against a list nothing claims on. It would also fall outside the Mgmt λ's `GetParameter` grant,
+ * so the surface would fail soft to "unknown" for a reason no operator could see.
  */
 async function allowlistSnapshot(): Promise<{ allowlist: string[]; live: boolean }> {
   try {
-    const raw = await getParam(`${SSM_PREFIX}/config/runner-labels`, 0);
+    const raw = await getParam(RUNNER_LABELS_PARAM, 0);
     return { allowlist: raw.split(',').map((l) => l.trim()).filter(Boolean), live: true };
   } catch (err) {
     console.error(JSON.stringify({ msg: 'allowlist read failed', error: errMsg(err) }));
