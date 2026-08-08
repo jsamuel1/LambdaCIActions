@@ -29,10 +29,17 @@ import crypto from 'node:crypto';
  *     caller cannot hand us an arbitrary `ExclusiveStartKey` and walk an index we would
  *     never have queried for them;
  *   - **scope binding** — the AAD covers `(route, installation grants, repo, status)`, so a
- *     cursor minted for one list cannot be replayed against another, and one operator's
- *     cursor is inert in another operator's session.
+ *     cursor minted for one list cannot be replayed against another, nor by a session holding
+ *     a different set of installation grants.
  *
- * Binding the grant set means a cursor stops working when the operator's installations
+ * The bound principal is the GRANT SET, not the operator. Two operators who administer
+ * exactly the same installations mint interchangeable cursors — deliberately, and with no
+ * disclosure: the scope pins every input to the visibility filter, so a cursor only ever
+ * resumes a walk whose visible rows both sessions were already entitled to. What it cannot do
+ * is cross a visibility boundary. Do not upgrade this to a per-session claim without binding
+ * something session-specific; `test/mgmt-cursor-scope.test.mjs` pins the distinction.
+ *
+ * Binding the grant set also means a cursor stops working when the operator's installations
  * change (a re-login after access changes). That is the conservative direction: the cursor's
  * whole purpose is to resume a walk whose visibility filter was computed from those grants.
  *

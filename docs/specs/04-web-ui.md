@@ -223,9 +223,11 @@ That post-query filter is also why the cursor is sealed rather than merely encod
 belonging to an installation the session may not administer. It is encrypted (AES-256-GCM
 under a key derived from the session secret) with its scope — view, the session's installation
 grants, and any repo/status filter — bound as additional authenticated data. A cursor is
-therefore unreadable, unforgeable, and inert outside the list and session that minted it. A
-cursor that will not open is answered with **400**, not a silent restart from the head page:
-the client's recovery is to drop it and refetch (`test/mgmt-cursor-scope.test.mjs`).
+therefore unreadable, unforgeable, and inert outside the list and the visibility scope that
+minted it (the bound principal is the session's **grant set**, not its operator — see
+[ADR-052](../DECISIONS.md#adr-052)). A cursor that will not open is answered with **400**, not
+a silent restart from the head page: the client's recovery is to drop it and refetch
+(`test/mgmt-cursor-scope.test.mjs`).
 
 `GET /api/health` counts are **platform-wide** (the status index is not per-installation),
 while `stuck` and every run list are filtered to the session's installations. Counts follow

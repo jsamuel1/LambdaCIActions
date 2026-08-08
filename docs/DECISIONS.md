@@ -2959,8 +2959,15 @@ Three properties from one primitive:
 - **Integrity** — a forged or edited cursor fails the GCM tag and is refused, so a caller
   cannot hand us an arbitrary `ExclusiveStartKey` and walk an index we would never have
   queried on their behalf. Bare pre-ADR-052 plaintext keys are refused for the same reason.
-- **Scope binding** — a cursor minted for one list is inert against another, and against
-  another operator's session, closing cursor-swapping between filters as well as the leak.
+- **Scope binding** — a cursor minted for one list is inert against another, and against a
+  session holding a different set of installation grants, closing cursor-swapping between
+  filters as well as the leak. The bound principal is the **grant set**, not the operator:
+  two operators administering exactly the same installations mint interchangeable cursors.
+  That is deliberate and discloses nothing — the scope pins every input to the visibility
+  filter, so such a cursor only resumes a walk over rows both sessions were already entitled
+  to. Making it per-session would require binding something session-specific (a login or a
+  per-session nonce), which buys no confidentiality and would invalidate cursors on every
+  re-login.
 
 Two supporting choices:
 

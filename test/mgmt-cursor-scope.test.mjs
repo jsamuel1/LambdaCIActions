@@ -159,6 +159,25 @@ test('a cursor minted under another secret is refused', () => {
   assert.equal(openCursor(sealed, MINE, 'a-rotated-secret').ok, false);
 });
 
+test('the bound principal is the grant SET, not the operator', () => {
+  // Two DIFFERENT operators who administer exactly the same installations produce the same
+  // canonical scope, so their cursors are interchangeable. That is the design, not a gap: the
+  // scope pins every input to the visibility filter, so such a cursor can only resume a walk
+  // over rows both sessions were already entitled to see.
+  //
+  // Pinned because the docs previously claimed a cursor was inert in "another operator's
+  // session", which is false here and only accidentally true when grant sets differ. Nothing
+  // session-specific is bound (no login, no per-session nonce); if that ever changes, this
+  // test is where the claim gets upgraded.
+  const alice = { view: 'runs:status', installationIds: [11], status: 'failed' };
+  const bob = { view: 'runs:status', installationIds: [11], status: 'failed' };
+  const sealed = sealCursor(encodeCursor(OTHER_TENANT_KEY), alice, SECRET);
+  assert.equal(openCursor(sealed, bob, SECRET).ok, true, 'equal grants ⇒ equal scope');
+  // The boundary that IS enforced: any difference in the visible row set refuses.
+  const carol = { view: 'runs:status', installationIds: [11, 22], status: 'failed' };
+  assert.equal(openCursor(sealed, carol, SECRET).ok, false, 'a wider grant set is a new scope');
+});
+
 test('forged, tampered and plaintext cursors are refused rather than restarted', () => {
   const raw = encodeCursor(OTHER_TENANT_KEY);
   const sealed = sealCursor(raw, MINE, SECRET);

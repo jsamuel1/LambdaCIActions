@@ -15,6 +15,7 @@ import {
   resolveVisibleRepos,
 } from '../dist/src/mgmt/report-store.js';
 import { applyFilters, computeReport, validateReportSpec } from '../dist/src/mgmt/reports.js';
+import { asRawCursor } from '../dist/src/shared/cursor.js';
 
 const NOW = new Date('2026-07-15T12:00:00.000Z');
 
@@ -47,16 +48,25 @@ function job(repoId, over = {}) {
   };
 }
 
-/** Fake GSI2: a map of repoId → newest-first pages. Records which repos were queried. */
+/**
+ * Fake GSI2: a map of repoId → newest-first pages. Records which repos were queried.
+ *
+ * Cursors are `RawCursor` (`{ raw }`), the shape the real store hands back since ADR-052 —
+ * NOT bare strings. Modelling them as strings made this fake a closed loop that production
+ * could never enter: `Number(opts.cursor)` on a real cursor is `NaN`, so `pages[NaN]` is
+ * `undefined` and the multi-page walk below would stop after one page without any assertion
+ * noticing. Built through `asRawCursor` so the throwing `toJSON` backstop rides along too.
+ */
 function fakeIndex(byRepo) {
   const queried = [];
   const listRunsByRepo = async (repoId, opts = {}) => {
     queried.push(repoId);
     const pages = byRepo[repoId] ?? [[]];
-    const page = Number(opts.cursor ?? 0);
+    const page = Number(opts.cursor?.raw ?? 0);
+    assert.ok(Number.isInteger(page), `fake got a non-RawCursor cursor: ${JSON.stringify(opts.cursor?.raw)}`);
     return {
       runs: pages[page] ?? [],
-      nextCursor: page + 1 < pages.length ? String(page + 1) : undefined,
+      nextCursor: page + 1 < pages.length ? asRawCursor(String(page + 1)) : undefined,
     };
   };
   return { listRunsByRepo, queried };
