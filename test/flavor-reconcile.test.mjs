@@ -15,6 +15,8 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import {
   reconcileFlavors,
   catalogFlavors,
@@ -31,6 +33,9 @@ import {
   PENDING_IMAGE_STATES,
 } from '../dist/src/shared/flavor-reconcile.js';
 import { shouldClaim } from '../dist/src/ingest/filter.js';
+// The CLI integration tests below resolve the deploy pin through the CLI's own loader, so the
+// stubbed identity cannot disagree with a contributor's machine-local `.env.local`.
+import { loadEnvLocal } from '../dist/lib/deploy-env.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BUILD_SCRIPT = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), 'utf8');
@@ -915,6 +920,34 @@ test('--fix emits exactly one JSON document, describing the post-fix state', () 
   assert.match(post, /JSON\.stringify\(/, 'the post-fix path must emit the JSON document');
 });
 
+test('--json --fix still emits a document when nothing is safely fixable', () => {
+  // `--json` suppresses the pre-fix document on the way in so that only one is printed. The
+  // no-op branch therefore has to print one itself, or a `--json --fix` caller gets prose on
+  // stdout and NO document to reconcile against the exit code — unparseable, and
+  // indistinguishable from a crash. Both exits are reachable without any drift being fixable: a
+  // healthy environment (every row `ok`, exit 0) and an in-flight build (`image_building` is
+  // warn with `safeFix: null`, exit 1).
+  const branch = /if \(actionable\.length === 0\) \{[\s\S]{0,1400}?process\.exit\(report\.drift \? 1 : 0\);/.exec(
+    RECONCILE_CODE,
+  );
+  assert.ok(branch, 'the nothing-fixable branch was not found');
+  // The document must be emitted INSIDE that branch, gated on --json...
+  assert.match(
+    branch[0],
+    /if \(JSON_OUT\) \{[\s\S]{0,400}?JSON\.stringify\(/,
+    'the no-op fix path must emit its own JSON document',
+  );
+  // ...and carry the same keys as the post-fix document, so a consumer parses one schema.
+  const doc = /JSON\.stringify\(\s*\{([\s\S]{0,400}?)\}/.exec(branch[0]);
+  assert.ok(doc, 'no JSON payload found in the no-op fix branch');
+  for (const key of ['env', 'region', 'attempted', 'labels', 'probeFailures']) {
+    assert.match(doc[1], new RegExp(`\\b${key}\\b`), `the no-op document omits ${key}`);
+  }
+  assert.match(doc[1], /attempted: \[\]/, 'nothing was attempted, so `attempted` must be empty');
+  // The human-readable line stays for a non-JSON run.
+  assert.match(branch[0], /nothing safely fixable/);
+});
+
 test('an operational failure exits 2, never 1 — it is not drift', () => {
   // The 1-vs-2 split is this tool applied to itself: 1 means "I read the plane and it
   // disagrees", 2 means "do not trust this report". An unreadable fleet or a failed build
@@ -1043,4 +1076,357 @@ test('the CD deploy role can read config params but not secrets', () => {
   // The secret subtrees must not be reachable from the CD credential.
   assert.doesNotMatch(stmt, /github|mgmt\//);
   assert.doesNotMatch(stmt, /ssm:PutParameter/, 'CD must not write control-plane config');
+});
+
+// --- `--json` stdout really is one parseable document (ADR-049) --------------
+//
+// The source-level assertions above prove the no-op `--fix` branch CONTAINS a
+// `JSON.stringify`. They cannot prove that what lands on stdout parses, and it did not: the
+// deploy-target pin printed `✓ deploy target verified: …` to stdout ahead of every document, so
+// `JSON.parse(stdout)` threw on all four --json paths while ADR-049 and the RUNBOOK promised a
+// consumer exactly one document matching the exit code. These tests run the CLI for real
+// against a stub `aws` and parse its stdout, which is the only way that claim can be checked.
+
+/**
+ * The pin the CLI will ACTUALLY resolve, by the CLI's own precedence: `<repoRoot>/.env.local`
+ * when it exists, else the process environment (ADR-047). Reused rather than reimplemented,
+ * because guessing wrong here does not fail the assertion under test — it fails the deploy-pin
+ * guard with an unrelated message.
+ *
+ * This matters because the pin is machine-local. Hardcoding a canonical account made these
+ * tests pass here and in CI (fresh clone, no `.env.local`, so the process pin below wins) while
+ * failing for any contributor whose `.env.local` names a different account, region, or
+ * `LCA_DEPLOY_ENV` — and failing with `Deploy-target mismatch:` rather than anything about the
+ * JSON contract. So the stub echoes back whatever account the CLI resolves, and the run selects
+ * the pinned env: the STS identity comparison is still exercised, it just cannot be the thing
+ * that breaks.
+ */
+const PIN = (() => {
+  const pin = loadEnvLocal(REPO_ROOT); // .env.local, else process env, else null
+  // Defaults apply ONLY when there is no pin at all (a checkout with neither a file nor exported
+  // variables). Where a pin EXISTS its values are used verbatim, even if incomplete: defaulting
+  // a missing field there would hide a pin the CLI is about to reject, and the test would fail
+  // on the guard's message instead of skipping with the reason.
+  if (!pin) return { account: '863638663908', region: 'us-west-2', env: '', supplied: false };
+  return {
+    account: (pin.LCA_DEPLOY_ACCOUNT || '').trim(),
+    region: (pin.LCA_DEPLOY_REGION || '').trim(),
+    // '' when unpinned: the CLI then defaults to `dev`, and passing no --env keeps that.
+    env: (pin.LCA_DEPLOY_ENV || '').trim(),
+    supplied: true,
+  };
+})();
+/** The env the CLI will run against, and therefore the SSM prefix the stub must answer on. */
+const PIN_ENV = PIN.env || 'dev';
+/**
+ * A pin the CLI would reject (half-written file, bad account/region/env) is not something these
+ * tests can work around, and silently passing would be worse than saying why they were skipped.
+ * Validated with the CLI's own rules so the verdict cannot drift from what it will accept.
+ */
+const PIN_USABLE =
+  /^\d{12}$/.test(PIN.account) &&
+  /^[a-z]{2}(-[a-z]+)+-\d$/.test(PIN.region) &&
+  /^(dev|prod)?$/.test(PIN.env);
+const PIN_SKIP = PIN_USABLE
+  ? false
+  : `unusable deploy pin (account=${PIN.account || '-'} region=${PIN.region || '-'} ` +
+    `env=${PIN.env || '-'}) — fix .env.local to run the CLI integration tests`;
+
+/** A stub `aws` on PATH, so the CLI's real spawnSync calls resolve to a scripted plane. */
+function stubAws(dir, { labels, imageStates, imageProbeFails = false }) {
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  const params = catalogFlavors().map((f) => ({
+    Name: `/lca/${PIN_ENV}/config/image-arn-${f.name}`,
+    Value: `arn:fake:${f.name}`,
+  }));
+  const script = `#!/usr/bin/env node
+const a = process.argv.slice(2);
+const has = (s) => a.includes(s);
+if (a[0] === 'sts') { console.log(${JSON.stringify(PIN.account)}); process.exit(0); }
+if (a[0] === 'ssm' && a[1] === 'get-parameter') {
+  const name = a[a.indexOf('--name') + 1];
+  const m = /image-arn-(.+)$/.exec(name);
+  if (m) { console.log('arn:fake:' + m[1]); process.exit(0); }
+  // labels === null models a plane where the allowlist parameter was never seeded. Only
+  // ParameterNotFound may read as absent (the rest is an unreadable credential), so the stub
+  // has to emit that exact error for the CLI's classifier.
+  if (${labels === null ? 'true' : 'false'}) {
+    console.error('An error occurred (ParameterNotFound) when calling the GetParameter operation');
+    process.exit(254);
+  }
+  console.log(${JSON.stringify(labels)}); process.exit(0);
+}
+// build-images publishes the image ARN through this before it considers the label.
+if (a[0] === 'ssm' && a[1] === 'put-parameter') { console.log('{"Version":1}'); process.exit(0); }
+if (a[0] === 'ssm' && a[1] === 'get-parameters-by-path') {
+  console.log(JSON.stringify({ Parameters: ${JSON.stringify(params)} })); process.exit(0);
+}
+if (a[0] === 'lambda-microvms' && a[1] === 'get-microvm-image') {
+  if (${imageProbeFails ? 'true' : 'false'}) {
+    console.error('An error occurred (AccessDeniedException) when calling the GetMicrovmImage operation');
+    process.exit(254);
+  }
+  const arn = a[a.indexOf('--image-identifier') + 1];
+  const states = ${JSON.stringify(imageStates)};
+  console.log(JSON.stringify({ state: states[arn.replace('arn:fake:', '')] ?? 'UPDATED' }));
+  process.exit(0);
+}
+if (a[0] === 'lambda-microvms' && a[1] === 'list-microvms') { console.log('{"microvms":[]}'); process.exit(0); }
+process.exit(1);
+`;
+  const p = path.join(bin, 'aws');
+  fs.writeFileSync(p, script, { mode: 0o755 });
+  return bin;
+}
+
+/**
+ * Run the CLI with a stubbed plane, against the pin the CLI itself resolves (see `PIN`). The
+ * process-environment pin below is the fallback for a checkout with no `.env.local` (a CI
+ * runner, ADR-047); where a file pin exists it wins, and `PIN` already read it, so the two
+ * agree either way. `--env` is passed only when the pin names one, because binding a selected
+ * env to an unpinned run would be a different test.
+ */
+function runReconcile(args, plane) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lca-reconcile-cli-'));
+  const bin = stubAws(dir, plane);
+  const envArgs = PIN.env ? ['--env', PIN.env] : [];
+  const r = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, 'scripts', 'flavors-reconcile.mjs'), ...envArgs, ...args],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+        LCA_DEPLOY_ACCOUNT: PIN.account,
+        LCA_DEPLOY_REGION: PIN.region,
+        LCA_DEPLOY_ENV: PIN.env,
+      },
+      cwd: REPO_ROOT,
+    },
+  );
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+const ALL_LABELS = catalogFlavors()
+  .map((f) => f.label)
+  .join(',');
+
+test('--json: stdout is exactly one parseable document on a healthy plane (exit 0)', { skip: PIN_SKIP }, () => {
+  const r = runReconcile(['--json'], { labels: ALL_LABELS, imageStates: {} });
+  assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stderr}`);
+  const doc = JSON.parse(r.stdout); // throws if anything else reached stdout
+  assert.equal(doc.drift, false);
+  assert.equal(doc.rows.length, catalogFlavors().length);
+  // The pin confirmation is still emitted — on stderr, where it cannot corrupt the document.
+  assert.match(r.stderr, /deploy target verified/);
+  assert.doesNotMatch(r.stdout, /deploy target verified/);
+});
+
+test('--json --fix: one parseable document with an empty `attempted` when nothing is fixable', { skip: PIN_SKIP }, () => {
+  // Exit 0 flavour of the no-op branch: healthy plane, so no row carries a safeFix.
+  const r = runReconcile(['--json', '--fix'], { labels: ALL_LABELS, imageStates: {} });
+  assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stderr}`);
+  const doc = JSON.parse(r.stdout);
+  assert.deepEqual(doc.attempted, [], 'nothing was remediated');
+  assert.equal(doc.drift, false);
+});
+
+test('--json --fix: one parseable document on the exit-1 no-op branch (build in flight)', { skip: PIN_SKIP }, () => {
+  // `image_building` is warn with safeFix null: drift, but nothing safe to do. Before the fix
+  // this path printed prose and no document at all, so a consumer could not tell it from a
+  // crash.
+  const r = runReconcile(['--json', '--fix'], {
+    labels: ALL_LABELS,
+    imageStates: { rust: 'CREATING' },
+  });
+  assert.equal(r.status, 1, `expected exit 1 (drift), got ${r.status}\n${r.stderr}`);
+  const doc = JSON.parse(r.stdout);
+  assert.deepEqual(doc.attempted, []);
+  assert.equal(doc.drift, true);
+  const rust = doc.rows.find((row) => row.name === 'rust');
+  assert.equal(rust.health, 'image_building');
+  assert.equal(rust.safeFix, null);
+});
+
+test('--json and --json --fix documents share one schema', { skip: PIN_SKIP }, () => {
+  const plain = JSON.parse(runReconcile(['--json'], { labels: ALL_LABELS, imageStates: {} }).stdout);
+  const fixed = JSON.parse(
+    runReconcile(['--json', '--fix'], { labels: ALL_LABELS, imageStates: {} }).stdout,
+  );
+  // `attempted` is the only key --fix adds; everything a consumer reads is present in both.
+  assert.deepEqual(
+    Object.keys(fixed).filter((k) => k !== 'attempted').sort(),
+    Object.keys(plain).sort(),
+  );
+});
+
+test('--json --fix: a remediation that changed nothing is reported as unresolved, not fixed', { skip: PIN_SKIP }, () => {
+  // The one --json path that actually SPAWNS `build-images`, and it was covered only at source
+  // level: the child's stdout redirect and the remediation document had never been parsed from
+  // a real run. It also pins the honesty of that document. With no `runner-labels` parameter
+  // every flavor is `label_missing` with `safeFix: 'add-label'`, so --fix runs seven children —
+  // each of which publishes its ARN, refuses to CREATE the allowlist, and exits 0 (ADR-049
+  // § 4c). Keyed off the pre-fix action list this reported seven repairs beside `drift: true`
+  // and seven still-broken rows; scored against the post-fix read it reports what happened.
+  const r = runReconcile(['--json', '--fix'], {
+    labels: null, // ParameterNotFound — the allowlist does not exist
+    imageStates: {},
+  });
+  assert.equal(r.status, 1, `expected exit 1 (drift remains), got ${r.status}\n${r.stderr}`);
+  const doc = JSON.parse(r.stdout); // the child's own stdout must not be on this stream
+  assert.equal(doc.attempted.length, catalogFlavors().length, 'every flavor should be attempted');
+  for (const a of doc.attempted) {
+    assert.equal(a.action, 'add-label');
+    assert.equal(a.was, 'label_missing');
+    assert.equal(a.outcome, 'unresolved', `${a.name} was not repaired, so it is not applied`);
+    assert.equal(a.now, 'label_missing', 'post-fix health, so a running build stays separable');
+  }
+  assert.equal(doc.drift, true);
+  // The child narrated on stderr, where it cannot corrupt the document.
+  assert.match(r.stderr, /label publish only/);
+  assert.doesNotMatch(r.stdout, /label publish only/);
+});
+
+test('--fix progress narration and the child build go to stderr under --json', () => {
+  // Even with the document emitted, the remediation path wrote three progress lines to stdout
+  // and ran `build-images` with stdio:'inherit', so a successful fix produced prose AND a
+  // document on the same stream. Both are gated now.
+  const fixBlock = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('fleet is quiescent'),
+    RECONCILE_CODE.indexOf('let after;'),
+  );
+  assert.ok(fixBlock.length > 0, 'remediation block not found');
+  assert.ok(
+    fixBlock.includes('build-images.mjs'),
+    'the slice must actually cover the remediation loop',
+  );
+  assert.doesNotMatch(
+    fixBlock,
+    /console\.log\(/,
+    'the remediation path must not write to stdout — use note(), which respects --json',
+  );
+  // `note` must actually route on JSON_OUT rather than being an alias for console.log.
+  assert.match(
+    RECONCILE_CODE,
+    /const note = \(msg\) => \(JSON_OUT \? console\.error\(msg\) : console\.log\(msg\)\)/,
+    'note() must send narration to stderr under --json',
+  );
+  // And the child's stdout must not land on ours.
+  const runFn = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('function run(cmd, cmdArgs)'),
+    RECONCILE_CODE.indexOf('const SEV_MARK'),
+  );
+  assert.match(runFn, /JSON_OUT \?/, 'run() must redirect the child under --json');
+  assert.doesNotMatch(runFn, /spawnSync\(cmd, cmdArgs, \{ stdio: 'inherit' \}\)/);
+});
+
+test('--json: an incomplete image probe exits 2 with NO document on stdout', { skip: PIN_SKIP }, () => {
+  // Exit 2 means "do not trust this report", and the ADR/RUNBOOK/script header all say it
+  // prints no document. This path printed one anyway: `probeFailures` is populated during
+  // `observe`, but the emission ran before the guard that reads it, so an AccessDenied produced
+  // a full-looking report — `image_unverified` rows are shaped exactly like observed ones — on
+  // stdout, immediately followed by exit 2. A consumer keying on the exit code is fine; one
+  // parsing stdout is handed a report we simultaneously declared INCOMPLETE. The other exit-2
+  // paths (unreadable allowlist, unreadable fleet, failed remediation) all print prose to
+  // stderr only, so this was the single asymmetric one.
+  const r = runReconcile(['--json'], {
+    labels: ALL_LABELS,
+    imageStates: {},
+    imageProbeFails: true,
+  });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}\n${r.stderr}`);
+  assert.equal(r.stdout.trim(), '', `exit 2 must print no document, got:\n${r.stdout.slice(0, 400)}`);
+  // The diagnosis is still emitted — on stderr, with the probe failures named.
+  assert.match(r.stderr, /image state probe\(s\) could not be completed/);
+  assert.match(r.stderr, /AccessDenied/);
+});
+
+test('the non-fix JSON emission is gated on there being no probe failure', () => {
+  // Source-level companion to the CLI test above, so the gate cannot be removed while the
+  // integration test is skipped/slow. Assert the BRANCH: `probeFailures` appears in the
+  // document payload itself (it is a reported key), so a bare word match stays green after the
+  // gate is deleted.
+  const pre = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('if (JSON_OUT) {'),
+    RECONCILE_CODE.indexOf('const actionable ='),
+  );
+  assert.ok(pre.length > 0, 'pre-fix output block not found');
+  assert.match(
+    pre,
+    /if \(probeFailures\.length === 0\) \{[\s\S]{0,200}?JSON\.stringify\(/,
+    'the pre-fix document must be gated on a complete probe',
+  );
+  // The human table is deliberately NOT gated: rows plus the diagnosis beat silence, and prose
+  // was never claimed to be parseable.
+  assert.match(pre, /printTable\(report, labels\)/);
+});
+
+test('every documented --json invocation pipes through `npm run --silent`', () => {
+  // `npm run` banners `> lambda-ci-actions@0.0.0 flavors:reconcile` to STDOUT before the script
+  // runs, so a documented `npm run flavors:reconcile -- --json | jq` could never parse — the
+  // one-document contract holds for the script, and the wrapper broke it in the very examples
+  // that demonstrate it.
+  //
+  // Scanned by WALKING the authored tree, not from a list of files known to mention the
+  // command. An enumeration is the same blind spot this guard exists to close: the script's own
+  // header kept the unparseable form after the RUNBOOK was fixed precisely because the check
+  // only looked where the bug had already been found. A new example — a CD summary step in
+  // `.github/workflows/deploy.yml`, a runbook page, an ADR — is caught wherever it lands.
+  // `node scripts/flavors-reconcile.mjs --json` is exempt because it has no npm wrapper to
+  // banner.
+  //
+  // Unlike the behavioural guards in this file, this one reads the RAW sources: a usage block IS
+  // a comment, so scanning `RECONCILE_CODE` (comment-stripped) would find nothing in the script
+  // and pass vacuously — which is how the header kept the unparseable form.
+  //
+  // `test/` is the one exclusion, and it is a carve-out rather than a scope: this file has to
+  // quote the broken `npm run flavors:reconcile -- --json | jq` form verbatim to explain what is
+  // being prevented, so scanning itself would fail on its own counter-example.
+  const SKIP_DIRS = new Set([
+    '.git',
+    '.agents',
+    '.kermes-worktrees',
+    'node_modules',
+    'dist',
+    'cdk.out',
+    'coverage',
+    'test',
+  ]);
+  const SCAN_EXT = new Set(['.md', '.ts', '.tsx', '.mjs', '.js', '.json', '.sh', '.yml', '.yaml']);
+  const walk = (dir, out = []) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) walk(p, out);
+      } else if (
+        entry.isFile() &&
+        (SCAN_EXT.has(path.extname(entry.name)) || entry.name.startsWith('Dockerfile'))
+      ) {
+        out.push(p);
+      }
+    }
+    return out;
+  };
+  const sources = walk(REPO_ROOT).map((p) => [
+    path.relative(REPO_ROOT, p),
+    fs.readFileSync(p, 'utf8'),
+  ]);
+  assert.ok(sources.length > 20, `the walk found only ${sources.length} files — has the tree moved?`);
+  let checked = 0;
+  for (const [file, text] of sources) {
+    for (const m of text.matchAll(/npm run (--silent )?flavors:reconcile[^\n`]*/g)) {
+      const cmd = m[0];
+      if (!cmd.includes('--json')) continue;
+      checked++;
+      assert.match(
+        cmd,
+        /npm run --silent/,
+        `${file}: a documented --json command must use --silent, or npm's banner precedes the ` +
+          `document: ${cmd}`,
+      );
+    }
+  }
+  assert.ok(checked >= 3, `expected the documented --json invocations to be found, saw ${checked}`);
 });

@@ -184,6 +184,13 @@ export function stsCallerAccount(): string {
  *     exports AWS_PROFILE from the pin when the shell didn't set one, then compares the pin
  *     against the real STS caller account.
  * Returns the verified target; the caller should use target.region for all AWS calls.
+ *
+ * `log` is where the confirmation line goes, defaulting to stdout because for an interactive
+ * deploy script that IS the output. A caller whose stdout is a machine-readable document must
+ * pass `console.error` instead: a diagnostic printed ahead of the document makes stdout
+ * unparseable, which is exactly the failure `flavors:reconcile --json` promises not to have
+ * (ADR-049). Kept as an injected sink rather than a global stderr switch so the deploy scripts
+ * that legitimately treat this as their output are unchanged.
  */
 export function assertDeployTarget(opts: {
   repoRoot: string;
@@ -191,8 +198,16 @@ export function assertDeployTarget(opts: {
   env?: string | null;
   dryRun?: boolean;
   getCaller?: () => string;
+  log?: (msg: string) => void;
 }): DeployTarget | null {
-  const { repoRoot, region = null, env = null, dryRun = false, getCaller = stsCallerAccount } = opts;
+  const {
+    repoRoot,
+    region = null,
+    env = null,
+    dryRun = false,
+    getCaller = stsCallerAccount,
+    log = console.log,
+  } = opts;
   if (dryRun) return null;
   const envLocal = loadEnvLocal(repoRoot);
   const target = validateTarget(envLocal, { region, env });
@@ -207,6 +222,6 @@ export function assertDeployTarget(opts: {
         'Switch AWS_PROFILE/credentials to the pinned account, or update the pin deliberately.',
     );
   }
-  console.log(`✓ deploy target verified: account ${target.account}, region ${target.region}${target.env ? `, env ${target.env}` : ''}`);
+  log(`✓ deploy target verified: account ${target.account}, region ${target.region}${target.env ? `, env ${target.env}` : ''}`);
   return target;
 }

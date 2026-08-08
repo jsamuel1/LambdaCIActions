@@ -160,6 +160,43 @@ test('assertDeployTarget: AWS_PROFILE exported from pin when unset', () => {
   }
 });
 
+test('assertDeployTarget: the confirmation goes to the injected sink, not stdout', () => {
+  // `flavors:reconcile --json` promises stdout is exactly one parseable document (ADR-049).
+  // This line printed unconditionally to stdout put a `✓ deploy target verified: …` prefix
+  // ahead of that document, so `JSON.parse(stdout)` threw — the contract was false for every
+  // JSON caller. The sink lets such a caller take it on stderr while interactive deploy
+  // scripts keep it on stdout.
+  const repoRoot = tmpRepo('LCA_DEPLOY_ACCOUNT=863638663908\nLCA_DEPLOY_REGION=us-west-2\n');
+  const lines = [];
+  const prevLog = console.log;
+  let wroteStdout = false;
+  console.log = () => {
+    wroteStdout = true;
+  };
+  try {
+    assertDeployTarget({ repoRoot, getCaller: () => '863638663908', log: (m) => lines.push(m) });
+  } finally {
+    console.log = prevLog;
+  }
+  assert.equal(lines.length, 1, 'the confirmation must reach the injected sink exactly once');
+  assert.match(lines[0], /deploy target verified/);
+  assert.equal(wroteStdout, false, 'nothing may go to stdout when a sink was supplied');
+});
+
+test('assertDeployTarget: default sink is stdout, for interactive deploy scripts', () => {
+  const repoRoot = tmpRepo('LCA_DEPLOY_ACCOUNT=863638663908\nLCA_DEPLOY_REGION=us-west-2\n');
+  const seen = [];
+  const prevLog = console.log;
+  console.log = (m) => seen.push(m);
+  try {
+    assertDeployTarget({ repoRoot, getCaller: () => '863638663908' });
+  } finally {
+    console.log = prevLog;
+  }
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /deploy target verified: account 863638663908, region us-west-2/);
+});
+
 // --- process-environment pin (ADR-047) --------------------------------------
 //
 // A CI runner checks out a fresh clone: there is no gitignored `.env.local` to read, and

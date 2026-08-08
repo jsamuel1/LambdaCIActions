@@ -2829,7 +2829,32 @@ run against that snapshot reports success after adding no label at all — the w
 unrunnable, from a command that just said it fixed it. Re-observing costs a handful of API calls
 and generalises to any remediation that silently no-ops. An incomplete probe on that second read
 is exit 2 (unknown), not success. With `--json`, `--fix` emits exactly one document — the
-post-fix report — because two on one stdout parse as neither.
+post-fix report — because two on one stdout parse as neither. That holds on the paths where
+nothing was remediated too: `--json` suppresses the pre-fix document to keep the count at one, so
+a run with no safely-fixable row emits that report itself (with an empty `attempted`) rather than
+leaving a consumer prose and no document — reachable both on a healthy environment (exit 0) and
+with a build in flight (`image_building` is warn with no safe fix, exit 1).
+
+The document's remediation key is `attempted`, and each entry is scored against that same
+second read (`outcome`, plus the flavor's post-fix `now` health). Calling it `fixed` and filling
+it from the pre-fix action list reintroduced the overclaim this section forbids one paragraph
+up, in the machine-readable surface: the no-`runner-labels` run emits seven `add-label` entries
+next to `drift: true` and seven rows still `label_missing`. The exit code was right and the key
+said the opposite, which is worse than prose doing it — a consumer reads the key. `now` keeps
+`unresolved` distinguishable from a rebuild that is simply still running.
+
+"One document" is a claim about the whole stream, so everything else that narrates moves off it
+under `--json`: the deploy-pin confirmation (`assertDeployTarget` takes a log sink for exactly
+this), the `--fix` progress lines, and `build-images`' own stdout, which `stdio: 'inherit'` used
+to merge into ours. A document preceded by a `✓ deploy target verified: …` line is not parseable,
+so the contract was previously false on every `--json` path regardless of which branch printed.
+Exit 2 is deliberately outside it, and that means printing **nothing**: an unreadable plane or a
+failed remediation has no trustworthy report to serialize, and the diagnosis goes to stderr. An
+incomplete image probe is the case that makes this load-bearing rather than pedantic — it still
+produces a full-looking report whose `image_unverified` rows are shaped exactly like observed
+ones, so emitting it hands a consumer something parseable that we simultaneously say not to
+trust. The human table still prints there, because prose was never claimed to be parseable and
+an operator is better served by the rows plus the diagnosis than by silence.
 
 **5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
 a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the

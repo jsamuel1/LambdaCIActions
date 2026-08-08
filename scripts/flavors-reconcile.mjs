@@ -40,9 +40,24 @@
  *
  * Usage:
  *   npm run flavors:reconcile                       # dev, full check (needs the deploy pin)
- *   npm run flavors:reconcile -- --env dev --json
+ *   npm run --silent flavors:reconcile -- --env dev --json   # --silent: npm banners to stdout
  *   npm run flavors:reconcile -- --no-image-check   # SSM params only, no microVM API calls
  *   npm run flavors:reconcile -- --fix              # deploy-touching; builds what is missing
+ *
+ * `--json` makes stdout exactly one document, on every path that produces a report (exit 0 and
+ * 1, with or without `--fix`). Everything that narrates — the deploy-pin confirmation, `--fix`
+ * progress, `build-images`' own output — goes to stderr, because a single line ahead of the
+ * document makes the whole stream unparseable. Exit 2 prints no document: there is no
+ * trustworthy report to serialize.
+ *
+ * `attempted` in the `--fix` document lists remediations RUN, each scored against the post-fix
+ * read (`outcome`, `now`) rather than against the child's exit code — a remediation can exit 0
+ * having changed nothing (ADR-049 § 4c).
+ *
+ * That contract is the SCRIPT's. `npm run` prints its own `> lambda-ci-actions@0.0.0 …` banner to
+ * stdout before this file executes, so any documented `--json` invocation through npm needs
+ * `--silent` — otherwise the example that demonstrates the contract is the one thing that breaks
+ * it. Invoking `node scripts/flavors-reconcile.mjs --json` directly needs no flag.
  */
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -98,7 +113,15 @@ async function guardDeployTarget() {
     process.exit(2);
   }
   try {
-    const target = mod.assertDeployTarget({ repoRoot: REPO_ROOT, region: REGION, env: ENV });
+    // Under `--json` stdout carries exactly one document, so the pin confirmation goes to
+    // stderr — still visible in a terminal, but it cannot land ahead of the JSON and make it
+    // unparseable.
+    const target = mod.assertDeployTarget({
+      repoRoot: REPO_ROOT,
+      region: REGION,
+      env: ENV,
+      log: JSON_OUT ? console.error : console.log,
+    });
     REGION = target.region;
   } catch (e) {
     console.error(`ERROR: ${e.message}`);
@@ -216,8 +239,17 @@ function nonTerminatedMicroVms(reconcile) {
   }
 }
 
+/**
+ * Progress narration. Goes to stderr under `--json` so that stdout stays a single parseable
+ * document (ADR-049); plain stdout otherwise, where it is the output an operator reads.
+ */
+const note = (msg) => (JSON_OUT ? console.error(msg) : console.log(msg));
+
 function run(cmd, cmdArgs) {
-  const r = spawnSync(cmd, cmdArgs, { stdio: 'inherit' });
+  // The child (build-images) writes its own progress to stdout. Under `--json` that would sit
+  // ahead of our document on the same stream, so map the child's stdout onto our stderr.
+  const stdio = JSON_OUT ? ['ignore', 2, 'inherit'] : 'inherit';
+  const r = spawnSync(cmd, cmdArgs, { stdio });
   if (r.status !== 0) throw new Error(`${cmd} ${cmdArgs.join(' ')} exited ${r.status}`);
 }
 
@@ -302,15 +334,26 @@ async function main() {
   // post-fix one when fixing, this one otherwise.
   if (JSON_OUT) {
     if (!FIX) {
-      console.log(
-        JSON.stringify(
-          { env: ENV, region: REGION, labels: liveLabels, ...report, probeFailures },
-          null,
-          2,
-        ),
-      );
+      // ...and nothing at all when the next statement is going to exit 2. A document belongs to
+      // exits 0 and 1 ("I read the plane"); exit 2 means "do not trust this report", and
+      // serializing one anyway invites a consumer to parse a report we just said was
+      // INCOMPLETE — `image_unverified` rows are indistinguishable in shape from observed ones.
+      // The diagnosis is on stderr, where the other exit-2 paths (unreadable allowlist,
+      // unreadable fleet, failed remediation) already put theirs; this was the one path that
+      // emitted a document with it, making the contract false for `--json` alone.
+      if (probeFailures.length === 0) {
+        console.log(
+          JSON.stringify(
+            { env: ENV, region: REGION, labels: liveLabels, ...report, probeFailures },
+            null,
+            2,
+          ),
+        );
+      }
     }
   } else {
+    // The human table still prints: `image_unverified` rows plus the probe diagnosis below are
+    // more use to an operator than nothing, and prose was never claimed to be parseable.
     printTable(report, labels);
   }
 
@@ -342,7 +385,23 @@ async function main() {
   }
   const actionable = report.rows.filter((r) => r.safeFix);
   if (actionable.length === 0) {
-    console.log('\n--fix: nothing safely fixable.');
+    // Still exactly one document. Nothing was remediated, so the report already read above IS
+    // the post-fix state — but `--json` suppressed it on the way in (to avoid printing two), so
+    // emitting nothing here would leave a `--json --fix` caller with prose on stdout and no
+    // document to reconcile against the exit code. Reachable on a healthy environment (every
+    // row ok, exit 0) and on `image_building` (warn, no safe fix, exit 1) alike. Same key shape
+    // as the post-fix document, with an empty `attempted`, so a consumer parses one schema.
+    if (JSON_OUT) {
+      console.log(
+        JSON.stringify(
+          { env: ENV, region: REGION, attempted: [], labels: liveLabels, ...report, probeFailures },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log('\n--fix: nothing safely fixable.');
+    }
     process.exit(report.drift ? 1 : 0);
   }
 
@@ -366,11 +425,11 @@ async function main() {
     process.exit(2);
   }
 
-  console.log('\n--fix: fleet is quiescent; applying safe remediations.');
+  note('\n--fix: fleet is quiescent; applying safe remediations.');
   for (const r of actionable) {
     const flags = ['--env', ENV, '--region', REGION, '--flavor', r.name];
     if (r.safeFix === 'add-label') flags.push('--publish-label-only');
-    console.log(`\n→ ${r.name} (${r.health}): build-images ${flags.join(' ')}`);
+    note(`\n→ ${r.name} (${r.health}): build-images ${flags.join(' ')}`);
     try {
       run(process.execPath, [path.join(REPO_ROOT, 'scripts', 'build-images.mjs'), ...flags]);
     } catch (e) {
@@ -397,7 +456,7 @@ async function main() {
   //
   // Re-reading is a handful of API calls and it generalises: any remediation that silently
   // no-ops is caught, not just this one.
-  console.log('\n--fix applied; re-reading live state to verify.');
+  note('\n--fix applied; re-reading live state to verify.');
   let after;
   try {
     after = observe(reconcile);
@@ -420,7 +479,25 @@ async function main() {
         {
           env: ENV,
           region: REGION,
-          fixed: actionable.map((r) => ({ name: r.name, was: r.health, action: r.safeFix })),
+          // What was ATTEMPTED, each scored against the post-fix read — not a list of things
+          // that worked. Naming it `fixed` and filling it from `actionable` was the overclaim
+          // this section exists to forbid: on an environment with no `runner-labels` parameter,
+          // `build-images` publishes each ARN, refuses to CREATE the allowlist, and exits 0, so
+          // a run emits seven `add-label` entries beside `drift: true` and seven still-
+          // `label_missing` rows. The exit code was right and the key contradicted it. `now` is
+          // the flavor's post-fix health, so `unresolved` stays distinguishable from a build
+          // that is merely still running (ADR-049 § 4c).
+          attempted: actionable.map((r) => {
+            const post = after.report.rows.find((row) => row.name === r.name);
+            return {
+              name: r.name,
+              was: r.health,
+              action: r.safeFix,
+              now: post?.health ?? null,
+              outcome:
+                post === undefined ? 'unknown' : post.severity === 'ok' ? 'applied' : 'unresolved',
+            };
+          }),
           labels: after.liveLabels,
           ...after.report,
           probeFailures,
@@ -446,7 +523,7 @@ async function main() {
     }
     process.exit(1);
   }
-  console.log('\n--fix complete: catalog and live state now agree.');
+  note('\n--fix complete: catalog and live state now agree.');
 }
 
 // A thrown error anywhere above is an operational failure, not drift: exit 2 so a caller can
