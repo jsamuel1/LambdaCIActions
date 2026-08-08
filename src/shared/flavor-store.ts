@@ -209,21 +209,21 @@ export interface RegisterFlavorInput {
  * Build the record a registration writes. Pure, so the namespacing + collision rules are
  * testable without DynamoDB.
  *
- * Throws on a name that is malformed or collides with a built-in — ADR-040 requires the
- * collision to be refused at REGISTRATION rather than resolved by precedence at routing time,
- * so an operator cannot redefine what `lambda-ci-node` means for their jobs.
+ * Throws {@link InvalidFlavorError} on a name that is malformed or collides with a built-in —
+ * ADR-040 requires the collision to be refused at REGISTRATION rather than resolved by precedence
+ * at routing time, so an operator cannot redefine what `lambda-ci-node` means for their jobs.
  */
 export function buildFlavorRecord(
   input: RegisterFlavorInput,
   now: Date = new Date(),
 ): CustomFlavorRecord {
   const nameError = customFlavorBaseNameError(input.base);
-  if (nameError) throw new Error(nameError);
+  if (nameError) throw new InvalidFlavorError(nameError);
   const name = customFlavorName(input.base);
   const label = customFlavorLabel(input.base);
   const collision = builtinCollision(name, label);
   if (collision) {
-    throw new Error(
+    throw new InvalidFlavorError(
       `custom flavor ${collision.field} collides with built-in flavor '${collision.collidesWith}'`,
     );
   }
@@ -269,6 +269,22 @@ export class FlavorExistsError extends Error {
   constructor(name: string) {
     super(`custom flavor '${name}' already exists for this installation`);
     this.name = 'FlavorExistsError';
+  }
+}
+
+/**
+ * Raised when the SUBMITTED flavor is unacceptable: a malformed base name, or a derived
+ * name/label that collides with a built-in (ADR-040).
+ *
+ * Typed rather than left for the caller to recognize by message text. The API has to map this to
+ * 400 and an infrastructure fault to 500, and a regex over `err.message` cannot tell them apart:
+ * a DynamoDB `ValidationException` mentioning an attribute "name" would be reported to the operator
+ * as invalid input, hiding a real fault behind a wrong diagnosis.
+ */
+export class InvalidFlavorError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidFlavorError';
   }
 }
 

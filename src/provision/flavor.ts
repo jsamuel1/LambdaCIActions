@@ -205,6 +205,8 @@ export interface FlavorResolution {
    * on an image the workflow never asked for.
    *
    * Absent whenever no custom flavor was named, so a job that never mentions one is unaffected.
+   * Also absent when the repo's FlavorMap explicitly remaps the custom label onto a flavor that
+   * does exist — that is an operator override, not a silent substitution.
    */
   unresolvedCustom?: string;
 }
@@ -224,6 +226,16 @@ function byName(catalog: readonly FlavorDef[], name: string): FlavorDef | undefi
  * when no other rule matched; treating it as one unconditionally would refuse jobs that
  * legitimately resolved through an explicit built-in label.
  *
+ * The FlavorMap gets the same treatment from the other direction: a custom LABEL that the map
+ * explicitly redefines is not an unresolved request, because the map is resolution step 1 — the
+ * HIGHEST-precedence rule — and an operator writing `lambda-ci-custom-gpu → node` has stated what
+ * that label means for this repo. Refusing it anyway would veto the override that resolution just
+ * honored, and it would break the obvious operator workaround: pinning a custom label to a
+ * known-good built-in while the custom image is invalid or being re-validated. The refusal exists
+ * for a SILENT fall-through onto an image the workflow never asked for; an explicit remap is the
+ * opposite of silent. Suppression is per-label, so a custom label with no map entry of its own is
+ * still refused even when some other label on the job is mapped.
+ *
  * Pure, and undefined whenever no custom flavor is named — which is what keeps the
  * zero-custom-flavor path byte-identical.
  */
@@ -232,13 +244,23 @@ function unresolvedNamedCustom(
   lower: readonly string[],
   opts: ResolveOptions,
 ): string | undefined {
+  const mapLower = opts.flavorMap
+    ? new Map(Object.entries(opts.flavorMap).map(([k, v]) => [k.toLowerCase(), v]))
+    : undefined;
+  const remappedToCatalogFlavor = (label: string): boolean => {
+    const mapped = mapLower?.get(label);
+    return mapped !== undefined && byName(catalog, mapped) !== undefined;
+  };
   for (const label of lower) {
-    if (isCustomFlavorLabel(label) && !catalog.some((f) => f.label.toLowerCase() === label)) {
+    if (
+      isCustomFlavorLabel(label) &&
+      !catalog.some((f) => f.label.toLowerCase() === label) &&
+      !remappedToCatalogFlavor(label)
+    ) {
       return label;
     }
   }
-  if (opts.flavorMap) {
-    const mapLower = new Map(Object.entries(opts.flavorMap).map(([k, v]) => [k.toLowerCase(), v]));
+  if (mapLower) {
     for (const label of lower) {
       const mapped = mapLower.get(label);
       if (mapped && isCustomFlavorName(mapped) && !byName(catalog, mapped)) return mapped;

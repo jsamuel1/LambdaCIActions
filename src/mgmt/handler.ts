@@ -59,6 +59,7 @@ import {
 } from './validate.js';
 import {
   FlavorExistsError,
+  InvalidFlavorError,
   buildFlavorRecord,
   deleteCustomFlavor,
   getCustomFlavor,
@@ -1543,8 +1544,10 @@ async function registerFlavorRoute(
   } catch (err) {
     if (err instanceof FlavorExistsError) return problem(409, err.message);
     // `buildFlavorRecord` throws on a malformed name or a built-in collision — both are the
-    // client's input, so 400 rather than 500 (ADR-040 refuses collisions at registration).
-    if (err instanceof Error && /collides with built-in|name /.test(err.message)) {
+    // client's input, so 400 rather than 500 (ADR-040 refuses collisions at registration). Matched
+    // by TYPE: message text cannot distinguish these from a DynamoDB fault that happens to mention
+    // a "name", which would misreport a real outage as bad operator input.
+    if (err instanceof InvalidFlavorError) {
       return problem(400, 'invalid custom flavor', [err.message]);
     }
     throw err;

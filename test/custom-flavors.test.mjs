@@ -27,6 +27,7 @@ import {
 } from '../dist/src/shared/flavor-catalog.js';
 import {
   buildFlavorRecord,
+  InvalidFlavorError,
   canTransitionValidation,
   isRoutableState,
   routableCustomFlavors,
@@ -246,6 +247,25 @@ test('buildFlavorRecord throws when the derived name would collide', () => {
     }),
     /must not repeat the 'custom-' prefix/,
     'a doubled prefix is refused before it can produce custom-custom-node',
+  );
+});
+
+test('a rejected registration throws a TYPED error, not one recognized by message text', () => {
+  // The Mgmt route maps this to 400 and anything else to 500. Matching on `err.message` would let a
+  // DynamoDB fault that happens to mention a "name" be reported to the operator as invalid input,
+  // so the type is the contract.
+  assert.throws(
+    () =>
+      buildFlavorRecord({
+        installationId: 42,
+        base: 'Not A Valid Name',
+        vcpu: 2,
+        memoryMb: 4096,
+        capabilities: [],
+        description: 'x',
+        imageArn: 'arn:x',
+      }),
+    (err) => err instanceof InvalidFlavorError && err.name === 'InvalidFlavorError',
   );
 });
 

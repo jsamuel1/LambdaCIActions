@@ -365,6 +365,47 @@ test('the refusal does NOT fire for legitimate resolutions', () => {
   assert.equal(otherLabel.unresolvedCustom, undefined);
 });
 
+test('a custom label the FlavorMap explicitly remaps to a built-in is NOT refused', () => {
+  // The FlavorMap is resolution step 1 — the highest-precedence rule — so an operator writing
+  // `lambda-ci-custom-gpu → node` has stated what that label means for this repo. That is the
+  // obvious workaround while a custom image is invalid or being re-validated, and refusing it
+  // would veto the override resolution just honored. The refusal exists for a SILENT fall-through
+  // onto an image the workflow never asked for; an explicit remap is the opposite of silent.
+  const remapped = resolveFlavor(['self-hosted', 'ubuntu-latest', 'lambda-ci-custom-gpu'], {
+    flavorMap: { 'lambda-ci-custom-gpu': 'node' },
+    mode: 'adopt',
+    customFlavors: [],
+  });
+  assert.equal(remapped.flavor, 'node');
+  assert.equal(remapped.reason, "FlavorMap override: 'lambda-ci-custom-gpu' → 'node'");
+  assert.equal(remapped.unresolvedCustom, undefined);
+
+  // Suppression is per-LABEL, not per-job: a second custom label with no map entry of its own is
+  // still an unresolved request, even though a different label on the job was remapped.
+  const partial = resolveFlavor(
+    ['self-hosted', 'lambda-ci-custom-gpu', 'lambda-ci-custom-fpga'],
+    { flavorMap: { 'lambda-ci-custom-gpu': 'node' }, customFlavors: [] },
+  );
+  assert.equal(partial.flavor, 'node');
+  assert.equal(partial.unresolvedCustom, 'lambda-ci-custom-fpga');
+
+  // A remap whose TARGET does not exist is not an override at all — resolution ignores it, so the
+  // custom label remains an unresolved request rather than being excused by a broken entry.
+  const brokenTarget = resolveFlavor(['self-hosted', 'lambda-ci-custom-gpu'], {
+    flavorMap: { 'lambda-ci-custom-gpu': 'no-such-flavor' },
+    customFlavors: [],
+  });
+  assert.equal(brokenTarget.unresolvedCustom, 'lambda-ci-custom-gpu');
+
+  // And a remap onto ANOTHER absent custom flavor is still refused. The label is what gets named:
+  // it is what the workflow actually wrote, and the label loop is checked before map values.
+  const remapToCustom = resolveFlavor(['self-hosted', 'lambda-ci-custom-gpu'], {
+    flavorMap: { 'lambda-ci-custom-gpu': 'custom-fpga' },
+    customFlavors: [],
+  });
+  assert.equal(remapToCustom.unresolvedCustom, 'lambda-ci-custom-gpu');
+});
+
 test('a signal upgrade away from a routable custom flavor is legitimate, not a refusal', () => {
   // `custom-nogpu` resolves fine but lacks docker, so the resolver upgrades to a built-in. That is
   // the documented ADR-039 replacement, and `replaced` already makes the toolchain loss visible —

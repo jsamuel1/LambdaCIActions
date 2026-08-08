@@ -287,7 +287,8 @@ read-only. Resolution composes `builtin ++ custom` through the single seam
 (on **name or label**) is rejected at registration rather than silently shadowing (or being shadowed
 by) it. Custom flavors are visible only to their own installation — a cross-tenant read is not
 "denied" but unaddressable, because the scope is the partition key. Requested memory is
-bounds-checked and the derived per-minute rate is surfaced before save via a no-write preview
+bounds-checked (against a fixed sanity ceiling today — the region's live microVM quota is not yet
+read) and the derived per-minute rate is surfaced before save via a no-write preview
 endpoint; per ADR-038 that rate is an **estimate** for the requested shape and `vcpu` is descriptive,
 so a description advertising a vCPU shape is refused.
 
@@ -299,9 +300,12 @@ cannot both launch a VM and both write a verdict, and non-`valid` is refused in 
 places (catalog composition, config validation, and immediately before launch, since resolution and
 launch are separate reads). Validation is (1) static checks — arm64, image ARN resolves and is
 readable by the provisioner, capabilities drawn from the closed vocabulary (`docker`, `node`,
-`python`, `java`, `go`, `rust`), memory within quota — **implemented, including a real image-state
-probe**; and (2) a **smoke run**: one microVM launched from the image with a synthetic JIT-registered
-runner that must register, execute a trivial job, and self-terminate through the hook broker — the
+`python`, `java`, `go`, `rust`), memory bounds-checked — **implemented, including a real image-state
+probe**, though the memory bound is currently a fixed sanity ceiling rather than the region's live
+microVM quota: nothing reads that quota yet, so an obvious typo is caught but a request that merely
+exceeds the account's real headroom is not (ADR-040); and (2) a **smoke run**: one microVM launched
+from the image with a synthetic JIT-registered runner that must register, execute a trivial job, and
+self-terminate through the hook broker — the
 verdict *classifier* is implemented and unit-tested, **the orchestrator that performs the run is
 not**. Static checks alone are not sufficient evidence: the `docker` flavor built fine, published its
 ARN and routed correctly while failing *every* job because nothing could start `dockerd`
