@@ -325,15 +325,26 @@ async function main() {
   // post-fix one when fixing, this one otherwise.
   if (JSON_OUT) {
     if (!FIX) {
-      console.log(
-        JSON.stringify(
-          { env: ENV, region: REGION, labels: liveLabels, ...report, probeFailures },
-          null,
-          2,
-        ),
-      );
+      // ...and nothing at all when the next statement is going to exit 2. A document belongs to
+      // exits 0 and 1 ("I read the plane"); exit 2 means "do not trust this report", and
+      // serializing one anyway invites a consumer to parse a report we just said was
+      // INCOMPLETE — `image_unverified` rows are indistinguishable in shape from observed ones.
+      // The diagnosis is on stderr, where the other exit-2 paths (unreadable allowlist,
+      // unreadable fleet, failed remediation) already put theirs; this was the one path that
+      // emitted a document with it, making the contract false for `--json` alone.
+      if (probeFailures.length === 0) {
+        console.log(
+          JSON.stringify(
+            { env: ENV, region: REGION, labels: liveLabels, ...report, probeFailures },
+            null,
+            2,
+          ),
+        );
+      }
     }
   } else {
+    // The human table still prints: `image_unverified` rows plus the probe diagnosis below are
+    // more use to an operator than nothing, and prose was never claimed to be parseable.
     printTable(report, labels);
   }
 

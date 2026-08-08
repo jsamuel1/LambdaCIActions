@@ -2673,8 +2673,13 @@ under `--json`: the deploy-pin confirmation (`assertDeployTarget` takes a log si
 this), the `--fix` progress lines, and `build-images`' own stdout, which `stdio: 'inherit'` used
 to merge into ours. A document preceded by a `✓ deploy target verified: …` line is not parseable,
 so the contract was previously false on every `--json` path regardless of which branch printed.
-Exit 2 is deliberately outside it: an unreadable plane or a failed remediation has no trustworthy
-report to serialize, and the diagnosis goes to stderr.
+Exit 2 is deliberately outside it, and that means printing **nothing**: an unreadable plane or a
+failed remediation has no trustworthy report to serialize, and the diagnosis goes to stderr. An
+incomplete image probe is the case that makes this load-bearing rather than pedantic — it still
+produces a full-looking report whose `image_unverified` rows are shaped exactly like observed
+ones, so emitting it hands a consumer something parseable that we simultaneously say not to
+trust. The human table still prints there, because prose was never claimed to be parseable and
+an operator is better served by the rows plus the diagnosis than by silence.
 
 **5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
 a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the

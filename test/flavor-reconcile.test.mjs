@@ -1085,7 +1085,7 @@ test('the CD deploy role can read config params but not secrets', () => {
 // against a stub `aws` and parse its stdout, which is the only way that claim can be checked.
 
 /** A stub `aws` on PATH, so the CLI's real spawnSync calls resolve to a scripted plane. */
-function stubAws(dir, { labels, imageStates }) {
+function stubAws(dir, { labels, imageStates, imageProbeFails = false }) {
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin, { recursive: true });
   const params = catalogFlavors().map((f) => ({
@@ -1106,6 +1106,10 @@ if (a[0] === 'ssm' && a[1] === 'get-parameters-by-path') {
   console.log(JSON.stringify({ Parameters: ${JSON.stringify(params)} })); process.exit(0);
 }
 if (a[0] === 'lambda-microvms' && a[1] === 'get-microvm-image') {
+  if (${imageProbeFails ? 'true' : 'false'}) {
+    console.error('An error occurred (AccessDeniedException) when calling the GetMicrovmImage operation');
+    process.exit(254);
+  }
   const arn = a[a.indexOf('--image-identifier') + 1];
   const states = ${JSON.stringify(imageStates)};
   console.log(JSON.stringify({ state: states[arn.replace('arn:fake:', '')] ?? 'UPDATED' }));
@@ -1226,4 +1230,60 @@ test('--fix progress narration and the child build go to stderr under --json', (
   );
   assert.match(runFn, /JSON_OUT \?/, 'run() must redirect the child under --json');
   assert.doesNotMatch(runFn, /spawnSync\(cmd, cmdArgs, \{ stdio: 'inherit' \}\)/);
+});
+
+test('--json: an incomplete image probe exits 2 with NO document on stdout', () => {
+  // Exit 2 means "do not trust this report", and the ADR/RUNBOOK/script header all say it
+  // prints no document. This path printed one anyway: `probeFailures` is populated during
+  // `observe`, but the emission ran before the guard that reads it, so an AccessDenied produced
+  // a full-looking report — `image_unverified` rows are shaped exactly like observed ones — on
+  // stdout, immediately followed by exit 2. A consumer keying on the exit code is fine; one
+  // parsing stdout is handed a report we simultaneously declared INCOMPLETE. The other exit-2
+  // paths (unreadable allowlist, unreadable fleet, failed remediation) all print prose to
+  // stderr only, so this was the single asymmetric one.
+  const r = runReconcile(['--json'], {
+    labels: ALL_LABELS,
+    imageStates: {},
+    imageProbeFails: true,
+  });
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}\n${r.stderr}`);
+  assert.equal(r.stdout.trim(), '', `exit 2 must print no document, got:\n${r.stdout.slice(0, 400)}`);
+  // The diagnosis is still emitted — on stderr, with the probe failures named.
+  assert.match(r.stderr, /image state probe\(s\) could not be completed/);
+  assert.match(r.stderr, /AccessDenied/);
+});
+
+test('the non-fix JSON emission is gated on there being no probe failure', () => {
+  // Source-level companion to the CLI test above, so the gate cannot be removed while the
+  // integration test is skipped/slow. Assert the BRANCH: `probeFailures` appears in the
+  // document payload itself (it is a reported key), so a bare word match stays green after the
+  // gate is deleted.
+  const pre = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('if (JSON_OUT) {'),
+    RECONCILE_CODE.indexOf('const actionable ='),
+  );
+  assert.ok(pre.length > 0, 'pre-fix output block not found');
+  assert.match(
+    pre,
+    /if \(probeFailures\.length === 0\) \{[\s\S]{0,200}?JSON\.stringify\(/,
+    'the pre-fix document must be gated on a complete probe',
+  );
+  // The human table is deliberately NOT gated: rows plus the diagnosis beat silence, and prose
+  // was never claimed to be parseable.
+  assert.match(pre, /printTable\(report, labels\)/);
+});
+
+test('the RUNBOOK pipes --json through `npm run --silent`', () => {
+  // `npm run` banners `> lambda-ci-actions@0.0.0 flavors:reconcile` to STDOUT before the script
+  // runs, so the documented `npm run flavors:reconcile -- --json | jq` could never parse — the
+  // one-document contract holds for the script, and the wrapper broke it in the example that
+  // demonstrates it. Every `--json` invocation in the RUNBOOK must therefore use --silent.
+  const runbook = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'RUNBOOK.md'), 'utf8');
+  const jsonInvocations = [...runbook.matchAll(/npm run (--silent )?flavors:reconcile[^\n`]*/g)]
+    .map((m) => m[0])
+    .filter((cmd) => cmd.includes('--json'));
+  assert.ok(jsonInvocations.length > 0, 'no documented --json invocation found');
+  for (const cmd of jsonInvocations) {
+    assert.match(cmd, /npm run --silent/, `documented --json command must use --silent: ${cmd}`);
+  }
 });
