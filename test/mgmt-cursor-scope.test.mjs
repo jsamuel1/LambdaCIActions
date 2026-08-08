@@ -239,12 +239,16 @@ test('openCursor never throws on hostile input', () => {
 // The source scan walks every route-bearing source file, not just `handler.ts`: a new list
 // route in a new file is exactly the case the type layer cannot catch on its own.
 //
-// These guards match SHAPES, not spellings — twice earned. An earlier revision keyed them on
-// `nextCursor: <expr>` and on the literal line `const opened = openCursor(…);`, and four
+// These guards match SHAPES, not spellings — three times earned. An earlier revision keyed them
+// on `nextCursor: <expr>` and on the literal line `const opened = openCursor(…);`, and four
 // ordinary ways of writing a route walked past all of them: ES shorthand, a renamed binding, a
 // scope argument containing a call, and a prettier-wrapped multi-line call. A later revision
 // still keyed the seal rule on the FIELD NAME `nextCursor`, and two more walked past: an object
 // SPREAD of the page (no field name exists to match) and a field simply renamed to `cursor`.
+// The revision after that still keyed the seal rule's raw-cursor READS on the binding name
+// `opened`, so a route naming its `openCursor` result anything else could echo the INBOUND
+// plaintext key back (`resumedFrom: oc.cursor`) past every guard here. Only the runtime backstop
+// caught it, as a 500 — fail-closed, but a test failure is the intended place to learn it.
 // Each is probed below the assertion that now catches it.
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
@@ -313,6 +317,32 @@ function endOfCall(src, open) {
   return -1;
 }
 
+/**
+ * A pattern matching every expression in `src` that READS a raw cursor.
+ *
+ * Two sources, both resolved by shape:
+ *
+ *   - `….nextCursor` — any store page, whatever the page was bound as;
+ *   - `<binding>.cursor` for every binding of an `openCursor(` result — the inbound plaintext
+ *     key. `guardedOpens` already resolves those names to check the 400; the seal rule needs
+ *     the same list, because it used to hardcode `opened`, and a route that named its result
+ *     anything else could echo the key into an untyped body past every guard here.
+ *
+ * A destructured `const { ok, cursor } = openCursor(…)` needs no entry: the discriminated
+ * union makes reading `cursor` before narrowing a type error (probed — TS2339), so that
+ * spelling cannot reach a body at all.
+ */
+function rawCursorReads(src) {
+  const names = new Set();
+  for (const m of src.matchAll(/openCursor\(/g)) {
+    const before = src.slice(0, m.index);
+    const plain = /(?:const|let)\s+(\w+)\s*=[\s\S]{0,20}$/.exec(before);
+    if (plain) names.add(plain[1]);
+  }
+  const alts = ['\\.nextCursor', ...[...names].map((n) => `\\b${n}\\.cursor`)];
+  return new RegExp(`(?:${alts.join('|')})\\b`);
+}
+
 function routeSources() {
   const out = [];
   for (const entry of readdirSync(SRC, { recursive: true, withFileTypes: true })) {
@@ -344,14 +374,27 @@ test('every route seals a cursor it puts in a body, whatever the field is called
   // Judged by what the RHS READS, not by what the field is named. The previous rule matched
   // `nextCursor:` specifically, so `cursor: page.nextCursor ?? null` — an ordinary rename —
   // walked straight past it and shipped the same plaintext key. Any field whose value reads a
-  // raw cursor (`….nextCursor`, `opened.cursor`) must either seal it, or reduce it to a boolean.
+  // raw cursor must either seal it, or reduce it to a boolean.
+  //
+  // A raw cursor has TWO sources in route code, and both must be recognized by shape rather
+  // than by one spelling:
+  //
+  //   - a store page's `….nextCursor` — the cursor we are about to hand out;
+  //   - the OPENED inbound cursor (`openCursor(…).cursor`) — the plaintext key the client only
+  //     ever held sealed. Echoing that back discloses exactly what ADR-052 seals.
+  //
+  // The second was keyed on the binding name `opened`, which is not a shape: a route naming
+  // its result anything else (`const oc = openCursor(…); … resumedFrom: oc.cursor`) typechecks
+  // against an untyped body and passed every guard here — only the runtime `toJSON` backstop
+  // caught it, as a 500. So resolve whatever each route actually named its result, exactly as
+  // `guardedOpens` already does for the 400 rule.
   //
   // The boolean escape is load-bearing, not a loophole: `anyIndexTruncated:
   // pages.some((p) => p.nextCursor !== undefined)` legitimately asks whether an index was
   // truncated. A comparison yields `true`/`false`, which carries no identifier.
-  const readsCursor = /(?:\.nextCursor|\bopened\.cursor)\b/;
   let sealed = 0;
   for (const [rel, src] of SOURCES) {
+    const readsCursor = rawCursorReads(src);
     for (const m of stripTypeDecls(src).matchAll(/(\w+):\s*([^,\n]+(?:\n[^,\n]*)??)(?=,|\n\s*[}\])])/g)) {
       const [field, rhsRaw] = [m[1], m[2]];
       const rhs = rhsRaw.trim().replace(/[\s;}]+$/, '');
@@ -369,6 +412,40 @@ test('every route seals a cursor it puts in a body, whatever the field is called
     }
   }
   assert.ok(sealed >= 2, `expected both runs branches to seal, found ${sealed}`);
+});
+
+test('the seal rule recognizes a cursor read under whatever the route named it', () => {
+  // Guard the guard, twice over. `rawCursorReads` is what makes the rule above shape-based
+  // rather than spelling-based, so pin BOTH that it resolves the handler's real binding and
+  // that it would catch a route which chose a different name.
+  const handlerReads = rawCursorReads(HANDLER);
+  assert.ok(handlerReads.test('opened.cursor'), "the handler's own binding must be resolved");
+  assert.ok(handlerReads.test('page.nextCursor'), 'a store page read must be resolved');
+  // The leak that walked past the previous rule: a renamed binding echoed into an untyped
+  // body. `resumedFrom: oc.cursor` returns the plaintext key the client only held SEALED.
+  const renamed = `
+    const oc = openCursor(q.cursor, scope, secret);
+    if (!oc.ok) return problem(400, CURSOR_REFUSED);
+    return json(200, {
+      runs,
+      resumedFrom: oc.cursor,
+      complete: false,
+    });
+  `;
+  const reads = rawCursorReads(renamed);
+  assert.ok(reads.test('oc.cursor'), 'a renamed openCursor binding must be resolved');
+  // …and the rule built on it must reject that body, since the read is neither sealed nor
+  // reduced to a boolean.
+  const offending = [
+    ...stripTypeDecls(renamed).matchAll(/(\w+):\s*([^,\n]+(?:\n[^,\n]*)??)(?=,|\n\s*[}\])])/g),
+  ].filter((m) => reads.test(m[2].trim()) && !/seal(?:Cursor|CursorOrNull)\(/.test(m[2]));
+  assert.equal(offending.length, 1, 'the renamed echo must be seen as an unsealed cursor read');
+  assert.equal(offending[0][1], 'resumedFrom');
+  // A cursor-free binding contributes no alternation, so the pattern must not degenerate into
+  // matching everything.
+  const none = rawCursorReads('const x = 1;');
+  assert.equal(none.test('x.cursor'), false);
+  assert.equal(none.test('anything'), false);
 });
 
 test('a route cannot spread a store page into a response body', () => {

@@ -2986,10 +2986,12 @@ Two supporting choices:
   cannot see — reaching through `.raw`, minting a cursor inside a route, dropping the 400,
   spreading a store page into a body, or putting a cursor in a field under any name. They match
   the *shape* of a call rather than one spelling of it (balanced-paren extents; the binding name
-  the route actually chose; the RHS's cursor *reads* rather than the field's name), because
-  line-shaped and name-keyed rules were each defeated in review — by ES shorthand, a renamed
-  binding, a scope argument containing a call, a prettier-wrapped multi-line call, an object
-  **spread** of the page, and a field renamed from `nextCursor` to `cursor`. (3) Because a leak
+  the route actually chose, for both the 400 check and the raw-cursor reads it must recognize;
+  the RHS's cursor *reads* rather than the field's name), because line-shaped and name-keyed
+  rules were each defeated in review — by ES shorthand, a renamed binding, a scope argument
+  containing a call, a prettier-wrapped multi-line call, an object **spread** of the page, a
+  field renamed from `nextCursor` to `cursor`, and a route that renamed its `openCursor` result
+  and echoed the inbound plaintext key back as a different field. (3) Because a leak
   need not *spell* anything — a spread has no field name at all — the value itself refuses:
   `asRawCursor` installs a non-enumerable `toJSON` that throws. `JSON.stringify` consults it for
   any reachable value at any depth under any key, which is precisely the set of paths a
@@ -3020,9 +3022,12 @@ Two supporting choices:
   visibility filter was computed from those grants.
 - Rotating the session secret invalidates outstanding cursors. Same blast radius as the
   session cookie, which is signed with that secret and already re-issued on rotation.
-- Sealing costs one HKDF and one AES-GCM pass over ~200 bytes per page — unmeasurable next to
-  the DynamoDB query it accompanies. Cursors grow by the 12-byte nonce, 16-byte tag, and
-  version prefix.
+- Sealing costs one HKDF and one AES-GCM pass over ~200 bytes per page, plus one
+  non-enumerable property per cursor for the backstop — unmeasurable next to the DynamoDB query
+  it accompanies. Cursors grow by the 12-byte nonce, 16-byte tag, and version prefix. The
+  backstop is invisible to the seams that legitimately handle raw cursors: `sealCursor`,
+  `decodeCursor`, and the report fan-out all read `.raw` directly, and `toJSON` being
+  non-enumerable keeps the wrapper `deepEqual` to a plain `{ raw }`.
 - A future paginated route inherits the requirement from three places, and the last is the one
   that does not depend on how the route is written: it cannot return a store cursor from a
   **declared** body, because `RawCursor` is not assignable to `string | null`; the source guards
@@ -3031,8 +3036,3 @@ Two supporting choices:
   response fails closed instead of shipping plaintext. The unclaimed-jobs list is the first such
   route, needs a `view` of its own when it lands, and should declare its body the way
   `RunListBody` does.
-- Sealing is one AES-GCM pass; the backstop is one non-enumerable property per cursor. Neither
-  is measurable next to the DynamoDB query. The backstop is invisible to the store-side seams
-  that legitimately handle raw cursors — `sealCursor`, `decodeCursor`, and the report fan-out all
-  read `.raw` directly, and `toJSON` being non-enumerable keeps the wrapper `deepEqual` to a
-  plain `{ raw }`.

@@ -63,8 +63,8 @@ import crypto from 'node:crypto';
  *      store cursor a compile error — but only for routes that declare one, and `json()` takes
  *      `unknown`;
  *   2. source guards (`test/mgmt-cursor-scope.test.mjs`) scan every file under `src/` for the
- *      residue the types cannot see — but they match SPELLINGS, and a leak need not spell
- *      anything (an object spread has no field name at all);
+ *      residue the types cannot see — but they match code SHAPES, and a leak need not take any
+ *      shape they enumerate (an object spread has no field name at all);
  *   3. the raw cursor **throws if serialized** (see `UNSERIALIZABLE`), which is the only layer
  *      that is a property of the value rather than of how the code was written.
  *
