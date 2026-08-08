@@ -820,23 +820,64 @@ test('--fix is rejected with --no-image-check', () => {
   assert.ok(fixGate > 0 && refusal.index < fixGate, 'the refusal must precede fix selection');
 });
 
-test('drift --fix could not remediate still exits non-zero', () => {
-  // Exiting 0 because the FIXABLE half was fixed would claim an agreement the plane does not
-  // have: an `image_building` row (or any state whose remedy is a human decision) carries no
-  // safeFix, so a scheduled `--fix` would report success while a flavor stayed unrunnable.
+test('--fix scores itself on a RE-READ of live state, not on child exit codes', () => {
+  // Exiting 0 because every remediation returned 0 would claim an agreement the plane does not
+  // have. `build-images` exits 0 when `runner-labels` is ABSENT: it publishes the image ARN,
+  // warns, and refuses to CREATE the parameter (creating it from one flavor would drop every
+  // other label). On an environment that skipped the phase-0 seed, every row is
+  // `label_missing`/`not_built`, so a pre-fix "unfixable" snapshot is EMPTY — and scoring the run
+  // against that snapshot reported success after adding no label at all, leaving the entire
+  // catalog unrunnable. That is ADR-049 § 4c failing on its own terms, so the verdict has to come
+  // from re-observing the plane.
   const fix = RECONCILE_CODE.slice(RECONCILE_CODE.indexOf('const actionable ='));
   assert.ok(fix.length > 0, '--fix block not found');
-  assert.match(fix, /const unfixable = /, 'must compute the rows it will not touch');
+
+  // The observation must be a real second read, positioned AFTER the remediation loop...
+  const loop = fix.indexOf('for (const r of actionable)');
+  const reread = fix.indexOf('after = observe(reconcile)');
+  assert.ok(loop > 0, 'remediation loop not found');
+  assert.ok(reread > loop, 'the post-fix read must follow the remediation loop');
+
+  // ...and the exit must be derived from THAT read, not from the pre-fix report.
+  const verdict = /const remaining = after\.report\.rows\.filter\([\s\S]{0,900}?process\.exit\(1\);/.exec(
+    fix,
+  );
+  assert.ok(
+    verdict,
+    'expected leftover drift to be computed from the post-fix report and exit 1',
+  );
+  assert.ok(verdict.index > reread, 'the verdict must be computed after re-reading');
+
+  // The stale-snapshot verdict must be gone entirely, or it could be restored by accident.
+  assert.doesNotMatch(
+    fix,
+    /const unfixable =/,
+    'the pre-fix snapshot verdict must not survive alongside the re-read',
+  );
+
+  // A post-fix read that cannot complete its probes is UNKNOWN, not success.
   assert.match(
     fix,
-    /unfixable\.length > 0[\s\S]{0,600}?process\.exit\(1\)/,
-    'leftover drift must exit 1, not 0',
+    /probeFailures\.length[\s\S]{0,500}?process\.exit\(2\)/,
+    'an incomplete post-fix probe must exit 2, not pass as fixed',
   );
-  // And that check must come AFTER the remediation loop, or a fixable row would be counted
-  // against the run it is about to fix.
-  const loop = fix.indexOf('for (const r of actionable)');
-  const leftover = fix.indexOf('unfixable.length > 0');
-  assert.ok(loop > 0 && leftover > loop, 'the leftover check must follow the fix loop');
+
+  // And the absent-allowlist cause is named, because the child only logged it.
+  assert.match(fix, /after\.labels\.absent/, 'must diagnose an absent allowlist explicitly');
+  assert.match(fix, /Seed it first/);
+});
+
+test('--fix emits exactly one JSON document, describing the post-fix state', () => {
+  // Two JSON documents on one stdout breaks every parser, and the document a `--json --fix`
+  // consumer needs is the state AFTER remediation — the same state the exit code describes.
+  const pre = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('if (JSON_OUT) {'),
+    RECONCILE_CODE.indexOf('const actionable ='),
+  );
+  assert.ok(pre.length > 0, 'pre-fix output block not found');
+  assert.match(pre, /if \(!FIX\) \{/, 'the pre-fix JSON must be suppressed when fixing');
+  const post = RECONCILE_CODE.slice(RECONCILE_CODE.indexOf('after = observe(reconcile)'));
+  assert.match(post, /JSON\.stringify\(/, 'the post-fix path must emit the JSON document');
 });
 
 test('an operational failure exits 2, never 1 — it is not drift', () => {

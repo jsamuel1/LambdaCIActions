@@ -2652,6 +2652,18 @@ agreement. 2 is an operational failure: unreadable live state, an incomplete ima
 unreadable fleet, or a remediation that failed part-way (which stops rather than continuing).
 Collapsing the two would let "I could not look" render as an ordinary drift table.
 
+That verdict is taken from a **re-read of the plane after remediating**, not from the child
+processes' exit codes against the pre-fix report. The two are different facts, and the gap is
+reachable: `build-images` exits 0 when `runner-labels` is *absent* — it publishes the image ARN,
+warns, and refuses to CREATE the parameter, because creating it from one flavor would drop every
+other label an operator had seeded. On an environment that skipped the phase-0 seed every row is
+`label_missing`/`not_built`, so the set of rows `--fix` will not touch is empty, and scoring the
+run against that snapshot reports success after adding no label at all — the whole catalog still
+unrunnable, from a command that just said it fixed it. Re-observing costs a handful of API calls
+and generalises to any remediation that silently no-ops. An incomplete probe on that second read
+is exit 2 (unknown), not success. With `--json`, `--fix` emits exactly one document — the
+post-fix report — because two on one stdout parse as neither.
+
 **5. One derivation, one surface today.** The verdicts live in `src/shared/flavor-reconcile.ts`,
 a pure module the CLI and `build-images` consume. A CLI that says `python` is blocked while the
 console shows it green is the same class of bug as the one being fixed here, so the mapping from

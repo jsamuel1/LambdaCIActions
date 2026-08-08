@@ -16,8 +16,9 @@
  *
  * Exit codes:
  *   0 — catalog and live state agree, and nothing is left to do
- *   1 — drift (including drift `--fix` could not safely remediate, e.g. an in-flight build or a
- *       flavor whose only honest remedy is a human decision)
+ *   1 — drift. With `--fix`, drift that REMAINS after remediating (verified by re-reading the
+ *       plane, not by trusting that each build exited 0 — see the --fix block for why those are
+ *       different facts)
  *   2 — usage error / could not read live state / a remediation failed. Includes an image probe
  *       we could not complete: an unreadable image is UNKNOWN, and reporting it as missing would
  *       be a confident verdict about a plane we never observed.
@@ -259,15 +260,18 @@ function printTable(report, labels) {
   );
 }
 
-async function main() {
-  await guardDeployTarget();
-  const reconcile = await import(path.join(REPO_ROOT, 'dist', 'src', 'shared', 'flavor-reconcile.js'));
-  classifyProbe = reconcile.classifyImageProbeFailure;
-  classifySsmRead = reconcile.classifySsmReadFailure;
-
+/**
+ * Read the live plane once and derive the report.
+ *
+ * Extracted so `--fix` can re-observe after remediating instead of reasoning about the plane
+ * from a pre-fix snapshot plus a child process's exit code. Those two are not the same fact:
+ * `build-images` deliberately exits 0 when the allowlist parameter is absent (it refuses to
+ * CREATE the parameter, because doing so from one flavor would drop every other label), so a
+ * remediation can succeed by its own lights while adding no label at all.
+ */
+function observe(reconcile) {
   const labels = ssmGetOptional(LABELS_PARAM);
-  const labelsValue = labels.value;
-  const liveLabels = reconcile.parseRunnerLabels(labelsValue);
+  const liveLabels = reconcile.parseRunnerLabels(labels.value);
   const claimed = new Set(liveLabels.map((l) => l.toLowerCase()));
   const arns = readImageArns();
 
@@ -282,16 +286,30 @@ async function main() {
     };
   });
 
-  const report = reconcile.reconcileFlavors(observations, liveLabels);
+  return { labels, liveLabels, report: reconcile.reconcileFlavors(observations, liveLabels) };
+}
 
+async function main() {
+  await guardDeployTarget();
+  const reconcile = await import(path.join(REPO_ROOT, 'dist', 'src', 'shared', 'flavor-reconcile.js'));
+  classifyProbe = reconcile.classifyImageProbeFailure;
+  classifySsmRead = reconcile.classifySsmReadFailure;
+
+  const { labels, liveLabels, report } = observe(reconcile);
+
+  // With `--fix` the interesting document is the state AFTER remediation, and emitting two JSON
+  // documents on one stdout would break any parser. So `--json` prints exactly one report: the
+  // post-fix one when fixing, this one otherwise.
   if (JSON_OUT) {
-    console.log(
-      JSON.stringify(
-        { env: ENV, region: REGION, labels: liveLabels, ...report, probeFailures },
-        null,
-        2,
-      ),
-    );
+    if (!FIX) {
+      console.log(
+        JSON.stringify(
+          { env: ENV, region: REGION, labels: liveLabels, ...report, probeFailures },
+          null,
+          2,
+        ),
+      );
+    }
   } else {
     printTable(report, labels);
   }
@@ -323,11 +341,6 @@ async function main() {
     process.exit(2);
   }
   const actionable = report.rows.filter((r) => r.safeFix);
-  // Drift this tool will NOT touch: an in-flight build, or a state whose only honest remedy is a
-  // human decision (an unverifiable image, a catalog entry that should be deleted). It must
-  // still be reported as drift after a partial fix — exiting 0 because the fixable half was
-  // fixed would claim agreement the plane does not have.
-  const unfixable = report.rows.filter((r) => r.severity !== 'ok' && !r.safeFix);
   if (actionable.length === 0) {
     console.log('\n--fix: nothing safely fixable.');
     process.exit(report.drift ? 1 : 0);
@@ -372,16 +385,68 @@ async function main() {
       process.exit(2);
     }
   }
-  console.log('\n--fix complete. Re-run `npm run flavors:reconcile` to confirm.');
-  // Only the fixable half is fixed. Anything left is still drift, and the exit code has to say
-  // so or a scheduled `--fix` run reports success while a flavor stays unrunnable.
-  if (unfixable.length > 0) {
+  // Re-OBSERVE rather than trust the remediations' exit codes against the pre-fix report.
+  //
+  // A child that exited 0 has not necessarily fixed anything: `build-images` deliberately exits
+  // 0 when `runner-labels` is ABSENT — it publishes the image ARN, warns, and refuses to create
+  // the parameter, because creating it from one flavor would drop every other label. On an
+  // environment that skipped the phase-0 seed, every row is `label_missing`/`not_built`, so the
+  // pre-fix `unfixable` set is empty; scoring the run against that snapshot would have reported
+  // success after adding no label at all, leaving the whole catalog unrunnable. That is exactly
+  // the "partially-remediated run cannot exit 0" rule (ADR-049 § 4c) failing on its own terms.
+  //
+  // Re-reading is a handful of API calls and it generalises: any remediation that silently
+  // no-ops is caught, not just this one.
+  console.log('\n--fix applied; re-reading live state to verify.');
+  let after;
+  try {
+    after = observe(reconcile);
+  } catch (e) {
+    console.error(`\nERROR: could not re-read live state after --fix — ${e?.message ?? e}`);
+    process.exit(2);
+  }
+  if (probeFailures.length) {
     console.error(
-      `\n${unfixable.length} flavor(s) still drifted and NOT safely fixable: ` +
-        `${unfixable.map((r) => `${r.name} (${r.health})`).join(', ')}.`,
+      `\nERROR: ${probeFailures.length} image state probe(s) could not be completed on the ` +
+        'post-fix read, so whether the remediation worked is UNKNOWN. Re-run ' +
+        '`npm run flavors:reconcile` once the credential/region is fixed.',
     );
+    process.exit(2);
+  }
+  if (!JSON_OUT) printTable(after.report, after.labels);
+  else
+    console.log(
+      JSON.stringify(
+        {
+          env: ENV,
+          region: REGION,
+          fixed: actionable.map((r) => ({ name: r.name, was: r.health, action: r.safeFix })),
+          labels: after.liveLabels,
+          ...after.report,
+          probeFailures,
+        },
+        null,
+        2,
+      ),
+    );
+
+  const remaining = after.report.rows.filter((r) => r.severity !== 'ok');
+  if (remaining.length > 0) {
+    console.error(
+      `\n${remaining.length} flavor(s) still drifted after --fix: ` +
+        `${remaining.map((r) => `${r.name} (${r.health})`).join(', ')}.`,
+    );
+    // One cause is common enough to name, because the remediation cannot fix it and said so only
+    // in a child process's log: with no allowlist parameter there is nothing to append a label to.
+    if (after.labels.absent) {
+      console.error(
+        `${LABELS_PARAM} does not exist, so no label could be added. Seed it first ` +
+          "(docs/DEPLOY-M1.md phase 0 — `--value 'lambda-ci'`), then re-run --fix.",
+      );
+    }
     process.exit(1);
   }
+  console.log('\n--fix complete: catalog and live state now agree.');
 }
 
 // A thrown error anywhere above is an operational failure, not drift: exit 2 so a caller can

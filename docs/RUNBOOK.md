@@ -312,10 +312,20 @@ label** — that would take routing away from jobs that may depend on it right n
 refuses outright if any microVM is non-terminated. Removing a flavor is a deliberate act: drop
 it from `flavors.json` *and* edit the allowlist parameter by hand.
 
-Exit codes for `--fix` follow the same 1-vs-2 rule as a plain report: **1** means drift remains
-(including drift `--fix` will not touch, such as an in-flight build), **2** means something went
-wrong and this report should not be trusted — an unreadable fleet, or a remediation that failed
-part-way, which stops the run rather than continuing down the list.
+Exit codes for `--fix` follow the same 1-vs-2 rule as a plain report, and `--fix` **re-reads the
+live plane after remediating** rather than trusting that each build exited 0: **1** means drift
+remains, **2** means something went wrong and this report should not be trusted — an unreadable
+fleet, an incomplete post-fix probe, or a remediation that failed part-way, which stops the run
+rather than continuing down the list.
+
+The re-read matters for one case in particular. If `/lca/<env>/config/runner-labels` does not
+exist at all, `build:images` publishes the image ARN, warns, and refuses to *create* the
+parameter (creating it from one flavor would drop every other label) — and exits 0. So a `--fix`
+run can build every missing image, add no label whatsoever, and be told by each child process
+that it succeeded. Scored against the plane instead, that run exits 1 and names the cause. Seed
+the parameter (`docs/DEPLOY-M1.md` phase 0) and re-run.
+
+With `--json`, `--fix` prints exactly one document: the post-fix report, matching the exit code.
 
 CD runs `flavors:reconcile --no-image-check` as a **report-only** step, so drift shows up in the
 deploy summary. It never builds: an image build is deploy-touching, and the CD job is itself a

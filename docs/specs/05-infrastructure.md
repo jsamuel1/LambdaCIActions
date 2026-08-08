@@ -188,8 +188,12 @@ region is indistinguishable from a missing flavor), and exits non-zero on drift:
 when live state could not be read at all (including an image probe that failed for any reason
 other than `ResourceNotFoundException` — unknown is not absent). `--fix` builds a missing image
 or adds a label for a verified one; it never removes a label, refuses on a non-quiescent fleet,
-and refuses on an incomplete probe. A `--fix` run that clears only the safely-fixable half still
-exits 1, and a failed remediation exits 2 rather than passing as drift. Verdicts come from
+and refuses on an incomplete probe. `--fix` scores itself by **re-reading the plane afterwards**,
+not by trusting each remediation's exit code: `build-images` exits 0 when `runner-labels` is
+absent (it will not create the parameter from one flavor), so a run can build every image, add no
+label, and be told it succeeded. A `--fix` run that leaves any drift exits 1, an incomplete
+post-fix probe exits 2, and a failed remediation exits 2 rather than passing as drift. Verdicts
+come from
 `src/shared/flavor-reconcile.ts`, which the console health item must consume when it lands so the
 CLI and the console cannot disagree.
 
