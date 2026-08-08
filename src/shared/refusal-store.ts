@@ -81,7 +81,14 @@ export interface RecordRefusalInput {
  * `ubuntu-latest` volumes it would not be.
  *
  * Everything else IS overwritten: the reason, fix, and especially `claimedLabels` describe the
- * MOST RECENT refusal, which is what an operator is diagnosing.
+ * MOST RECENT refusal, which is what an operator is diagnosing. That includes the OPTIONAL
+ * attributes: an absent one is `REMOVE`d rather than left alone, because a row is re-written by a
+ * later refusal of the SAME (repo, run, job) that can have reached a DIFFERENT gate. The stored
+ * analysis is re-read on every delivery, so a re-scan between two deliveries of one queued job can
+ * move it from the runner-group gate to the compat gate — and a retained `runnerGroup` would then
+ * render "runner group: gpu" underneath a `compat-block` reason, asserting a cause that is no
+ * longer the one that refused the job. `REMOVE` of an attribute that was never written is a no-op,
+ * so first-write rows are unaffected.
  */
 export function buildRefusalUpsert(
   input: RecordRefusalInput,
@@ -137,22 +144,30 @@ export function buildRefusalUpsert(
     ':ttl': Math.floor(now.getTime() / 1000) + terminalTtlSeconds(),
     ':one': 1,
   };
-  // Optional strings are OMITTED rather than written as undefined (a DynamoDB validation
+  // Optional strings are OMITTED from SET rather than written as undefined (a DynamoDB validation
   // error) — and omitted rather than written empty, so an absent workflow name stays absent
-  // instead of rendering as a blank cell that looks like a bug in the console.
+  // instead of rendering as a blank cell that looks like a bug in the console. They are then
+  // REMOVEd, so this refusal's row cannot carry a previous refusal's leftovers (see the header).
+  const removeParts: string[] = [];
   for (const [attr, value] of [
     ['fix', input.fix],
     ['workflowName', input.workflowName],
     ['jobName', input.jobName],
     ['runnerGroup', input.runnerGroup],
   ] as const) {
-    if (value === undefined || value === '') continue;
+    if (value === undefined || value === '') {
+      removeParts.push(attr);
+      continue;
+    }
     setParts.push(`${attr} = :${attr}`);
     values[`:${attr}`] = value;
   }
   return {
     key: { pk: refusalPk(input.repoId, input.runId, input.jobId), sk: REFUSAL_SK },
-    updateExpression: `SET ${setParts.join(', ')} ADD occurrences :one`,
+    updateExpression:
+      `SET ${setParts.join(', ')}` +
+      (removeParts.length ? ` REMOVE ${removeParts.join(', ')}` : '') +
+      ' ADD occurrences :one',
     names,
     values,
   };

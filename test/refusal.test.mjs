@@ -348,6 +348,33 @@ test('a recurring refusal RISES in both indexes, and remembers when it started',
   assert.equal(up.values[':one'], 1);
 });
 
+test('a later refusal of the same job cannot inherit the previous one’s attributes', () => {
+  // The row is keyed on (repo, run, job), and the SAME queued job can be re-delivered after a
+  // re-scan changed its stored analysis — so delivery 1 can refuse at the runner-group gate and
+  // delivery 2 at the compat gate. Omitting the now-absent attribute from SET leaves the OLD value
+  // in place, which renders "runner group: gpu" under a compat-block reason: a cause that is not
+  // the one that refused the job. Absent optionals are REMOVEd for that reason.
+  const first = buildRefusalUpsert(
+    upsertInput({ code: 'runner-group', runnerGroup: 'gpu', fix: 'move it to the default group' }),
+  );
+  assert.match(first.updateExpression, /runnerGroup = :runnerGroup/);
+  assert.ok(!/REMOVE/.test(first.updateExpression), 'nothing to remove when all are present');
+
+  const second = buildRefusalUpsert(upsertInput({ code: 'compat-block', runnerGroup: undefined }));
+  const remove = /REMOVE (.+?) ADD /.exec(second.updateExpression);
+  assert.ok(remove, 'absent optionals must be REMOVEd, not silently retained');
+  assert.ok(
+    remove[1].split(', ').includes('runnerGroup'),
+    `runnerGroup must be removed, got: ${remove[1]}`,
+  );
+  // Order still has to be a valid UpdateExpression: SET … REMOVE … ADD, each clause at most once.
+  assert.match(second.updateExpression, /^SET .+ REMOVE .+ ADD occurrences :one$/);
+  assert.ok(!(':runnerGroup' in second.values), 'a removed attribute takes no value placeholder');
+  // The ADD/if_not_exists semantics survive the extra clause.
+  assert.match(second.updateExpression, /firstSeenAt = if_not_exists\(firstSeenAt, :now\)/);
+  assert.equal(second.values[':one'], 1);
+});
+
 test('both refusal indexes sort on the SAME clock', () => {
   // Different sort semantics per index would make the same list reorder itself when a repo filter
   // was applied — worse than either ordering on its own.
@@ -378,6 +405,10 @@ test('absent optional fields are omitted, never written as undefined or empty', 
   for (const attr of ['fix', 'workflowName', 'jobName', 'runnerGroup']) {
     assert.ok(!(`:${attr}` in up.values), `${attr} must be omitted`);
     assert.ok(!up.updateExpression.includes(`${attr} = :`), `${attr} must not be SET`);
+    // … and explicitly cleared, so the row describes THIS refusal only (see the stale-attribute
+    // test above). An empty string counts as absent: a blank cell in the console reads as a bug.
+    const remove = /REMOVE (.+?) ADD /.exec(up.updateExpression);
+    assert.ok(remove && remove[1].split(', ').includes(attr), `${attr} must be REMOVEd`);
   }
 });
 

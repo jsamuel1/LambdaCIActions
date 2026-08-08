@@ -2988,7 +2988,12 @@ billable or inflates the platform error rate — the two outcomes this card expl
 
 Row semantics: `firstSeenAt` is `if_not_exists` (so "this has been broken for 7 hours" survives
 every re-delivery) and `occurrences` is an `ADD` — so the row distinguishes "happened once an hour
-ago" from "still happening on every push", which a last-write-wins row cannot express. **Both GSI
+ago" from "still happening on every push", which a last-write-wins row cannot express. Every other
+attribute describes the MOST RECENT refusal, and one that refusal does not have is `REMOVE`d rather
+than left in place: the row is keyed on (repo, run, job), the stored analysis is re-read on every
+delivery, and a re-scan between two deliveries of one queued job can move it from the runner-group
+gate to the compat gate — a retained `runnerGroup` would then render "runner group: gpu" beneath a
+`compat-block` reason, asserting a cause that is not the one that refused the job. **Both GSI
 sort keys track `lastSeenAt`, not `firstSeenAt`**: the screen answers "what is broken NOW", and
 keying the index on first sight sank a refusal that started hours ago and is still firing below the
 head page, where no client-side sort could recover it. Using different sort clocks per index was
