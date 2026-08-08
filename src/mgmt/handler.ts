@@ -643,6 +643,19 @@ async function route_(
       // picker and any unscoped caller still get. With it, the installation's own custom flavors
       // are appended in EVERY state, because the console's job is to show `pending`/`invalid` and
       // why; per-row `routable` carries the ADR-041 rule instead of omission.
+      //
+      // ABSENT and MALFORMED are not the same request, and this is the one route where the
+      // difference is invisible in the reply. `asPositiveInt` maps both to `undefined`, so a
+      // `?installation=abc` typo would otherwise fall through to the unscoped branch and return a
+      // 200 with no custom rows AND no `customFlavorsRead` field — a client cannot tell its scope
+      // was dropped from an installation that genuinely has none. That is the same conflation the
+      // degraded-read handling below exists to prevent, one layer up: the console would report
+      // "no custom flavors" for an installation that has several. Every other installation-scoped
+      // route already 400s on a malformed value; only the ABSENCE of the param is a valid unscoped
+      // request.
+      if (q.installation !== undefined && asPositiveInt(q.installation) === undefined) {
+        return problem(400, 'installation must be a positive integer');
+      }
       const scoped = asPositiveInt(q.installation);
       if (scoped !== undefined) {
         if (!canAdminInstallation(session, scoped)) return problem(403, 'forbidden');

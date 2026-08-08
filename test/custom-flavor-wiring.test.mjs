@@ -476,6 +476,42 @@ test('the Flavors API keeps that distinction too, instead of showing an empty ca
   assert.match(block, /customFlavorsRead: custom \? 'ok' : 'degraded'/);
 });
 
+test('a malformed installation is refused, not silently answered unscoped', async () => {
+  const { readFileSync } = await import('node:fs');
+  // `asPositiveInt` maps an ABSENT param and a MALFORMED one to the same `undefined`, but they are
+  // different requests. Absent is a valid unscoped call (the built-in catalog). Malformed used to
+  // fall through to that same branch and return 200 with no custom rows and NO `customFlavorsRead`
+  // field — so a client could not distinguish "your scope was dropped" from "this installation has
+  // none", which is the exact conflation the degraded-read reporting above exists to prevent. It
+  // also skipped `canAdminInstallation` entirely, so the reply shape depended on a typo.
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const src = strip(readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8'));
+  const at = src.indexOf("case 'listFlavors'");
+  assert.ok(at > 0, 'listFlavors route is gone');
+  const block = src.slice(at, at + 1600);
+
+  const guard = block.search(
+    /if \(q\.installation !== undefined && asPositiveInt\(q\.installation\) === undefined\)/,
+  );
+  assert.ok(guard >= 0, 'a malformed ?installation= is not refused');
+  assert.match(
+    block.slice(guard, guard + 220),
+    /problem\(400,/,
+    'the malformed-installation branch must return 400, not fall through',
+  );
+  // The guard has to run BEFORE the scope is resolved, or the unscoped branch answers first.
+  const scopeAt = block.search(/const scoped = asPositiveInt\(q\.installation\)/);
+  assert.ok(scopeAt > guard, 'the refusal must precede scope resolution');
+
+  // And the semantics it relies on: only absence is a valid unscoped request.
+  const { asPositiveInt } = await import('../dist/src/mgmt/router.js');
+  assert.equal(asPositiveInt(undefined), undefined, 'absent stays unscoped');
+  for (const bad of ['abc', '', '0', '-1', '1.5', '1e3', ' 7']) {
+    assert.equal(asPositiveInt(bad), undefined, `${JSON.stringify(bad)} must not scope`);
+  }
+  assert.equal(asPositiveInt('42'), 42);
+});
+
 test('the provisioner marks the run failed on a confirmed-unroutable flavor, and retries a degraded read', async () => {
   const { readFileSync } = await import('node:fs');
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
