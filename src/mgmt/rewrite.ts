@@ -25,7 +25,7 @@
  * and corrupting a workflow.
  */
 import { isAdoptLabel, incompatibleRunnerLabel, unreachableRunnerGroup } from '../ingest/adopt.js';
-import { builtinFlavors, isCustomFlavorLabel } from '../shared/flavor-catalog.js';
+import { builtinFlavors, isCustomFlavorLabel, isCustomFlavorName } from '../shared/flavor-catalog.js';
 
 interface FlavorLabel {
   name: string;
@@ -122,6 +122,12 @@ export interface RewriteTarget {
   jobId: string;
   /** Flavor name (`base` / `node` / `docker`) — its label is what gets inserted. */
   flavor: string;
+  /**
+   * Set when this job is a candidate by SHAPE but must not be rewritten, with the operator-facing
+   * reason. Carried on the target rather than dropped so the job still appears in the plan as a
+   * SKIP: a silently omitted job looks like a workflow we decided needed no change.
+   */
+  skip?: string;
 }
 
 /** `runs-on: <value>` on a single line, capturing indent + inline comment. */
@@ -723,6 +729,13 @@ export function planFileRewrite(
       skipped.push({ jobId: target.jobId, reason: 'job already carries an LCA label' });
       continue;
     }
+    // A refusal decided from the stored ROUTE (a custom-flavor target, or one that could not be
+    // resolved) — see `customRouteSkip`. Checked before the flavor lookup because `labelForFlavor`
+    // would report a `custom-*` route as `unknown flavor`, which is both wrong and alarming.
+    if (target.skip) {
+      skipped.push({ jobId: target.jobId, reason: target.skip });
+      continue;
+    }
     const lcaLabel = labelForFlavor(target.flavor);
     if (!lcaLabel) {
       skipped.push({ jobId: target.jobId, reason: `unknown flavor '${target.flavor}'` });
@@ -759,7 +772,7 @@ export function planFileRewrite(
  */
 export function rewriteTargets(
   jobs: { id: string; runs_on: string[]; runner_group?: string | null }[],
-  routes: Record<string, { flavor: string }> = {},
+  routes: Record<string, { flavor: string; unresolvedCustom?: string }> = {},
 ): RewriteTarget[] {
   const out: RewriteTarget[] = [];
   for (const job of jobs) {
@@ -778,9 +791,55 @@ export function rewriteTargets(
     // workflow for a job that still cannot run — and the file-level planner refuses the
     // object-form selector anyway, so counting it here only overstated the preview.
     if (unreachableRunnerGroup(job.runner_group)) continue;
-    out.push({ jobId: job.id, flavor: routes[job.id]?.flavor ?? 'base' });
+    const route = routes[job.id];
+    const skip = customRouteSkip(route);
+    out.push({ jobId: job.id, flavor: route?.flavor ?? 'base', ...(skip ? { skip } : {}) });
   }
   return out;
+}
+
+/**
+ * Why a job routed through a CUSTOM flavor must not be auto-rewritten (ADR-040).
+ *
+ * Both cases below are reached the same way — a repo whose FlavorMap points one of this job's
+ * hosted labels (`ubuntu-latest`) at a `custom-*` flavor — and in both the built-in label this
+ * module would author is the WRONG answer, because inserting it *removes the label the FlavorMap
+ * is keyed on*. `[ubuntu-latest]` → `[self-hosted, lambda-ci]` makes the map entry match nothing,
+ * so the job resolves by its new explicit label and is pinned to `base` forever. We would have
+ * edited a customer's file to silently discard their custom-flavor routing.
+ *
+ *   - `unresolvedCustom` — the job named a `custom-*` flavor that was not in the composed catalog
+ *     when Discovery ran. That is NOT proof it does not exist: the custom-flavor read fails OPEN
+ *     (ADR-040), so a DynamoDB fault stores exactly the same route as a genuinely deleted flavor,
+ *     with `flavor` holding the fall-through answer. Acting on it is acting on a possible false
+ *     absence — the reason the resolver reports it separately instead of only returning `base`.
+ *   - a `custom-*` route that DID resolve — the operator's intent is known and honored at
+ *     provision time, and `labelForFlavor` deliberately cannot author a custom label (a
+ *     per-installation label is revocable; see this module's header). Skipping says so, where
+ *     falling through to `unknown flavor 'custom-gpu'` would tell an operator their registered,
+ *     validated flavor does not exist.
+ *
+ * A job with no custom flavor anywhere returns undefined, so nothing about the built-in path
+ * changes.
+ */
+function customRouteSkip(
+  route: { flavor: string; unresolvedCustom?: string } | undefined,
+): string | undefined {
+  if (route?.unresolvedCustom) {
+    return (
+      `job routes through custom flavor '${route.unresolvedCustom}', which could not be resolved ` +
+      'when this workflow was scanned — rewriting would replace the label its FlavorMap entry is ' +
+      'keyed on. Re-scan once the flavor is registered and `valid`, or edit this job by hand.'
+    );
+  }
+  if (isCustomFlavorName(route?.flavor)) {
+    return (
+      `job routes to custom flavor '${route?.flavor}'; its label is per-installation and ` +
+      'revocable, so it is never inserted automatically — add the label by hand if you want this ' +
+      'job pinned to it.'
+    );
+  }
+  return undefined;
 }
 
 /**
@@ -814,7 +873,7 @@ export function planPreviewFromAnalyses(
   analyses: {
     path: string;
     parsed?: { jobs: { id: string; runs_on: string[] }[] };
-    routes?: Record<string, { flavor: string }>;
+    routes?: Record<string, { flavor: string; unresolvedCustom?: string }>;
   }[],
 ): RewritePreview {
   const jobs: RewritePreviewJob[] = [];
@@ -833,6 +892,12 @@ export function planPreviewFromAnalyses(
       // actually write (it reads the real file, quotes intact).
       const tokens = job.runs_on.map((l) => yamlLabelToken(l));
       const before = tokens.length === 1 ? tokens[0] : `[${tokens.join(', ')}]`;
+      // Same order as `planFileRewrite`: a route-level refusal is the truthful diagnosis, and
+      // reporting it as `unknown flavor 'custom-gpu'` would deny a registered flavor exists.
+      if (target.skip) {
+        jobs.push({ path: analysis.path, jobId: job.id, before, skipped: target.skip });
+        continue;
+      }
       const lcaLabel = labelForFlavor(target.flavor);
       if (!lcaLabel) {
         jobs.push({

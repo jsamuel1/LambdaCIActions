@@ -132,14 +132,30 @@ test('a description advertising a vCPU shape is refused (ADR-038)', () => {
     '8 cores for compiling',
     '2.5 vCPU burst',
     'now with 16 threads',
+    // A NUMBER WORD advertises capacity just as loudly as a digit, and a digit-only regex misses
+    // it entirely.
+    'builder with two vCPUs',
+    'sixteen cores of compile',
+    'eight-thread builder',
+    // The built-in guard is `doesNotMatch(/vcpu/i)` — the word alone, no count. These two strings
+    // render in the same console table, so a looser rule here would let operator text make exactly
+    // the claim ADR-038 retracts while the catalog could not.
+    'vCPU is indicative only',
+    'more vcpu than base',
   ]) {
     const res = validateCustomFlavor(body({ description }));
     assert.equal(res.ok, false, `should refuse: ${description}`);
     assert.match(res.errors.join(' '), /must not advertise a vCPU shape/);
   }
-  // ...while an honest toolchain description passes, including one that mentions memory.
+  // ...while an honest toolchain description passes, including one that mentions memory, and one
+  // that uses a core/thread word WITHOUT a count ("multi-core" is not a capacity claim).
   assert.equal(validateCustomFlavor(body({ description: 'Rust + sccache, 4 GB' })).ok, true);
+  assert.equal(
+    validateCustomFlavor(body({ description: 'multi-core friendly build image' })).ok,
+    true,
+  );
   assert.equal(advertisesVcpuShape('Rust toolchain image'), false);
+  assert.equal(advertisesVcpuShape('thread sanitizer preinstalled'), false);
 });
 
 test('capabilities outside the closed vocabulary are refused, not silently inert', () => {
@@ -763,5 +779,102 @@ test('a job already carrying a custom LCA label needs no rewrite', async () => {
       /already carries an LCA label/,
       `skip reason should name the real cause, got: ${plan.skipped[0].reason}`,
     );
+  }
+});
+
+test('a job routed to a custom flavor by FlavorMap is skipped, not relabelled to a built-in', async () => {
+  const { rewriteTargets, planFileRewrite, planPreviewFromAnalyses } = await import(
+    '../dist/src/mgmt/rewrite.js'
+  );
+  // The other reachable route to a custom flavor, and the one the label check above cannot cover:
+  // the job's `runs-on` carries only a HOSTED label, and the repo's FlavorMap points that label at
+  // a custom flavor. Inserting `lambda-ci` here does not merely add a label — it REMOVES
+  // `ubuntu-latest`, the key the FlavorMap entry is on, so the job would be pinned to `base`
+  // forever by an edit we made in the customer's own repository.
+  const jobs = [{ id: 'build', runs_on: ['ubuntu-latest'] }];
+  const yaml = [
+    'name: ci',
+    'on: push',
+    'jobs:',
+    '  build:',
+    '    runs-on: ubuntu-latest',
+    '      steps:',
+    '        - run: echo hi',
+    '',
+  ].join('\n');
+
+  // (a) The route RESOLVED to the custom flavor. Authoring stays built-in only, so the honest
+  //     answer is a skip that names the flavor — not `unknown flavor 'custom-gpu'`, which would
+  //     tell an operator their registered, validated flavor does not exist.
+  const resolved = rewriteTargets(jobs, { build: { flavor: 'custom-gpu' } });
+  assert.equal(resolved.length, 1, 'the job should still appear in the plan as a skip');
+  assert.match(resolved[0].skip ?? '', /custom flavor 'custom-gpu'/);
+  const resolvedPlan = planFileRewrite('.github/workflows/ci.yml', yaml, resolved);
+  assert.deepEqual(resolvedPlan.edits, []);
+  assert.match(resolvedPlan.skipped[0].reason, /per-installation and revocable/);
+  assert.doesNotMatch(resolvedPlan.skipped[0].reason, /unknown flavor/);
+
+  // (b) The route could NOT be resolved. Discovery's custom-flavor read fails OPEN (ADR-040), so a
+  //     DynamoDB fault stores the identical route a genuinely deleted flavor would — `flavor:
+  //     'base'` — with `unresolvedCustom` as the only evidence that `base` is a fall-through and
+  //     not the operator's intent. Acting on `flavor` alone acts on a possible FALSE absence.
+  const degraded = rewriteTargets(jobs, {
+    build: { flavor: 'base', unresolvedCustom: 'custom-gpu' },
+  });
+  assert.equal(degraded.length, 1);
+  assert.match(degraded[0].skip ?? '', /could not be resolved/);
+  const degradedPlan = planFileRewrite('.github/workflows/ci.yml', yaml, degraded);
+  assert.deepEqual(
+    degradedPlan.edits,
+    [],
+    'an edit was authored over a route that could not be resolved — this silently discards the ' +
+      "operator's custom-flavor routing in their own repository",
+  );
+  assert.match(degradedPlan.skipped[0].reason, /custom flavor 'custom-gpu'/);
+
+  // The console dry run must agree with the λ, or the operator approves a plan that then differs.
+  for (const routes of [
+    { build: { flavor: 'custom-gpu' } },
+    { build: { flavor: 'base', unresolvedCustom: 'custom-gpu' } },
+  ]) {
+    const preview = planPreviewFromAnalyses([
+      { path: '.github/workflows/ci.yml', parsed: { jobs }, routes },
+    ]);
+    assert.equal(preview.changes, 0, `preview proposed an edit for ${JSON.stringify(routes)}`);
+    assert.equal(preview.skipped, 1);
+    assert.match(preview.jobs[0].skipped ?? '', /custom flavor 'custom-gpu'/);
+    assert.doesNotMatch(preview.jobs[0].skipped ?? '', /unknown flavor/);
+  }
+});
+
+test('an ordinary built-in route is still rewritten exactly as before', async () => {
+  const { rewriteTargets, planFileRewrite, planPreviewFromAnalyses } = await import(
+    '../dist/src/mgmt/rewrite.js'
+  );
+  // The guard above must not cost the built-in path anything: no custom flavor is named anywhere,
+  // so nothing is skipped and the edit is authored as it was pre-ADR-040.
+  const jobs = [{ id: 'build', runs_on: ['ubuntu-latest'] }];
+  const yaml = [
+    'name: ci',
+    'on: push',
+    'jobs:',
+    '  build:',
+    '    runs-on: ubuntu-latest',
+    '      steps:',
+    '        - run: echo hi',
+    '',
+  ].join('\n');
+  for (const routes of [{}, { build: { flavor: 'node' } }]) {
+    const targets = rewriteTargets(jobs, routes);
+    assert.equal(targets.length, 1);
+    assert.equal(targets[0].skip, undefined);
+    const plan = planFileRewrite('.github/workflows/ci.yml', yaml, targets);
+    assert.equal(plan.edits.length, 1, `no edit authored for ${JSON.stringify(routes)}`);
+    assert.deepEqual(plan.skipped, []);
+    const preview = planPreviewFromAnalyses([
+      { path: '.github/workflows/ci.yml', parsed: { jobs }, routes },
+    ]);
+    assert.equal(preview.changes, 1);
+    assert.equal(preview.skipped, 0);
   }
 });

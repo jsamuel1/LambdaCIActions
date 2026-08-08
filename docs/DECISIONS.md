@@ -1909,6 +1909,15 @@ there contradicts that screen's own footnote in the same view (the `docker` desc
 exactly this sweep miss). Revisit if the API later exposes a vCPU request, at which point `vcpu`
 becomes requestable and this ADR's point 2 is superseded.
 
+**Extended by ADR-040 (custom flavors).** An operator-supplied `description` renders in that same
+table, so `validateCustomFlavor` applies the same rule at registration — and it has to be the same
+*strength*, not merely the same intent. A digit-plus-unit regex is weaker than the built-in guard
+(`doesNotMatch(/vcpu/i)`, the word alone): "builder with two vCPUs" advertises capacity just as
+loudly as "2 vCPU", so operator text could make precisely the claim this ADR retracts while the
+catalog could not. `advertisesVcpuShape` therefore refuses `vCPU` in any form, plus a COUNT of
+cores/threads in digits or number words. Core/thread vocabulary without a count ("multi-core
+friendly") stays legal, since it claims no shape.
+
 ## ADR-039 — Expanded standard flavor set with prebaked runner tool cache (M5)
 **Status**: Accepted (v1) · extends the catalog established in [ADR-020](#adr-020)
 **Context**: The catalog shipped `base`, `node`, `docker`. Any other language runtime meant a
@@ -2031,7 +2040,29 @@ static imports moved behind it (`src/provision/flavor.ts`, `src/mgmt/views.ts`,
 edit to a customer's workflow file and a per-installation label can be revoked, which would leave a
 committed `runs-on` nobody claims; `flavor-reconcile.ts` because it reconciles the catalog against
 `image-arn-<flavor>` in SSM and the env-scoped label allowlist, neither of which a custom flavor
-participates in. The optional `custom`/`customFlavors` parameters are trailing on
+participates in.
+
+Built-in-only *authoring* forced a matching refusal on the *deciding* side, which is not the same
+question. `rewriteTargets`/`planFileRewrite` now SKIP a job whose stored route involves a custom
+flavor, rather than authoring the built-in label for whatever the route happens to say:
+
+- A route that **resolved** to `custom-*` is honored at provision time, so a skip naming the flavor
+  is the truthful diagnosis — falling through to `labelForFlavor` reported it as
+  `unknown flavor 'custom-gpu'`, telling an operator their registered, validated flavor did not
+  exist.
+- A route carrying **`unresolvedCustom`** is the dangerous one, and it is a direct consequence of
+  the fail-open read: a DynamoDB fault during discovery stores the *identical* route a genuinely
+  deleted flavor would (`flavor: 'base'`), so acting on `flavor` alone acts on a possible **false
+  absence**. For the reachable case — a FlavorMap pointing a hosted label such as `ubuntu-latest`
+  at a custom flavor — the edit does not merely add a label, it *removes the label the map entry is
+  keyed on*: `[ubuntu-latest]` → `[self-hosted, lambda-ci]` pins that job to `base` permanently, in
+  the customer's own repository, discarding routing the operator configured. `WorkflowAnalysisRecord`
+  therefore declares `unresolvedCustom` on its stored routes, because a signal that a planner must
+  read is part of the record's contract rather than an incidental runtime field.
+
+That is a distinct route from the label case (a job already carrying `lambda-ci-custom-*`, which
+`alreadyTargetsLca` skips): there the operator had already targeted LCA, so there was no hosted
+label to replace at all. The optional `custom`/`customFlavors` parameters are trailing on
 every seam, so omitting them is the pre-ADR-040 behavior exactly, and `composeCatalog([])` returns
 the built-in array *itself* — no copy, no re-sort, satisfying (5) in code rather than by convention.
 The hot-path read is gated by `needsCustomFlavors()`, a pure test for whether the job could name a

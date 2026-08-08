@@ -421,7 +421,17 @@ export interface WorkflowAnalysisRecord {
   /** Per-job compat results + folded workflow level; absent when parse failed. */
   compat?: { level: CompatLevel; jobs: Record<string, CompatResult> };
   /** Per-job flavor resolution (routing preview for the UI); absent when parse failed. */
-  routes?: Record<string, { flavor: string; reason: string }>;
+  /**
+   * Per-job routing preview, as `resolveFlavor` returned it.
+   *
+   * `unresolvedCustom` is declared because it is LOAD-BEARING for anything that acts on a stored
+   * route: it marks a job that NAMED a `custom-*` flavor which was not in the composed catalog
+   * when the scan ran — either genuinely absent, or unreadable, because Discovery's custom-flavor
+   * read fails open (ADR-040). `flavor` is then the fall-through answer, NOT the operator's
+   * intent, so a planner that reads `flavor` alone would act on a false absence (see
+   * `rewriteTargets`).
+   */
+  routes?: Record<string, { flavor: string; reason: string; unresolvedCustom?: string }>;
   /** Parse failure detail (WorkflowParseError message); analysis fields absent. */
   parseError?: string;
   /** Git blob sha of the parsed content (spec 03 `last_parsed_sha`). */

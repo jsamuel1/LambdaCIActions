@@ -595,13 +595,48 @@ export function validateCustomFlavor(
 /**
  * Whether a description advertises a vCPU shape (ADR-038 honesty rule).
  *
- * Matches the spirit of the repo's source-level guard over `microvm/flavors.json` descriptions:
- * a count next to a vCPU/core word. `test/image-content.test.mjs` enforces it for built-ins;
- * this enforces it for operator-supplied text, which lands in the same table.
+ * Two rules, because a digit-plus-unit regex is not enough — "two vCPUs" advertises capacity just
+ * as loudly as "2 vCPU":
+ *
+ *   1. **`vCPU` in any form is refused outright, with or without a number.** This is exactly the
+ *    rule `test/image-content.test.mjs` applies to built-in descriptions (`doesNotMatch(/vcpu/i)`),
+ *    and the two must agree: both strings render verbatim in the same console table, so a rule that
+ *    only bound the built-ins would let operator text make the claim ADR-038 retracts. The word has
+ *    no honest use in a description — the API accepts no vCPU request, so there is nothing truthful
+ *    to say with it.
+ *   2. **A COUNT of cores/threads is refused** — digits or number words. Unlike `vcpu` these words
+ *    have legitimate uses ("multi-core builds", "thread sanitizer"), so only a counted claim is
+ *    refused rather than the vocabulary.
  */
 export function advertisesVcpuShape(description: string): boolean {
-  return /\b\d+(\.\d+)?\s*(v?cpus?|vcpu|cores?|threads?)\b/i.test(description);
+  if (/v\s*cpus?\b/i.test(description)) return true;
+  return new RegExp(`\\b(\\d+(\\.\\d+)?|${NUMBER_WORDS.join('|')})[\\s-]*(cpus?|cores?|threads?)\\b`, 'i').test(
+    description,
+  );
 }
+
+/**
+ * Number words a description might use instead of a digit.
+ *
+ * Small integers only: this bounds a CAPACITY claim, and nobody advertises a shape as
+ * "thirty-seven cores". A wider list would start refusing prose that merely counts something else.
+ */
+const NUMBER_WORDS = [
+  'one',
+  'two',
+  'three',
+  'four',
+  'five',
+  'six',
+  'seven',
+  'eight',
+  'nine',
+  'ten',
+  'twelve',
+  'sixteen',
+  'thirty-two',
+  'sixty-four',
+];
 
 /**
  * Whether a string looks like a microVM image ARN.
