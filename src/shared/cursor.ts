@@ -66,10 +66,12 @@ import crypto from 'node:crypto';
  * anyone who holds it.
  *
  * Deliberately **not** a branded `string`. A branded string is still assignable to `string`,
- * so `nextCursor: page.nextCursor ?? null` would still typecheck against a `string | null`
- * response contract — exactly the leak this module exists to prevent. Wrapping the value in
- * an object makes that line a compile error, so the raw key can only reach a client if
- * someone reaches through `.raw` on purpose.
+ * so a response contract of `string | null` would not reject it — which is how the original
+ * leak was written. The wrapper is necessary but not sufficient: a route body typed `unknown`
+ * (as `json()` takes) accepts a `RawCursor` happily and serializes the plaintext key one level
+ * deeper, as `"nextCursor":{"raw":"eyJwayI6…"}`. The compile error arrives only once the body
+ * is DECLARED with `nextCursor: string | null` (see `RunListBody` in `src/mgmt/handler.ts`);
+ * the source guards in `test/mgmt-cursor-scope.test.mjs` cover routes that declare nothing.
  */
 export interface RawCursor {
   readonly raw: string;

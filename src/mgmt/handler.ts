@@ -39,6 +39,7 @@ import {
   toWorkflowView,
   type AppInstallationView,
   type LabelImpactView,
+  type RunView,
   type SettingsView,
   type WebhookDeliveryView,
 } from './views.js';
@@ -163,6 +164,29 @@ import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
  * refetch the head page.
  */
 const CURSOR_REFUSED = 'cursor is not valid for this query; reload the list';
+
+/**
+ * The `GET /api/runs` body (ADR-052).
+ *
+ * This type exists to make the cursor contract load-bearing rather than aspirational.
+ * `json()` takes `unknown`, so a `RawCursor` wrapper alone does NOT stop
+ * `nextCursor: page.nextCursor ?? null` from compiling — it would just serialize the
+ * plaintext key one level deeper, as `"nextCursor":{"raw":"eyJwayI6…"}`. Declaring
+ * `nextCursor` as `string | null` and returning the body through `runList` is what turns
+ * that line into a type error. A new paginated route must adopt the same pattern: its own
+ * typed body, or the wrapper buys nothing at the boundary.
+ */
+interface RunListBody {
+  runs: RunView[];
+  /** SEALED cursor (`sealCursorOrNull`) or `null`. A store `RawCursor` cannot satisfy this. */
+  nextCursor: string | null;
+  complete: boolean;
+}
+
+/** `json(200, …)` for a run list, with the sealed-cursor contract enforced by the type. */
+function runList(body: RunListBody): Reply {
+  return json(200, body);
+}
 
 const ENV_NAME = process.env.LCA_ENV ?? 'dev';
 const SSM_PREFIX = process.env.SSM_PREFIX ?? `/lca/${ENV_NAME}`;
@@ -820,7 +844,7 @@ async function listRunsRoute(
     // repo-filtered window PERMANENTLY partial: the head page always has an open cursor while
     // history remains, and the client ANDs every page's flag, so walking to the end could
     // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
-    return json(200, {
+    return runList({
       runs: page.runs.map((r) => toRunView(r, now)),
       nextCursor: sealCursorOrNull(page.nextCursor, scope, secret),
       complete: repoResponseComplete(status !== undefined),
@@ -842,7 +866,7 @@ async function listRunsRoute(
     );
     // A status-filtered page holds only the jobs IN that status, so a run folded from it is
     // partial by construction however far the cursor got.
-    return json(200, {
+    return runList({
       runs: page.runs.map((r) => toRunView(r, now)),
       nextCursor: sealCursorOrNull(page.nextCursor, scope, secret),
       complete: false,
@@ -862,7 +886,7 @@ async function listRunsRoute(
   // per-status pages: truncation must be judged before the visibility filter, since a page
   // filled with another tenant's rows looks short while this operator's sibling jobs sit
   // unread past the boundary (ADR-029).
-  return json(200, {
+  return runList({
     runs: merged.map((r) => toRunView(r, now)),
     nextCursor: null,
     complete: mergedResponseComplete({

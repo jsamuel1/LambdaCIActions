@@ -2966,13 +2966,17 @@ Two supporting choices:
   categorically different: forged, replayed across scopes, or minted under a rotated secret.
   Restarting the walk would re-serve the head page under a "load older" click, surfacing as
   duplicate rows rather than as the refusal it is.
-- **The raw cursor is a wrapper type, not a branded string.** `RawCursor` is
-  `{ readonly raw: string }`, so `nextCursor: page.nextCursor ?? null` fails to compile against
-  a `string | null` response contract. A branded *string* would not: it stays assignable to
-  `string`, which is exactly how the original leak was written. The type now makes the safe
-  path the only one that compiles, and source-level guards in
-  `test/mgmt-cursor-scope.test.mjs` cover the residue the type system cannot see (reaching
-  through `.raw`, minting a cursor inside a route, dropping the 400).
+- **The raw cursor is a wrapper type, and the source guards finish the job.** `RawCursor` is
+  `{ readonly raw: string }` rather than a branded `string`, because a branded string stays
+  assignable to `string` — which is exactly how the original leak was written. The wrapper is
+  necessary but **not sufficient**: `json()` takes `unknown`, so nothing about the wrapper
+  alone stops `nextCursor: page.nextCursor ?? null` from compiling. It would serialize the
+  same plaintext key one level deeper, as `"nextCursor":{"raw":"eyJwayI6…"}`. The compile
+  error is bought by DECLARING the body: `RunListBody.nextCursor` is `string | null`, so
+  `RawCursor | null` is not assignable. A paginated route with an undeclared body has no such
+  protection, so the source guards in `test/mgmt-cursor-scope.test.mjs` scan every file under
+  `src/` for the residue the types cannot see — reaching through `.raw`, minting a cursor
+  inside a route, dropping the 400, or returning a cursor from an untyped body.
 
 **Alternatives rejected.**
 
@@ -2998,6 +3002,9 @@ Two supporting choices:
 - Sealing costs one HKDF and one AES-GCM pass over ~200 bytes per page — unmeasurable next to
   the DynamoDB query it accompanies. Cursors grow by the 12-byte nonce, 16-byte tag, and
   version prefix.
-- Any future paginated route inherits the requirement structurally: it cannot return a store
-  cursor without calling `sealCursor`, because the types do not allow it. The unclaimed-jobs
-  list is the first such route and needs a `view` of its own when it lands.
+- A future paginated route inherits the requirement from two places, and both matter: it
+  cannot return a store cursor from a **declared** body, because `RawCursor` is not
+  assignable to `string | null`; and the source guards scan the whole `src/` tree, so a route
+  that skips the declared body is caught by the test rather than by the compiler. The
+  unclaimed-jobs list is the first such route, needs a `view` of its own when it lands, and
+  should declare its body the way `RunListBody` does.

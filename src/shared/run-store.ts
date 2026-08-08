@@ -390,8 +390,8 @@ export async function listRunsByStatus(status: RunStatus, limit = 100): Promise<
  *
  * **This value is NOT fit to hand a client.** The key names the last row SCANNED, which on a
  * post-query-authorized list is routinely a row the session may not see, and base64url is an
- * encoding rather than a protection. It is typed `RawCursor` so the compiler rejects handing
- * it to an API body directly; cross the boundary with `sealCursor` (ADR-052).
+ * encoding rather than a protection. It is typed `RawCursor` so a declared response body
+ * (`nextCursor: string | null`) rejects it; cross the boundary with `sealCursor` (ADR-052).
  */
 export function encodeCursor(key: Record<string, unknown> | undefined): RawCursor | undefined {
   if (!key) return undefined;

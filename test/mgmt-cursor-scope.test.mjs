@@ -16,7 +16,9 @@
 //   4. the routes actually seal — no `nextCursor` reaches a body straight off a store page.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join, relative, sep } from 'node:path';
 import {
   asRawCursor,
   canonicalScope,
@@ -197,21 +199,110 @@ test('openCursor never throws on hostile input', () => {
 
 // ---- route wiring ----------------------------------------------------------
 //
-// The type system stops a RAW cursor reaching a `string | null` body (`RawCursor` is a
-// wrapper, not a branded string, precisely so `page.nextCursor ?? null` fails to compile).
-// It cannot stop someone reaching through `.raw`, so pin the source shape too.
+// Two layers hold the boundary, and it is worth being exact about which does what:
+//
+//   - The TYPE layer works only where a response body is declared. `json()` takes `unknown`,
+//     so the `RawCursor` wrapper alone would NOT stop `nextCursor: page.nextCursor ?? null`
+//     from compiling — it would serialize the plaintext key one level deeper, as
+//     `"nextCursor":{"raw":"eyJwayI6…"}`. `RunListBody` declares `nextCursor: string | null`,
+//     which is what makes that line a type error (`RawCursor | null` is not assignable).
+//   - The SOURCE layer below covers what the types cannot see: reaching through `.raw`,
+//     minting a cursor inside a route, dropping the 400, or adding a paginated route with an
+//     UNTYPED body — where the compiler has no contract to enforce.
+//
+// The source scan therefore walks every route-bearing source file, not just `handler.ts`: a
+// new list route in a new file is exactly the case the type layer cannot catch on its own.
 
-const HANDLER = readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+const SRC = fileURLToPath(new URL('../src/', import.meta.url));
+
+/**
+ * Files that legitimately handle a raw store cursor: `cursor.ts` defines the wrapper,
+ * `run-store.ts` mints it, and `paging.ts` is the shared collector whose contract is to hand
+ * one back to its SERVER-side caller (`collectVisible` returns `{ runs, nextCursor }`). None of
+ * them build a response body. Everything else under `src/` is treated as route code.
+ */
+const CURSOR_OWNERS = ['shared/cursor.ts', 'shared/run-store.ts', 'mgmt/paging.ts'];
+
+/**
+ * Strip comments before scanning. The guards below match on shapes like
+ * `nextCursor: <rhs>`, and good documentation QUOTES the unsafe shape it is warning about —
+ * this module's own header does. Scanning prose would make every such comment a build
+ * failure, which teaches the next author to delete the warning rather than heed it.
+ *
+ * Block comments go first; line comments only when `//` opens the line, so a `'https://…'`
+ * inside a string literal cannot swallow the code that follows it on the same line.
+ */
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+}
+
+/**
+ * Strip TYPE declarations, so the value-assignment guard cannot confuse a type member with a
+ * response field. `RunListBody` legitimately contains `nextCursor: string | null;`.
+ *
+ * The tempting shortcut — skipping any right-hand side that ends in `;` — is wrong and was
+ * caught by probing it: a single-line object literal ends in `;` as well
+ * (`return { body: { nextCursor: page.nextCursor ?? null } };`), so that rule silently stops
+ * guarding the exact leak it exists to catch. Remove the declarations instead, and judge every
+ * remaining `nextCursor:` as a value.
+ */
+function stripTypeDecls(src) {
+  return src.replace(/^(?:export )?(?:interface|type)\s+\w+[^{]*\{[\s\S]*?^\}/gm, '');
+}
+
+function routeSources() {
+  const out = [];
+  for (const entry of readdirSync(SRC, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
+    const rel = relative(SRC, join(entry.parentPath ?? entry.path, entry.name)).split(sep).join('/');
+    if (CURSOR_OWNERS.includes(rel)) continue;
+    out.push([rel, stripComments(readFileSync(join(SRC, rel), 'utf8'))]);
+  }
+  return out;
+}
+
+const SOURCES = routeSources();
+const HANDLER = stripComments(readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8'));
+
+test('the scan actually covers the route sources', () => {
+  // Guard the guard: a broken walk would make every assertion below vacuously pass.
+  const names = SOURCES.map(([rel]) => rel);
+  assert.ok(names.includes('mgmt/handler.ts'), 'handler must be scanned');
+  assert.ok(SOURCES.length >= 10, `expected the src tree, got ${SOURCES.length} files`);
+  for (const owner of CURSOR_OWNERS) {
+    assert.ok(!names.includes(owner), `${owner} owns the raw cursor and is exempt by design`);
+  }
+  // …and that stripping removed prose without eating code.
+  assert.ok(!HANDLER.includes('ADR-052'), 'comments should be stripped');
+  assert.ok(HANDLER.includes('sealCursorOrNull('), 'code must survive stripping');
+});
 
 test('every route seals its outgoing cursor', () => {
-  const assignments = [...HANDLER.matchAll(/nextCursor:\s*([^,\n]+)/g)].map((m) => m[1].trim());
-  assert.ok(assignments.length >= 3, 'expected the runs routes to be found');
-  for (const rhs of assignments) {
-    assert.ok(
-      rhs === 'null' || rhs.startsWith('sealCursorOrNull(') || rhs.startsWith('sealCursor('),
-      `nextCursor must be sealed or explicitly null, got: ${rhs}`,
-    );
+  let found = 0;
+  for (const [rel, src] of SOURCES) {
+    for (const m of stripTypeDecls(src).matchAll(/nextCursor:\s*([^,\n]+)/g)) {
+      // Trailing punctuation belongs to the enclosing literal, not the expression: a
+      // single-line body closes with `} };`. Judge the expression itself.
+      const rhs = m[1].trim().replace(/[\s;}]+$/, '');
+      found++;
+      assert.ok(
+        rhs === 'null' || rhs.startsWith('sealCursorOrNull(') || rhs.startsWith('sealCursor('),
+        `${rel}: nextCursor must be sealed or explicitly null, got: ${rhs}`,
+      );
+    }
   }
+  assert.ok(found >= 3, 'expected the runs routes to be found');
+});
+
+test('a paginated response body types its cursor as string | null', () => {
+  // The type layer only bites where a body is declared. If a route hands `nextCursor` to an
+  // untyped `json()` body, `RawCursor` is assignable and the leak compiles — so pin that the
+  // runs list keeps its declared contract.
+  assert.match(HANDLER, /interface RunListBody \{[^}]*nextCursor: string \| null;/s);
+  const sealed = [...HANDLER.matchAll(/nextCursor: sealCursorOrNull\(/g)];
+  assert.equal(sealed.length, 2, 'both paginated runs branches seal');
+  // …and that they return through the typed helper rather than a bare `json(200, {…})`.
+  assert.equal([...HANDLER.matchAll(/return runList\(\{/g)].length, 3, 'all three via runList');
 });
 
 test('no route reaches through the RawCursor wrapper or re-encodes a key itself', () => {
@@ -219,27 +310,28 @@ test('no route reaches through the RawCursor wrapper or re-encodes a key itself'
   // `.raw` reached off something cursor-shaped — that is the one way to defeat the wrapper
   // without a type error.
   const unwrap = /\b(\w*[Cc]ursor\w*|page\.nextCursor|opened\.cursor)\s*(\?\.|\.)raw\b/;
-  assert.equal(unwrap.test(HANDLER), false, 'handler must not unwrap a RawCursor');
-  assert.equal(/encodeCursor\s*\(/.test(HANDLER), false, 'cursor minting belongs to the store');
+  for (const [rel, src] of SOURCES) {
+    assert.equal(unwrap.test(src), false, `${rel} must not unwrap a RawCursor`);
+    assert.equal(/encodeCursor\s*\(/.test(src), false, `${rel}: cursor minting belongs to the store`);
+    // A route calling `asRawCursor(q.cursor)` would restore the plaintext-cursor hole while
+    // satisfying the type checker.
+    assert.equal(/asRawCursor\s*\(/.test(src), false, `${rel}: asRawCursor stays store-side`);
+  }
 });
 
 test('every route that accepts a cursor opens it before querying', () => {
-  // `q.cursor` may only be consumed through `openCursor` — passing it to a store call
-  // directly is the pre-ADR-052 behavior (and would not typecheck, but pin it anyway).
-  for (const m of HANDLER.matchAll(/q\.cursor/g)) {
-    const around = HANDLER.slice(Math.max(0, m.index - 120), m.index + 40);
-    assert.ok(around.includes('openCursor('), `q.cursor must be opened, near: ${around.slice(-80)}`);
+  for (const [rel, src] of SOURCES) {
+    // `q.cursor` may only be consumed through `openCursor` — passing it to a store call
+    // directly is the pre-ADR-052 behavior (and would not typecheck, but pin it anyway).
+    for (const m of src.matchAll(/q\.cursor/g)) {
+      const around = src.slice(Math.max(0, m.index - 120), m.index + 40);
+      assert.ok(around.includes('openCursor('), `${rel}: q.cursor must be opened, near: ${around.slice(-80)}`);
+    }
+    // And a failed open must refuse, not fall through to a head-page query.
+    for (const [, nextLine] of src.matchAll(/const opened = openCursor\([^)]*\);\n([^\n]*)\n/g)) {
+      assert.match(nextLine, /if \(!opened\.ok\) return problem\(400/, `${rel}: must refuse`);
+    }
   }
-  // And a failed open must refuse, not fall through to a head-page query.
-  const opens = [...HANDLER.matchAll(/const opened = openCursor\([^)]*\);\n([^\n]*)\n/g)];
+  const opens = [...HANDLER.matchAll(/const opened = openCursor\([^)]*\);\n/g)];
   assert.ok(opens.length >= 2, 'expected both runs branches to open a cursor');
-  for (const [, nextLine] of opens) {
-    assert.match(nextLine, /if \(!opened\.ok\) return problem\(400/);
-  }
-});
-
-test('asRawCursor stays store-side', () => {
-  // A route calling `asRawCursor(q.cursor)` would restore the plaintext-cursor hole while
-  // satisfying the type checker.
-  assert.equal(/asRawCursor\s*\(/.test(HANDLER), false);
 });
