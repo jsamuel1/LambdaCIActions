@@ -75,6 +75,19 @@ import { staticGate, smokeWorkflowYaml } from '../flavorval/validate-core.js';
 import { shapeRatePerMinute } from './views.js';
 import { planPreviewFromAnalyses } from './rewrite.js';
 import { collectVisible } from './paging.js';
+import {
+  openCursor,
+  sealCursorOrNull,
+  type CursorScope,
+} from '../shared/cursor.js';
+
+/**
+ * Refusal message for a cursor that will not open under the scope it was presented with
+ * (ADR-052). Deliberately does not distinguish forged from cross-scope from
+ * secret-rotated — the client's recovery is the same in every case: drop the cursor and
+ * refetch the head page.
+ */
+const CURSOR_REFUSED = 'cursor is not valid for this query; reload the list';
 import { mergedResponseComplete, repoResponseComplete } from './run-rollup.js';
 import {
   METRIC_CATALOG,
@@ -286,7 +299,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     const session = decodeSession(cookies[SESSION_COOKIE], secret);
     if (!session) return toResult(problem(401, 'not authenticated'));
 
-    return toResult(await route_(result.match, event, session));
+    return toResult(await route_(result.match, event, session, secret));
   } catch (err) {
     // Never echo internals to the browser; the detail goes to CloudWatch. Sanitized even
     // there: the relink route carries an App PEM + webhook/client secrets in its request body,
@@ -408,6 +421,8 @@ async function route_(
   match: RouteMatch,
   event: APIGatewayProxyEventV2,
   session: SessionPayload,
+  /** Session secret — also seals pagination cursors (ADR-052). */
+  secret: string,
 ): Promise<Reply> {
   const q = event.queryStringParameters ?? {};
   switch (match.route.id) {
@@ -601,7 +616,7 @@ async function route_(
     }
 
     case 'listRuns':
-      return listRunsRoute(session, q);
+      return listRunsRoute(session, q, secret);
 
     case 'getRun': {
       const run = await authorizeRun(session, match);
@@ -758,15 +773,24 @@ async function route_(
  * page can come back shorter than `limit`. We keep paging until the page is full or the
  * index is exhausted — otherwise an operator with one of several installations would see a
  * near-empty list plus a cursor, which reads as "no runs".
+ *
+ * That same post-query filter is why `nextCursor` is SEALED (ADR-052): the store's cursor is
+ * the last row SCANNED, so on a filtered walk it habitually names a row belonging to an
+ * installation this session may not administer. It is encrypted and bound to this list's
+ * scope, and a cursor that fails to open under the scope it is presented with is refused
+ * rather than restarted — a silent restart would re-serve the head page under a "load older"
+ * click and read as duplicate rows.
  */
 async function listRunsRoute(
   session: SessionPayload,
   q: Record<string, string | undefined>,
+  secret: string,
 ): Promise<Reply> {
   const limit = parseLimit(q.limit);
   // One `now` for the whole response so every row's live-cost estimate is measured against the
   // same instant (and so `.map(toRunView)` can't accidentally pass the array INDEX as `now`).
   const now = new Date();
+  const installationIds = grantedInstallationIds(session);
   const visible = (runs: RunRecord[]): RunRecord[] =>
     runs.filter((r) => canAdminInstallation(session, r.installationId));
 
@@ -780,11 +804,17 @@ async function listRunsRoute(
     // honoured as a post-query predicate rather than ignored: the console can set both, and
     // silently dropping one would show every status under a "failed" filter.
     const status = q.status as RunStatus | undefined;
+    // The status predicate is part of the scope even though it does not pick the index: a
+    // cursor minted under `?repo=1&status=failed` walked a different visible sequence than
+    // one minted under `?repo=1`, so the two must not be interchangeable.
+    const scope: CursorScope = { view: 'runs:repo', installationIds, repoId, status };
+    const opened = openCursor(q.cursor, scope, secret);
+    if (!opened.ok) return problem(400, CURSOR_REFUSED);
     const page = await collectVisible(
       (cursor) => listRunsByRepo(repoId, { limit, cursor }),
       (runs) => visible(runs).filter((r) => status === undefined || r.status === status),
       limit,
-      q.cursor,
+      opened.cursor,
     );
     // `complete` reports whether rows were DROPPED from this response, not whether the index
     // is exhausted — cursor exhaustion is the client's half of the verdict (ADR-029).
@@ -796,7 +826,7 @@ async function listRunsRoute(
     // never clear the badge. A status predicate does drop sibling jobs, so it forces `false`.
     return json(200, {
       runs: page.runs.map((r) => toRunView(r, now)),
-      nextCursor: page.nextCursor ?? null,
+      nextCursor: sealCursorOrNull(page.nextCursor, scope, secret),
       complete: repoResponseComplete(status !== undefined),
     });
   }
@@ -805,17 +835,20 @@ async function listRunsRoute(
       return problem(400, `status must be one of ${ALL_STATUSES.join(', ')}`);
     }
     const status = q.status as RunStatus;
+    const scope: CursorScope = { view: 'runs:status', installationIds, status };
+    const opened = openCursor(q.cursor, scope, secret);
+    if (!opened.ok) return problem(400, CURSOR_REFUSED);
     const page = await collectVisible(
       (cursor) => listRunsByStatusPaged(status, { limit, cursor }),
       visible,
       limit,
-      q.cursor,
+      opened.cursor,
     );
     // A status-filtered page holds only the jobs IN that status, so a run folded from it is
     // partial by construction however far the cursor got.
     return json(200, {
       runs: page.runs.map((r) => toRunView(r, now)),
-      nextCursor: page.nextCursor ?? null,
+      nextCursor: sealCursorOrNull(page.nextCursor, scope, secret),
       complete: false,
     });
   }

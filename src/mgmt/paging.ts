@@ -16,21 +16,27 @@
  * skips them). We therefore return every visible row collected — up to one index page beyond
  * `limit` — rather than silently dropping run history. The client already de-duplicates
  * appended pages by run key.
+ *
+ * The cursor this returns is a `RawCursor`: it names the last row SCANNED, not the last row
+ * RETURNED, so on a filtered walk it routinely identifies another tenant's row. It must be
+ * sealed before it reaches a response body (ADR-052) — the brand enforces that.
  */
+
+import type { RawCursor } from '../shared/cursor.js';
 
 /** How many index pages a single request will walk while filtering for visibility. */
 export const MAX_FILTER_PAGES = 5;
 
 export interface Page<T> {
   runs: T[];
-  nextCursor?: string;
+  nextCursor?: RawCursor;
 }
 
 export async function collectVisible<T>(
-  fetchPage: (cursor?: string) => Promise<Page<T>>,
+  fetchPage: (cursor?: RawCursor) => Promise<Page<T>>,
   filter: (rows: T[]) => T[],
   limit: number,
-  startCursor?: string,
+  startCursor?: RawCursor,
   maxPages: number = MAX_FILTER_PAGES,
 ): Promise<Page<T>> {
   const out: T[] = [];
