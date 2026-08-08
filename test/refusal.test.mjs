@@ -985,6 +985,46 @@ test('the console exposes Unclaimed as its own destination', () => {
   assert.ok(!/active.*unclaimed|unclaimed.*errorRate/.test(dash));
 });
 
+test('a cross-installation refusal opens ITS repo, not the selected installation\'s', () => {
+  // Unclaimed is platform-wide: `listRefusalsRoute` filters on `canAdminInstallation`, so a session
+  // with two grants sees both installations' refusals in one list. Repo detail is
+  // installation-SCOPED — it fetches `?installation=<selected id>` and `authorizeRepo` looks the
+  // repo up under that installation, answering a flat `404 repo not found` on a mismatch.
+  //
+  // So the remediation button has to carry the ROW's installation. Without this the button
+  // dead-ends on "repo not found" for every refusal outside the currently selected installation —
+  // a false negative on the screen whose entire purpose is to explain a job the console previously
+  // said nothing about.
+  const screen = stripComments(src('web/src/screens/Unclaimed.tsx'));
+  assert.match(
+    screen,
+    /selectInstallation\(row\.installationId\)/,
+    'the row must switch the shell to its own installation before navigating',
+  );
+  const handler = screen.slice(
+    screen.indexOf('function openRepoSettings('),
+    screen.indexOf('return (', screen.indexOf('function openRepoSettings(')),
+  );
+  assert.ok(handler.length > 0, 'openRepoSettings not found');
+  // Guarded, so an already-selected installation is not re-set (a needless localStorage write and
+  // state update on every click).
+  assert.match(handler, /row\.installationId !== selectedInstallationId/);
+  // Both in ONE handler: React commits the installation change with the route change, so Repo
+  // detail mounts with the right installation instead of fetching a 404 and correcting itself.
+  assert.match(handler, /navigate\(`\/repos\/\$\{row\.repoId\}`\)/);
+
+  // And the shell must actually pass the setter down — the screen's prop is optional, so a missing
+  // wire would silently degrade to the old dead-end rather than failing to compile.
+  const main = stripComments(src('web/src/main.tsx'));
+  assert.match(main, /selectInstallation: setInstallation/, 'shell does not expose the switcher');
+  // Both switches in the shell have a `case 'unclaimed':`, so anchor on the JSX element itself
+  // rather than the case label — the first match is `titleFor`'s, which renders no props.
+  const route = main.slice(main.indexOf('<Unclaimed'), main.indexOf('/>', main.indexOf('<Unclaimed')));
+  assert.ok(route.length > 0, '<Unclaimed> is not rendered by the shell');
+  assert.match(route, /selectInstallation=\{ctx\.selectInstallation\}/);
+  assert.match(route, /installationId=\{ctx\.installationId\}/);
+});
+
 test('Settings surfaces the allowlist-vs-catalog reconciliation on the runner-labels card', () => {
   // Scope item 3 landed on the SETTINGS screen, which a sibling card (PR #28) rewrote into its own
   // module while this work was in flight. The reconciliation therefore has to live beside trunk's

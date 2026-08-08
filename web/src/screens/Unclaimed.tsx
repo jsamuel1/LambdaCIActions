@@ -47,9 +47,13 @@ function refusalKey(r: UnclaimedJob): string {
  */
 export function Unclaimed({
   repoFilter,
+  installationId,
+  selectInstallation,
   navigate,
 }: {
   repoFilter?: number;
+  installationId?: number;
+  selectInstallation?: (id: number) => void;
   navigate: (to: string) => void;
 }): JSX.Element {
   const page = useApi(
@@ -241,6 +245,8 @@ export function Unclaimed({
                   open={expanded.has(key)}
                   onToggle={() => toggle(key)}
                   navigate={navigate}
+                  selectedInstallationId={installationId}
+                  selectInstallation={selectInstallation}
                 />
               );
             })}
@@ -300,6 +306,8 @@ function UnclaimedRow({
   open,
   onToggle,
   navigate,
+  selectedInstallationId,
+  selectInstallation,
 }: {
   row: UnclaimedJob;
   liveAllowlist: string[];
@@ -307,6 +315,8 @@ function UnclaimedRow({
   open: boolean;
   onToggle: () => void;
   navigate: (to: string) => void;
+  selectedInstallationId?: number;
+  selectInstallation?: (id: number) => void;
 }): JSX.Element {
   /**
    * Whether the allowlist has CHANGED since the refusal. Compared as case-insensitive sets,
@@ -316,6 +326,28 @@ function UnclaimedRow({
    * be refused again for exactly the same reason.
    */
   const changed = allowlistChanged(row.claimedLabels, liveAllowlist, liveKnown);
+  /**
+   * Open this repo's settings, SWITCHING the shell's installation first when the refusal belongs
+   * to a different one.
+   *
+   * This screen is platform-wide — `listRefusalsRoute` returns rows for every installation the
+   * session administers — while Repo detail is installation-scoped: it calls
+   * `/api/repos/{repoId}/workflows?installation=<the SELECTED id>`, and `authorizeRepo` looks the
+   * row up under that installation, so a mismatch is a flat `404 repo not found`. Without the
+   * switch, the remediation button on a second installation's refusal dead-ends on an error that
+   * says the repo does not exist — a false negative on the one screen whose whole purpose is to
+   * explain a job the console previously said nothing about.
+   *
+   * Both calls sit in one handler so React commits the installation change and the route change
+   * together; Repo detail therefore mounts with the right installation rather than fetching a 404
+   * first and correcting itself.
+   */
+  function openRepoSettings(): void {
+    if (selectInstallation && row.installationId !== selectedInstallationId) {
+      selectInstallation(row.installationId);
+    }
+    navigate(`/repos/${row.repoId}`);
+  }
   return (
     <>
       <tr className="clickable" onClick={onToggle}>
@@ -367,7 +399,7 @@ function UnclaimedRow({
                 <a href={row.githubUrl} target="_blank" rel="noreferrer">
                   Open the run on GitHub
                 </a>
-                <button onClick={() => navigate(`/repos/${row.repoId}`)}>Repo settings</button>
+                <button onClick={openRepoSettings}>Repo settings</button>
               </div>
             </div>
           </td>

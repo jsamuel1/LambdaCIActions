@@ -117,6 +117,7 @@ function App(): JSX.Element {
           navigate,
           repoFilter,
           installations: me.data.installations,
+          selectInstallation: setInstallation,
         })}
       </main>
     </div>
@@ -153,6 +154,13 @@ function renderRoute(
     navigate: (to: string) => void;
     repoFilter: string | null;
     installations: { installationId: number; accountLogin: string }[];
+    /**
+     * Switch the shell's selected installation. Needed by the PLATFORM-WIDE screens: they list
+     * rows from every installation the session administers, so a link from one of those rows to
+     * an installation-scoped screen has to carry its own installation rather than inherit
+     * whichever one the selector happens to hold.
+     */
+    selectInstallation: (id: number) => void;
   },
 ): JSX.Element {
   const [head, a, b, c] = segments;
@@ -179,6 +187,8 @@ function renderRoute(
       return (
         <Unclaimed
           repoFilter={ctx.repoFilter ? Number(ctx.repoFilter) : undefined}
+          installationId={ctx.installationId}
+          selectInstallation={ctx.selectInstallation}
           navigate={ctx.navigate}
         />
       );
