@@ -1351,7 +1351,7 @@ async function putRunnerLabelsRoute(
     return json(200, { dryRun: true, applied: false, labels: current, impact });
   }
 
-  // The Mgmt λ has no PutParameter grant at all (ADR-025/028) — the broker owns config writes.
+  // The Mgmt λ has no PutParameter grant at all (ADR-025/034) — the broker owns config writes.
   let res: AppcfgResult;
   try {
     res = await invokeAppcfg({

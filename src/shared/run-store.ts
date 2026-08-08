@@ -311,7 +311,7 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
 }
 
 /**
- * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/017). Separate from
+ * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/019). Separate from
  * transitionRun because the mapping must be recorded even if the status already advanced
  * (e.g. an ultra-fast job whose `completed` webhook beat the `running` transition) — the
  * hook broker reads this back at job end to self-terminate on the VM's behalf, and the

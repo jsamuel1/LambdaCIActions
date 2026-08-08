@@ -767,7 +767,7 @@ async function restoreVersions(
 /**
  * Write the environment's claim list. Lives here (not in the Mgmt λ) because the console
  * holds NO `ssm:PutParameter` grant at all — concentrating config-write authority in one
- * control-plane function keeps the internet-facing surface read-mostly (ADR-025/028), and
+ * control-plane function keeps the internet-facing surface read-mostly (ADR-025/034), and
  * ADR-027 explicitly rejected letting the management plane mutate runner-label config.
  *
  * `runner-labels` is a plain String, not a SecureString: the labels are public by nature
