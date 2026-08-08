@@ -270,6 +270,7 @@ Statuses and what they mean:
 |---|---|---|
 | `ok` | ok | label claimed, image `CREATED`/`UPDATED` — runnable |
 | `image_unverified` | ok | parameters look right, image state not checked (`--no-image-check`) |
+| `label_unverified` | ok | image verified but the allowlist was not read, so selectability is unknown. Not reachable from this CLI (it always reads the allowlist) — it exists for a consumer that reads only `image-arn-*`, e.g. the console health item |
 | `image_building` | warn | a build is in flight; wait |
 | `label_missing` | warn | image exists but no label — capacity that can never be selected |
 | `image_missing` | **blocked** | label claimed with no image — jobs get claimed then fail in provisioning, with no GitHub-hosted fallback |

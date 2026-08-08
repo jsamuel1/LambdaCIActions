@@ -232,6 +232,30 @@ test('a flavor with no observation at all is blocked, not silently ok', () => {
   assert.equal(report.drift, true);
 });
 
+test('not_built with an UNREAD allowlist does not claim the label was observed absent', () => {
+  // The console's exact position: it reads `image-arn-*` presence via DescribeParameters and no
+  // label VALUE at all, so every unbuilt flavor reaches this row with `labelClaimed: undefined`.
+  // The absent image is decisive on its own, so `not_built`/`blocked`/`build` all stand — but the
+  // detail must not report an unobserved allowlist as a second finding. Same optional-by-ignorance
+  // split `label_missing` already carries, one health value over.
+  const row = rowFor({ name: 'python', imageArn: null });
+  assert.equal(row.health, 'not_built');
+  assert.equal(row.severity, 'blocked', 'a flavor with no image is still blocked');
+  assert.equal(row.safeFix, 'build', 'building is safe regardless of what the allowlist says');
+  assert.doesNotMatch(
+    row.detail,
+    /nor claimed/,
+    'the allowlist was never read, so its state must not be asserted',
+  );
+  assert.match(row.detail, /not observed/);
+  assert.match(row.detail, /queue forever/, 'the real consequence must still be stated');
+
+  // And an allowlist that WAS read and is genuinely missing the label keeps the stronger wording.
+  const observed = rowFor({ name: 'python', labelClaimed: false, imageArn: null, imageState: null });
+  assert.equal(observed.health, 'not_built');
+  assert.match(observed.detail, /neither built nor claimed/);
+});
+
 // --- an unreadable probe is not evidence of absence -------------------------
 
 test('only ResourceNotFoundException means the image is absent', () => {

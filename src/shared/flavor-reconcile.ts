@@ -142,7 +142,9 @@ export interface FlavorObservation {
  *                          fail in provisioning, having lost the GitHub-hosted fallback.
  *                          The worst state, and the one label-before-image creates.
  * - `not_built`           — neither label nor image. A catalog entry that silently queues
- *                          forever. Safe to fix by building.
+ *                          forever. Safe to fix by building. Also covers "no image, allowlist
+ *                          not read": the missing image is decisive on its own, so the verdict
+ *                          holds, but the detail must not claim the label was observed absent.
  * - `image_failed`        — the image exists in a *_FAILED state.
  */
 export type FlavorHealth =
@@ -273,8 +275,17 @@ function detailOf(row: Omit<FlavorReconcileRow, 'detail' | 'fix' | 'safeFix'>): 
       return `'${row.label}' IS claimed but there is no usable image — jobs get claimed and ` +
         'then fail in provisioning, with no GitHub-hosted fallback left';
     case 'not_built':
-      return 'advertised by the catalog but neither built nor claimed — jobs queue forever ' +
-        'with no error anywhere';
+      // Same optional-by-ignorance split as `label_missing`. The absent image is a verified
+      // fact either way, but `labelClaimed: undefined` means the allowlist was never read —
+      // the console's position exactly (it reads `image-arn-*` presence and no label value) —
+      // so saying "nor claimed" would state an unobserved fact as a finding, which is the one
+      // thing this module exists not to do.
+      return row.labelClaimed === undefined
+        ? 'advertised by the catalog with no image — jobs queue forever with no error ' +
+            `anywhere. Whether '${row.label}' is claimed was not observed, but no label can ` +
+            'help without an image'
+        : 'advertised by the catalog but neither built nor claimed — jobs queue forever ' +
+            'with no error anywhere';
     case 'image_failed':
       return `image build ${row.imageState} — rebuild before this flavor can run anything`;
     default:
