@@ -12,6 +12,13 @@ import {
   installationToDiscoveryRequests,
 } from '../discover/filter.js';
 import { putQueuedRun, transitionRun } from '../shared/run-store.js';
+import { recordRefusal } from '../shared/refusal-store.js';
+import {
+  classifyRefusal,
+  sampleRefusalLog,
+  REFUSAL_LOG_SAMPLE_RATE,
+  type RefusalInput,
+} from './refusal.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { listCustomFlavors, routableCustomFlavors, type CustomFlavorRecord } from '../shared/flavor-store.js';
 import { isCustomFlavorLabel } from '../shared/flavor-catalog.js';
@@ -371,27 +378,132 @@ async function handleWorkflowJob(
     .map((l) => l.trim())
     .filter(Boolean);
 
+  /**
+   * Repo onboarding mode, read below. Declared here because the refusal emitter reports it: a
+   * refusal that cannot say which mode was in force is not diagnosable (`no LCA label` means
+   * something different in `label` and `adopt` mode).
+   *
+   * Fails OPEN on a lookup error, but "open" here means `label` mode (the safe default): a DDB
+   * fault must never silently start intercepting a repo's `ubuntu-latest` jobs.
+   */
+  let repoMode: RepoMode | undefined;
+
+  /**
+   * Emit one refusal (ADR-050): a structured log line always, plus a durable row when the
+   * refusal is actionable.
+   *
+   * Every `claimed: false` path funnels through here. Before this existed, `decideClaim`'s
+   * rejection — the ONE refusal an operator actually hits, an `lambda-ci-*` label missing from
+   * the live allowlist — returned its reason in a 202 body that GitHub discards and logged
+   * nothing, while its three sibling branches all logged. Eight PRs queued for ~7 h with no
+   * error in the console, the run list, or CloudWatch.
+   *
+   * Best-effort by construction: a store failure is logged and swallowed, because a webhook
+   * that 5xx's makes GitHub retry a delivery whose CLAIM decision is already final.
+   */
+  async function refuse(
+    gate: RefusalInput['gate'],
+    reason: string,
+    extra: { group?: string | null } = {},
+  ): Promise<void> {
+    const jobLabels = wf.workflow_job?.labels ?? [];
+    const cls = classifyRefusal({
+      gate,
+      jobLabels,
+      claimedLabels,
+      mode: repoMode,
+      reason,
+      group: extra.group,
+    });
+    const line = {
+      msg: `job not claimed — ${cls.code}`,
+      level: cls.level,
+      code: cls.code,
+      actionable: cls.actionable,
+      repo: wf.repository.full_name,
+      repoId: wf.repository.id,
+      runId: wf.workflow_job?.run_id,
+      jobId: wf.workflow_job?.id,
+      job: wf.workflow_job?.name,
+      workflow: wf.workflow_job?.workflow_name ?? undefined,
+      jobLabels,
+      // The live allowlist snapshot: the other half of the diagnosis, and it changes over time,
+      // so a log line without it cannot be re-read later to explain the decision.
+      claimedLabels,
+      lcaLabels: cls.lcaLabels,
+      mode: repoMode ?? 'label',
+      reason,
+      ...(cls.fix ? { fix: cls.fix } : {}),
+      ...(extra.group ? { group: extra.group } : {}),
+    };
+    if (cls.actionable) {
+      console.log(JSON.stringify(line));
+    } else {
+      // The noise lane is SAMPLED, not merely tagged `level: 'debug'`.
+      //
+      // This function is reached by every `workflow_job.queued` delivery for every repo the App
+      // can see, and an un-onboarded repo's `ubuntu-latest` jobs are its normal steady state. The
+      // level field alone changes nothing: these Lambdas emit with `console.log`, so a `debug`
+      // tag still lands in CloudWatch at the same volume and cost as the real misconfiguration it
+      // is supposed to be distinguishable from — and burying the one actionable line under
+      // thousands of expected ones is the failure ADR-050 exists to end.
+      //
+      // Kept rather than dropped because a sampled line still answers "is the webhook arriving at
+      // all?", which is the first question when a repo appears inert. Sampled DETERMINISTICALLY on
+      // the job id so a given job either logs or does not — a random draw would make the same job
+      // appear and disappear across GitHub's webhook re-deliveries, which reads as a platform
+      // fault while diagnosing one.
+      if (sampleRefusalLog(wf.workflow_job?.id)) {
+        console.log(JSON.stringify({ ...line, sampled: REFUSAL_LOG_SAMPLE_RATE }));
+      }
+    }
+    if (!cls.actionable) return; // expected steady state — sampled, never stored
+    try {
+      await recordRefusal({
+        repoId: wf.repository.id,
+        repoFullName: wf.repository.full_name,
+        installationId: wf.installation.id,
+        runId: wf.workflow_job.run_id,
+        jobId: wf.workflow_job.id,
+        code: cls.code,
+        reason,
+        fix: cls.fix,
+        labels: jobLabels,
+        claimedLabels,
+        mode: repoMode ?? 'label',
+        workflowName: wf.workflow_job.workflow_name ?? undefined,
+        jobName: wf.workflow_job.name ?? undefined,
+        runnerGroup: extra.group ?? undefined,
+      });
+    } catch (err) {
+      console.error(
+        JSON.stringify({ msg: 'recordRefusal failed', code: cls.code, error: errMsg(err) }),
+      );
+    }
+  }
+
   // Repo config gate FIRST (was: after the label check). Adopt mode (M5, ADR-030) makes the
   // repo's `mode` an INPUT to the claim decision, not just an opt-out — a job with no LCA
   // label is claimed iff the repo opted into adopt. So the row is read before deciding.
   //
-  // Fails OPEN on a lookup error, but "open" here means `label` mode (the safe default):
-  // a DDB fault must never silently start intercepting a repo's `ubuntu-latest` jobs.
-  let repoMode: RepoMode | undefined;
+  // The try covers the LOOKUP only. The refusal emit + `return` deliberately sit outside it: an
+  // emitter throw inside the try would be caught as a "lookup failed" fail-open and fall through
+  // to `decideClaim`, which would then CLAIM a labelled job in a repo the operator switched off —
+  // the observability fix silently inverting the opt-out gate.
+  let optedOut: { reason: string } | undefined;
   try {
     const repo = await getRepo(wf.installation.id, wf.repository.id);
-    if (isRepoOptedOut(repo)) {
-      console.log(
-        JSON.stringify({
-          msg: 'job not claimed — repo opted out',
-          repo: wf.repository.full_name,
-          enabled: repo?.enabled,
-          mode: repo?.mode ?? 'label',
-        }),
-      );
-      return json(202, { ok: true, claimed: false, disabled: true });
-    }
+    // Read the mode BEFORE the opt-out check so a refusal on this branch reports the mode that
+    // caused it (`off`) rather than the `label` default.
     repoMode = repo?.mode;
+    if (isRepoOptedOut(repo)) {
+      optedOut = {
+        reason:
+          repo?.enabled === false
+            ? 'the repo is disabled in LambdaCIActions'
+            : "the repo's onboarding mode is 'off'",
+      };
+    }
   } catch (err) {
     console.error(
       JSON.stringify({
@@ -399,6 +511,10 @@ async function handleWorkflowJob(
         error: errMsg(err),
       }),
     );
+  }
+  if (optedOut) {
+    await refuse('repo-disabled', optedOut.reason);
+    return json(202, { ok: true, claimed: false, disabled: true });
   }
 
   const jobLabels = wf.workflow_job?.labels ?? [];
@@ -414,12 +530,18 @@ async function handleWorkflowJob(
     mode: repoMode,
   });
   if (!decision.claim) {
+    await refuse('claim', decision.reason);
     return json(202, { ok: true, claimed: false, reason: decision.reason });
   }
 
   // Compat gate (spec 03 § routing): a job whose stored analysis says `block` is not
   // eligible — don't claim it (GitHub-hosted still runs it). Fail OPEN: no stored
   // analysis / no unambiguous match / a DB fault must never stop a labeled job.
+  //
+  // As with the opt-out gate above, the try covers the ANALYSIS LOOKUP only; the refusal emit and
+  // its `return` happen after it, so an emitter throw cannot be swallowed as a fail-open and let
+  // a job through the very gate that just refused it.
+  let postClaim: { gate: 'runner-group' | 'compat-block'; reason: string; group?: string } | undefined;
   try {
     const analyses = await listWorkflowAnalyses(wf.repository.id);
     const match = matchJobAnalysis(analyses, {
@@ -438,37 +560,31 @@ async function handleWorkflowJob(
     // fail-open posture stands (recorded as the residual gap in ADR-030).
     const group = match?.job?.runner_group;
     if (unreachableRunnerGroup(group)) {
-      console.log(
-        JSON.stringify({
-          msg: 'job not claimed — runs-on names a non-default runner group',
-          repo: wf.repository.full_name,
-          job: wf.workflow_job.name,
-          workflow: match?.workflow.path,
-          group,
-        }),
-      );
-      return json(202, {
-        ok: true,
-        claimed: false,
+      postClaim = {
+        gate: 'runner-group',
         reason:
           `runs-on requests runner group '${group}'; LambdaCIActions registers runners in the ` +
           'repository default group only, so this job would never be assigned to one',
-      });
-    }
-    if (match?.compat && !match.compat.eligible) {
-      console.log(
-        JSON.stringify({
-          msg: 'job not claimed — compat block',
-          repo: wf.repository.full_name,
-          job: wf.workflow_job.name,
-          workflow: match.workflow.path,
-          messages: match.compat.messages.map((m) => m.code),
-        }),
-      );
-      return json(202, { ok: true, claimed: false, blocked: true });
+        group: group ?? undefined,
+      };
+    } else if (match?.compat && !match.compat.eligible) {
+      postClaim = {
+        gate: 'compat-block',
+        reason:
+          'compatibility analysis blocked this job: ' +
+          match.compat.messages.map((m) => m.code).join(', '),
+      };
     }
   } catch (err) {
     console.error(JSON.stringify({ msg: 'compat gate lookup failed (failing open)', error: errMsg(err) }));
+  }
+  if (postClaim?.gate === 'runner-group') {
+    await refuse('runner-group', postClaim.reason, { group: postClaim.group });
+    return json(202, { ok: true, claimed: false, reason: postClaim.reason });
+  }
+  if (postClaim?.gate === 'compat-block') {
+    await refuse('compat-block', postClaim.reason);
+    return json(202, { ok: true, claimed: false, blocked: true });
   }
 
   const msg = toProvisionRequest(wf, decision.via);

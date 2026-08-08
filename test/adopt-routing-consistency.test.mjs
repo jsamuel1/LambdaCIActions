@@ -98,7 +98,10 @@ test('the parser preserves the runner group from the object form', async () => {
 
 test('ingest refuses to claim a job that names a non-default runner group', () => {
   const ingestSrc = fs.readFileSync(path.join(ROOT, 'src', 'ingest', 'handler.ts'), 'utf8');
-  const gate = ingestSrc.indexOf('runs-on names a non-default runner group');
+  // Anchored on the refusal EMITTER call rather than on the log line's prose: every refusal is
+  // now emitted through one classifier (ADR-050), so the branch marker is the gate name, and the
+  // operator-facing text is free to be reworded without disarming this guard.
+  const gate = ingestSrc.indexOf("refuse('runner-group'");
   assert.ok(gate > 0, 'runner-group gate not found in ingest');
   // It reads the group off the MATCHED analysis (the webhook cannot carry it) …
   assert.match(ingestSrc, /match\?\.job\?\.runner_group/);
