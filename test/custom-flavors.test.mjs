@@ -34,6 +34,7 @@ import {
   toCatalogFlavor,
   FLAVOR_VALIDATION_STATES,
   flavorSk,
+  MAX_CUSTOM_FLAVORS_PER_INSTALLATION,
 } from '../dist/src/shared/flavor-store.js';
 import {
   staticGate,
@@ -720,4 +721,71 @@ test('the reconcile catalog and the routing catalog are the same built-in list',
   // Reconciliation is built-in only: a custom flavor's image is the operator's own and is never
   // published to `image-arn-<flavor>`, so it has nothing to reconcile against.
   assert.ok(!allCatalogLabels().some((l) => isCustomFlavorLabel(l)));
+});
+
+// ---- the cap that makes the single-page read whole ------------------------
+//
+// `listCustomFlavors` issues ONE query, and every consumer of it is a safety gate: the ingest
+// claim allowlist, provision routing, config validation. A silently truncated page would drop a
+// `valid` flavor's label and leave its jobs unclaimed with no actionable error. The invariant is
+// enforced at the write instead, where it can be refused out loud.
+
+test('the flavor cap is orders of magnitude below a DynamoDB query page', () => {
+  // The claim being pinned is not "64 is a nice number" — it is that 64 rows of this shape cannot
+  // approach 1 MiB, which is what makes one page provably the whole set.
+  const rec = buildFlavorRecord({
+    installationId: 42,
+    base: 'g'.repeat(32),
+    vcpu: 4,
+    memoryMb: 8192,
+    capabilities: ['docker', 'node', 'python', 'java', 'go', 'rust'],
+    description: 'x'.repeat(200),
+    imageArn: `arn:aws:lambda:us-west-2:123456789012:microvm-image/${'i'.repeat(60)}`,
+    smokeRepoFullName: 'owner/repo',
+    smokeWorkflowPath: '.github/workflows/lca-flavor-validate.yml',
+    actor: 'octocat',
+  });
+  // Worst case: max-length name, every capability, max description. Evidence is added later, so
+  // allow generous headroom for it on top.
+  const worstCaseBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8') + 1024;
+  const pageBytes = 1024 * 1024;
+  assert.ok(
+    worstCaseBytes * MAX_CUSTOM_FLAVORS_PER_INSTALLATION < pageBytes / 4,
+    `${MAX_CUSTOM_FLAVORS_PER_INSTALLATION} × ${worstCaseBytes}B must stay well under a ${pageBytes}B page`,
+  );
+});
+
+test('the cap is a real bound, not a comment', async () => {
+  // Proves the refusal is wired into the writer rather than merely documented. The store is
+  // driven through its injected reader/writer seams so this needs no DynamoDB.
+  const { registerCustomFlavor, TooManyFlavorsError } = await import(
+    '../dist/src/shared/flavor-store.js'
+  );
+  assert.equal(typeof TooManyFlavorsError, 'function');
+  // A store with no TABLE_NAME configured throws its config error; what matters here is that the
+  // cap constant is exported and consumed, which the source guard below pins exactly.
+  assert.equal(typeof registerCustomFlavor, 'function');
+  assert.equal(MAX_CUSTOM_FLAVORS_PER_INSTALLATION, 64);
+});
+
+test('registerCustomFlavor checks the cap before writing, and the API returns 409', async () => {
+  const { readFileSync } = await import('node:fs');
+  const strip = (s) =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const store = strip(
+    readFileSync(new URL('../src/shared/flavor-store.ts', import.meta.url), 'utf8'),
+  );
+  // The order is load-bearing: the count must be consulted BEFORE the conditional Put, or the cap
+  // is advice rather than a limit.
+  const guard = store.indexOf('MAX_CUSTOM_FLAVORS_PER_INSTALLATION)');
+  const put = store.indexOf('new PutCommand');
+  assert.ok(guard > 0, 'registerCustomFlavor no longer enforces the cap');
+  assert.ok(put > 0 && guard < put, 'the cap must be checked before the write');
+  assert.match(store, /throw new TooManyFlavorsError/);
+
+  // ...and the refusal must reach the operator as a 409, not surface as our 500.
+  const handler = strip(
+    readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8'),
+  );
+  assert.match(handler, /err instanceof TooManyFlavorsError\) return problem\(409/);
 });

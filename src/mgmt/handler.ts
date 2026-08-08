@@ -60,6 +60,7 @@ import {
 import {
   FlavorExistsError,
   InvalidFlavorError,
+  TooManyFlavorsError,
   buildFlavorRecord,
   deleteCustomFlavor,
   getCustomFlavor,
@@ -1543,6 +1544,10 @@ async function registerFlavorRoute(
     });
   } catch (err) {
     if (err instanceof FlavorExistsError) return problem(409, err.message);
+    // The per-installation cap (`MAX_CUSTOM_FLAVORS_PER_INSTALLATION`) is what keeps the
+    // single-page flavor read whole, so exceeding it is a refusal the operator must SEE — 409, not
+    // a 500 that reads as our fault. Deleting an unused flavor is the remedy.
+    if (err instanceof TooManyFlavorsError) return problem(409, err.message);
     // `buildFlavorRecord` throws on a malformed name or a built-in collision — both are the
     // client's input, so 400 rather than 500 (ADR-040 refuses collisions at registration). Matched
     // by TYPE: message text cannot distinguish these from a DynamoDB fault that happens to mention

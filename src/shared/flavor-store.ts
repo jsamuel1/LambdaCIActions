@@ -46,6 +46,28 @@ export function flavorSk(name: string): string {
 /** The `begins_with` prefix that enumerates an installation's custom flavors. */
 export const FLAVOR_SK_PREFIX = 'FLAVOR#';
 
+/**
+ * Max custom flavors one installation may register.
+ *
+ * This bound is what makes the single-page `listCustomFlavors` query below CORRECT rather than
+ * merely adequate. Every consumer of that read is a safety gate — the ingest claim allowlist,
+ * provision routing, config validation — and a silently truncated page would drop a `valid`
+ * flavor's label, leaving its jobs unclaimed with no actionable error. Rather than paginate a
+ * read that should never need it (and thereby make the truncation *invisible* instead of
+ * *impossible*), registration refuses past this cap: 64 rows of a few hundred bytes each cannot
+ * approach DynamoDB's 1 MiB page, so one page is provably the whole set.
+ *
+ * 64 is also a real product bound, not just a technical one. A custom flavor is an operator-built
+ * microVM image; an installation with dozens already has an image-sprawl problem, and each one
+ * carries a validation smoke run against microVM quota.
+ *
+ * The count-then-write is not atomic, so simultaneous registrations can land a few rows over the
+ * cap. That is deliberate and harmless: the cap exists to keep the row count orders of magnitude
+ * below the page limit, and a conditional counter would serialize every registration to make the
+ * boundary exact at a number nobody is near.
+ */
+export const MAX_CUSTOM_FLAVORS_PER_INSTALLATION = 64;
+
 // ---- validation state machine (ADR-041) ------------------------------------
 
 /**
@@ -288,15 +310,32 @@ export class InvalidFlavorError extends Error {
   }
 }
 
+/** Raised when the installation already holds {@link MAX_CUSTOM_FLAVORS_PER_INSTALLATION}. */
+export class TooManyFlavorsError extends Error {
+  constructor(limit: number) {
+    super(`installation already has the maximum of ${limit} custom flavors`);
+    this.name = 'TooManyFlavorsError';
+  }
+}
+
 /**
  * Register a custom flavor. Conditional on the row NOT existing, so a double-submit is a
  * refusal rather than a silent overwrite of an already-validated flavor's evidence.
+ *
+ * Enforces {@link MAX_CUSTOM_FLAVORS_PER_INSTALLATION} first — see that constant for why the cap
+ * is a correctness property of the single-page read and not merely a quota.
  */
 export async function registerCustomFlavor(
   input: RegisterFlavorInput,
   now: Date = new Date(),
 ): Promise<CustomFlavorRecord> {
   const rec = buildFlavorRecord(input, now);
+  // Deliberately AFTER `buildFlavorRecord`: a malformed name or a built-in collision is a 400 that
+  // should not cost a query, and it is the more common operator error.
+  const existing = await listCustomFlavors(input.installationId);
+  if (existing.length >= MAX_CUSTOM_FLAVORS_PER_INSTALLATION) {
+    throw new TooManyFlavorsError(MAX_CUSTOM_FLAVORS_PER_INSTALLATION);
+  }
   try {
     await requireDoc().send(
       new PutCommand({
@@ -314,7 +353,16 @@ export async function registerCustomFlavor(
   return rec;
 }
 
-/** List an installation's custom flavors (all states — the console shows their progress). */
+/**
+ * List an installation's custom flavors (all states — the console shows their progress).
+ *
+ * One page, deliberately, and safe because registration caps the row count at
+ * {@link MAX_CUSTOM_FLAVORS_PER_INSTALLATION} — orders of magnitude below DynamoDB's 1 MiB query
+ * page. Every caller is a safety gate that would fail quietly on a partial result (a dropped
+ * `valid` row means its label leaves the claim allowlist and its jobs are never claimed), so the
+ * invariant is enforced at the WRITE, where it can be refused loudly, instead of papered over
+ * with paging here.
+ */
 export async function listCustomFlavors(
   installationId: number,
 ): Promise<CustomFlavorRecord[]> {
