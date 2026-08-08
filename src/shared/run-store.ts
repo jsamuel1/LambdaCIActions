@@ -311,13 +311,13 @@ export async function transitionRun(input: TransitionInput): Promise<boolean> {
 }
 
 /**
- * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/017). Separate from
+ * Unconditionally stamp the run↔VM mapping on a run row (ADR-015/019). Separate from
  * transitionRun because the mapping must be recorded even if the status already advanced
  * (e.g. an ultra-fast job whose `completed` webhook beat the `running` transition) — the
  * hook broker reads this back at job end to self-terminate on the VM's behalf, and the
  * Reaper correlates live VMs against it. Only requires the row to exist.
  *
- * Also mirrors the run's hook capability token hash (ADR-020) onto the row. The JIT config
+ * Also mirrors the run's hook capability token hash (ADR-021) onto the row. The JIT config
  * item carrying the same hash ages out after 30 min (JITCONFIG_TTL_SECONDS), but a job may
  * legitimately run for hours (Reaper's cap is 2h), and self-terminate fires at job END — so
  * the durable run row, not the short-lived JIT item, has to be what authorizes `terminate`.
@@ -348,7 +348,7 @@ export async function stampMicrovmId(input: {
 }
 
 /**
- * Build the stamp write's update expression (pure, so the ADR-020 mirror is unit-testable).
+ * Build the stamp write's update expression (pure, so the ADR-021 mirror is unit-testable).
  * `hookTokenHash` is optional and must be OMITTED from the expression when absent rather
  * than written as undefined: a plain `SET hookTokenHash = :hth` with no value is a DynamoDB
  * validation error, and writing an empty value would strand the brokered terminate on a

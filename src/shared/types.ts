@@ -128,7 +128,7 @@ export interface RewriteRequest {
  * The JSON we hand to `run-microvm --run-hook-payload` (delivered to /run). HARD cap 4096
  * bytes (GA lambda-microvms). The JIT config alone exceeds this, so it is NOT inlined — we
  * pass only a small reference; the /run hook resolves it through the hook broker λ, which is
- * the only AWS surface the VM can reach (ADR-016 by-reference payload, ADR-020 brokered
+ * the only AWS surface the VM can reach (ADR-016 by-reference payload, ADR-021 brokered
  * access).
  */
 export interface RunHookPayload {
@@ -199,7 +199,7 @@ export interface RunRecord {
   flavor?: string;
   microvmId?: string;
   /**
-   * SHA-256 of the run's hook capability token (ADR-020), mirrored here by `stampMicrovmId`
+   * SHA-256 of the run's hook capability token (ADR-021), mirrored here by `stampMicrovmId`
    * because the brokered self-terminate fires at job end, after the JIT config item carrying
    * the same hash has TTL'd away. Control-plane only: it is the verifier for a bearer
    * secret, so it must never be serialized into a management-API response or the UI

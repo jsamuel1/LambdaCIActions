@@ -90,7 +90,7 @@ export function createHandler(deps: BrokerDeps = defaultDeps) {
 
     // action === 'terminate' — self-terminate on behalf of the caller's own run only.
     // Authorized off the DURABLE run row: the JIT config item's 30-min TTL is shorter than
-    // a legitimate job, and this fires at job end (ADR-020 consequences).
+    // a legitimate job, and this fires at job end (ADR-021 consequences).
     const row = await deps.getRunFieldsByKey(pk, runSk);
     if (!row || !row.hookTokenHash) {
       // Provision writes microvmId + the token hash in ONE post-launch stamp, so "row has

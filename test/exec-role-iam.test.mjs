@@ -90,7 +90,7 @@ test('TerminateMicrovm lives on the broker role, region-scoped', () => {
 // The broker is the one role an untrusted VM can reach (indirectly, via InvokeFunction), so
 // it must not itself hold table-wide enumeration. It does exactly two GetItems by primary
 // key — `grantReadData` would re-introduce Query/Scan/BatchGetItem + `/index/*`, i.e. the
-// harvesting primitive ADR-020 removed, one hop further out.
+// harvesting primitive ADR-021 removed, one hop further out.
 test('broker DynamoDB access is GetItem on the table only', () => {
   const stmts = brokerStatements(synth());
   const ddb = stmts.flatMap(actionsOf).filter((a) => typeof a === 'string' && a.startsWith('dynamodb:'));

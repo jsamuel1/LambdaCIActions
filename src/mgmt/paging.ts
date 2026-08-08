@@ -1,7 +1,7 @@
 /**
  * Visibility-filtered pagination (spec 04 § Authorization).
  *
- * The run indexes (GSI1 status/time, GSI2 repo/time — ADR-021) are keyed by status/repo, not
+ * The run indexes (GSI1 status/time, GSI2 repo/time — ADR-023) are keyed by status/repo, not
  * by installation, so authorization is a filter applied AFTER the query. A naive
  * "query one page, filter, return" leaks that into the API contract: an operator whose
  * installation is a minority of platform traffic gets a nearly-empty list plus a cursor,

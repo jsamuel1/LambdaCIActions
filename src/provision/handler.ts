@@ -69,12 +69,12 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
 async function provisionOne(record: SQSRecord): Promise<void> {
   const req = JSON.parse(record.body) as ProvisionRequest;
 
-  // Config guard FIRST, before anything irreversible (ADR-020). An unset broker name would
+  // Config guard FIRST, before anything irreversible (ADR-021). An unset broker name would
   // launch a VM whose /run hook 400s on the missing pointer field, stranding it until the
   // Reaper — and, worse, it would already have consumed a single-use GitHub JIT config.
   // Fail here (before the mint) so SQS retries and then DLQs with nothing burnt.
   const brokerName = process.env.HOOK_BROKER_NAME;
-  if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-020 brokered run hook)');
+  if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-021 brokered run hook)');
 
   // Idempotency guard (spec 05): move queued→provisioning. A duplicate delivery whose run
   // already advanced (running/terminal) is rejected by the forward-only guard — skip the
@@ -212,7 +212,7 @@ async function provisionOne(record: SQSRecord): Promise<void> {
     // Launch failed — record the failure so the run isn't a ghost, then rethrow so SQS
     // retries → DLQ after maxReceiveCount.
     //
-    // REDACT FIRST (ADR-020): `payload` carries the plaintext capability token, and an SDK
+    // REDACT FIRST (ADR-021): `payload` carries the plaintext capability token, and an SDK
     // validation/serialization error echoes the offending request value back ("Value '…' at
     // 'runHookPayload' failed to satisfy constraint"). Unscrubbed, that string lands in the
     // run row's `reason` — durable for 90 days and surfaced by the management API/UI — and in

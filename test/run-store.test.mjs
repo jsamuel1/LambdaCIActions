@@ -153,7 +153,7 @@ test('the watermark rides the same forward-only guarded write as the status', ()
   assert.ok(!condition.includes('completed'));
 });
 
-// ADR-020: the stamp write is the ONLY place the hook capability token hash reaches the
+// ADR-021: the stamp write is the ONLY place the hook capability token hash reaches the
 // durable run row, and that row is what authorizes the brokered terminate at job end (the
 // JIT config item carrying the same hash ages out after 30 min). Pin both shapes.
 test('the stamp write mirrors the hook token hash onto the run row', () => {
