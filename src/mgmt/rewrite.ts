@@ -25,13 +25,24 @@
  * and corrupting a workflow.
  */
 import { isAdoptLabel, incompatibleRunnerLabel, unreachableRunnerGroup } from '../ingest/adopt.js';
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { builtinFlavors } from '../shared/flavor-catalog.js';
 
 interface FlavorLabel {
   name: string;
   label: string;
 }
-const FLAVORS: FlavorLabel[] = (flavorsCatalog as { flavors: FlavorLabel[] }).flavors;
+/**
+ * BUILT-IN labels only, deliberately (ADR-040).
+ *
+ * This module PLANS A YAML EDIT to someone's workflow file, so the label it writes has to be one
+ * that will still resolve for as long as that file lives. A custom flavor's label is
+ * per-installation, mutable and revocable: deleting the flavor, or its validation lapsing to
+ * `invalid`, would leave a committed `runs-on: [self-hosted, lambda-ci-custom-x]` that ingest no
+ * longer claims — a job queued forever, in a file we edited. `LCA_LABELS` is also used to decide
+ * a job needs NO rewrite, and a custom label already qualifies there via the resolver, so the
+ * only effect of adding them here would be to author a label we cannot keep a promise about.
+ */
+const FLAVORS: readonly FlavorLabel[] = builtinFlavors();
 
 /** LCA routing labels, lowercased — a job already carrying one needs no rewrite. */
 const LCA_LABELS = new Set(FLAVORS.map((f) => f.label.toLowerCase()));

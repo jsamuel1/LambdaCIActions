@@ -181,6 +181,94 @@ interface RawMicroVM {
   startedAt?: string | number | Date;
 }
 
+/**
+ * States in which a microVM image can actually serve `RunMicrovm` (service model 2025-09-09:
+ * `CREATING | CREATED | CREATE_FAILED | UPDATING | UPDATED | UPDATE_FAILED | DELETING |
+ * DELETE_FAILED | DELETED`).
+ *
+ * `UPDATED` is the state a rebuilt image lands in, so it is as usable as `CREATED` — omitting it
+ * would report every rebuilt flavor as broken.
+ */
+const USABLE_IMAGE_STATES: ReadonlySet<string> = new Set(['CREATED', 'UPDATED']);
+
+/** What a probe learned about one image. */
+export interface MicroVMImageState {
+  /** True when the image exists AND is in a state that can serve a launch. */
+  usable: boolean;
+  /** Service-reported state, or `ABSENT` when the ARN resolves to nothing. */
+  state: string;
+  /** The image's own ARN as the service reports it (echoing back what we asked for). */
+  imageArn?: string;
+  /** Newest version that successfully built, when the service reports one. */
+  latestActiveImageVersion?: string;
+  /** Newest failed version — the actionable half of a `CREATE_FAILED`/`UPDATE_FAILED`. */
+  latestFailedImageVersion?: string;
+  /** Populated when the probe itself failed (not a verdict about the image). */
+  error?: string;
+}
+
+/**
+ * Probe one microVM image: does this ARN resolve to a real image, and is it launchable?
+ *
+ * Two callers need exactly this, which is why it lives here rather than in either of them:
+ *   - the ADR-041 static gate, which must refuse to smoke-test an ARN that resolves to nothing
+ *     (`imageAvailability()` in the Mgmt API only proves an SSM PARAMETER exists — a parameter
+ *     holding a stale ARN reports the flavor as available while every launch fails);
+ *   - the operator-facing flavor reconcile/drift report, which needs "real image state" as a
+ *     column distinct from "ARN param present".
+ *
+ * ONE derivation on purpose: a CLI and a console health item that each decided separately what
+ * "usable" means would eventually disagree about the same image.
+ *
+ * Never throws. A missing image is a VERDICT (`usable: false`, `state: 'ABSENT'`); a probe that
+ * could not run (throttle, permissions, SDK gap) is reported with `error` set and `usable: false`,
+ * so a caller can tell "this image is broken" from "I could not find out" — collapsing those two
+ * would let a transient throttle mark an operator's working image permanently invalid.
+ */
+export async function getMicroVMImageState(
+  client: LambdaClient,
+  imageArn: string,
+): Promise<MicroVMImageState> {
+  let GetMicrovmImageCommand: CommandCtor;
+  try {
+    GetMicrovmImageCommand = await loadCommand('GetMicrovmImageCommand');
+  } catch (err) {
+    return { usable: false, state: 'UNKNOWN', error: errText(err) };
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = (await client.send(
+      new GetMicrovmImageCommand({ imageIdentifier: imageArn }) as any,
+    )) as {
+      imageArn?: string;
+      state?: string;
+      latestActiveImageVersion?: string;
+      latestFailedImageVersion?: string;
+    };
+    const state = res.state ?? 'UNKNOWN';
+    return {
+      usable: USABLE_IMAGE_STATES.has(state),
+      state,
+      imageArn: res.imageArn,
+      latestActiveImageVersion: res.latestActiveImageVersion,
+      latestFailedImageVersion: res.latestFailedImageVersion,
+    };
+  } catch (err) {
+    const name = (err as { name?: string }).name;
+    // A definitive "no such image" is an ANSWER, not a probe failure: the ARN is wrong or the
+    // image was deleted, and the static gate should fail the flavor loudly on it.
+    if (name === 'ResourceNotFoundException') return { usable: false, state: 'ABSENT' };
+    // AccessDenied is also a real answer to the question the ADR-041 gate actually asks — "is
+    // this image readable by our role?" — but it is reported with `error` so the operator sees
+    // that the problem is a grant rather than a broken build.
+    return { usable: false, state: name === 'AccessDeniedException' ? 'FORBIDDEN' : 'UNKNOWN', error: errText(err) };
+  }
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function normalizeMicroVM(vm: RawMicroVM): LiveMicroVM {
   let startedAt: number | undefined;
   const s = vm.startedAt;

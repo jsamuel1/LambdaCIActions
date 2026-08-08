@@ -1,4 +1,10 @@
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import {
+  builtinFlavors,
+  composeCatalog,
+  isCustomFlavorLabel,
+  isCustomFlavorName,
+  type CatalogFlavor,
+} from '../shared/flavor-catalog.js';
 import { adoptFlavorForLabel } from '../ingest/adopt.js';
 import type { RepoMode } from '../shared/types.js';
 
@@ -32,6 +38,21 @@ import type { RepoMode } from '../shared/types.js';
  *
  * Kept pure (no AWS calls) so it is trivially testable; wiring into ingest/provision (supplying
  * the per-repo FlavorMap + job signals) is done by the caller.
+ *
+ * ## Custom flavors (ADR-040/041)
+ *
+ * An installation's own `custom-*` flavors are composed OVER the built-in catalog by the caller
+ * and passed in as `opts.customFlavors`. Three properties this module is responsible for:
+ *
+ *   1. **No behavior change when none are registered.** With `customFlavors` absent or empty the
+ *      composed catalog is the built-in array itself, so every resolution below is byte-identical
+ *      to the pre-ADR-040 code. This module never reads the store — the caller decides whether a
+ *      read is even needed (`needsCustomFlavors`).
+ *   2. **A custom label cannot reroute a built-in label.** The tie-break is longest-label-then-
+ *      flavor-name-ascending and is independent of catalog ORDER, so appending custom entries
+ *      cannot change which built-in wins. `lambda-ci-custom-*` is also strictly longer than every
+ *      built-in label, so it only ever wins when it was named explicitly.
+ *   3. **A signal upgrade never upgrades INTO a custom flavor.** See `smallestWithCapability`.
  */
 
 export interface FlavorDef {
@@ -56,8 +77,23 @@ export interface FlavorDef {
   description: string;
 }
 
-const FLAVORS: FlavorDef[] = (flavorsCatalog as { flavors: FlavorDef[] }).flavors;
+const FLAVORS: readonly FlavorDef[] = builtinFlavors();
 const DEFAULT_FLAVOR = 'base';
+
+/**
+ * Compile-time proof that `FlavorDef` and the catalog seam's `CatalogFlavor` stay the same shape.
+ *
+ * `FlavorDef` is declared in full above rather than aliased to `CatalogFlavor` because
+ * `test/image-content.test.mjs` asserts, by reading this file's TEXT, that every key present in
+ * `microvm/flavors.json` appears in the `FlavorDef` declaration — an alias would satisfy the
+ * type checker while letting a newly added catalog key silently bypass the routing type. These
+ * two assignments make the duplication safe: if either type gains or loses a field, this file
+ * stops compiling.
+ */
+const _flavorDefIsCatalogFlavor: CatalogFlavor = undefined as unknown as FlavorDef;
+const _catalogFlavorIsFlavorDef: FlavorDef = undefined as unknown as CatalogFlavor;
+void _flavorDefIsCatalogFlavor;
+void _catalogFlavorIsFlavorDef;
 
 /**
  * The closed capability vocabulary (ADR-041 static gate). Capabilities are not free-form
@@ -80,9 +116,26 @@ export function areCapabilitiesKnown(caps: readonly string[]): boolean {
   return caps.every((c) => KNOWN_CAPABILITIES.includes(c));
 }
 
-/** Every flavor in the catalog (read-only view; the JSON is compiled in at build time). */
+/**
+ * Every BUILT-IN flavor (read-only view; the JSON is compiled in at build time).
+ *
+ * Deliberately built-in-only: custom flavors are per-installation (ADR-040), so there is no
+ * single global answer to "every flavor" and a caller that wants one is asking the wrong
+ * question. Installation-scoped consumers compose via `composeCatalog`/`effectiveFlavors`.
+ */
 export function allFlavors(): readonly FlavorDef[] {
   return FLAVORS;
+}
+
+/**
+ * The catalog an installation actually sees: `builtin ++ custom` (ADR-040).
+ *
+ * Returns the built-in array itself when there are no custom flavors — no copy, no re-sort.
+ */
+export function effectiveFlavors(
+  customFlavors?: readonly CatalogFlavor[],
+): readonly FlavorDef[] {
+  return composeCatalog(customFlavors);
 }
 
 /** Signals extracted from a job (spec 03 § parsing model → step_signals). */
@@ -97,6 +150,15 @@ export type FlavorMap = Record<string, string>;
 export interface ResolveOptions {
   /** Per-repo FlavorMap override (highest precedence). */
   flavorMap?: FlavorMap;
+  /**
+   * The installation's ROUTABLE custom flavors (ADR-040/041) — i.e. only those whose validation
+   * state is `valid`. Composed over the built-in catalog for this resolution only.
+   *
+   * The caller is responsible for the routability filter (`routableCustomFlavors`); passing an
+   * unvalidated flavor here would route jobs at an image nothing has executed, which is the
+   * failure ADR-041 exists to prevent. Absent/empty ⇒ built-in catalog, byte-identical behavior.
+   */
+  customFlavors?: readonly CatalogFlavor[];
   /**
    * Per-repo operator-chosen fallback flavor (console `defaultFlavor`, spec 04). Used
    * instead of the catalog `base` when no map entry / explicit label matched. Ignored when
@@ -134,8 +196,33 @@ export interface FlavorResolution {
   replaced?: string;
 }
 
-function byName(name: string): FlavorDef | undefined {
-  return FLAVORS.find((f) => f.name === name);
+function byName(catalog: readonly FlavorDef[], name: string): FlavorDef | undefined {
+  return catalog.find((f) => f.name === name);
+}
+
+/**
+ * Whether resolving THIS job could possibly need the installation's custom flavors.
+ *
+ * ADR-040 requires that an installation with no custom flavors sees byte-identical behavior and
+ * **no I/O**. The provisioner cannot know whether rows exist without reading, so the gate is the
+ * other way round: it asks whether a custom flavor could win at all. A custom flavor is only ever
+ * reachable by being NAMED — a `lambda-ci-custom-*` label on the job, a FlavorMap value in the
+ * `custom-*` namespace, or a `custom-*` defaultFlavor — because signal upgrades never target
+ * custom flavors and adopt-mode maps only to built-ins. If none of those are present, the read is
+ * skipped entirely.
+ *
+ * Pure, and derived from the same namespace predicates the store uses, so a job that never
+ * mentions a custom flavor costs exactly what it did before ADR-040.
+ */
+export function needsCustomFlavors(
+  labels: readonly string[] | undefined,
+  opts: Pick<ResolveOptions, 'flavorMap' | 'defaultFlavor'> = {},
+): boolean {
+  if (labels?.some((l) => isCustomFlavorLabel(l))) return true;
+  if (opts.flavorMap && Object.values(opts.flavorMap).some((v) => isCustomFlavorName(v))) {
+    return true;
+  }
+  return isCustomFlavorName(opts.defaultFlavor);
 }
 
 /**
@@ -160,9 +247,10 @@ function byName(name: string): FlavorDef | undefined {
  * record the ambiguity in the resolution reason instead of hiding it.
  */
 function explicitLabelMatch(
+  catalog: readonly FlavorDef[],
   lower: string[],
 ): { def: FlavorDef; ambiguousWith: string[] } | undefined {
-  const matches = FLAVORS.filter((f) => lower.includes(f.label.toLowerCase())).sort(
+  const matches = catalog.filter((f) => lower.includes(f.label.toLowerCase())).sort(
     (a, b) => b.label.length - a.label.length || a.name.localeCompare(b.name),
   );
   if (matches.length === 0) return undefined;
@@ -174,7 +262,20 @@ function explicitLabelMatch(
   return { def, ambiguousWith };
 }
 
-/** Smallest (by vcpu, then memory) flavor that advertises the given capability. */
+/**
+ * Smallest (by vcpu, then memory) BUILT-IN flavor that advertises the given capability.
+ *
+ * Built-in-only on purpose (ADR-040/041). A signal upgrade is an implicit decision the job never
+ * asked for: `runs-on: [self-hosted, lambda-ci]` plus a `services:` block silently becomes
+ * `docker`. If custom flavors competed here, registering a small docker-capable `custom-*` image
+ * would silently capture every docker-signal job in the installation — including jobs that named
+ * a BUILT-IN label — and route them at an operator image on the strength of a `vcpu` number.
+ * Custom flavors stay reachable only by being named explicitly.
+ *
+ * A job that genuinely wants a custom docker image says so with its label, a FlavorMap entry, or
+ * `defaultFlavor`; because that flavor already advertises `docker`, no upgrade fires and the
+ * explicit choice survives.
+ */
 function smallestWithCapability(cap: string): FlavorDef | undefined {
   return [...FLAVORS]
     .filter((f) => f.capabilities.includes(cap))
@@ -185,9 +286,13 @@ function smallestWithCapability(cap: string): FlavorDef | undefined {
  * Apply signal-based upgrade (resolution step 4): if the resolved flavor lacks a
  * capability the job needs, upgrade to the smallest flavor that provides it.
  */
-function applySignalUpgrade(current: FlavorResolution, signals?: JobSignals): FlavorResolution {
+function applySignalUpgrade(
+  catalog: readonly FlavorDef[],
+  current: FlavorResolution,
+  signals?: JobSignals,
+): FlavorResolution {
   if (!signals?.needs_docker) return current;
-  const def = byName(current.flavor);
+  const def = byName(catalog, current.flavor);
   if (def?.capabilities.includes('docker')) return current;
   const upgraded = smallestWithCapability('docker');
   if (!upgraded) return current;
@@ -215,6 +320,8 @@ function applySignalUpgrade(current: FlavorResolution, signals?: JobSignals): Fl
  */
 export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): FlavorResolution {
   const lower = labels.map((l) => l.toLowerCase());
+  // `builtin ++ custom` for this resolution only; the built-in array itself when none.
+  const catalog = effectiveFlavors(opts.customFlavors);
 
   // 1. Repo FlavorMap override — explicit label → flavor. Case-insensitive on the label key.
   if (opts.flavorMap) {
@@ -223,8 +330,9 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
     );
     for (const label of lower) {
       const mapped = mapLower.get(label);
-      if (mapped && byName(mapped)) {
+      if (mapped && byName(catalog, mapped)) {
         return applySignalUpgrade(
+          catalog,
           { flavor: mapped, reason: `FlavorMap override: '${label}' → '${mapped}'` },
           opts.signals,
         );
@@ -234,7 +342,7 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
 
   // 2. Explicit LCA label — prefer the most specific (longest) matching label, breaking
   //    equal-length ties by flavor name so the outcome never depends on catalog order.
-  const explicit = explicitLabelMatch(lower);
+  const explicit = explicitLabelMatch(catalog, lower);
   if (explicit) {
     const ambiguity = explicit.ambiguousWith.length
       ? ` (equally specific label(s) ${explicit.ambiguousWith
@@ -242,6 +350,7 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
           .join(', ')} also present; resolved by flavor name)`
       : '';
     return applySignalUpgrade(
+      catalog,
       {
         flavor: explicit.def.name,
         reason: `explicit LCA label '${explicit.def.label}'${ambiguity}`,
@@ -254,8 +363,9 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
   if (opts.mode === 'adopt') {
     for (const label of lower) {
       const mapped = adoptFlavorForLabel(label);
-      if (mapped && byName(mapped)) {
+      if (mapped && byName(catalog, mapped)) {
         return applySignalUpgrade(
+          catalog,
           { flavor: mapped, reason: `adopt-mode standard label '${label}' → '${mapped}'` },
           opts.signals,
         );
@@ -265,8 +375,10 @@ export function resolveFlavor(labels: string[], opts: ResolveOptions = {}): Flav
 
   // 5. Fallback — the repo's operator-chosen defaultFlavor if set + valid, else base;
   //    record a warning. Signal upgrade still applies (e.g. docker needed).
-  const repoDefault = opts.defaultFlavor && byName(opts.defaultFlavor) ? opts.defaultFlavor : undefined;
+  const repoDefault =
+    opts.defaultFlavor && byName(catalog, opts.defaultFlavor) ? opts.defaultFlavor : undefined;
   return applySignalUpgrade(
+    catalog,
     repoDefault
       ? { flavor: repoDefault, reason: `fallback to repo defaultFlavor '${repoDefault}' (no matching label)` }
       : { flavor: DEFAULT_FLAVOR, reason: 'fallback to base (no matching label)' },

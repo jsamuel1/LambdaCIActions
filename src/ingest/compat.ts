@@ -1,4 +1,4 @@
-import flavorsCatalog from '../../microvm/flavors.json' with { type: 'json' };
+import { builtinFlavors, composeCatalog, type CatalogFlavor } from '../shared/flavor-catalog.js';
 import type {
   CompatLevel,
   CompatMessage,
@@ -23,33 +23,38 @@ import type { FlavorResolution } from '../provision/flavor.js';
 
 const LEVEL_RANK: Record<CompatLevel, number> = { ok: 0, warn: 1, risk: 2, block: 3 };
 
-/** Flavor names that advertise the `docker` capability (derived from the catalog). */
-const DOCKER_CAPABLE_FLAVORS = new Set<string>(
-  (flavorsCatalog as { flavors: { name: string; capabilities: string[] }[] }).flavors
-    .filter((f) => f.capabilities.includes('docker'))
-    .map((f) => f.name),
-);
+/**
+ * The catalog views this gate needs, derived from a flavor list.
+ *
+ * Built per call when an installation has custom flavors (ADR-040), and taken from the
+ * precomputed built-in maps otherwise — so the common path allocates nothing and behaves exactly
+ * as it did before custom flavors existed.
+ */
+interface CatalogViews {
+  /** Flavor names advertising `docker`. */
+  dockerCapable: ReadonlySet<string>;
+  /** `label` (lower-cased) → the capabilities that label's flavor advertises. */
+  byLabel: ReadonlyMap<string, string[]>;
+  /** `name` → the capabilities that flavor advertises. */
+  byFlavor: ReadonlyMap<string, string[]>;
+}
+
+function buildViews(flavors: readonly CatalogFlavor[]): CatalogViews {
+  return {
+    dockerCapable: new Set(flavors.filter((f) => f.capabilities.includes('docker')).map((f) => f.name)),
+    byLabel: new Map(flavors.map((f) => [f.label.toLowerCase(), f.capabilities])),
+    byFlavor: new Map(flavors.map((f) => [f.name, f.capabilities])),
+  };
+}
 
 /**
- * Catalog view used to detect a job whose explicitly requested toolchain is not in the flavor
- * it actually resolved to. Derived from the catalog (never hard-coded) so a new flavor is
- * covered by construction.
+ * Views over the BUILT-IN catalog, computed once.
+ *
+ * Derived from the catalog rather than hard-coded (so a new flavor is covered by construction) and
+ * from the shared seam rather than a local JSON import, so this gate and the resolver can never
+ * disagree about what a flavor provides.
  */
-const CATALOG = (
-  flavorsCatalog as {
-    flavors: { name: string; label: string; capabilities: string[] }[];
-  }
-).flavors;
-
-/** `label` (lower-cased) → the capabilities that label's flavor advertises. */
-const CAPABILITIES_BY_LABEL = new Map<string, string[]>(
-  CATALOG.map((f) => [f.label.toLowerCase(), f.capabilities]),
-);
-
-/** `name` → the capabilities that flavor advertises. */
-const CAPABILITIES_BY_FLAVOR = new Map<string, string[]>(
-  CATALOG.map((f) => [f.name, f.capabilities]),
-);
+const BUILTIN_VIEWS = buildViews(builtinFlavors());
 
 /** Return the worst (highest-rank) of two levels. */
 function worse(a: CompatLevel, b: CompatLevel): CompatLevel {
@@ -73,8 +78,22 @@ function hasToken(haystack: string, tokens: string[]): boolean {
 /**
  * Analyze one parsed job against its resolved flavor. Pure. Returns the worst level that fired,
  * `eligible = level !== 'block'`, and every triggered message.
+ *
+ * `customFlavors` (ADR-040) is optional and trailing: the installation's ROUTABLE custom flavors,
+ * so the capability-derived gates below see operator-supplied toolchains too. Omitting it — or
+ * passing `[]` — yields byte-identical results to the pre-ADR-040 behavior. It matters because
+ * `toolchain-dropped` is derived from capabilities: without it, a custom `python` flavor swapped
+ * for `docker` by a signal upgrade would lose its toolchain with no warning at all.
  */
-export function analyzeCompat(job: ParsedJob, resolution: FlavorResolution): CompatResult {
+export function analyzeCompat(
+  job: ParsedJob,
+  resolution: FlavorResolution,
+  customFlavors?: readonly CatalogFlavor[],
+): CompatResult {
+  const views =
+    customFlavors && customFlavors.length > 0
+      ? buildViews(composeCatalog(customFlavors))
+      : BUILTIN_VIEWS;
   const messages: CompatMessage[] = [];
   const add = (m: CompatMessage) => {
     messages.push(m);
@@ -148,12 +167,12 @@ export function analyzeCompat(job: ParsedJob, resolution: FlavorResolution): Com
 
   // warn: job needs Docker but the resolved flavor lacks it (safety net for a FlavorMap override
   // that pinned a non-docker flavor; the resolver's signal upgrade normally prevents this).
-  if (job.step_signals.needs_docker && !DOCKER_CAPABLE_FLAVORS.has(resolution.flavor)) {
+  if (job.step_signals.needs_docker && !views.dockerCapable.has(resolution.flavor)) {
     add({
       level: 'warn',
       code: 'docker-missing',
       text: `job needs Docker but resolved flavor '${resolution.flavor}' lacks it.`,
-      fix: `Remove the FlavorMap entry pinning this job to '${resolution.flavor}', or point it at a docker-capable flavor (${[...DOCKER_CAPABLE_FLAVORS].join(', ')}).`,
+      fix: `Remove the FlavorMap entry pinning this job to '${resolution.flavor}', or point it at a docker-capable flavor (${[...views.dockerCapable].join(', ')}).`,
     });
   }
 
@@ -183,16 +202,16 @@ export function analyzeCompat(job: ParsedJob, resolution: FlavorResolution): Com
   // carries no such information) would ALSO make every adopt-mode job with `services:` emit a
   // spurious `toolchain-dropped` warn for a toolchain the workflow never requested, turning
   // adopted repos yellow and destroying the compat signal spec 03 depends on.
-  const resolvedCaps = CAPABILITIES_BY_FLAVOR.get(resolution.flavor) ?? [];
+  const resolvedCaps = views.byFlavor.get(resolution.flavor) ?? [];
   const requested = new Set<string>();
   const noteMissing = (caps: readonly string[]) => {
     for (const cap of caps) if (!resolvedCaps.includes(cap)) requested.add(cap);
   };
   for (const label of job.runs_on) {
-    noteMissing(CAPABILITIES_BY_LABEL.get(label.toLowerCase()) ?? []);
+    noteMissing(views.byLabel.get(label.toLowerCase()) ?? []);
   }
   if (resolution.replaced) {
-    noteMissing(CAPABILITIES_BY_FLAVOR.get(resolution.replaced) ?? []);
+    noteMissing(views.byFlavor.get(resolution.replaced) ?? []);
   }
   if (requested.size > 0) {
     const missing = [...requested].sort();
@@ -225,11 +244,12 @@ export function analyzeCompat(job: ParsedJob, resolution: FlavorResolution): Com
 export function analyzeWorkflowCompat(
   wf: ParsedWorkflow,
   resolveFn: (job: ParsedJob) => FlavorResolution,
+  customFlavors?: readonly CatalogFlavor[],
 ): { path: string; jobs: Record<string, CompatResult>; level: CompatLevel } {
   const jobs: Record<string, CompatResult> = {};
   let level: CompatLevel = 'ok';
   for (const job of wf.jobs) {
-    const result = analyzeCompat(job, resolveFn(job));
+    const result = analyzeCompat(job, resolveFn(job), customFlavors);
     jobs[job.id] = result;
     level = worse(level, result.level);
   }
