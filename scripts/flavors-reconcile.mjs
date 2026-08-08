@@ -50,6 +50,10 @@
  * document makes the whole stream unparseable. Exit 2 prints no document: there is no
  * trustworthy report to serialize.
  *
+ * `attempted` in the `--fix` document lists remediations RUN, each scored against the post-fix
+ * read (`outcome`, `now`) rather than against the child's exit code — a remediation can exit 0
+ * having changed nothing (ADR-049 § 4c).
+ *
  * That contract is the SCRIPT's. `npm run` prints its own `> lambda-ci-actions@0.0.0 …` banner to
  * stdout before this file executes, so any documented `--json` invocation through npm needs
  * `--silent` — otherwise the example that demonstrates the contract is the one thing that breaks
@@ -386,11 +390,11 @@ async function main() {
     // emitting nothing here would leave a `--json --fix` caller with prose on stdout and no
     // document to reconcile against the exit code. Reachable on a healthy environment (every
     // row ok, exit 0) and on `image_building` (warn, no safe fix, exit 1) alike. Same key shape
-    // as the post-fix document, with an empty `fixed`, so a consumer parses one schema.
+    // as the post-fix document, with an empty `attempted`, so a consumer parses one schema.
     if (JSON_OUT) {
       console.log(
         JSON.stringify(
-          { env: ENV, region: REGION, fixed: [], labels: liveLabels, ...report, probeFailures },
+          { env: ENV, region: REGION, attempted: [], labels: liveLabels, ...report, probeFailures },
           null,
           2,
         ),
@@ -475,7 +479,25 @@ async function main() {
         {
           env: ENV,
           region: REGION,
-          fixed: actionable.map((r) => ({ name: r.name, was: r.health, action: r.safeFix })),
+          // What was ATTEMPTED, each scored against the post-fix read — not a list of things
+          // that worked. Naming it `fixed` and filling it from `actionable` was the overclaim
+          // this section exists to forbid: on an environment with no `runner-labels` parameter,
+          // `build-images` publishes each ARN, refuses to CREATE the allowlist, and exits 0, so
+          // a run emits seven `add-label` entries beside `drift: true` and seven still-
+          // `label_missing` rows. The exit code was right and the key contradicted it. `now` is
+          // the flavor's post-fix health, so `unresolved` stays distinguishable from a build
+          // that is merely still running (ADR-049 § 4c).
+          attempted: actionable.map((r) => {
+            const post = after.report.rows.find((row) => row.name === r.name);
+            return {
+              name: r.name,
+              was: r.health,
+              action: r.safeFix,
+              now: post?.health ?? null,
+              outcome:
+                post === undefined ? 'unknown' : post.severity === 'ok' ? 'applied' : 'unresolved',
+            };
+          }),
           labels: after.liveLabels,
           ...after.report,
           probeFailures,

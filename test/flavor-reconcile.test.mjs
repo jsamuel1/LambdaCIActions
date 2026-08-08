@@ -940,10 +940,10 @@ test('--json --fix still emits a document when nothing is safely fixable', () =>
   // ...and carry the same keys as the post-fix document, so a consumer parses one schema.
   const doc = /JSON\.stringify\(\s*\{([\s\S]{0,400}?)\}/.exec(branch[0]);
   assert.ok(doc, 'no JSON payload found in the no-op fix branch');
-  for (const key of ['env', 'region', 'fixed', 'labels', 'probeFailures']) {
+  for (const key of ['env', 'region', 'attempted', 'labels', 'probeFailures']) {
     assert.match(doc[1], new RegExp(`\\b${key}\\b`), `the no-op document omits ${key}`);
   }
-  assert.match(doc[1], /fixed: \[\]/, 'nothing was fixed, so `fixed` must be empty');
+  assert.match(doc[1], /attempted: \[\]/, 'nothing was attempted, so `attempted` must be empty');
   // The human-readable line stays for a non-JSON run.
   assert.match(branch[0], /nothing safely fixable/);
 });
@@ -1148,8 +1148,17 @@ if (a[0] === 'ssm' && a[1] === 'get-parameter') {
   const name = a[a.indexOf('--name') + 1];
   const m = /image-arn-(.+)$/.exec(name);
   if (m) { console.log('arn:fake:' + m[1]); process.exit(0); }
+  // labels === null models a plane where the allowlist parameter was never seeded. Only
+  // ParameterNotFound may read as absent (the rest is an unreadable credential), so the stub
+  // has to emit that exact error for the CLI's classifier.
+  if (${labels === null ? 'true' : 'false'}) {
+    console.error('An error occurred (ParameterNotFound) when calling the GetParameter operation');
+    process.exit(254);
+  }
   console.log(${JSON.stringify(labels)}); process.exit(0);
 }
+// build-images publishes the image ARN through this before it considers the label.
+if (a[0] === 'ssm' && a[1] === 'put-parameter') { console.log('{"Version":1}'); process.exit(0); }
 if (a[0] === 'ssm' && a[1] === 'get-parameters-by-path') {
   console.log(JSON.stringify({ Parameters: ${JSON.stringify(params)} })); process.exit(0);
 }
@@ -1215,12 +1224,12 @@ test('--json: stdout is exactly one parseable document on a healthy plane (exit 
   assert.doesNotMatch(r.stdout, /deploy target verified/);
 });
 
-test('--json --fix: one parseable document with an empty `fixed` when nothing is fixable', { skip: PIN_SKIP }, () => {
+test('--json --fix: one parseable document with an empty `attempted` when nothing is fixable', { skip: PIN_SKIP }, () => {
   // Exit 0 flavour of the no-op branch: healthy plane, so no row carries a safeFix.
   const r = runReconcile(['--json', '--fix'], { labels: ALL_LABELS, imageStates: {} });
   assert.equal(r.status, 0, `expected exit 0, got ${r.status}\n${r.stderr}`);
   const doc = JSON.parse(r.stdout);
-  assert.deepEqual(doc.fixed, [], 'nothing was remediated');
+  assert.deepEqual(doc.attempted, [], 'nothing was remediated');
   assert.equal(doc.drift, false);
 });
 
@@ -1234,7 +1243,7 @@ test('--json --fix: one parseable document on the exit-1 no-op branch (build in 
   });
   assert.equal(r.status, 1, `expected exit 1 (drift), got ${r.status}\n${r.stderr}`);
   const doc = JSON.parse(r.stdout);
-  assert.deepEqual(doc.fixed, []);
+  assert.deepEqual(doc.attempted, []);
   assert.equal(doc.drift, true);
   const rust = doc.rows.find((row) => row.name === 'rust');
   assert.equal(rust.health, 'image_building');
@@ -1246,11 +1255,38 @@ test('--json and --json --fix documents share one schema', { skip: PIN_SKIP }, (
   const fixed = JSON.parse(
     runReconcile(['--json', '--fix'], { labels: ALL_LABELS, imageStates: {} }).stdout,
   );
-  // `fixed` is the only key --fix adds; everything a consumer reads is present in both.
+  // `attempted` is the only key --fix adds; everything a consumer reads is present in both.
   assert.deepEqual(
-    Object.keys(fixed).filter((k) => k !== 'fixed').sort(),
+    Object.keys(fixed).filter((k) => k !== 'attempted').sort(),
     Object.keys(plain).sort(),
   );
+});
+
+test('--json --fix: a remediation that changed nothing is reported as unresolved, not fixed', { skip: PIN_SKIP }, () => {
+  // The one --json path that actually SPAWNS `build-images`, and it was covered only at source
+  // level: the child's stdout redirect and the remediation document had never been parsed from
+  // a real run. It also pins the honesty of that document. With no `runner-labels` parameter
+  // every flavor is `label_missing` with `safeFix: 'add-label'`, so --fix runs seven children —
+  // each of which publishes its ARN, refuses to CREATE the allowlist, and exits 0 (ADR-049
+  // § 4c). Keyed off the pre-fix action list this reported seven repairs beside `drift: true`
+  // and seven still-broken rows; scored against the post-fix read it reports what happened.
+  const r = runReconcile(['--json', '--fix'], {
+    labels: null, // ParameterNotFound — the allowlist does not exist
+    imageStates: {},
+  });
+  assert.equal(r.status, 1, `expected exit 1 (drift remains), got ${r.status}\n${r.stderr}`);
+  const doc = JSON.parse(r.stdout); // the child's own stdout must not be on this stream
+  assert.equal(doc.attempted.length, catalogFlavors().length, 'every flavor should be attempted');
+  for (const a of doc.attempted) {
+    assert.equal(a.action, 'add-label');
+    assert.equal(a.was, 'label_missing');
+    assert.equal(a.outcome, 'unresolved', `${a.name} was not repaired, so it is not applied`);
+    assert.equal(a.now, 'label_missing', 'post-fix health, so a running build stays separable');
+  }
+  assert.equal(doc.drift, true);
+  // The child narrated on stderr, where it cannot corrupt the document.
+  assert.match(r.stderr, /label publish only/);
+  assert.doesNotMatch(r.stdout, /label publish only/);
 });
 
 test('--fix progress narration and the child build go to stderr under --json', () => {

@@ -327,7 +327,7 @@ that it succeeded. Scored against the plane instead, that run exits 1 and names 
 the parameter (`docs/DEPLOY-M1.md` phase 0) and re-run.
 
 With `--json`, `--fix` prints exactly one document: the post-fix report, matching the exit code.
-A run that finds nothing safely fixable prints that same shape with an empty `fixed`, so the
+A run that finds nothing safely fixable prints that same shape with an empty `attempted`, so the
 output is always parseable — never prose on stdout. Everything that narrates (the deploy-pin
 confirmation, `--fix` progress, and `build-images`' own output) goes to stderr under `--json`, so
 `aws`-style piping works — with `--silent`, because `npm run` itself banners the script name to
@@ -335,6 +335,17 @@ stdout:
 
 ```bash
 npm run --silent flavors:reconcile -- --json | jq '.rows[] | select(.severity != "ok")'
+```
+
+`attempted` is what `--fix` **ran**, not what it repaired: each entry carries `outcome`
+(`applied` / `unresolved` / `unknown`) and the flavor's post-fix `now` health, scored from the
+re-read above. A remediation can exit 0 having changed nothing — the absent-allowlist case is
+exactly that — so read `outcome`, or the top-level `drift`, never the presence of an entry.
+
+```bash
+# which flavors did --fix actually repair?
+npm run --silent flavors:reconcile -- --json --fix |
+  jq -r '.attempted[] | select(.outcome == "applied") | .name'
 ```
 
 Exit 2 prints no document at all: the plane could not be read, so there is no report to

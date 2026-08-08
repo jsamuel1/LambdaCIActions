@@ -2664,9 +2664,17 @@ and generalises to any remediation that silently no-ops. An incomplete probe on 
 is exit 2 (unknown), not success. With `--json`, `--fix` emits exactly one document — the
 post-fix report — because two on one stdout parse as neither. That holds on the paths where
 nothing was remediated too: `--json` suppresses the pre-fix document to keep the count at one, so
-a run with no safely-fixable row emits that report itself (with an empty `fixed`) rather than
+a run with no safely-fixable row emits that report itself (with an empty `attempted`) rather than
 leaving a consumer prose and no document — reachable both on a healthy environment (exit 0) and
 with a build in flight (`image_building` is warn with no safe fix, exit 1).
+
+The document's remediation key is `attempted`, and each entry is scored against that same
+second read (`outcome`, plus the flavor's post-fix `now` health). Calling it `fixed` and filling
+it from the pre-fix action list reintroduced the overclaim this section forbids one paragraph
+up, in the machine-readable surface: the no-`runner-labels` run emits seven `add-label` entries
+next to `drift: true` and seven rows still `label_missing`. The exit code was right and the key
+said the opposite, which is worse than prose doing it — a consumer reads the key. `now` keeps
+`unresolved` distinguishable from a rebuild that is simply still running.
 
 "One document" is a claim about the whole stream, so everything else that narrates moves off it
 under `--json`: the deploy-pin confirmation (`assertDeployTarget` takes a log sink for exactly
