@@ -48,6 +48,32 @@ function stripComments(src) {
 const BUILD_CODE = stripComments(BUILD_SCRIPT);
 const RECONCILE_CODE = stripComments(RECONCILE_SCRIPT);
 
+test('the comment stripper actually removes comments (it guards every source assertion)', () => {
+  // Every source-level assertion below runs against stripped text, so a broken stripper would
+  // silently turn all of them into prose searches — and both scripts carry long comment blocks
+  // that DESCRIBE the very rules being asserted. That is the exact failure mode: a guard passing
+  // on the comment explaining a deleted instruction.
+  const stripped = stripComments(
+    ['// throw new Error(commented);', ' * throw new Error(jsdoc);', '/* throw new Error(block);', 'const real = 1;'].join(
+      '\n',
+    ),
+  );
+  assert.doesNotMatch(stripped, /commented|jsdoc|block/, 'stripper left comment text behind');
+  assert.match(stripped, /const real = 1;/, 'stripper removed real code');
+
+  // And it is demonstrably doing work on the real inputs: these phrases exist ONLY in the
+  // scripts' comments, so their absence proves the strip ran against the actual files.
+  assert.ok(
+    BUILD_SCRIPT.includes('Strictly worse.') && !BUILD_CODE.includes('Strictly worse.'),
+    'build-images comments were not stripped',
+  );
+  assert.ok(
+    RECONCILE_SCRIPT.includes('do not trust this report') &&
+      !RECONCILE_CODE.includes('do not trust this report'),
+    'flavors-reconcile comments were not stripped',
+  );
+});
+
 const ARN = 'arn:aws:lambda:us-west-2:111122223333:microvm-image:lca-dev-python';
 
 function obs(over = {}) {
@@ -302,11 +328,28 @@ test('the CLI reports an incomplete probe as exit 2 and blocks --fix', () => {
   // AccessDenied run must not look like a clean 0 or a diagnosable 1.
   assert.match(RECONCILE_CODE, /classifyImageProbeFailure/);
   assert.match(RECONCILE_CODE, /probeFailures\.push\(/);
-  const probeExit = RECONCILE_CODE.indexOf('probeFailures.length');
+
+  // Assert the BRANCH, not merely that the words appear somewhere. `probeFailures.length` also
+  // occurs inside the block's own diagnostic message, and `process.exit(2)` occurs elsewhere in
+  // the file — so an `indexOf` pair plus a file-wide `process.exit(2)` match stays green after
+  // the guard is neutered to `if (false)`: the exit dies, `--fix` is no longer blocked by an
+  // AccessDenied, and nothing fails.
+  const guard = /if \(probeFailures\.length\)\s*\{[\s\S]{0,1200}?process\.exit\(2\);/.exec(
+    RECONCILE_CODE,
+  );
+  assert.ok(
+    guard,
+    'expected a live `if (probeFailures.length) { … process.exit(2) }` branch, not just the words',
+  );
+
+  // ...and it must be reachable BEFORE `--fix` selects any action, or an unreadable probe could
+  // still authorise a rebuild of a healthy catalog.
   const fixGate = RECONCILE_CODE.indexOf('const actionable =');
-  assert.ok(probeExit > 0 && fixGate > 0, 'expected both the probe check and the fix selection');
-  assert.ok(probeExit < fixGate, 'the incomplete-probe exit must precede any remediation');
-  assert.match(RECONCILE_CODE, /process\.exit\(2\)/);
+  assert.ok(fixGate > 0, 'fix selection not found');
+  assert.ok(
+    guard.index < fixGate,
+    'the incomplete-probe exit must precede any remediation selection',
+  );
 });
 
 test('build-images distinguishes an unreadable image from an absent one when refusing', () => {
@@ -547,7 +590,15 @@ test('build-images refuses to build or replace an image on a live fleet', () => 
     BUILD_CODE.indexOf('function assertQuiescentFleet('),
   );
   assert.ok(lister.length > 0, 'nonTerminatedMicroVms body not found');
-  assert.match(lister, /nextToken/, 'must follow the pagination token');
+  // Assert the token is SENT, not merely read back. `/nextToken/` alone matches the response
+  // parse (`token = body.nextToken ?? …`), so deleting the `--next-token` push leaves this guard
+  // green while every iteration silently re-requests page 1.
+  assert.match(
+    lister,
+    /cmd\.push\('--next-token', token\)/,
+    'must SEND the pagination token, not only read it back',
+  );
+  assert.match(lister, /token = body\.nextToken/, 'must read the next token from the response');
   assert.match(lister, /aws\(cmd\)/, 'must use aws(), which throws — unreadable is not empty');
 
   // The gate refuses; it does not warn and continue.
@@ -631,8 +682,20 @@ test('the reconcile CLI exits non-zero on drift', () => {
 
 test('--fix never removes a label and refuses a non-quiescent fleet', () => {
   assert.doesNotMatch(RECONCILE_CODE, /remove|delete-parameter/i);
-  // All pages, not the first: a single-page check would pass while VMs sit on page 2.
-  assert.match(RECONCILE_CODE, /nextToken/);
+  // All pages, not the first: a single-page check would pass while VMs sit on page 2. Scope to
+  // the fleet lister and assert the token is SENT — a file-wide `/nextToken/` also matches
+  // `readImageArns`, and matching only the response parse survives deleting the request push.
+  const lister = RECONCILE_CODE.slice(
+    RECONCILE_CODE.indexOf('function nonTerminatedMicroVms('),
+    RECONCILE_CODE.indexOf('function run('),
+  );
+  assert.ok(lister.length > 0, 'nonTerminatedMicroVms body not found');
+  assert.match(
+    lister,
+    /cmd\.push\('--next-token', token\)/,
+    'the fleet check must SEND the pagination token, not only read it back',
+  );
+  assert.match(lister, /token = body\.nextToken/);
   assert.match(RECONCILE_CODE, /non-terminated microVM/);
   const fixIdx = RECONCILE_CODE.indexOf('--fix: fleet is quiescent');
   const gateIdx = RECONCILE_CODE.indexOf('nonTerminatedMicroVms()');
@@ -641,7 +704,21 @@ test('--fix never removes a label and refuses a non-quiescent fleet', () => {
 
 test('--fix is rejected with --no-image-check', () => {
   // Adding a label on the strength of an unverified parameter is the ordering violation.
-  assert.match(RECONCILE_CODE, /--fix requires the real image state/);
+  //
+  // Assert the live branch. The refusal MESSAGE lives INSIDE the block, so matching only that
+  // text stays green after the condition is neutered to `if (false)` — which silently re-enables
+  // exactly the `--fix --no-image-check` combination ADR-049 forbids.
+  const refusal =
+    /if \(NO_IMAGE_CHECK\)\s*\{[\s\S]{0,800}?--fix requires the real image state[\s\S]{0,600}?process\.exit\(2\);/.exec(
+      RECONCILE_CODE,
+    );
+  assert.ok(
+    refusal,
+    'expected a live `if (NO_IMAGE_CHECK) { … --fix requires the real image state … exit(2) }`',
+  );
+  // And it must refuse before any action is chosen, not after.
+  const fixGate = RECONCILE_CODE.indexOf('const actionable =');
+  assert.ok(fixGate > 0 && refusal.index < fixGate, 'the refusal must precede fix selection');
 });
 
 test('drift --fix could not remediate still exits non-zero', () => {
