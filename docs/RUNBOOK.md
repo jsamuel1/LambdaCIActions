@@ -243,6 +243,82 @@ Prod adds nothing but flags — the account separation is the boundary (ADR-033)
 `-c env=prod`. Verify after deploy: console Settings shows every secret present, Flavors shows
 every image available, and a test push completes green.
 
+## Flavors: adding, rebuilding, and checking one against reality
+
+A catalog entry in `microvm/flavors.json` is a **claim**, not capacity. What a job can actually
+run on is the live claim allowlist plus a real image (ADR-051). Check the two against the
+catalog at any time — read-only, safe to run whenever:
+
+```bash
+npm run flavors:reconcile -- --env <env>            # exits 1 on drift
+npm run flavors:reconcile -- --env <env> --json      # machine-readable
+npm run flavors:reconcile -- --env <env> --no-image-check   # SSM params only
+```
+
+Exit 2 means the report is **incomplete**, not that the plane is broken: either SSM could not be
+read, or `get-microvm-image` failed for a reason other than `ResourceNotFoundException`
+(AccessDenied, expired credentials, wrong region, or an `aws` older than 2.35.17 with no
+`lambda-microvms` service). Those flavors are reported `image_unverified` rather than as missing
+images, and `--fix` refuses — an unreadable image is *unknown*, and rebuilding a healthy catalog
+on the strength of a permissions error is the harm that avoids.
+
+Statuses and what they mean:
+
+| status | severity | meaning |
+|---|---|---|
+| `ok` | ok | label claimed, image `CREATED`/`UPDATED` — runnable |
+| `image_unverified` | ok | parameters look right, image state not checked (`--no-image-check`) |
+| `image_building` | warn | a build is in flight; wait |
+| `label_missing` | warn | image exists but no label — capacity that can never be selected |
+| `image_missing` | **blocked** | label claimed with no image — jobs get claimed then fail in provisioning, with no GitHub-hosted fallback |
+| `not_built` | **blocked** | advertised by the catalog, neither built nor claimed — jobs queue forever with no error |
+| `image_failed` | **blocked** | the image build failed; rebuild |
+
+**Add a flavor to a live environment** (build the image, then advertise it — never the reverse):
+
+```bash
+npm run build:images -- --env <env> --flavor <name>
+npm run flavors:reconcile -- --env <env>       # expect it to go green
+```
+
+**Rebuild after a Dockerfile / patch change.** The label stays in place throughout, and the ARN
+is repointed only after the new version verifies:
+
+```bash
+npm run build:images -- --env <env> --flavor <name> --rebuild
+npm run build:images -- --env <env> --rebuild                 # whole set
+```
+
+Quiesce first for either — the image-hook contract is a serialized skew window, so no job may
+be in flight (`aws lambda-microvms list-microvms`, all pages).
+
+**Fix drift in the safe direction only:**
+
+```bash
+npm run flavors:reconcile -- --env <env> --fix
+```
+
+`--fix` builds a missing image or adds a label for an image that verifies. It **never removes a
+label** — that would take routing away from jobs that may depend on it right now — and it
+refuses outright if any microVM is non-terminated. Removing a flavor is a deliberate act: drop
+it from `flavors.json` *and* edit the allowlist parameter by hand.
+
+CD runs `flavors:reconcile --no-image-check` as a **report-only** step, so drift shows up in the
+deploy summary. It never builds: an image build is deploy-touching, and the CD job is itself a
+microVM, so it cannot honour the quiesce precondition (ADR-051).
+
+### A job that stays queued forever
+
+Symptom: GitHub shows the job `QUEUED` indefinitely, nothing in Provision's logs, no run row.
+`shouldClaim` refuses before flavor resolution and GitHub discards ingest's 202, so there is no
+error anywhere by design. Diagnose in this order:
+
+1. `npm run flavors:reconcile -- --env <env>` — this is usually the whole answer.
+2. Confirm you are querying the **platform's** region, not the workload's. A
+   `ParameterNotFound` from the wrong region is indistinguishable from a missing flavor.
+3. If the flavor is `ok`, the problem is elsewhere: check the repo is enabled, its mode, the
+   runner group (non-default groups are refused), and the workflow's labels.
+
 ## Break-glass
 
 **Stop all claiming immediately** (platform-wide, no deploy): point the runner-labels config

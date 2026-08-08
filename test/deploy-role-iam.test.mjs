@@ -109,14 +109,40 @@ test('no managed policies at all (never AdministratorAccess)', () => {
   assert.deepEqual(props.ManagedPolicyArns ?? [], []);
 });
 
-test('the role holds exactly assume-bootstrap-roles + the two workflow reads', () => {
+test('the role holds exactly assume-bootstrap-roles + the workflow reads', () => {
   const stmts = deployRoleStatements(synth().template);
   const actions = [...new Set(stmts.flatMap(actionsOf))].sort();
   assert.deepEqual(actions, [
     'cloudformation:DescribeStacks',
     'lambda:GetFunctionConfiguration',
+    // Flavor reconcile, report-only (ADR-051). Reads are scoped to /lca/<env>/config/* —
+    // asserted below — so the secret subtrees stay unreachable from CD.
+    'ssm:GetParameter',
+    'ssm:GetParameters',
+    'ssm:GetParametersByPath',
     'sts:AssumeRole',
   ]);
+  // No write to the control plane, ever: CD reports drift, a human fixes it.
+  for (const a of actions) {
+    assert.doesNotMatch(String(a), /^ssm:(Put|Delete)/, `CD must not hold ${a}`);
+  }
+});
+
+test('the reconcile grant reaches config only, never the secret subtrees', () => {
+  // /lca/<env>/github/* is the App PEM + webhook secret + OAuth client secret, and
+  // /lca/<env>/mgmt/* is the console session key. A CD credential that could read those would
+  // be a far bigger grant than "report which flavors are runnable".
+  const stmts = deployRoleStatements(synth().template);
+  const ssm = stmts.filter((s) => actionsOf(s).some((a) => String(a).startsWith('ssm:')));
+  assert.equal(ssm.length, 1, 'expected exactly one SSM statement');
+  const resources = resourcesOf(ssm[0]).map((r) => JSON.stringify(r));
+  assert.ok(resources.length > 0);
+  for (const r of resources) {
+    assert.match(r, /parameter\/lca\/[^/"]+\/config/, `SSM grant too broad: ${r}`);
+    assert.doesNotMatch(r, /\/github\//, `SSM grant reaches secrets: ${r}`);
+    assert.doesNotMatch(r, /\/mgmt\//, `SSM grant reaches secrets: ${r}`);
+    assert.notEqual(r, '"*"');
+  }
 });
 
 test('the workflow\u2019s own AWS calls are all covered by the role', () => {

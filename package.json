@@ -18,6 +18,7 @@
     "synth": "npm run build && cdk synth",
     "cdk": "cdk",
     "build:images": "node scripts/build-images.mjs",
+    "flavors:reconcile": "node scripts/flavors-reconcile.mjs",
     "app:create": "node scripts/create-github-app.mjs",
     "app:manifest": "node scripts/create-github-app.mjs --dry-run",
     "backfill:installs": "node scripts/backfill-installs.mjs"

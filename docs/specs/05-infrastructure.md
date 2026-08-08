@@ -10,6 +10,7 @@ orchestrator), IAM posture, and operational concerns (quotas, cost, observabilit
 - [Stack decomposition](#stack-decomposition)
 - [Secrets (SSM SecureString)](#secrets-ssm-securestring)
 - [Phased deployment](#phased-deployment)
+- [Flavor publication & reconciliation](#flavor-publication--reconciliation)
 - [IAM posture](#iam-posture)
 - [Networking](#networking)
 - [Observability](#observability)
@@ -101,7 +102,7 @@ only *referenced* by CDK.
 | `/lca/<env>/github/app-id` | String | App ID |
 | `/lca/<env>/github/app-slug` | String | App slug, for install URLs. Written by `create-github-app.mjs` and re-written by the App-config broker on relink/rollback (ADR-034) |
 | `/lca/<env>/config/image-arn-<flavor>` | String | Published by build script |
-| `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Must list every flavor label in `microvm/flavors.json` (plus any mapped label); a missing one means those jobs are never claimed. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
+| `/lca/<env>/config/runner-labels` | String | Claimed labels — the claim **allowlist** checked before flavor resolution. Seeded with `lambda-ci` at phase 0; `build:images` appends each flavor's label after that flavor's image verifies (ADR-051), and never removes one. A label with no image is worse than a missing label — see [Flavor publication & reconciliation](#flavor-publication--reconciliation). Check with `npm run flavors:reconcile`. See [DEPLOY-M1](../DEPLOY-M1.md#phase-0--secrets-out-of-band-adr-008) |
 | `/lca/<env>/config/table-name` | String | Published by `DataStack` |
 | `/lca/<env>/config/platform-admins` | String | Comma-separated GitHub logins allowed to make **platform-wide** settings changes (relink the App, change runner labels, test webhook delivery). **Fails closed** — unset authorizes nobody (ADR-035). Created manually, see [DEPLOY-M4](../DEPLOY-M4.md) |
 
@@ -129,7 +130,9 @@ console-origin pass, and a one-time step 0 when CD is used:
 
 2. build microVM images →  npm run build:images -- --env <env>
                           (per flavor: stage Dockerfile.<flavor>, zip microvm/,
-                           upload, build, snapshot, poll, prune, write image ARN → SSM)
+                           upload, build, snapshot, poll, prune, write image ARN → SSM,
+                           THEN add the flavor's label to runner-labels — in that order,
+                           ADR-051)
                           NOTE: this is a node script, not the CDK app — it reads its own
                           `--env` (default `dev`), NOT `-c env=…`. On a prod deploy the flag
                           is mandatory, or the ARNs land under /lca/dev and step 3 fails.
@@ -155,6 +158,43 @@ control plane that owns the runner executing the job. Steps 1–2, `ControlStack
 
 Re-running step 2 rebuilds images (e.g. patch day); steps 3–4 are idempotent. Full console
 runbook: [DEPLOY-M4](../DEPLOY-M4.md).
+
+## Flavor publication & reconciliation
+
+Step 2 publishes **two** pieces of live state per flavor, and the order between them is a
+safety property (ADR-051):
+
+1. `/lca/<env>/config/image-arn-<flavor>` — only after the image reaches `CREATED`/`UPDATED`.
+2. `/lca/<env>/config/runner-labels` — the flavor's label appended, and **only** if (1)
+   verified. `build:images` refuses otherwise.
+
+The asymmetry that forces the order: an image with no label leaves the job queued on GitHub,
+where a GitHub-hosted runner can still take it. A label with no image makes Ingest *claim* the
+job — which surrenders that fallback — and then fail in provisioning. So the intermediate state
+of a correct publication is recoverable, and the intermediate state of the reverse is not.
+
+Because both are **deployment** facts, no repository test can prove them. `npm run
+flavors:reconcile` is the check:
+
+| source | fact |
+|---|---|
+| `microvm/flavors.json` | which flavors are *advertised* |
+| `/lca/<env>/config/runner-labels` | which labels Ingest will *claim* |
+| `/lca/<env>/config/image-arn-<flavor>` | which flavors *point at* an image |
+| `get-microvm-image` | whether that image *exists*, and in what state |
+
+It is read-only, deploy-target pinned (ADR-018/ADR-037 — a `ParameterNotFound` from the wrong
+region is indistinguishable from a missing flavor), and exits non-zero on drift: 1 for drift, 2
+when live state could not be read at all (including an image probe that failed for any reason
+other than `ResourceNotFoundException` — unknown is not absent). `--fix` builds a missing image
+or adds a label for a verified one; it never removes a label, refuses on a non-quiescent fleet,
+and refuses on an incomplete probe. Verdicts come from `src/shared/flavor-reconcile.ts`, which
+the console health item must consume when it lands so the CLI and the console cannot disagree.
+
+Building is **workstation-only**. CD runs the reconcile as a report-only step
+(`--no-image-check`, `continue-on-error`) under a credential scoped to `/lca/<env>/config/*`;
+it holds no microVM-image authority, and an image build could not honour its own quiesce
+precondition from inside a microVM job anyway (ADR-047/ADR-051).
 
 ## IAM posture
 

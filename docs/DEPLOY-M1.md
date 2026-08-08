@@ -69,18 +69,37 @@ Also seed the claimed-labels config the Ingest λ reads. This is the **claim all
 `shouldClaim` (`src/ingest/filter.ts`) drops any `workflow_job` whose `runs-on` contains none
 of these labels, *before* flavor resolution runs. A flavor label that is missing here is a
 silent dead end — the job is acked 202 `claimed:false`, no runner is ever provisioned, and the
-job just sits queued on GitHub with no error anywhere. So seed **every** flavor label from
-`microvm/flavors.json`, not just `lambda-ci` (pinned by `test/filter.test.mjs`):
+job just sits queued on GitHub with no error anywhere.
+
+Seed the labels for the flavors you are actually going to **build in phase 2**, starting with
+`lambda-ci` (base). The parameter must exist before phase 2, because `build:images` appends to
+it and deliberately will not create it (creating it from one flavor would drop everything else
+an operator had seeded):
 
 ```sh
 aws ssm put-parameter --name /lca/dev/config/runner-labels \
   --type String --overwrite --region us-west-2 \
-  --value 'lambda-ci,lambda-ci-node,lambda-ci-python,lambda-ci-java,lambda-ci-go,lambda-ci-rust,lambda-ci-docker'
+  --value 'lambda-ci'
+```
+
+**Do not pre-seed a label for a flavor you have not built** (ADR-051). It is not a harmless
+head start: ingest would CLAIM those jobs and then fail in provisioning, and a claimed job has
+already lost its GitHub-hosted fallback — strictly worse than staying queued. From phase 2 on,
+`build:images` adds each label itself, only after that flavor's image verifies. The full set,
+for reference (`test/filter.test.mjs` pins this list against the catalog, so a new flavor fails
+there rather than in a queued-forever job):
+
+```
+lambda-ci,lambda-ci-node,lambda-ci-python,lambda-ci-java,lambda-ci-go,lambda-ci-rust,lambda-ci-docker
 ```
 
 Add any non-LCA label you intend to claim via a repo `FlavorMap` (e.g. `ubuntu-latest`) to
-this list too — the map is consulted during *resolution*, which the claim gate runs before.
-Re-run this command after adding a flavor to the catalog; nothing publishes it automatically.
+this parameter by hand — the map is consulted during *resolution*, which the claim gate runs
+before. `build:images` is append-only and preserves such labels.
+
+Check the result at any time with `npm run flavors:reconcile` (ADR-051), which compares the
+catalog against the live allowlist, the `image-arn-*` parameters and the real image state, and
+exits non-zero on drift.
 
 ## Phase 1 — infra (image build bucket + role)
 
@@ -91,15 +110,42 @@ npx cdk deploy LCA-Image-dev -c env=dev -c region=us-west-2
 Publishes `/lca/dev/config/image-code-bucket` to SSM. No orchestrator yet (image ARNs
 don't exist).
 
-## Phase 2 — build the microVM image
+## Phase 2 — build the microVM images
 
-Stages `microvm/Dockerfile.base`, zips the context, uploads it, runs `create-microvm-image`,
-polls to `CREATED`, and publishes the image ARN to `/lca/dev/config/image-arn-base`.
+Per flavor: stages `microvm/Dockerfile.<flavor>`, zips the context, uploads it, runs
+`create-microvm-image` (or `update-microvm-image` when it already exists), polls to
+`CREATED`/`UPDATED`, publishes the image ARN to `/lca/dev/config/image-arn-<flavor>`, **and
+only then** adds the flavor's label to `/lca/dev/config/runner-labels`.
 
 ```sh
+# whole catalog
 npm run build:images -- --env dev --region us-west-2
+# one flavor (the normal way to add or rebuild one)
+npm run build:images -- --env dev --region us-west-2 --flavor python
 # preview only:
 npm run build:images -- --env dev --region us-west-2 --dry-run
+```
+
+**Image first, label second is enforced (ADR-051).** The script refuses to add a label whose
+image is not in a usable state, because the two intermediate states are not symmetric: an
+image with no label leaves the job queued and still runnable by a GitHub-hosted runner, while
+a label with no image makes ingest *claim* the job and then fail in provisioning, with the
+fallback already given away.
+
+Other flags:
+
+| flag | effect |
+|---|---|
+| `--flavor <name>` | build/rebuild one flavor |
+| `--all` | explicit whole catalog (the default) |
+| `--rebuild` | intent marker for a patch-day rebuild; repoints the ARN after the new version verifies and leaves the label in place |
+| `--skip-label` | publish the ARN but do not advertise the flavor yet (leaves `label_missing` drift) |
+| `--publish-label-only` | no build: verify an already-published image and add its label |
+
+Confirm afterwards:
+
+```sh
+npm run flavors:reconcile -- --env dev
 ```
 
 **arm64 only** (AGENTS.md / ADR-007) — the base image + runner tarball are Graviton.
