@@ -20,16 +20,28 @@ import { JITCONFIG_SK, RUN_SK } from './run-store.js';
  * does not widen any VM's authority: the broker derives the key from the token-bound ref, so a
  * smoke VM can address only its own partition and cannot name a `RUN#` row (or vice versa).
  *
- * Both rows carry a TTL. A smoke run is minutes long, but the row must outlive it far enough for
- * the Reaper's backstop (2h cap) to still resolve `microvmId` for a VM that never self-terminated
- * — otherwise a broken image's VM would be orphaned by the very cleanup meant to catch it.
+ * Both rows carry a TTL. A smoke run is minutes long; the TTL is generous so that a run which
+ * outlives its orchestrator (a λ timeout mid-run) can still be served by the broker for the rest of
+ * the VM's life, and so a verdict written late still has its rows to clean up. It is residue
+ * control, NOT a safety mechanism.
+ *
+ * The Reaper does not depend on these rows at all, and it is worth being precise about that because
+ * the opposite is an easy assumption to make. Its lifetime-cap sweep enumerates the live fleet with
+ * `listMicroVMs` and terminates by `startedAt`, so a smoke VM that never self-terminates is capped
+ * regardless of whether its row still exists (or ever existed). Its *reconciliation* half is the
+ * part smoke runs genuinely fall outside: that reads the run-status GSI, and a `SMOKE#` row has no
+ * run status, so it never appears there. The consequence is that a leaked smoke VM is bounded by
+ * the lifetime cap only, with no earlier orphan detection — acceptable because the validator owns
+ * its own deadline, but it is the reason the deadline is the validator's responsibility rather than
+ * something it may delegate to the Reaper.
  */
 
 const client = DynamoDBClient ? new DynamoDBClient({}) : undefined;
 const doc = client ? DynamoDBDocumentClient.from(client) : undefined;
 const TABLE = process.env.TABLE_NAME;
 
-/** 6h — comfortably past the Reaper's 2h cap, short enough to leave no lasting residue. */
+/** 6h — long enough to outlive any plausible run plus late cleanup, short enough to leave no
+ * lasting residue. Not load-bearing for termination; see the Reaper note in the module comment. */
 const SMOKE_TTL_SECONDS = 6 * 60 * 60;
 
 function requireDoc(): DynamoDBDocumentClient {

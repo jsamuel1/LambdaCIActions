@@ -45,7 +45,8 @@ import {
   DEFAULT_SMOKE_WORKFLOW_PATH,
 } from '../dist/src/flavorval/validate-core.js';
 import { shouldClaim } from '../dist/src/ingest/filter.js';
-import { isRunRef, isSmokeRef, isBrokerRef, parseHookRequest } from '../dist/src/hook/broker-core.js';
+import { isRunRef, isSmokeRef, isBrokerRef, keysFromRef, parseHookRequest } from '../dist/src/hook/broker-core.js';
+import { smokePk, smokeRef } from '../dist/src/shared/smoke-store.js';
 import { buildFlavorViews, flavorNames } from '../dist/src/mgmt/views.js';
 import { analyzeCompat } from '../dist/src/ingest/compat.js';
 
@@ -557,8 +558,32 @@ test('the broker accepts a SMOKE ref without loosening the RUN ref grammar', () 
   }
 });
 
-test('parseHookRequest serves a smoke ref and still rejects a malformed one', () => {
-  const token = 'x'.repeat(32);
+/**
+ * The smoke-store ref generator and the broker's ref parser are separate modules that must agree
+ * byte-for-byte, and nothing else pins them together: the store is written for the deferred
+ * smoke-run λ, so no production caller exercises the pair yet. Without this test the two could
+ * drift silently (a changed separator, an extra key segment) and the failure would only appear the
+ * first time a live smoke VM called the broker — i.e. during the deploy-touching work that can
+ * least afford it.
+ */
+test('the smoke store ref round-trips through the broker parser and key derivation', () => {
+  const ref = smokeRef(42, 7);
+  assert.equal(ref, 'SMOKE#42#7#JITCONFIG');
+  assert.ok(isSmokeRef(ref), 'the store must emit a ref the broker recognizes');
+  assert.ok(isBrokerRef(ref));
+  assert.ok(!isRunRef(ref), 'a smoke ref must never pass as a run ref');
+  // The broker derives the item key from the ref alone, so this equality IS the isolation
+  // property: the VM's token addresses exactly the partition the store wrote.
+  const keys = keysFromRef(ref);
+  assert.equal(keys.pk, smokePk(42, 7));
+  assert.equal(keys.jitSk, 'JITCONFIG');
+  assert.equal(keys.runSk, 'RUN');
+  // A smoke ref cannot be steered at a RUN# partition, and vice versa.
+  assert.ok(!keysFromRef('RUN#1#2#3#JITCONFIG').pk.startsWith('SMOKE#'));
+  assert.ok(keys.pk.startsWith('SMOKE#'));
+});
+
+test('parseHookRequest serves a smoke ref and still rejects a malformed one', () => {  const token = 'x'.repeat(32);
   assert.equal(parseHookRequest({ action: 'terminate', ref: 'SMOKE#42#1#JITCONFIG', token }).ref, 'SMOKE#42#1#JITCONFIG');
   assert.throws(() => parseHookRequest({ action: 'terminate', ref: 'SMOKE#x#1#JITCONFIG', token }), /malformed ref/);
 });

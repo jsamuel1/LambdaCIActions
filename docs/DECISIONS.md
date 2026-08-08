@@ -2128,6 +2128,14 @@ custom is routable.** That is the safe direction, and it is the state this ADR m
 without evidence. The console surface is deferred with it, since its main job is showing validation
 progress. Both are tracked as the successor card to this one, and both are **deploy-touching**.
 
+Two pieces of that λ's scaffolding *did* land here, and are recorded so the successor card finds
+them instead of rebuilding them: `src/shared/smoke-store.ts` (the `SMOKE#<installationId>#<seq>`
+JIT/RUN row pair, in the shapes the broker already reads) and the broker's `isSmokeRef` grammar
+extension. Neither has a production caller yet — nothing writes a `SMOKE#` row, so the widened
+grammar admits a ref that resolves to no item, and the store is tree-shaken out of every bundle.
+The cross-module ref contract between them is pinned by test, because a drift there would otherwise
+only surface during the live smoke run.
+
 > **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
 > to **042..046** to vacate a collision, following the same convention as the 038..041 block
 > above. At the time of renumbering 030..033 were claimed by `kermes/task-tidal-hawk` (PR #23),

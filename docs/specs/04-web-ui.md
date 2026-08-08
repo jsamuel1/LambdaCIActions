@@ -48,12 +48,12 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
 | **Reports** | Spend + utilisation + run analytics over a window, and an NL report assistant | spend/billable compute minutes/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
 | **Flavors** | Global flavor catalog + image availability | name, label, arch, size, capabilities, $/min, image built? | `#/flavors` |
+| **Settings** | GitHub App linkage, runner labels, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
 
 > Custom flavors (ADR-040/041) are exposed by the API rows below but the Flavors **screen** does not
 > yet render or register them: its main job would be showing validation progress, and the smoke-run
 > λ that produces that progress is not deployed, so no custom flavor can reach `valid`. Screen work
 > is deferred to the same successor card as the λ.
-| **Settings** | GitHub App linkage, runner labels, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
 
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has
 a handful of workflow files, and the operator's question ("which job goes where, and what's
