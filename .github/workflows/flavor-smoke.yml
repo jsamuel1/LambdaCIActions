@@ -22,7 +22,9 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------------
-  # java — setup-java resolves ${RUNNER_TOOL_CACHE}/Java_temurin_jdk/<ver>/arm64.
+  # java — setup-java resolves ${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/<version>/arm64.
+  # That folder is `Java_<installer-class>_<packageType>`, NOT the `distribution:` input
+  # (temurin's installer is `super(`Temurin-${jvmImpl}`, ...)`) — see ADR-053.
   # Dockerfile.java bakes 21.0.12+8 as the directory `21.0.12-8` (setup-java's `+`->`-`
   # normalisation), so `java-version: '21'` must be satisfiable by that entry.
   # ---------------------------------------------------------------------------------
