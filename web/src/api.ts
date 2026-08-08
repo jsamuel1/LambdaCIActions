@@ -261,7 +261,8 @@ export interface Flavor {
   capabilities: string[];
   description: string;
   usdPerMinute: number;
-  imageAvailable: boolean;
+  /** `null` when the image-presence check did not run — unknown, NOT absent (ADR-051). */
+  imageAvailable: boolean | null;
 }
 
 export interface AppLinkage {

@@ -78,12 +78,20 @@ export interface FlavorReadiness {
 export interface ControlPlaneSnapshot {
   /** `/lca/<env>/config/runner-labels`, split + trimmed. */
   allowlist: string[];
-  /** `flavor name → an image-arn-<name> parameter exists`. */
-  imagePublished: Record<string, boolean>;
+  /**
+   * `flavor name → an image-arn-<name> parameter exists`, or `undefined` when the presence check
+   * was not performed. Consumers must not read `undefined` as "nothing is published".
+   */
+  imagePublished: Record<string, boolean> | undefined;
   /**
    * False when a live read failed and the snapshot is therefore not evidence of anything. Every
    * consumer must degrade to "unknown" rather than rendering a flavor as broken because SSM was
    * briefly unavailable — a false alarm on this surface teaches operators to ignore it.
+   *
+   * This is the AND of both reads: `reconcileFlavors` needs the allowlist and the image map to
+   * derive a state, so it is only ever called with `live: true`. Callers that render just ONE of
+   * the two facts must consult that fact's own liveness (`imagePublished === undefined`) rather
+   * than this flag, or an allowlist failure would suppress image evidence it never touched.
    */
   live: boolean;
 }
@@ -134,13 +142,14 @@ export function reconcileFlavors(
 ): FlavorReadiness[] {
   const allowed = new Set(snapshot.allowlist.map((l) => l.trim().toLowerCase()).filter(Boolean));
   return flavors.map((f) => {
+    const imagePublished = snapshot.imagePublished ?? {};
     const labelAllowlisted = allowed.has(f.label.trim().toLowerCase());
-    const imagePublished = snapshot.imagePublished[f.name] === true;
+    const imageIsPublished = imagePublished[f.name] === true;
     const state: FlavorReadinessState = labelAllowlisted
-      ? imagePublished
+      ? imageIsPublished
         ? 'ready'
         : 'imageMissing'
-      : imagePublished
+      : imageIsPublished
         ? 'unclaimable'
         : 'unroutable';
     const detail = fixFor(state, f);
@@ -148,7 +157,7 @@ export function reconcileFlavors(
       flavor: f.name,
       label: f.label,
       labelAllowlisted,
-      imagePublished,
+      imagePublished: imageIsPublished,
       state,
       runnable: state === 'ready',
       ...(detail ?? {}),

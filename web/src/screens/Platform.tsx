@@ -38,7 +38,9 @@ export function Flavors(): JSX.Element {
     <div className="card">
       {flavors.data.controlPlaneLive === false && (
         <p className="muted">
-          Could not read the live control plane — the Runnable column reads <em>unchecked</em>.
+          Could not read the live control plane — the Runnable column reads <em>unchecked</em>, and
+          any <em>unchecked</em> Image cell means the check did not run, not that the image is
+          missing.
         </p>
       )}
       {notRunnable.length > 0 && (
@@ -79,7 +81,11 @@ export function Flavors(): JSX.Element {
                 <td>{f.capabilities.join(', ') || '—'}</td>
                 <td>~{formatCost(f.usdPerMinute)}</td>
                 <td>
-                  {f.imageAvailable ? (
+                  {f.imageAvailable === null ? (
+                    <span className="muted" title="The image-arn parameter check could not be performed — this is not evidence the image is missing.">
+                      unchecked
+                    </span>
+                  ) : f.imageAvailable ? (
                     <span className="badge ok">built</span>
                   ) : (
                     <span className="badge warn">not built</span>

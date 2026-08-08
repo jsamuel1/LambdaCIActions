@@ -14,6 +14,8 @@ import {
   classifyRefusal,
   lcaShapedLabel,
   lcaShapedLabels,
+  sampleRefusalLog,
+  REFUSAL_LOG_SAMPLE_RATE,
 } from '../dist/src/ingest/refusal.js';
 import {
   buildRefusalUpsert,
@@ -665,17 +667,23 @@ test('no refusal emit sits inside a fail-open try, where a throw would invert it
   }
 });
 
-test('the emitter logs unconditionally and stores only actionable refusals', () => {
+test('the emitter logs BOTH lanes and stores only actionable refusals', () => {
   const handler = stripComments(src('src/ingest/handler.ts'));
   const emitter = handler.slice(
     handler.indexOf('async function refuse('),
     handler.indexOf('// Repo config gate FIRST'),
   );
   assert.ok(emitter.length > 0, 'refuse() not found — update this test');
-  // The log line comes BEFORE the actionable gate, or the noise lane would be silent again.
+  // Both lanes emit BEFORE the store gate, or the noise lane would be silent again — the
+  // non-actionable lane is SAMPLED (see `sampleRefusalLog`), never dropped, because a sampled line
+  // is what distinguishes "the webhook is not arriving" from "it arrives and we correctly ignore
+  // it". The actionable lane is never sampled.
   const logAt = emitter.indexOf('console.log(JSON.stringify(line))');
+  const sampledAt = emitter.indexOf('sampleRefusalLog(');
   const gateAt = emitter.indexOf('if (!cls.actionable) return');
-  assert.ok(logAt > 0 && gateAt > logAt, 'the actionable gate must not skip the log line');
+  assert.ok(logAt > 0, 'the actionable lane must log in full');
+  assert.ok(sampledAt > 0, 'the noise lane must still emit a sampled line');
+  assert.ok(gateAt > logAt && gateAt > sampledAt, 'the store gate must not skip either log lane');
   // The diagnosis needs BOTH halves: what the job asked for and what the allowlist held.
   assert.match(emitter, /jobLabels,/);
   assert.match(emitter, /claimedLabels,/);
@@ -704,10 +712,10 @@ test('mgmt reconciles workflows and flavors against the live control plane', () 
   assert.match(flavors, /reconcileFlavors\(/);
   assert.match(flavors, /allowlist/);
   // A failed live read must NOT be reconciled: `controlPlaneSnapshot` degrades to an empty
-  // allowlist + empty image map, and `reconcileFlavors` takes no view on `live`, so passing the
-  // sentinel through derives every catalog flavor as `unroutable`. The screen would then announce
-  // "N flavors cannot run in this environment" because SSM blipped — the same false certainty as
-  // the misleading green, inverted. Every readiness site must gate on `live` first.
+  // allowlist (and an `undefined` image map), and `reconcileFlavors` takes no view on `live`, so
+  // passing the sentinel through derives every catalog flavor as `unroutable`. The screen would
+  // then announce "N flavors cannot run in this environment" because SSM blipped — the same false
+  // certainty as the misleading green, inverted. Every readiness site must gate on `live` first.
   assert.match(
     flavors,
     /snapshot\.live \? reconcileFlavors\(/,
@@ -810,8 +818,15 @@ test('mgmt reads the allowlist VALUE live, and only that one non-secret paramete
     !unclaimed.includes('controlPlaneSnapshot('),
     'the unclaimed route must not probe image availability it does not render',
   );
-  // Fail SOFT: a read error must yield `live: false`, not a page of false alarms.
-  assert.match(snapshot, /live: false/);
+  // Fail SOFT: a read error must NOT throw out of here, or the whole Flavors route 500s on a
+  // transient SSM error instead of degrading to `unchecked`. `live` is no longer a literal — it is
+  // computed from BOTH reads, because each fails independently and an allowlist failure must not
+  // discard an image map that was read successfully (that rendered every flavor "not built").
+  assert.match(snapshot, /live: labels\.live && imagePublished !== undefined/);
+  assert.ok(
+    !/\bthrow\b/.test(snapshot),
+    'controlPlaneSnapshot must degrade, not throw — its callers render `unchecked` from the flags',
+  );
 
   // Presence-only probing must remain the rule for every OTHER parameter (spec 04 hard rule).
   const getParamCalls = handler.match(/getParam\(/g) ?? [];
@@ -941,4 +956,151 @@ test('a re-cased allowlist is NOT reported as a config change', () => {
     !/liveAllowlist\.includes\(/.test(screen),
     'a raw-case comparison in the screen would re-introduce the false "config changed" badge',
   );
+});
+
+// ---- unknown ≠ absent for the IMAGE half of the snapshot (ADR-051) --------------------------
+//
+// The allowlist and image reads fail INDEPENDENTLY. The first version of this feature folded both
+// into one try/catch that returned `{allowlist: [], imagePublished: {}, live: false}`, so an
+// allowlist failure discarded a perfectly good image map and `buildFlavorViews({})` then rendered
+// every catalog flavor "not built". The readiness column correctly said `unchecked` while the Image
+// column beside it asserted, with no evidence, that nothing was built — the same false certainty
+// this ADR removes, in a different column.
+
+test('buildFlavorViews distinguishes an unread image check from no images published', () => {
+  const unknown = buildFlavorViews(undefined);
+  assert.ok(unknown.length > 0);
+  for (const v of unknown) {
+    assert.equal(v.imageAvailable, null, `${v.name} must be unknown, not false, when unread`);
+  }
+  // `{}` is still a positive claim that the check ran and found nothing — callers enumerating the
+  // catalog for names rely on it and it must not become `null`.
+  for (const v of buildFlavorViews({})) {
+    assert.equal(v.imageAvailable, false, `${v.name} must be false when the check ran`);
+  }
+  for (const v of buildFlavorViews({ base: true })) {
+    assert.equal(v.imageAvailable, v.name === 'base');
+  }
+});
+
+test('reconcileFlavors treats an unread image map as absent but never crashes', () => {
+  // Readiness is only ever reached with `live: true` (both reads succeeded), so `undefined` here is
+  // defence in depth rather than a rendered state — but it must not throw, because that would turn
+  // a degraded read into a 500 on the whole Flavors route.
+  const rows = reconcileFlavors([{ name: 'python', label: 'lambda-ci-python' }], {
+    allowlist: ['lambda-ci-python'],
+    imagePublished: undefined,
+    live: false,
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].imagePublished, false);
+  assert.equal(rows[0].state, 'imageMissing');
+});
+
+test('the control-plane snapshot keeps the two live facts independent', () => {
+  const handler = stripComments(src('src/mgmt/handler.ts'));
+  const snap = handler.slice(
+    handler.indexOf('async function controlPlaneSnapshot'),
+    handler.indexOf('async function flavorReadinessOrUndefined'),
+  );
+  assert.ok(snap.length > 0, 'controlPlaneSnapshot not found — update this test');
+  // The image read must have its own fail-soft path, so an allowlist error cannot erase it.
+  assert.match(snap, /imageAvailabilityOrUndefined\(\)/);
+  // `live` is the AND of both reads (readiness needs both), NOT the allowlist alone.
+  assert.match(snap, /live: labels\.live && imagePublished !== undefined/);
+  // The old shape: one try/catch returning an empty image map as if it were observed.
+  assert.ok(
+    !/imagePublished: \{\}/.test(snap),
+    'an empty image map on failure renders every flavor "not built" with no evidence',
+  );
+  // And the route must pass the map through rather than substituting a sentinel.
+  const flavors = handler.slice(
+    handler.indexOf("case 'listFlavors':"),
+    handler.indexOf("case 'health':"),
+  );
+  assert.match(flavors, /buildFlavorViews\(snapshot\.imagePublished\)/);
+});
+
+test('the Flavors screen renders an unread image check as unchecked', () => {
+  const screen = stripComments(src('web/src/screens/Platform.tsx'));
+  // `null` must be handled BEFORE the truthiness branch — `!null` and `!false` are otherwise the
+  // same "not built" cell, which is the whole defect.
+  const cell = screen.slice(screen.indexOf('f.imageAvailable'), screen.indexOf('ReadinessBadge r={r}'));
+  assert.match(cell, /f\.imageAvailable === null/);
+  assert.ok(
+    cell.indexOf('=== null') < cell.indexOf('not built'),
+    'the unknown branch must precede the "not built" branch',
+  );
+});
+
+// ---- the noise lane is SAMPLED, not merely tagged (ADR-050) --------------------------------
+//
+// `classifyRefusal` returns `level: 'debug'` for a non-actionable refusal, but these Lambdas emit
+// with `console.log`, which lands at the same CloudWatch level and cost regardless of a `level`
+// field inside the payload. Tagging alone left every `ubuntu-latest` job from every visible repo
+// logging in full — the exact volume that buries the one actionable line this surface exists to
+// make findable.
+
+test('sampleRefusalLog is deterministic in the job id', () => {
+  // Same id, same answer, every time — GitHub re-delivers webhooks, and a random draw would make
+  // one job's line appear and vanish between deliveries while someone reads the log to diagnose it.
+  for (const id of [0, 1, 99, 100, 12345, 987654321]) {
+    assert.equal(sampleRefusalLog(id), sampleRefusalLog(id), `id ${id} must be stable`);
+  }
+  // At the default 1% rate exactly one id in each 100 consecutive ids is selected.
+  const selected = [];
+  for (let i = 0; i < 400; i++) if (sampleRefusalLog(i)) selected.push(i);
+  assert.deepEqual(selected, [0, 100, 200, 300]);
+  // Explicit rates: 1 logs everything (useful for a debug deployment), 0 logs nothing.
+  assert.equal(sampleRefusalLog(7, 1), true);
+  assert.equal(sampleRefusalLog(0, 0), false);
+  assert.equal(sampleRefusalLog(100, 0), false);
+  // A malformed delivery with no job id is rare by construction and worth seeing.
+  assert.equal(sampleRefusalLog(undefined), true);
+  assert.equal(sampleRefusalLog(Number.NaN), true);
+  // Negative/fractional ids must not escape the bucket arithmetic.
+  assert.equal(typeof sampleRefusalLog(-100), 'boolean');
+  assert.equal(sampleRefusalLog(-100), true);
+  assert.equal(REFUSAL_LOG_SAMPLE_RATE, 0.01);
+});
+
+test('ingest logs actionable refusals in full and only samples the rest', () => {
+  const handler = stripComments(src('src/ingest/handler.ts'));
+  const refuse = handler.slice(
+    handler.indexOf('async function refuse('),
+    handler.indexOf('// Repo config gate FIRST'),
+  );
+  assert.ok(refuse.length > 0, 'refuse() not found — update this test');
+  // The actionable branch is unconditional: a misconfiguration is never sampled away.
+  assert.match(refuse, /if \(cls\.actionable\) \{\s*console\.log\(JSON\.stringify\(line\)\);/);
+  // The noise lane is gated on the sampler.
+  assert.match(refuse, /if \(sampleRefusalLog\(wf\.workflow_job\?\.id\)\) \{/);
+  // A bare unconditional emit is the defect: it makes `level: 'debug'` decorative.
+  const emits = [...refuse.matchAll(/console\.log\(JSON\.stringify\(/g)];
+  assert.equal(emits.length, 2, 'expected exactly the actionable emit and the sampled emit');
+  // The sampled line says so, so a reader does not mistake 1% of the traffic for all of it.
+  assert.match(refuse, /sampled: REFUSAL_LOG_SAMPLE_RATE/);
+  // Persistence remains restricted to actionable refusals regardless of sampling.
+  assert.ok(
+    refuse.indexOf('if (!cls.actionable) return;') < refuse.indexOf('recordRefusal({'),
+    'a non-actionable refusal must return before the store write',
+  );
+});
+
+test('the unclaimed window Refresh performs the recovery its seam warning advertises', () => {
+  const screen = stripComments(src('web/src/screens/Unclaimed.tsx'));
+  // The warning tells the operator to "refresh to reload it from one snapshot". `page.reload()`
+  // alone re-fetches only the HEAD page, leaving the held older pages and `pagedPastHead` intact —
+  // so the hole the warning is about survives, and so does the warning. An advertised recovery
+  // that does not recover is worse than none: the operator believes the window is whole.
+  assert.match(screen, /function resetWindow\(\): void \{/);
+  assert.match(screen, /function refresh\(\): void \{\s*resetWindow\(\);\s*page\.reload\(\);/);
+  assert.match(screen, /<button onClick=\{refresh\}>Refresh<\/button>/);
+  assert.ok(
+    !/onClick=\{page\.reload\}/.test(screen),
+    'Refresh must reset the appended window, not just re-poll the head page',
+  );
+  // The filter-change path must share the same reset, so the two cannot drift.
+  const effect = screen.slice(screen.indexOf('useEffect(() => {'), screen.indexOf('function resetWindow'));
+  assert.match(effect, /resetWindow\(\);/);
 });

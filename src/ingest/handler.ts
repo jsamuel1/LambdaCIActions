@@ -13,7 +13,12 @@ import {
 } from '../discover/filter.js';
 import { putQueuedRun, transitionRun } from '../shared/run-store.js';
 import { recordRefusal } from '../shared/refusal-store.js';
-import { classifyRefusal, type RefusalInput } from './refusal.js';
+import {
+  classifyRefusal,
+  sampleRefusalLog,
+  REFUSAL_LOG_SAMPLE_RATE,
+  type RefusalInput,
+} from './refusal.js';
 import { listWorkflowAnalyses } from '../shared/workflow-store.js';
 import { listCustomFlavors, routableCustomFlavors, type CustomFlavorRecord } from '../shared/flavor-store.js';
 import { isCustomFlavorLabel } from '../shared/flavor-catalog.js';
@@ -431,8 +436,28 @@ async function handleWorkflowJob(
       ...(cls.fix ? { fix: cls.fix } : {}),
       ...(extra.group ? { group: extra.group } : {}),
     };
-    console.log(JSON.stringify(line));
-    if (!cls.actionable) return; // expected steady state — logged, never stored
+    if (cls.actionable) {
+      console.log(JSON.stringify(line));
+    } else {
+      // The noise lane is SAMPLED, not merely tagged `level: 'debug'`.
+      //
+      // This function is reached by every `workflow_job.queued` delivery for every repo the App
+      // can see, and an un-onboarded repo's `ubuntu-latest` jobs are its normal steady state. The
+      // level field alone changes nothing: these Lambdas emit with `console.log`, so a `debug`
+      // tag still lands in CloudWatch at the same volume and cost as the real misconfiguration it
+      // is supposed to be distinguishable from — and burying the one actionable line under
+      // thousands of expected ones is the failure ADR-050 exists to end.
+      //
+      // Kept rather than dropped because a sampled line still answers "is the webhook arriving at
+      // all?", which is the first question when a repo appears inert. Sampled DETERMINISTICALLY on
+      // the job id so a given job either logs or does not — a random draw would make the same job
+      // appear and disappear across GitHub's webhook re-deliveries, which reads as a platform
+      // fault while diagnosing one.
+      if (sampleRefusalLog(wf.workflow_job?.id)) {
+        console.log(JSON.stringify({ ...line, sampled: REFUSAL_LOG_SAMPLE_RATE }));
+      }
+    }
+    if (!cls.actionable) return; // expected steady state — sampled, never stored
     try {
       await recordRefusal({
         repoId: wf.repository.id,

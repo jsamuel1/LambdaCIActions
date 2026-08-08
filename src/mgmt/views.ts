@@ -518,8 +518,17 @@ export interface FlavorView {
   description: string;
   /** Per-minute estimate so the UI can show relative cost. */
   usdPerMinute: number;
-  /** True when an image ARN for this flavor is published in SSM (i.e. it's buildable). */
-  imageAvailable: boolean;
+  /**
+   * Whether an `image-arn-<name>` parameter is published — or `null` when the presence check
+   * was not performed (ADR-051). `false` is a positive claim that the image is absent; a failed
+   * SSM read must not be able to make it, because "not built" against a healthy catalog is the
+   * same false certainty as the misleading green, only inverted.
+   *
+   * A CUSTOM flavor's value is derived from its own stored `imageArn`, not from the SSM presence
+   * map, so it is never `null`: the operator supplied the ARN and the row either carries one or
+   * does not.
+   */
+  imageAvailable: boolean | null;
   /** True for an operator-registered custom flavor (ADR-040). Absent for a built-in. */
   custom?: boolean;
   /** Validation state (ADR-041). Absent for a built-in — built-ins are not validated. */
@@ -566,9 +575,14 @@ export interface CustomFlavorInput {
  * Unlike the resolver, this deliberately lists custom flavors in EVERY state: the console's whole
  * job here is to show an operator that a flavor is `pending`/`validating`/`invalid` and why. The
  * routability rule is carried per-row (`routable`) instead of by omission.
+ *
+ * `available === undefined` means the image-presence check was NOT performed and every BUILT-IN
+ * `imageAvailable` is `null` (unknown). That is distinct from `{}`, which means the check ran and
+ * found nothing published. Callers enumerating the catalog for names pass `{}` freely; only a
+ * caller that actually attempted the read and failed passes `undefined`.
  */
 export function buildFlavorViews(
-  available: Record<string, boolean>,
+  available: Record<string, boolean> | undefined,
   custom?: readonly CustomFlavorInput[],
 ): FlavorView[] {
   const builtin = FLAVORS.map((f) => ({
@@ -580,7 +594,7 @@ export function buildFlavorViews(
     capabilities: f.capabilities,
     description: f.description,
     usdPerMinute: flavorRatePerMinute(f.name) ?? 0,
-    imageAvailable: available[f.name] === true,
+    imageAvailable: available === undefined ? null : available[f.name] === true,
     // A built-in ships with the platform and is not subject to ADR-041 validation: its image is
     // built by our own build script from a Dockerfile in this repo, and `imageAvailable` already
     // reports whether that happened.

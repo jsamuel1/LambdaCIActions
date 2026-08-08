@@ -247,3 +247,39 @@ export function classifyRefusal(input: RefusalInput): RefusalClassification {
  * cannot change a claim outcome.
  */
 const INCOMPATIBLE_HINT = /^(windows|macos)|^(x64|x86|x86_64|x86-64|amd64|i386|i686)$/;
+
+/**
+ * Fraction of NON-actionable refusals that are logged (ADR-050).
+ *
+ * 1 in 100. The non-actionable lane is every `workflow_job.queued` delivery from every repo the
+ * App can see that is not asking for LambdaCIActions — for an org with any GitHub-hosted CI at all
+ * this is the dominant webhook volume, and logging all of it would bury the actionable line this
+ * whole surface exists to make findable, as well as costing CloudWatch ingest for a decision that
+ * is already known to be correct.
+ *
+ * Not zero: a sampled line is the difference between "the webhook is not arriving" and "the
+ * webhook arrives and we are correctly ignoring it", which is the first fork when a repo looks
+ * inert. Actionable refusals are NEVER sampled — they are logged in full and persisted.
+ */
+export const REFUSAL_LOG_SAMPLE_RATE = 0.01;
+
+/**
+ * Whether this non-actionable refusal is the one in `1/REFUSAL_LOG_SAMPLE_RATE` that gets logged.
+ *
+ * Deterministic in the job id, NOT random. GitHub re-delivers a webhook on failure and a job can
+ * be seen more than once; a random draw would make the same job's line appear and disappear
+ * between deliveries, which looks like a platform fault to whoever is reading the log to diagnose
+ * one. Keying on the id means a job either logs on every delivery or on none.
+ *
+ * An absent id (a malformed delivery) logs: it is rare by construction and worth seeing.
+ */
+export function sampleRefusalLog(
+  jobId: number | undefined,
+  rate: number = REFUSAL_LOG_SAMPLE_RATE,
+): boolean {
+  if (rate >= 1) return true;
+  if (rate <= 0) return false;
+  if (jobId === undefined || !Number.isFinite(jobId)) return true;
+  const bucket = Math.floor(1 / rate);
+  return Math.abs(Math.trunc(jobId)) % bucket === 0;
+}

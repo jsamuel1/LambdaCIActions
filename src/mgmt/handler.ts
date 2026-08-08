@@ -725,19 +725,20 @@ async function route_(
       }
       const snapshot = await controlPlaneSnapshot();
       return json(200, {
+        // Passed through with its own liveness: `undefined` renders the Image column as unchecked
+        // instead of asserting every flavor is unbuilt when only the SSM read failed.
         flavors: buildFlavorViews(snapshot.imagePublished),
         // The live control-plane reconciliation (ADR-051). Kept a SEPARATE array rather than
         // merged into each FlavorView so the catalog projection stays a pure function of the
         // catalog, and a per-flavor axis added elsewhere cannot collide with this one.
         //
-        // EMPTY when the live read failed, never reconciled against the failure sentinel.
-        // `controlPlaneSnapshot` degrades to `{allowlist: [], imagePublished: {}, live: false}`,
-        // and `reconcileFlavors` takes no view on `live` — so passing that sentinel through would
-        // derive every catalog flavor as `unroutable` and make the screen announce "N flavors
-        // cannot run in this environment" on a transient SSM error. That is the same false
-        // certainty as the misleading green this ADR removes, only inverted, and an alarm that
-        // fires when nothing is wrong is one operators stop reading. Same rule as
-        // `flavorReadinessOrUndefined` and the Settings route: unknown ≠ broken.
+        // EMPTY when EITHER live read failed, never reconciled against a failure sentinel.
+        // `reconcileFlavors` takes no view on `live` — so reconciling an unread allowlist or an
+        // unread image map would derive every catalog flavor as `unroutable`/`imageMissing` and
+        // make the screen announce "N flavors cannot run in this environment" on a transient SSM
+        // error. That is the same false certainty as the misleading green this ADR removes, only
+        // inverted, and an alarm that fires when nothing is wrong is one operators stop reading.
+        // Same rule as `flavorReadinessOrUndefined` and the Settings route: unknown ≠ broken.
         readiness: snapshot.live ? reconcileFlavors(catalogForReadiness(), snapshot) : [],
         allowlist: snapshot.allowlist,
         unmatchedAllowlistLabels: unmatchedAllowlistLabels(catalogForReadiness(), snapshot.allowlist),
@@ -2206,6 +2207,23 @@ async function allowlistSnapshot(): Promise<{ allowlist: string[]; live: boolean
 }
 
 /**
+ * Which flavors have a published `image-arn-<name>` parameter — or `undefined` when the check
+ * could not be performed.
+ *
+ * `undefined` rather than `{}` on failure (ADR-051): `{}` is a positive claim that no flavor has
+ * an image, which would render the whole catalog "not built" on a transient SSM error. Presence
+ * only — `DescribeParameters` returns no values, so no SecureString can leak here.
+ */
+async function imageAvailabilityOrUndefined(): Promise<Record<string, boolean> | undefined> {
+  try {
+    return await imageAvailability();
+  } catch (err) {
+    console.error(JSON.stringify({ msg: 'image availability read failed', error: errMsg(err) }));
+    return undefined;
+  }
+}
+
+/**
  * Read the LIVE control plane: the claim allowlist and which flavor images are published
  * (ADR-051).
  *
@@ -2214,24 +2232,32 @@ async function allowlistSnapshot(): Promise<{ allowlist: string[]; live: boolean
  * labels), never a SecureString. The Mgmt λ's grant names this one path explicitly — spec 04's
  * hard rule is that no SECRET value is readable here, not that no parameter is.
  *
- * Fails SOFT: a read error yields `live: false` with an empty allowlist, and every consumer
- * renders `unknown` rather than marking flavors broken. A false alarm on this surface is worse
- * than a missing one — it is the surface whose whole purpose is to be trusted when it warns.
+ * Fails SOFT, and the two facts fail INDEPENDENTLY. `live` is the AND of both, because readiness
+ * reconciliation needs both to derive a state. But the image map keeps its own liveness
+ * (`undefined` = unread), so an allowlist failure cannot make the Flavors table claim every image
+ * is missing — the catalog projection would otherwise report a confident "not built" for an
+ * evidence-free reason. A false alarm on this surface is worse than a missing one: it is the
+ * surface whose whole purpose is to be trusted when it warns.
  */
 async function controlPlaneSnapshot(): Promise<ControlPlaneSnapshot> {
-  try {
-    const [labels, imagePublished] = await Promise.all([
-      allowlistSnapshot(),
-      imageAvailability(),
-    ]);
-    if (!labels.live) throw new Error('allowlist unavailable');
-    return { allowlist: labels.allowlist, imagePublished, live: true };
-  } catch (err) {
+  const [labels, imagePublished] = await Promise.all([
+    allowlistSnapshot(),
+    imageAvailabilityOrUndefined(),
+  ]);
+  if (!labels.live || imagePublished === undefined) {
     console.error(
-      JSON.stringify({ msg: 'control-plane snapshot read failed', error: errMsg(err) }),
+      JSON.stringify({
+        msg: 'control-plane snapshot incomplete',
+        allowlistLive: labels.live,
+        imagesLive: imagePublished !== undefined,
+      }),
     );
-    return { allowlist: [], imagePublished: {}, live: false };
   }
+  return {
+    allowlist: labels.allowlist,
+    imagePublished,
+    live: labels.live && imagePublished !== undefined,
+  };
 }
 
 /**

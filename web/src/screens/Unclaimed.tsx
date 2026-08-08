@@ -87,11 +87,31 @@ export function Unclaimed({
 
   // A filter change invalidates every appended page, its cursor and the seam.
   useEffect(() => {
+    resetWindow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoFilter]);
+
+  /**
+   * Drop every appended page and the seam bookkeeping, returning the window to "the head page IS
+   * the window".
+   *
+   * Shared by the filter-change effect and Refresh. Refresh MUST do this: the seam warning tells
+   * the operator to "refresh to reload it from one snapshot", and re-fetching only the head page
+   * while keeping the held older pages leaves exactly the hole the warning is about — and, because
+   * `pagedPastHead` also survived, leaves the warning itself on screen. An advertised recovery that
+   * does not recover is worse than none: the operator believes the window is whole.
+   */
+  function resetWindow(): void {
     setOlder([]);
     setCursor(undefined);
     setMoreErr(undefined);
     setSeam(noSeam);
-  }, [repoFilter]);
+  }
+
+  function refresh(): void {
+    resetWindow();
+    page.reload();
+  }
 
   if (page.error) return <ErrorBox message={page.error} />;
   if (!page.data) return <Loading what="unclaimed jobs" />;
@@ -155,7 +175,7 @@ export function Unclaimed({
           {repoFilter !== undefined && (
             <button onClick={() => navigate('/unclaimed')}>Clear repo filter</button>
           )}
-          <button onClick={page.reload}>Refresh</button>
+          <button onClick={refresh}>Refresh</button>
         </div>
         <p className="muted">
           Jobs LambdaCIActions declined to claim. GitHub leaves these <code>queued</code> — nothing

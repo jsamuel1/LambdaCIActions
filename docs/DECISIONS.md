@@ -2960,8 +2960,18 @@ storing a row per job would bury the misconfiguration and cost money. So a refus
 **actionable** only when the job carries evidence someone meant it to run here — an LCA-shaped
 label (catalog label, or `lambda-ci`-prefixed) — which in the allowlist-miss case is exactly the
 label the operator forgot to allowlist. Actionable ⇒ `level: info` + a stored row. Otherwise ⇒
-`level: debug`, no row. `runner-group` and `compat-block` are always actionable: both are reached
-only after a claim decision already said yes.
+`level: debug`, **sampled 1-in-100**, no row. `runner-group` and `compat-block` are always
+actionable: both are reached only after a claim decision already said yes.
+
+The sampling is the enforcement, not the `level` field. These Lambdas emit with `console.log`, so a
+`level: debug` tag inside the JSON payload lands in CloudWatch at exactly the same level, volume and
+ingest cost as the actionable line it is supposed to be distinguishable from — the tag alone left the
+noise lane fully loud, which is the outcome the paragraph above exists to prevent. The non-actionable
+lane is therefore gated on `sampleRefusalLog`, which is deterministic in the job id rather than
+random: GitHub re-delivers webhooks, and a random draw would make one job's line appear and vanish
+between deliveries — reading as a platform fault to whoever is reading the log to diagnose one. The
+rate is not zero because a sampled line still answers "is the webhook arriving at all?", the first
+fork when a repo looks inert.
 
 Classification is derived from the **labels**, never by parsing `decideClaim`'s prose. The reason
 string is operator-facing and gets reworded; matching on it would make the classification
@@ -3018,9 +3028,11 @@ rows are not read.
   from the allowlist is not LCA-shaped, so its refusals stay in the debug/no-row lane. It is
   indistinguishable from `runs-on: [self-hosted, gpu]` targeting a foreign fleet, which must not
   become an error in every repo. Naming custom labels with the `lambda-ci` prefix opts them in.
-- The `no-lca-label` / `no-standard-label` lanes log at `level: debug` inside a `console.log`, so
-  they are still in CloudWatch and greppable; they are simply not promoted to a row. If that
-  volume ever matters, the emitter is the single place to add sampling.
+- The `no-lca-label` / `no-standard-label` lanes are sampled at `REFUSAL_LOG_SAMPLE_RATE` (1%), so
+  99 of every 100 expected refusals leave no trace at all. That is the intended trade: the lane is
+  the dominant webhook volume for any org with GitHub-hosted CI, and its decisions are already known
+  to be correct. A specific ordinary job's refusal is therefore usually NOT greppable — if one must
+  be, raise the rate to 1 in the emitter. Actionable refusals are never sampled.
 
 ## ADR-051 — Routing display reconciles against the LIVE control plane, not the catalog (M4 fix)
 **Status**: Accepted (v1) · amends [ADR-030](#adr-030) (routing preview) and the Flavors view of
@@ -3076,6 +3088,15 @@ job view carries `platform: RouteReadiness` alongside `compat`, and the workflow
 state. `ready` on an unread control plane is the original bug; crying wolf on a transient SSM error
 teaches operators to ignore the one surface whose value is being trusted when it warns.
 `countUnrunnableJobs` therefore excludes `unknown`.
+
+*The two live facts fail independently.* Readiness needs both the allowlist and the image map, so
+`ControlPlaneSnapshot.live` is their AND and `reconcileFlavors` is only ever called with it true. But
+the Flavors table also renders the image half **on its own**, so that half carries its own liveness:
+`imagePublished === undefined` means the presence check did not run, and `FlavorView.imageAvailable`
+is correspondingly `boolean | null`. Folding both reads into one failure sentinel meant an allowlist
+error discarded an image map that had been read successfully, and the table then asserted every
+catalog flavor was "not built" — an evidence-free claim in the column beside the one correctly saying
+`unchecked`. Absence and ignorance are different answers in every column, not just the derived one.
 
 The Mgmt λ's SSM grant gains `GetParameter` on `${ssmPrefix}/config/runner-labels`. This does not
 weaken spec 04's hard rule: the rule is that no **secret** value is readable from the management
