@@ -776,3 +776,269 @@ export async function ensurePullRequest(params: {
   });
   return { url: pr.html_url, number: pr.number, created: true };
 }
+
+// ---- custom-flavor smoke validation (ADR-041) -------------------------------
+
+/**
+ * Mint the single-use JIT runner config for a smoke run.
+ *
+ * Separate from {@link generateJitConfig} rather than a flag on it, because the two differ in the
+ * one field that matters for safety. A real job's runner is minted with the job's OWN `runs-on`
+ * labels, verbatim, so GitHub can assign it that job; a smoke runner is minted with ONLY the
+ * one-shot nonce label, so the sole job it can ever be assigned is the validation workflow this
+ * run dispatches. Sharing a code path would make that the caller's discipline instead of the
+ * function's contract — and a smoke runner that accidentally advertised `lambda-ci-*` would run a
+ * customer's production job on an image nothing has validated.
+ *
+ * `runnerId` is returned alongside the config because the smoke run has to be able to DELETE the
+ * registration in its cleanup: a runner that registered and then never took its job (the
+ * ADR-019/020 failure mode) stays in the repo's runner list as offline residue, in someone else's
+ * repository, after we condemned the image.
+ */
+export async function generateSmokeJitConfig(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  /** The one-shot nonce label. MUST be the only non-default label (see `smokeLabel`). */
+  label: string;
+  /** Runner name, so a leftover registration is identifiable in the repo's runner list. */
+  name: string;
+}): Promise<{ jitConfig: string; runnerId?: number }> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{
+    encoded_jit_config: string;
+    runner?: { id?: number };
+  }>(`/repos/${params.owner}/${params.repo}/actions/runners/generate-jitconfig`, {
+    method: 'POST',
+    token,
+    tokenType: 'token',
+    body: {
+      name: params.name,
+      runner_group_id: 1,
+      // Exactly one label. Not the job's labels, not `lambda-ci*` — see the note above.
+      labels: [params.label],
+      work_folder: '_work',
+    },
+  });
+  return { jitConfig: body.encoded_jit_config, runnerId: body.runner?.id };
+}
+
+/**
+ * Dispatch a `workflow_dispatch` workflow on a ref, with inputs.
+ *
+ * GitHub answers 204 with NO body — it does not tell you which run it created, which is why
+ * {@link listWorkflowDispatchRuns} exists and why the caller must record the dispatch time
+ * before calling this.
+ */
+export async function dispatchWorkflow(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  /** Workflow file path (`.github/workflows/x.yml`) or its numeric id. */
+  workflow: string;
+  ref: string;
+  inputs?: Record<string, string>;
+}): Promise<void> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  await githubJson<Record<string, never>>(
+    `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/dispatches`,
+    {
+      method: 'POST',
+      token,
+      tokenType: 'token',
+      body: { ref: params.ref, ...(params.inputs ? { inputs: params.inputs } : {}) },
+    },
+  );
+}
+
+/** One `workflow_dispatch`-triggered run of a workflow. */
+export interface WorkflowDispatchRun {
+  id: number;
+  status?: string;
+  conclusion?: string | null;
+  /** Epoch ms of `created_at`, for "created at/after my dispatch" matching. */
+  createdAt: number;
+  htmlUrl?: string;
+}
+
+/**
+ * List a workflow's `workflow_dispatch` runs, newest first.
+ *
+ * Scoped by `event=workflow_dispatch` and one page. The caller uses "created at or after the moment
+ * I dispatched" only to NARROW the candidates — the dispatch API returns no run id, so there is
+ * nothing to match on directly. The window is not sufficient on its own and must not be treated as
+ * identification: a concurrent or manual dispatch of the same workflow in the same second would
+ * satisfy it. {@link listRunJobs} supplies the nonce-bearing evidence that confirms a candidate.
+ */
+export async function listWorkflowDispatchRuns(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  workflow: string;
+  perPage?: number;
+}): Promise<WorkflowDispatchRun[]> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const per = Math.min(Math.max(params.perPage ?? 10, 1), 100);
+  const { body } = await githubJson<{
+    workflow_runs?: {
+      id?: number;
+      status?: string;
+      conclusion?: string | null;
+      created_at?: string;
+      html_url?: string;
+    }[];
+  }>(
+    `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/runs` +
+      `?event=workflow_dispatch&per_page=${per}`,
+    { token, tokenType: 'token' },
+  );
+  return (body.workflow_runs ?? [])
+    .filter((r): r is { id: number } & typeof r => typeof r.id === 'number')
+    .map((r) => ({
+      id: r.id,
+      status: r.status,
+      conclusion: r.conclusion ?? null,
+      createdAt: r.created_at ? new Date(r.created_at).getTime() : 0,
+      htmlUrl: r.html_url,
+    }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/** One job of a workflow run, with the fields that identify which runner served it. */
+export interface WorkflowRunJob {
+  id: number;
+  name: string;
+  status?: string;
+  conclusion?: string | null;
+  /** The runner that took the job. Empty while queued. */
+  runnerName?: string;
+  /** The job's resolved `runs-on` labels — where a validation nonce becomes observable. */
+  labels: string[];
+}
+
+/**
+ * List a workflow run's jobs.
+ *
+ * This is what makes smoke-run attribution sound rather than presumed. A GitHub JIT runner is
+ * matched by LABEL, not bound to the job that caused it to be minted, and the dispatch API returns
+ * no run id — so "the newest run created after I dispatched" is a candidate, not an identification.
+ * A job's `labels` carry its resolved `runs-on`, which for the validation workflow contains the
+ * one-shot nonce, and `runner_name` is the agent that actually served it. Either is positive
+ * evidence that a given run is OURS; without one, a concurrent or manual dispatch of the same
+ * workflow could lend its green conclusion to an image that never ran anything.
+ */
+export async function listRunJobs(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  runId: number;
+}): Promise<WorkflowRunJob[]> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{
+    jobs?: {
+      id?: number;
+      name?: string;
+      status?: string;
+      conclusion?: string | null;
+      runner_name?: string | null;
+      labels?: string[];
+    }[];
+  }>(`/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/jobs?per_page=100`, {
+    token,
+    tokenType: 'token',
+  });
+  return (body.jobs ?? [])
+    .filter((j): j is { id: number } & typeof j => typeof j.id === 'number')
+    .map((j) => ({
+      id: j.id,
+      name: typeof j.name === 'string' ? j.name : '',
+      status: j.status,
+      conclusion: j.conclusion ?? null,
+      ...(typeof j.runner_name === 'string' && j.runner_name
+        ? { runnerName: j.runner_name }
+        : {}),
+      labels: (j.labels ?? []).filter((l): l is string => typeof l === 'string'),
+    }));
+}
+
+/** A self-hosted runner registered against a repository. */
+export interface RepoRunner {
+  id: number;
+  name: string;
+  status?: string;
+  busy?: boolean;
+  labels: string[];
+}
+
+/**
+ * List a repository's self-hosted runners.
+ *
+ * One page at the API maximum. The smoke run uses this to observe that its runner REGISTERED —
+ * the single fact that distinguishes "the image booted but the agent never started" (ADR-019/020)
+ * from "the agent came up and something later went wrong", and the two have completely different
+ * operator remedies.
+ */
+export async function listRepoRunners(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+}): Promise<RepoRunner[]> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const { body } = await githubJson<{
+    runners?: { id?: number; name?: string; status?: string; busy?: boolean; labels?: { name?: string }[] }[];
+  }>(`/repos/${params.owner}/${params.repo}/actions/runners?per_page=100`, {
+    token,
+    tokenType: 'token',
+  });
+  return (body.runners ?? [])
+    .filter((r): r is { id: number; name: string } & typeof r =>
+      typeof r.id === 'number' && typeof r.name === 'string',
+    )
+    .map((r) => ({
+      id: r.id,
+      name: r.name,
+      status: r.status,
+      busy: r.busy,
+      labels: (r.labels ?? [])
+        .map((l) => l.name)
+        .filter((n): n is string => typeof n === 'string'),
+    }));
+}
+
+/**
+ * Delete a runner registration.
+ *
+ * Cleanup, and the reason it must not throw on 404: the normal path is that the runner ALREADY
+ * removed itself when its single-use JIT registration was consumed, so "not found" is the success
+ * case. Any other error is surfaced, because a registration we failed to remove is residue we left
+ * in an operator's repository.
+ */
+export async function deleteRepoRunner(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  runnerId: number;
+}): Promise<void> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  try {
+    await githubJson<Record<string, never>>(
+      `/repos/${params.owner}/${params.repo}/actions/runners/${params.runnerId}`,
+      { method: 'DELETE', token, tokenType: 'token' },
+    );
+  } catch (err) {
+    if (githubErrorStatus(err) === 404) return;
+    throw err;
+  }
+}

@@ -2117,12 +2117,12 @@ as bugs:
   `staticGate`'s `maxMemoryMb` parameter has **no production caller**. So an obvious typo
   (`655360`) is caught, but a request that merely exceeds the account's real headroom is not — it
   fails later, at launch. Closing this needs a quota read (there is no `getMicroVMQuota` helper in
-  `src/shared/microvm.ts`), so it belongs with the validator λ that would consume it.
-- **(4) rate before save — implemented in the API, not in the console.** `POST
-  /api/flavors/preview` returns `usdPerMinute` for the proposed shape with `rateIsEstimate: true`
-  (ADR-038), and `buildFlavorViews` carries it per row; no screen renders either yet. The Flavors
-  screen is deferred to the same successor card as the ADR-041 smoke-run λ, because a registration
-  form whose flavors can never reach `valid` would be a control with no outcome.
+  `src/shared/microvm.ts`); the validator λ that would consume it now exists, so this is a
+  standalone follow-up rather than a blocked one.
+- **(4) rate before save — implemented.** `POST /api/flavors/preview` returns `usdPerMinute` for the
+  proposed shape with `rateIsEstimate: true` (ADR-038), `buildFlavorViews` carries it per row, and
+  the Flavors screen renders both: the registration form's `Check` button calls the preview endpoint
+  for the server's static-gate verdict plus the rate before anything is written.
 
 - **Custom labels are NOT added to `/lca/<env>/config/runner-labels`.** That parameter is
   environment-scoped while a custom flavor is per-installation, so seeding it would make
@@ -2134,7 +2134,7 @@ as bugs:
   we could not confirm strands it.
 
 ## ADR-041 — A custom flavor is not routable until a smoke run proves it (M5)
-**Status**: Accepted (v1) · **enforcement implemented; smoke-run orchestrator deferred** ·
+**Status**: Accepted (v1) · **implemented** ·
 depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
 **Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
 published its image ARN, resolved correctly from its label, and then failed every single job
@@ -2171,8 +2171,7 @@ so it consumes quota, costs money, and needs a repo to register against; it is t
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
 the static gates; the smoke run itself is verified against a live environment.
 
-**As implemented — and what is NOT yet.** The *enforcement* half is complete and is what makes the
-rule true rather than advisory:
+**As implemented.** The *enforcement* half is what makes the rule true rather than advisory:
 
 - The state machine lives in `src/shared/flavor-store.ts`. Legal transitions are enforced **in the
   DynamoDB condition expression**, not in a read-then-write, so only one of two concurrent runs can
@@ -2180,8 +2179,9 @@ rule true rather than advisory:
   That is narrower than "two runs can never both launch a VM": a manual re-validate deliberately
   moves `validating → pending`, which re-opens the transition, so an operator who re-validates a run
   in flight can have two VMs alive at once. The loser's verdict is still refused, so the *record*
-  stays correct; bounding the duplicate LAUNCH belongs to the λ that owns the run's deadline, and is
-  called out on the successor card. `valid → validating` and `invalid → validating`
+  stays correct; bounding the duplicate LAUNCH belongs to the λ that owns the run's deadline, and
+  remains an accepted residual risk — see ADR-041's "Residual risk". `valid → validating` and
+  `invalid → validating`
   are deliberately absent: re-validation must pass through `pending` so a flavor stops being
   routable the moment its evidence is withdrawn.
 - Only `valid` rows are composed into the catalog (`routableCustomFlavors`), so an unvalidated
@@ -2196,11 +2196,10 @@ rule true rather than advisory:
   ANSWER (`ABSENT`/`FORBIDDEN`) from a probe that could not run, and `staticGate` preserves the
   distinction as `image-probe-failed` + an `inconclusive` flag, with `staticFailureVerdict` mapping
   it to `pending`. Collapsing them would let one throttled `GetMicrovmImage` permanently condemn a
-  working image. Note what this does NOT yet mean in a deployed environment: the gate's only
-  production caller is the no-write preview endpoint, which deliberately passes no `image`, so
-  `getMicroVMImageState` has **no production caller** and the image half of the gate first executes
-  when the λ below lands. It is tested directly against all three outcomes so that it is a
-  contract rather than an assumption.
+  working image. The gate's image half now has a production caller: the λ below probes the ARN and
+  passes the result in, so `getMicroVMImageState` executes on every validation run. The console's
+  no-write preview still deliberately passes no image, which is why a preview pass is explicitly not
+  reported as validation.
 - The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
   re-validate trigger; a new image ARN atomically repoints and resets to `pending`. Those routes
   needed an IAM grant the Mgmt role deliberately did not have: `PatchRepoConfig` is `UpdateItem`
@@ -2212,23 +2211,66 @@ rule true rather than advisory:
   `RUN#<repoId>#<runId>#<jobId>` partitions and therefore stay unaddressable: the Mgmt role still
   cannot forge or delete a run, which is the property `test/mgmt-stack.test.mjs` pins.
 
-**Not implemented:** the λ that actually *runs* a smoke run — launching the microVM, dispatching the
-nonce-bound workflow and observing registration/conclusion/self-termination — and its CDK wiring.
-Until it lands, `FLAVORVAL_FUNCTION_NAME` is unset, so registration honestly reports that validation
-could not be started and the flavor stays `pending`; **nothing can reach `valid`, therefore nothing
-custom is routable.** That is the safe direction, and it is the state this ADR mandates for a flavor
-without evidence. The console surface is deferred with it, since its main job is showing validation
-progress. Both are tracked as the successor card to this one, and both are **deploy-touching**.
+- The smoke-run λ (`src/flavorval/handler.ts` + `orchestrate.ts`) performs the run: it claims
+  `pending → validating` (the conditional write IS the concurrency guard — losing it means another
+  run owns the flavor, so it exits without writing), runs the static gate with the image probe,
+  mints a JIT runner carrying **only** a one-shot nonce label, launches ONE microVM, dispatches the
+  operator's `workflow_dispatch` validation workflow with that nonce, then observes three
+  independent facts and hands them to `classifySmoke`. ControlStack deploys it as
+  `lca-<env>-flavorval` with `RunMicrovm`/`ListMicrovms`/`TerminateMicrovm`/`GetMicrovmImage`, the
+  App PEM, and the table; MgmtStack gains `lambda:InvokeFunction` on that one ARN and nothing else,
+  mirroring ADR-034 — the console can ASK for a smoke run and still cannot launch anything itself.
 
-Two pieces of that λ's scaffolding *did* land here, and are recorded so the successor card finds
-them instead of rebuilding them: `src/shared/smoke-store.ts` (the `SMOKE#<installationId>#<seq>`
-JIT/RUN row pair, in the shapes the broker already reads) and the broker's `isSmokeRef` grammar
-extension. Neither has a production caller yet — nothing writes a `SMOKE#` row, so the widened
-grammar admits a ref that resolves to no item, and the store is tree-shaken out of every bundle.
-The cross-module ref contract between them is pinned by test, because a drift there would otherwise
-only surface during the live smoke run. `getMicroVMImageState` is in the same category: implemented
-and tested against all three of its outcomes, but with no production caller until the λ passes its
-result to `staticGate`.
+  Three properties of that λ are load-bearing and are unit-tested against injected effects rather
+  than only observed live, which is why the sequencing lives in `orchestrate.ts` behind an effects
+  interface:
+  1. **The VM is terminated on every exit path**, including the throwing ones — a `finally` also
+     removes a leftover runner registration from the operator's repo and drops the `SMOKE#` rows.
+  2. **An orchestration fault returns the row to `pending`**, never terminal `invalid`. A GitHub
+     5xx, a throttle or a lost budget says nothing about the image.
+  3. **The row never stays in `validating` on a crash.** The λ's own deadline (10 min) sits inside
+     its Lambda timeout (12 min) with a reserve, so polling stops while there is still time to
+     write a verdict; a λ killed by its timeout would write nothing.
+
+  Runner registration is observed two ways, because a single-use JIT runner is ephemeral: it leaves
+  the repo's runner list when its job ends, so a fast job can complete entirely between polls. A run
+  that reached `in_progress`/`completed` is therefore equally good proof — GitHub does not execute a
+  job without a runner. Relying on the list alone would fail a perfectly good fast image.
+
+  **Run attribution is by nonce, never by timestamp.** `workflow_dispatch` returns no run id, so the
+  λ narrows candidates to runs created at/after its dispatch and then CONFIRMS one by the nonce: the
+  candidate's job must carry the nonce in its resolved `runs-on` labels, or have been served by the
+  AgentName we minted (`lca-validate-<nonce>`). The window alone is not identification — a concurrent
+  or manual dispatch of the same workflow in the same second satisfies it, and GitHub's runners are
+  label-matched rather than bound to the job they were minted for. Accepting an unconfirmed candidate
+  would let a foreign run's green conclusion mark an unproven image `valid`, which is precisely the
+  outcome this ADR exists to prevent. It fails **closed**: no nonce evidence means "not confirmed
+  ours", so an unreachable jobs API yields a retryable `pending` rather than a false pass.
+
+  The λ is capped at `reservedConcurrentExecutions: 1`: a smoke run spends the same regional microVM
+  memory quota real jobs do, so an operator registering several flavors must not be able to starve
+  customer jobs of capacity. Its guest output goes to `/aws/lambda/microvms/validate/lca-<env>`, NOT
+  the per-run group real jobs write to — a validation attempt is not a customer job, and the console's
+  log pane reads the run group by run id.
+- The console's Flavors screen renders custom flavors in every state behind an installation selector
+  (a custom flavor is unaddressable without its installation), with the registration form, the
+  no-write static-gate + rate preview, re-validate/delete actions, and the smoke workflow YAML for
+  the operator to commit. Per ADR-038 every rate is labelled an estimate and `vcpu` indicative; the
+  server's description rule is surfaced verbatim rather than pre-empted by a client-side regex that
+  would eventually disagree with it.
+
+**Residual risk, deliberately accepted.** The condition expression bounds the *record*, not the
+number of live VMs: a manual re-validate legitimately moves `validating → pending`, so an operator
+who re-validates a run already in flight can have two smoke VMs alive at once. The loser's verdict is
+still refused, so the row stays correct, and each λ terminates its own VM in its `finally` — but for
+the overlap window both consume quota. Tightening it would need a run-scoped lease with cancellation,
+which buys little against a bounded, operator-initiated action.
+
+The scaffolding the predecessor card landed is now live rather than inert:
+`src/shared/smoke-store.ts`'s `SMOKE#<installationId>#<seq>` JIT/RUN row pair is written by the λ and
+served to the validation VM through the broker's `isSmokeRef` grammar, so the smoke run exercises the
+byte-identical guest contract a real job does. `getMicroVMImageState` likewise has a production
+caller for the first time.
 
 > **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
 > to **042..046** to vacate a collision, following the same convention as the 038..041 block

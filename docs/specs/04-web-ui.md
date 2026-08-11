@@ -49,13 +49,19 @@ a management API over the same DynamoDB the control/compute planes write to.
 | **Unclaimed** | Jobs the claim gate refused, and why | code, reason + fix, job labels, allowlist snapshot vs live, occurrences | `#/unclaimed` (`?repo=<id>`) |
 | **Run detail** | Single run/job deep-dive | state, microVM id, timings, cost estimate, CloudWatch log tail | `#/runs/{repoId}/{runId}/{jobId}` |
 | **Reports** | Spend + utilisation + run analytics over a window, and an NL report assistant | spend/billable compute minutes/job-count/duration p50-p90/failure rate/queue latency, by repo·flavor·workflow·status·time; CSV+JSON export | `#/reports` (`?metric=…&dimension=…&preset=…`) |
-| **Flavors** | Global flavor catalog + **live runnability** | name, label, arch, size, capabilities, $/min, image built?, label allowlisted?, runnable? | `#/flavors` |
+| **Flavors** | Built-in catalog + **live runnability**; per-installation **custom flavors** in every validation state, with registration / re-validate / delete | name, label, arch, size, capabilities, $/min, image built?, label allowlisted?, runnable?; custom: validation state + reason + image ARN, static-gate + rate preview, smoke workflow to commit | `#/flavors` |
 | **Settings** | GitHub App linkage, runner labels + **live catalog reconciliation**, webhook health + platform actions | verified App id/name/slug, installation ids + accounts, effective runner labels, unmatched/unrunnable reconciliation, webhook endpoint + delivery evidence, flavors, env/region | `#/settings` |
 
-> Custom flavors (ADR-040/041) are exposed by the API rows below but the Flavors **screen** does not
-> yet render or register them: its main job would be showing validation progress, and the smoke-run
-> λ that produces that progress is not deployed, so no custom flavor can reach `valid`. Screen work
-> is deferred to the same successor card as the λ.
+> Custom flavors (ADR-040/041) are rendered by the Flavors screen when an **installation is
+> selected** — they live in that installation's partition and are unaddressable without it. Every
+> state is listed (`pending`/`validating`/`invalid`/`valid`) with its `validationReason`, because the
+> screen's job is showing validation progress and the reason a verdict went against an image. A
+> custom row's Runnable cell is its ADR-041 validation state rather than the built-in
+> image/allowlist reconciliation: a custom image lives on its own row, not in this environment's
+> `image-arn-*` namespace, so reconciling it there would report `imageMissing` for an image that is
+> fine. Registration is two-step — `Check` calls the no-write preview for the server's static-gate
+> verdict and rate estimate before anything is written. Per ADR-038 every rate is labelled an
+> **estimate** and `vcpu` is marked indicative.
 
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has
 a handful of workflow files, and the operator's question ("which job goes where, and what's

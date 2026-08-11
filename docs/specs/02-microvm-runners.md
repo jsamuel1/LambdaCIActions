@@ -62,7 +62,7 @@ A **flavor** = a named runner image + resource shape + label. Selected per job f
 | `java` | `lambda-ci-java` | base + Temurin JDK 21 LTS | 2 / 8 GB | JDK, `JAVA_HOME` set; tool-cache prebaked |
 | `go` | `lambda-ci-go` | base + pinned Go | 2 / 4 GB | Go + cgo C toolchain; tool-cache prebaked |
 | `rust` | `lambda-ci-rust` | base + pinned Rust stable | 4 / 8 GB | rustc/cargo/clippy/rustfmt via rustup |
-| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **registration + routing implemented, smoke-run λ not** — must pass validation before it is routable, so none is routable yet (ADR-040/041) |
+| `custom-*` | per-installation | operator-supplied image | configurable | operator-specified; **implemented** — must pass an ADR-041 smoke run before it is routable (ADR-040/041) |
 
 † descriptive only — see the sizing note above.
 
@@ -277,16 +277,15 @@ The biggest reference win was baking dependencies into the snapshot:
 
 ## Custom flavors (bring-your-own image)
 
-> **Status: storage + routing implemented; the smoke-run λ is not.** Registration, storage,
-> installation-scoped resolution, claim-time label resolution and every routability *refusal* are
-> shipped — see ADR-040/041 for the exact seams. What is NOT shipped is the λ that performs a smoke
-> run, and its CDK wiring. Because a flavor only becomes routable by passing one, **no custom flavor
-> can currently reach `valid`, so none is routable in a deployed environment.** Registration honestly
-> reports that validation could not be started and leaves the flavor `pending`. The console surface
-> is deferred with the λ. Do not cite custom flavors as an end-to-end capability yet; the paragraphs
-> below describe the contract, with per-sentence status where they differ.
+> **Status: implemented.** Registration, storage, installation-scoped resolution, claim-time label
+> resolution, every routability *refusal*, the smoke-run λ and the console surface are all shipped —
+> see ADR-040/041 for the exact seams. A flavor becomes routable only by passing a smoke run, and the
+> λ that performs one (`src/flavorval/handler.ts`, deployed by ControlStack as
+> `lca-<env>-flavorval`) is what makes `valid` reachable. Registration reports whether validation
+> could be started; when the λ is not deployed in an environment the flavor stays `pending` and is
+> not routable, which remains the safe direction.
 
-An operator may register a `custom-*` flavor for their own installation (ADR-040) — **implemented**:
+An operator may register a `custom-*` flavor for their own installation (ADR-040):
 `POST /api/flavors?installation=<id>`, stored as a per-installation row in the shared table
 (`pk=INSTALL#<id>`, `sk=FLAVOR#<name>`), since the static JSON is compiled into the Lambdas and stays
 read-only. Resolution composes `builtin ++ custom` through the single seam
@@ -301,28 +300,33 @@ so a description advertising a vCPU shape is refused.
 
 A custom flavor is **not routable until it has demonstrably run a job** (ADR-041):
 `pending → validating → valid | invalid(reason)`, and only `valid` flavors are selectable in a
-`FlavorMap`/`defaultFlavor` or resolvable from a label. The **state machine and every refusal are
-implemented** — transitions are enforced in the DynamoDB condition expression, so only one run can
-win `pending → validating` and a stale verdict cannot overwrite a newer one — and non-`valid` is
-refused in three independent places (catalog composition, config validation, and immediately before
-launch, since resolution and
-launch are separate reads). Validation is (1) static checks — arm64, image ARN resolves and is
-readable by the provisioner, capabilities drawn from the closed vocabulary (`docker`, `node`,
-`python`, `java`, `go`, `rust`), memory bounds-checked — **the gate is implemented, but no deployed
-path probes an image yet**: the probe (`getMicroVMImageState`) and the gate's handling of its three
-outcomes are implemented and tested, while the gate's only caller today is the no-write preview
-endpoint, which deliberately probes nothing — so the probe runs for the first time when the
-smoke-run λ lands. The memory bound is likewise a fixed sanity ceiling rather than the region's live
-microVM quota: nothing reads that quota yet, so an obvious typo is caught but a request that merely
-exceeds the account's real headroom is not (ADR-040); and (2) a **smoke run**: one microVM launched
-from the image with a synthetic JIT-registered runner that must register, execute a trivial job, and
-self-terminate through the hook broker — the
-verdict *classifier* is implemented and unit-tested, **the orchestrator that performs the run is
-not**. Static checks alone are not sufficient evidence: the `docker` flavor built fine, published its
-ARN and routed correctly while failing *every* job because nothing could start `dockerd`
-(ADR-019/020) — which is why a static pass is never reported as validation. Re-validation is
-automatic when the image ARN changes (atomically repointing and resetting to `pending`) and manually
-triggerable — **both implemented**; each merely starts a run the λ cannot yet perform.
+`FlavorMap`/`defaultFlavor` or resolvable from a label. Transitions are enforced in the DynamoDB
+condition expression, so only one run can win `pending → validating` and a stale verdict cannot
+overwrite a newer one — and non-`valid` is refused in three independent places (catalog composition,
+config validation, and immediately before launch, since resolution and launch are separate reads).
+Validation is (1) static checks — arm64, image ARN resolves and is readable by the provisioner,
+capabilities drawn from the closed vocabulary (`docker`, `node`, `python`, `java`, `go`, `rust`),
+memory bounds-checked. The image probe (`getMicroVMImageState`) runs here, inside the validation λ;
+the console's pre-save preview deliberately probes nothing, so a preview pass is explicitly not
+validation. The memory bound is a fixed sanity ceiling rather than the region's live microVM quota:
+nothing reads that quota yet, so an obvious typo is caught but a request that merely exceeds the
+account's real headroom is not (ADR-040). And (2) a **smoke run**: one microVM launched from the
+image with a synthetic JIT-registered runner — minted with **only** a one-shot nonce label, outside
+the `lambda-ci*` namespace, so it can neither be claimed by ingest nor take a real queued job — which
+must register, execute a trivial dispatched job, and self-terminate through the hook broker. The
+dispatched run is identified by that **nonce**, not by dispatch time: `workflow_dispatch` returns no
+run id, so a candidate is confirmed by the nonce appearing in its job's resolved `runs-on` labels, or
+by the minted runner name having served it. A timestamp window alone would let a concurrent or manual
+dispatch of the same workflow lend a green conclusion to an image that never ran anything. All
+three are positively observed; a `success` conclusion alone is not sufficient, because an image that
+runs jobs but never self-terminates leaks a VM per job until the Reaper's cap. Static checks alone
+are not sufficient evidence either: the `docker` flavor built fine, published its ARN and routed
+correctly while failing *every* job because nothing could start `dockerd` (ADR-019/020) — which is
+why a static pass is never reported as validation. A fault in the orchestration itself (a GitHub
+5xx, a throttle, the λ losing its budget) returns the flavor to `pending`, never to terminal
+`invalid`: that verdict is reserved for evidence about the image. Re-validation is automatic when the
+image ARN changes (atomically repointing and resetting to `pending`) and manually triggerable from
+the console.
 
 Custom labels are deliberately **not** added to `/lca/<env>/config/runner-labels`: that parameter is
 environment-scoped while a custom flavor is per-installation, so seeding it would let one
