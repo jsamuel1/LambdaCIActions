@@ -41,7 +41,7 @@ function goodFlavor(over = {}) {
     memoryMb: 4096,
     capabilities: ['python'],
     description: 'CUDA smoke image',
-    imageArn: 'arn:aws:lambda:us-west-2:1:microvm-image/gpu',
+    imageArn: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:gpu',
     smokeRepoFullName: 'acme/ci',
     smokeWorkflowPath: '.github/workflows/lca-flavor-validate.yml',
     state: 'pending',
@@ -101,6 +101,7 @@ function scenario(opts = {}) {
     stampVm: async () => record('stampVm'),
     dispatch: async () => {
       record('dispatch');
+      if (opts.dispatchDelayMs) clock += opts.dispatchDelayMs;
       if (opts.throwOn === 'dispatch') throw new Error('GitHub 404 on workflow dispatch');
     },
     listRunners: async () => {
@@ -292,6 +293,23 @@ test('a fast job seen only via the run status still counts as a registered runne
   const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
 
   assert.equal(res.state, 'valid');
+});
+
+test('a slow dispatch response cannot exclude the run created during the request', async () => {
+  const dispatchedSecond = 1_700_000_000_000;
+  const s = scenario({
+    dispatchDelayMs: 1_500,
+    runners: () => [],
+    // GitHub created this while handling dispatch, before its 1.5 s response returned.
+    runs: () => [
+      { id: 9001, status: 'completed', conclusion: 'success', createdAt: dispatchedSecond },
+    ],
+    vms: () => [],
+  });
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+
+  assert.equal(res.state, 'valid');
+  assert.equal(res.evidence.workflowRunId, 9001);
 });
 
 test('a run created BEFORE our dispatch is not ours', async () => {

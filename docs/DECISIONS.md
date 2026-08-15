@@ -2221,6 +2221,12 @@ the static gates; the smoke run itself is verified against a live environment.
   App PEM, and the table; MgmtStack gains `lambda:InvokeFunction` on that one ARN and nothing else,
   mirroring ADR-034 — the console can ASK for a smoke run and still cannot launch anything itself.
 
+  The App manifest grants `actions: write`, not `read`: reading run metadata needs only `read`, but
+  `POST /actions/workflows/{workflow}/dispatches` requires `write`. Existing installations do not
+  inherit that authority silently — GitHub holds the permission upgrade pending until an account
+  administrator approves it. Until approval, dispatch returns 403 and the orchestrator correctly
+  restores the flavor to `pending`; built-in flavors remain unaffected.
+
   Three properties of that λ are load-bearing and are unit-tested against injected effects rather
   than only observed live, which is why the sequencing lives in `orchestrate.ts` behind an effects
   interface:

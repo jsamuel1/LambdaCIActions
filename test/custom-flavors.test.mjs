@@ -944,6 +944,32 @@ test('the flavor cap is orders of magnitude below a DynamoDB query page', () => 
   );
 });
 
+test('colon-delimited service ARN and slash-delimited ARN are accepted', () => {
+  // `lambda-microvms` returns the colon form from create/get-microvm-image; this must survive the
+  // full registration validator, not only the structural ARN predicate.
+  const serviceArn = 'arn:aws:lambda:us-west-2:123456789012:microvm-image:lca-dev-custom';
+  assert.equal(isMicrovmImageArn(serviceArn), true);
+
+  const res = validateCustomFlavor({
+    name: 'operator-node',
+    vcpu: 2,
+    memoryMb: 4096,
+    capabilities: [],
+    description: 'operator image built outside the catalog',
+    imageArn: serviceArn,
+    smokeRepoFullName: 'acme/ci',
+  });
+  assert.equal(res.ok, true, `service ARN refused: ${JSON.stringify(res.errors ?? [])}`);
+
+  assert.equal(
+    isMicrovmImageArn('arn:aws:lambda:us-west-2:123456789012:microvm-image/operator-gpu'),
+    true,
+  );
+  assert.equal(isMicrovmImageArn('arn:aws:lambda:us-west-2:123456789012:microvm-image'), false);
+  assert.equal(isMicrovmImageArn('arn:aws:lambda:us-west-2:123456789012:microvm-image:'), false);
+  assert.equal(isMicrovmImageArn('arn:aws:lambda:us-west-2:12345678901:microvm-image:x'), false);
+});
+
 test('every operator-supplied persisted field is length-bounded', () => {
   // The size argument above is only sound if nothing on the row can grow without limit. These are
   // the fields an operator controls; each must be refused past its cap by the validator that gates

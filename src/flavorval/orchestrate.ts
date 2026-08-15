@@ -327,8 +327,11 @@ export async function runValidation(
 
     // Dispatch AFTER the launch so the runner is on its way before the job is queued. The reverse
     // order also works (GitHub queues the job), but this way a launch failure costs no dispatch.
-    await deps.dispatch({ repoFullName, workflow, ref: branch, nonce });
+    // Capture the lower bound BEFORE the API call. GitHub creates the run while processing the
+    // dispatch, and `created_at` has only second granularity; sampling after a slow response can
+    // move the floor into the next second and exclude the run we just created forever.
     const dispatchedAtMs = deps.now();
+    await deps.dispatch({ repoFullName, workflow, ref: branch, nonce });
 
     const obs = await observeSmoke(deps, config, {
       repoFullName,

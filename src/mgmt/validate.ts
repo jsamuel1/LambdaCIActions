@@ -543,7 +543,10 @@ export function validateCustomFlavor(
   const imageArn = typeof input.imageArn === 'string' ? input.imageArn.trim() : '';
   if (!imageArn) errors.push('imageArn is required');
   else if (!isMicrovmImageArn(imageArn)) {
-    errors.push('imageArn must be a microVM image ARN (arn:<partition>:lambda:<region>:<account>:microvm-image/<name>)');
+    errors.push(
+      'imageArn must be a microVM image ARN ' +
+        '(arn:<partition>:lambda:<region>:<account>:microvm-image:<name>)',
+    );
   }
 
   let smokeRepoFullName: string | undefined;
@@ -641,13 +644,18 @@ const NUMBER_WORDS = [
 /**
  * Whether a string looks like a microVM image ARN.
  *
+ * Accepts the service's real `microvm-image:<name>` ARN form plus the slash form accepted by
+ * generic ARN tooling. The delimiter is not the security boundary: `getMicroVMImageState` verifies
+ * existence and readability during the static gate. Keeping this check structural rejects obvious
+ * junk before that live probe without refusing valid service output.
+ *
  * Length-capped as well as shape-checked: the ARN is persisted on the flavor row, and an unbounded
  * one would break the single-page `listCustomFlavors` invariant — see {@link MAX_IMAGE_ARN_LENGTH}.
  */
 export function isMicrovmImageArn(arn: string): boolean {
   return (
     arn.length <= MAX_IMAGE_ARN_LENGTH &&
-    /^arn:[a-z0-9-]+:lambda:[a-z0-9-]+:\d{12}:microvm-image\/[\w.-]+$/.test(arn)
+    /^arn:[a-z0-9-]+:lambda:[a-z0-9-]+:\d{12}:microvm-image[:/][\w.-]+$/.test(arn)
   );
 }
 

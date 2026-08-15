@@ -204,7 +204,7 @@ function RegisterFlavorForm({
           <input
             value={form.imageArn}
             onChange={(e) => set('imageArn', e.target.value)}
-            placeholder="arn:aws:lambda:us-west-2:123456789012:microvm-image/my-image"
+            placeholder="arn:aws:lambda:us-west-2:123456789012:microvm-image:my-image"
             autoComplete="off"
           />
         </label>

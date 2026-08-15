@@ -121,7 +121,14 @@ function buildManifest() {
     redirect_url: REDIRECT_URL,
     public: false,
     default_permissions: {
-      actions: 'read', // read workflow/run metadata
+      // `write`, not `read` — and the upgrade is ADR-041's, not a widening for its own sake.
+      // Reading run/job metadata (ingest, the console's run views) needs only `read`, but a
+      // custom-flavor smoke run must DISPATCH the operator's validation workflow, and
+      // `POST /actions/workflows/{f}/dispatches` requires `actions: write`. With `read` the live
+      // λ gets `HTTP 403: Resource not accessible by integration` and — correctly — returns the
+      // flavor to `pending`, so custom flavors could never reach `valid`. Found only by the
+      // ADR-041 live run; every unit test passed against a fake dispatch.
+      actions: 'write',
       administration: 'write', // register/remove self-hosted JIT runners
       contents: 'read', // read .github/workflows for ingestion
       metadata: 'read', // mandatory baseline
