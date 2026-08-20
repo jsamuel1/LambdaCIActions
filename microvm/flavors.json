@@ -39,7 +39,7 @@
       "vcpu": 2,
       "memoryMb": 8192,
       "capabilities": ["java"],
-      "description": "base + Eclipse Temurin JDK 21 LTS (aarch64) prebaked into the runner tool cache as Java_temurin_jdk so actions/setup-java resolves from cache. 8 GB — JVM builds (Gradle/Maven daemons) are the memory-hungriest of the standard set."
+      "description": "base + Eclipse Temurin JDK 21 LTS (aarch64) prebaked into the runner tool cache as Java_Temurin-Hotspot_jdk (setup-java's installer-class folder name, NOT the `distribution: temurin` input — ADR-053) so actions/setup-java resolves from cache. 8 GB — JVM builds (Gradle/Maven daemons) are the memory-hungriest of the standard set."
     },
     {
       "name": "go",

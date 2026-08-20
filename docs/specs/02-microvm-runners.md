@@ -99,8 +99,15 @@ Three details are load-bearing, and each is pinned by `test/image-content.test.m
    Without it `find()` returns empty and every job re-downloads — silently, at full speed,
    with no error.
 3. **`toolName` is a case-sensitive path**: `Python` (capitalized), `node`, `go`, and
-   `Java_<distribution>_<packageType>` (e.g. `Java_temurin_jdk`). The Java version directory
-   stores `21.0.12+8` as `21.0.12-8`, because a `+` in `JAVA_HOME` breaks some toolchains.
+   `Java_<distribution>_<packageType>`. For `distribution: temurin` that is
+   **`Java_Temurin-Hotspot_jdk`**, NOT `Java_temurin_jdk`: `<distribution>` is the installer
+   class's own name (`super(`Temurin-${jvmImpl}`, ...)`, jvmImpl defaults to `hotspot`), not the
+   `distribution:` workflow input. Baking the input's spelling is a silent miss — observed live
+   on `lca-dev-java` (run 31261348449), where setup-java logged `Trying to download...` and
+   installed to `Java_Temurin-Hotspot_jdk/21.0.12-8.0.LTS/arm64` while the baked entry sat
+   unused. The Java version directory stores `21.0.12+8` as `21.0.12-8`, because a `+` in
+   `JAVA_HOME` breaks some toolchains; `findInToolcache` maps it back with `replace('-', '+')`,
+   so `java-version: '21'` resolves to it.
 
 The `python` flavor installs via the **upstream `setup.sh`** shipped inside the
 `actions/python-versions` tarball — the same artifact `setup-python` downloads — rather than

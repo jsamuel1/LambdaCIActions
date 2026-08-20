@@ -273,19 +273,43 @@ test('tool-cache entries use the exact toolName the setup action looks up', () =
     'setup-node looks up "node"',
   );
   assert.match(instructions('Dockerfile.go'), /\/go\/\$\{GO_VERSION\}/, 'setup-go looks up "go"');
+  // `Java_<distribution>_<packageType>`, where <distribution> is the INSTALLER CLASS name,
+  // not the `distribution:` workflow input: temurin's installer is
+  // `super(`Temurin-${jvmImpl}`, ...)` with jvmImpl defaulting to hotspot. Baking the input's
+  // spelling (`Java_temurin_jdk`) is a silent cache MISS — proven live on lca-dev-java in run
+  // 31261348449, where setup-java logged `Trying to download...` and installed to
+  // Java_Temurin-Hotspot_jdk/21.0.12-8.0.LTS/arm64, ignoring the baked JDK entirely.
   assert.match(
     instructions('Dockerfile.java'),
+    /Java_Temurin-Hotspot_jdk/,
+    'setup-java looks up Java_<installer-class>_<pkg>, i.e. Java_Temurin-Hotspot_jdk',
+  );
+  assert.doesNotMatch(
+    instructions('Dockerfile.java'),
     /Java_temurin_jdk/,
-    'setup-java looks up Java_<distro>_<pkg>',
+    'Java_temurin_jdk is the workflow-input spelling and is never scanned',
   );
 });
 
 test('the java tool-cache version dir uses - not + for the build separator', () => {
   // setup-java stores 21.0.12+8 as `21.0.12-8` (a '+' in JAVA_HOME breaks toolchains) and maps
-  // it back when scanning. A '+' on disk means findAllVersions never sees the entry.
+  // it back when scanning via replace('-', '+'). A '+' on disk means findAllVersions never sees
+  // the entry. The path is assembled from ${JDK_TOOLCACHE_NAME}, so assert on that ARG and
+  // separately assert the ARG's value, rather than on a literal folder name spliced into a path.
   const df = instructions('Dockerfile.java');
-  assert.match(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/);
-  assert.doesNotMatch(df, /Java_temurin_jdk\/\$\{JDK_VERSION\}\+/);
+  assert.match(df, /ARG JDK_TOOLCACHE_NAME=Java_Temurin-Hotspot_jdk/);
+  assert.match(df, /\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/);
+  assert.doesNotMatch(df, /\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}\+/);
+  // The completion marker is a SIBLING of the arch dir; without it the entry is invisible.
+  assert.match(
+    df,
+    /touch \$\{RUNNER_TOOL_CACHE\}\/\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64\.complete/,
+  );
+  // JAVA_HOME must be derived from the same ARGs, so a version bump cannot leave it dangling.
+  assert.match(
+    df,
+    /ENV JAVA_HOME=\$\{RUNNER_TOOL_CACHE\}\/\$\{JDK_TOOLCACHE_NAME\}\/\$\{JDK_VERSION\}-\$\{JDK_BUILD\}\/arm64/,
+  );
 });
 
 test('toolchain versions are pinned, not latest (reproducible rebuilds)', () => {
@@ -613,5 +637,96 @@ test('no flavor description advertises a vCPU shape (ADR-038)', () => {
       `flavor ${flavor.name}: description names a vCPU count — the API accepts no vCPU ` +
         'request (ADR-038). State the requested memory instead.',
     );
+  }
+});
+
+test('no flavor description names a tool-cache folder its Dockerfile does not bake', () => {
+  // Same reason as the vCPU sweep above: `description` renders VERBATIM on the console's
+  // Flavors screen, so it is documentation we ship. ADR-053's defect was four artefacts
+  // agreeing on `Java_temurin_jdk` while the runner scanned `Java_Temurin-Hotspot_jdk` — and
+  // this catalog was the FIFTH copy, missed by that fix because nothing checked it. A cache
+  // folder named here but absent from the image documents a path that does not exist, which is
+  // exactly how the original wrong spelling stayed plausible.
+  const catalog = JSON.parse(read('flavors.json'));
+  for (const flavor of catalog.flavors) {
+    // setup-java's folder shape: `Java_<installer-class>_<packageType>`.
+    const named = flavor.description.match(/Java_[A-Za-z0-9_.-]+/g) ?? [];
+    for (const folder of named) {
+      assert.ok(
+        instructions(flavor.dockerfile).includes(folder),
+        `flavor ${flavor.name}: description names tool-cache folder ${folder}, but ` +
+          `${flavor.dockerfile} never creates it — the console would document a path the ` +
+          'image does not have (ADR-053)',
+      );
+    }
+  }
+});
+
+test('the flavor smoke workflow asserts the versions its images actually bake', () => {
+  // flavor-smoke.yml is the only thing that can observe a tool-cache HIT (ADR-053), and it does
+  // so against HARDCODED paths (`.../go/1.25.12/arm64`, `21.0.12-8`, `1\.97\.1`). Those are
+  // copies of Dockerfile ARGs, so bumping a toolchain desynchronises them silently — and the
+  // resulting smoke failure reads as a broken image rather than a stale workflow. ADR-053
+  // decision 2 says a cache path is derived from one ARG and never repeated; YAML cannot
+  // interpolate a Dockerfile ARG, so this test is what closes that gap. Same shape as the
+  // ci.yml node-version guard above.
+  const wf = fs.readFileSync(
+    path.join(REPO_ROOT, '.github', 'workflows', 'flavor-smoke.yml'),
+    'utf8',
+  );
+  // The workflow greps with escaped dots (`go1\.25\.12`) — the same literal for our purposes.
+  // Comment lines are stripped first: this file documents the wrong-folder defect in prose and
+  // uses `<ver>` placeholders, so a whole-file scan would grade the commentary rather than the
+  // assertions — the same trap the executed-instructions test below pins for Dockerfiles.
+  const plain = wf
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+    .replace(/\\\./g, '.');
+  const arg = (flavor, name) => {
+    const df = instructions(`Dockerfile.${flavor}`);
+    const value = df.match(new RegExp(`ARG ${name}=([^\\s\\\\]+)`))?.[1];
+    assert.ok(value, `Dockerfile.${flavor} must pin ARG ${name}`);
+    return value;
+  };
+
+  // java: both the folder name and the version directory come from ARGs.
+  const toolcache = arg('java', 'JDK_TOOLCACHE_NAME');
+  const jdkDir = `${arg('java', 'JDK_VERSION')}-${arg('java', 'JDK_BUILD')}`;
+  const javaPaths = [...plain.matchAll(/(Java_[A-Za-z0-9_.-]+)\/([^/\s"']+)\/arm64/g)];
+  assert.ok(javaPaths.length > 0, 'the java smoke job must assert a concrete tool-cache path');
+  for (const [, folder, version] of javaPaths) {
+    assert.equal(folder, toolcache, `smoke asserts ${folder}, image bakes ${toolcache}`);
+    assert.equal(version, jdkDir, `smoke asserts JDK ${version}, image bakes ${jdkDir}`);
+  }
+
+  // go: the cache path and the `go version` string must both track GO_VERSION.
+  const goVersion = arg('go', 'GO_VERSION');
+  const goPaths = [...plain.matchAll(/\bgo\/(\d+\.\d+\.\d+)\/arm64/g)].map((m) => m[1]);
+  assert.ok(goPaths.length > 0, 'the go smoke job must assert a concrete tool-cache path');
+  for (const version of goPaths) {
+    assert.equal(version, goVersion, `smoke asserts go ${version}, image bakes ${goVersion}`);
+  }
+  assert.ok(
+    plain.includes(`go${goVersion}`),
+    `the go smoke job must assert \`go version\` reports go${goVersion}`,
+  );
+
+  // rust: no tool cache is involved, so the pin is the rustc version the smoke job greps for.
+  const rustVersion = arg('rust', 'RUST_VERSION');
+  assert.ok(
+    plain.includes(rustVersion),
+    `the rust smoke job must assert rustc ${rustVersion} (Dockerfile.rust's RUST_VERSION)`,
+  );
+
+  // Every smoke job must target a label the catalog publishes: a misspelled or unbuilt label
+  // leaves the job QUEUED indefinitely, which reads as slow CI rather than as a failure.
+  const labels = new Set(JSON.parse(read('flavors.json')).flavors.map((f) => f.label));
+  const targeted = [...wf.matchAll(/runs-on:\s*\[self-hosted,\s*([A-Za-z0-9._-]+)\]/g)].map(
+    (m) => m[1],
+  );
+  assert.ok(targeted.length >= 3, 'expected a smoke job per built flavor');
+  for (const label of targeted) {
+    assert.ok(labels.has(label), `smoke workflow targets ${label}, absent from the flavor catalog`);
   }
 });

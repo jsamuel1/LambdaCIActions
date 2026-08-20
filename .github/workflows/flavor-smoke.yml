@@ -1,0 +1,170 @@
+name: Flavor smoke (java/go/rust)
+
+# ADR-049 flavor-catalog smoke: proves a BUILT flavor image is actually runnable, which
+# neither unit tests nor `cdk synth` can show. Each job runs on its own flavor label and
+# asserts the flavor's `actions/setup-*` resolved the image's PREBAKED tool-cache entry
+# instead of downloading a toolchain — a silent download makes the flavor pointless
+# (ADR-039). Assertions are steps, not eyeballing: a miss fails the job.
+#
+# Triggered by pushing this file (any branch) so it can be re-run by touching it, plus
+# workflow_dispatch once it lands on the default branch. Deliberately NOT part of ci.yml:
+# these labels only became claimable after their images were published, and a queued
+# smoke job must never gate ordinary CI.
+
+on:
+  push:
+    paths:
+      - '.github/workflows/flavor-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------------
+  # java — setup-java resolves ${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/<version>/arm64.
+  # That folder is `Java_<installer-class>_<packageType>`, NOT the `distribution:` input
+  # (temurin's installer is `super(`Temurin-${jvmImpl}`, ...)`) — see ADR-053.
+  # Dockerfile.java bakes 21.0.12+8 as the directory `21.0.12-8` (setup-java's `+`->`-`
+  # normalisation), so `java-version: '21'` must be satisfiable by that entry.
+  # ---------------------------------------------------------------------------------
+  java:
+    runs-on: [self-hosted, lambda-ci-java]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Attribution guard (task-1786169751-ddd5): a JIT runner is label-matched, not
+      # job-bound, so record the agent name and job id to compare against GitHub's own
+      # `runner_name` for this job afterwards.
+      - name: Record runner identity
+        run: |
+          echo "runner_name=${RUNNER_NAME}"
+          echo "run_id=${GITHUB_RUN_ID} job=${GITHUB_JOB}"
+
+      - name: Prove the baked cache entry exists before setup-java runs
+        run: |
+          set -eux
+          ls -d "${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64"
+          test -f "${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64.complete"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # A cache HIT leaves JAVA_HOME inside RUNNER_TOOL_CACHE at the baked entry. A download
+      # lands under the resolved upstream version instead (e.g. 21.0.12-8.0.LTS), so this is the
+      # load-bearing assertion — and it is what caught the original Java_temurin_jdk defect.
+      - name: Assert setup-java hit the prebaked cache (no download)
+        run: |
+          set -eux
+          echo "JAVA_HOME=${JAVA_HOME}"
+          case "${JAVA_HOME}" in
+            "${RUNNER_TOOL_CACHE}/Java_Temurin-Hotspot_jdk/21.0.12-8/arm64") ;;
+            *) echo "::error::JAVA_HOME is not the prebaked entry — setup-java downloaded a JDK"; exit 1 ;;
+          esac
+          java -version 2>&1 | tee /tmp/java-version
+          grep -q '21\.0\.12' /tmp/java-version
+
+      # Temurin flavors deliberately carry NO build-essential (published JARs only) —
+      # asserted by test/image-content.test.mjs. Confirm that holds at runtime too.
+      - name: Confirm the deliberate absence of a C toolchain
+        run: |
+          if command -v gcc >/dev/null 2>&1; then
+            echo "::error::gcc present on the java flavor — image content drifted"; exit 1
+          fi
+          echo "no gcc, as designed"
+
+  # ---------------------------------------------------------------------------------
+  # go — setup-go resolves ${RUNNER_TOOL_CACHE}/go/<ver>/arm64 with bin/go directly
+  # under it (Dockerfile.go extracts with --strip-components=1). GOROOT is deliberately
+  # NOT baked, so a job-selected toolchain wins.
+  # ---------------------------------------------------------------------------------
+  go:
+    runs-on: [self-hosted, lambda-ci-go]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner identity
+        run: |
+          echo "runner_name=${RUNNER_NAME}"
+          echo "run_id=${GITHUB_RUN_ID} job=${GITHUB_JOB}"
+
+      - name: Prove the baked cache entry exists before setup-go runs
+        run: |
+          set -eux
+          ls -d "${RUNNER_TOOL_CACHE}/go/1.25.12/arm64"
+          test -f "${RUNNER_TOOL_CACHE}/go/1.25.12/arm64.complete"
+          test -x "${RUNNER_TOOL_CACHE}/go/1.25.12/arm64/bin/go"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Assert setup-go hit the prebaked cache (no download)
+        run: |
+          set -eux
+          which go
+          case "$(which go)" in
+            "${RUNNER_TOOL_CACHE}/go/1.25.12/arm64/bin/go") ;;
+            *) echo "::error::go on PATH is not the prebaked entry — setup-go downloaded a toolchain"; exit 1 ;;
+          esac
+          go version | tee /tmp/go-version
+          grep -q 'go1\.25\.12' /tmp/go-version
+          # No baked GOROOT: the binary must derive its own.
+          test "$(go env GOROOT)" = "${RUNNER_TOOL_CACHE}/go/1.25.12/arm64"
+
+      - name: Build a real module (cgo linker present)
+        run: |
+          set -eux
+          cd "$(mktemp -d)"
+          go mod init smoke
+          cat > main.go <<'EOF'
+          package main
+
+          import "fmt"
+
+          func main() { fmt.Println("go smoke ok") }
+          EOF
+          CGO_ENABLED=1 go build -o smoke .
+          ./smoke
+
+  # ---------------------------------------------------------------------------------
+  # rust — rustup is on PATH; Rust does NOT use the runner tool cache, so the proof is
+  # a real `cargo build` as the unprivileged `runner` user with a genuine dependency
+  # fetch (RUSTUP_HOME is chowned to runner; CARGO_HOME is /home/runner/.cargo).
+  # ---------------------------------------------------------------------------------
+  rust:
+    runs-on: [self-hosted, lambda-ci-rust]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner identity
+        run: |
+          echo "runner_name=${RUNNER_NAME}"
+          echo "run_id=${GITHUB_RUN_ID} job=${GITHUB_JOB}"
+
+      - name: Assert the pinned toolchain is on PATH and we are the runner user
+        run: |
+          set -eux
+          test "$(id -un)" = runner
+          which cargo rustc
+          rustc --version | tee /tmp/rustc-version
+          grep -q '1\.97\.1' /tmp/rustc-version
+          cargo clippy --version
+          cargo fmt --version
+
+      # The real test: cargo must be able to WRITE its registry/cache as `runner` and
+      # fetch a crate from crates.io. A root-owned CARGO_HOME fails exactly here.
+      - name: cargo build with a real dependency fetch
+        run: |
+          set -eux
+          cd "$(mktemp -d)"
+          cargo init --name smoke
+          cargo add itoa@1.0.11
+          cargo build
+          ./target/debug/smoke
+          # Prove the registry cache landed in a runner-writable CARGO_HOME.
+          echo "CARGO_HOME=${CARGO_HOME:-<unset>}"
+          ls -d "${CARGO_HOME:-$HOME/.cargo}/registry"
