@@ -33,7 +33,21 @@ import {
  */
 
 const client = DynamoDBClient ? new DynamoDBClient({}) : undefined;
-const doc = client ? DynamoDBDocumentClient.from(client) : undefined;
+/**
+ * `removeUndefinedValues` is load-bearing here, not a convenience.
+ *
+ * The validation evidence map is assembled from OBSERVATIONS, and an observation that was never
+ * made is `undefined` — a run whose job never concluded has no `workflowConclusion`. Without this
+ * option the document client REFUSES the whole write ("Pass options.removeUndefinedValues=true"),
+ * and because the refusal happens inside the verdict write it also defeats the orchestrator's
+ * `pending` fallback: the row is then stranded in `validating`, which nothing but a manual
+ * re-validate can leave. Observed live on 2026-08-20 against `custom-brokenagent`. Dropping an
+ * absent observation is exactly the intended encoding — the field is optional on
+ * {@link FlavorValidationEvidence} — whereas failing the write loses the verdict entirely.
+ */
+const doc = client
+  ? DynamoDBDocumentClient.from(client, { marshallOptions: { removeUndefinedValues: true } })
+  : undefined;
 const TABLE = process.env.TABLE_NAME;
 
 // ---- pure key helpers ------------------------------------------------------

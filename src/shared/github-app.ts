@@ -1023,6 +1023,38 @@ export async function listRepoRunners(params: {
  * case. Any other error is surfaced, because a registration we failed to remove is residue we left
  * in an operator's repository.
  */
+/**
+ * Cancel a workflow run.
+ *
+ * Cleanup for a smoke run whose job was never served. A dispatched run with nothing to take it sits
+ * `queued` in the operator's Actions tab until GitHub expires it 24 hours later (observed live), so
+ * a validation that condemns an image would otherwise leave a pending run behind as residue in
+ * someone else's repository — the same reason `deleteRepoRunner` exists.
+ *
+ * Tolerates 404 (the run is already gone) and 409, which is what GitHub answers when the run has
+ * already reached a terminal state and there is therefore nothing to cancel.
+ */
+export async function cancelWorkflowRun(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  owner: string;
+  repo: string;
+  runId: number;
+}): Promise<void> {
+  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  try {
+    await githubJson<Record<string, never>>(
+      `/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/cancel`,
+      { method: 'POST', token, tokenType: 'token' },
+    );
+  } catch (err) {
+    const status = githubErrorStatus(err);
+    if (status === 404 || status === 409) return;
+    throw err;
+  }
+}
+
 export async function deleteRepoRunner(params: {
   appId: string;
   pem: string;

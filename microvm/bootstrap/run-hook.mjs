@@ -582,7 +582,26 @@ const server = http.createServer(async (req, res) => {
         res.end('{"error":"jit config fetch failed"}');
         return;
       }
-      if (!payload.jitConfig || !payload.runId || !payload.jobId) {
+      // Validity is about PRESENCE and TYPE, not truthiness. A validation smoke run has no GitHub
+      // `workflow_job`, so `src/shared/smoke-store.ts` stores `runId: 0, jobId: 0` deliberately —
+      // "present and numeric so the guest's own logging path behaves identically to a real job".
+      // A `!payload.runId` test rejects exactly that: zero is falsy, so the guest answered 400 and
+      // returned WITHOUT logging, so the only evidence was a guest log that stopped dead after the
+      // `/run` request line and a control plane that concluded "the runner never registered".
+      // Live evidence (2026-08-22): the proven `lca-dev-node` image, registered as a custom flavor,
+      // was condemned `invalid` this way — no image could ever have passed the ADR-041 smoke gate.
+      // Real jobs are unaffected: GitHub ids are never zero, so this only widens what the guest
+      // accepts to include the synthetic pair the control plane already sends.
+      if (
+        !payload.jitConfig ||
+        !Number.isFinite(payload.runId) ||
+        !Number.isFinite(payload.jobId)
+      ) {
+        log('resolved config incomplete', {
+          hasJitConfig: Boolean(payload.jitConfig),
+          runId: typeof payload.runId === 'number' ? payload.runId : typeof payload.runId,
+          jobId: typeof payload.jobId === 'number' ? payload.jobId : typeof payload.jobId,
+        });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end('{"error":"resolved config missing jitConfig/runId/jobId"}');
         return;

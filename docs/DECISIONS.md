@@ -2231,17 +2231,57 @@ the static gates; the smoke run itself is verified against a live environment.
   than only observed live, which is why the sequencing lives in `orchestrate.ts` behind an effects
   interface:
   1. **The VM is terminated on every exit path**, including the throwing ones — a `finally` also
-     removes a leftover runner registration from the operator's repo and drops the `SMOKE#` rows.
+     removes a leftover runner registration from the operator's repo, cancels an unconcluded smoke
+     run, and drops the `SMOKE#` rows.
   2. **An orchestration fault returns the row to `pending`**, never terminal `invalid`. A GitHub
      5xx, a throttle or a lost budget says nothing about the image.
   3. **The row never stays in `validating` on a crash.** The λ's own deadline (10 min) sits inside
      its Lambda timeout (12 min) with a reserve, so polling stops while there is still time to
      write a verdict; a λ killed by its timeout would write nothing.
 
+  Property 3 additionally requires that the verdict write itself cannot throw, which is why the
+  flavor store's document client sets `marshallOptions.removeUndefinedValues`. The evidence map is
+  assembled from OBSERVATIONS, and an observation never made is `undefined` — a run whose job never
+  concluded has no `workflowConclusion`. Without the option the client refuses the whole write, and
+  because that refusal happens INSIDE the verdict write it also defeats the `pending` fallback, whose
+  own write fails identically: the row is stranded in `validating`, which nothing but a manual
+  re-validate can leave. Live evidence (2026-08-20): a completed run classified `invalid`, logged its
+  verdict, threw `Pass options.removeUndefinedValues=true`, and left the row `validating` for two
+  days. Dropping an absent observation is the intended encoding — the field is optional — whereas
+  failing the write loses the verdict entirely. A *false* observation is a real observation and is
+  preserved: `selfTerminated: false` is the difference between "the VM leaked" and "we never looked".
+
   Runner registration is observed two ways, because a single-use JIT runner is ephemeral: it leaves
   the repo's runner list when its job ends, so a fast job can complete entirely between polls. A run
   that reached `in_progress`/`completed` is therefore equally good proof — GitHub does not execute a
   job without a runner. Relying on the list alone would fail a perfectly good fast image.
+
+  The list check demands a **CONNECTED** runner (`online`, or `busy`), not merely a row carrying the
+  nonce label. `POST /actions/runners/generate-jitconfig` REGISTERS the runner as a side effect of
+  minting it — the row appears immediately with `status: "offline"`, before any agent exists — so a
+  plain label match observes OUR OWN MINT and is true for every image, working or not. Live evidence
+  (2026-08-20): the deliberately broken fixture, whose `run.sh` exits 127 so no agent can ever
+  connect, was recorded `runnerRegistered: true` and then condemned for the WRONG reason — "the job
+  never reached a conclusion" instead of "the agent never started", which sends an operator looking
+  at their workflow rather than their entrypoint. `busy` is accepted alongside `online` because
+  GitHub can report a runner busy mid-job while its status field lags.
+
+  **The dispatched input is the LABEL, not the bare nonce.** The generated workflow's `runs-on` is
+  `[self-hosted, "${{ inputs.lca_nonce }}"]`, so the value dispatched IS the label GitHub matches
+  against the runner's advertised labels — and the runner advertises `lca-validate-<nonce>`.
+  Dispatching the bare nonce leaves the job permanently unmatchable, which is invisible to a unit
+  test that fakes the dispatch: both sides were internally consistent, and only GitHub's matcher
+  disagreed. Live evidence (2026-08-20): the job carried `runs-on` labels
+  `[self-hosted, 0daa6de266ff4eb3]`, sat `queued` with no runner able to take it, and was condemned
+  for a timeout that was OUR fault. No good image could have passed this gate.
+
+  **A smoke run that never concluded is cancelled during cleanup.** A dispatched run nothing can
+  serve otherwise sits `queued` in the operator's Actions tab until GitHub expires it 24 hours later
+  (live-observed), so a validation that condemns an image would leave a pending run behind as residue
+  — the same standard the leftover runner registration is held to. Only a run **confirmed ours by
+  nonce** and **not yet concluded** is cancelled: cancelling on the strength of the timestamp window
+  would reach into a bystander's dispatch, and cancelling a concluded run would destroy the evidence
+  the verdict rests on.
 
   **Run attribution is by nonce, never by timestamp.** `workflow_dispatch` returns no run id, so the
   λ narrows candidates to runs created at/after its dispatch and then CONFIRMS one by the nonce: the
@@ -2258,6 +2298,39 @@ the static gates; the smoke run itself is verified against a live environment.
   customer jobs of capacity. Its guest output goes to `/aws/lambda/microvms/validate/lca-<env>`, NOT
   the per-run group real jobs write to — a validation attempt is not a customer job, and the console's
   log pane reads the run group by run id.
+  **The smoke job requires ONLY the nonce label** — `runs-on: ["${{ inputs.lca_nonce }}"]`, with no
+  `self-hosted`. GitHub adds its default labels only to a runner that configures itself; a JIT runner
+  minted with an explicit `labels` array carries exactly that array and nothing else (verified live).
+  A `[self-hosted, <nonce>]` job therefore demands a label the smoke runner does not have and can
+  never be assigned: observed live on 2026-08-22, where a healthy agent connected, logged `Listening
+  for Jobs`, and the job sat queued until the deadline condemned a working image. Requiring only the
+  nonce is also the stronger safety position — adding `self-hosted` to the MINT instead would have let
+  a plain `runs-on: self-hosted` job in the operator's repo land on an unvalidated image.
+
+  **The guest accepts the smoke run's synthetic ids.** A smoke run has no `workflow_job`, so
+  `smoke-store` stores `runId: 0, jobId: 0` — "present and numeric so the guest's own logging path
+  behaves identically to a real job". The guest's `/run` guard validated them with `!payload.runId`,
+  and zero is falsy: it answered 400 and returned WITHOUT logging, so the only evidence was a guest
+  log that stopped after the `/run` request line and a control plane reporting "the runner never
+  registered". Live evidence (2026-08-22): the proven `lca-dev-node` image, registered unchanged as a
+  custom flavor, was condemned `invalid` this way. The guard now tests presence and type
+  (`Number.isFinite`) and LOGS its refusal — the silence was itself half the difficulty. Real jobs are
+  unaffected: GitHub ids are never zero. Note this lives in the baked guest image, so the fix reaches
+  an environment only when its images are rebuilt.
+
+  **Live verification (2026-08-22, dev).** Both halves of this ADR's acceptance criterion now hold
+  against the real control plane:
+  - A deliberately broken image (`lca-dev-val-brokenagent`, whose `run.sh` exits 127) reached terminal
+    `invalid` with the actionable reason "the image booted but its entrypoint/run-hook did not start
+    the agent", evidence `runnerRegistered: false`, `selfTerminated: false`, no leftover runner
+    registration and no live VM.
+  - The proven `lca-dev-node` image, registered as `custom-goodnode`, reached `valid` /
+    `routable: true` in 31 s with evidence `workflowConclusion: success`, `selfTerminated: true`,
+    `workflowRunId: 32603535501` — whose job ran on runner `lca-validate-251dd257105cce74`, the exact
+    AgentName that run minted. Its guest log shows the full contract: `job starting` → `Connected to
+    GitHub` → `Running job: validate` → `completed with result: Succeeded` → `self-terminate
+    requested`.
+
 - The console's Flavors screen renders custom flavors in every state behind an installation selector
   (a custom flavor is unaddressable without its installation), with the registration form, the
   no-write static-gate + rate preview, re-validate/delete actions, and the smoke workflow YAML for

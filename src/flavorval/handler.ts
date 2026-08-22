@@ -2,6 +2,7 @@ import { LambdaClient } from '@aws-sdk/client-lambda';
 import { randomBytes } from 'node:crypto';
 import { getParam } from '../shared/ssm.js';
 import {
+  cancelWorkflowRun,
   deleteRepoRunner,
   dispatchWorkflow,
   generateSmokeJitConfig,
@@ -240,6 +241,16 @@ export function awsDeps(): OrchestratorDeps {
         installationId: currentInstallationId,
         ...repoParts(input.repoFullName),
         runnerId: input.runnerId,
+      });
+    },
+    cancelRun: async (input) => {
+      const { appId, pem } = await creds();
+      await cancelWorkflowRun({
+        appId,
+        pem,
+        installationId: currentInstallationId,
+        ...repoParts(input.repoFullName),
+        runId: input.runId,
       });
     },
     endSmoke: (seq) => deleteSmokeRun(currentInstallationId, seq),

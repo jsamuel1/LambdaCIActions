@@ -82,15 +82,30 @@ export interface OrchestratorDeps {
   launch(input: { imageArn: string; ref: string; token: string }): Promise<{ microvmId: string }>;
   /** Record the launched VM id on the smoke row so a brokered terminate can resolve it. */
   stampVm(input: { seq: number; microvmId: string }): Promise<void>;
-  /** Dispatch the operator's validation workflow with the nonce as its input. */
+  /**
+   * Dispatch the operator's validation workflow with the nonce LABEL as its input.
+   *
+   * `nonce` here is the full `lca-validate-<hex>` label, not the bare hex: the workflow interpolates
+   * this value straight into `runs-on`, so it must be spelled exactly as the runner advertises it or
+   * no runner can ever match the job.
+   */
   dispatch(input: {
     repoFullName: string;
     workflow: string;
     ref: string;
     nonce: string;
   }): Promise<void>;
-  /** Names + labels of the repo's currently registered runners. */
-  listRunners(repoFullName: string): Promise<{ id: number; name: string; labels: string[] }[]>;
+  /**
+   * Names + labels of the repo's currently registered runners, with their connection state.
+   *
+   * `status`/`busy` are part of the contract, not decoration. `generate-jitconfig` REGISTERS the
+   * runner as a side effect of minting it (verified live: the row appears immediately with
+   * `status: "offline"`), so a label match alone observes OUR OWN MINT and proves nothing about
+   * the image. Only a runner that reached `online`/`busy` is evidence that the agent started.
+   */
+  listRunners(
+    repoFullName: string,
+  ): Promise<{ id: number; name: string; labels: string[]; status?: string; busy?: boolean }[]>;
   /** `workflow_dispatch` runs of the validation workflow, newest first. */
   listDispatchRuns(input: {
     repoFullName: string;
@@ -113,6 +128,14 @@ export interface OrchestratorDeps {
   terminateVm(microvmId: string): Promise<void>;
   /** Remove a leftover runner registration. Must treat 404 as success. */
   deleteRunner(input: { repoFullName: string; runnerId: number }): Promise<void>;
+  /**
+   * Cancel a smoke run that never reached a conclusion. Must treat "already terminal" as success.
+   *
+   * Residue cleanup, in the same class as `deleteRunner`: a dispatched run no runner could serve
+   * stays `queued` in the operator's Actions tab for 24 hours (live-observed), so a validation that
+   * condemns an image must not also leave a pending run in someone else's repository.
+   */
+  cancelRun(input: { repoFullName: string; runId: number }): Promise<void>;
   /** Best-effort removal of the `SMOKE#` rows. */
   endSmoke(seq: number): Promise<void>;
   /** Epoch ms. Injected so a deadline is testable without waiting. */
@@ -236,6 +259,10 @@ export async function runValidation(
   let microvmId: string | undefined;
   let runnerId: number | undefined;
   let repoFullName: string | undefined;
+  /** Set once a run is CONFIRMED ours, so cleanup can never cancel a bystander's run. */
+  let ourRunId: number | undefined;
+  /** Whether that run finished on its own. An unconcluded run is ours to cancel. */
+  let runConcluded = false;
   const evidence: FlavorValidationEvidence = { imageArn: rec.imageArn, startedAt };
 
   try {
@@ -331,7 +358,13 @@ export async function runValidation(
     // dispatch, and `created_at` has only second granularity; sampling after a slow response can
     // move the floor into the next second and exclude the run we just created forever.
     const dispatchedAtMs = deps.now();
-    await deps.dispatch({ repoFullName, workflow, ref: branch, nonce });
+    // The LABEL, not the bare nonce. The smoke workflow's `runs-on` is
+    // `[self-hosted, "${{ inputs.lca_nonce }}"]` — the input IS the label GitHub matches against the
+    // runner's advertised labels, and the runner advertises `smokeLabel(nonce)`. Dispatching the
+    // bare hex leaves the job permanently unmatched: observed live on 2026-08-20, where the job sat
+    // queued with `runs-on` labels `[self-hosted, <hex>]`, no runner could take it, and the run was
+    // condemned for "never reached a conclusion" — a verdict about OUR dispatch, not the image.
+    await deps.dispatch({ repoFullName, workflow, ref: branch, nonce: label });
 
     const obs = await observeSmoke(deps, config, {
       repoFullName,
@@ -346,6 +379,8 @@ export async function runValidation(
     evidence.workflowRunId = obs.workflowRunId;
     evidence.workflowConclusion = obs.observations.workflowConclusion;
     evidence.selfTerminated = obs.observations.selfTerminated;
+    ourRunId = obs.workflowRunId;
+    runConcluded = obs.observations.workflowConclusion !== undefined;
 
     const verdict = classifySmoke(obs.observations);
     deps.log({
@@ -389,7 +424,15 @@ export async function runValidation(
     // ALWAYS. A smoke VM that outlives its run is a leaked VM on the operator's quota, and a
     // leftover runner registration is residue we left in someone else's repository after
     // condemning their image. Neither may depend on the happy path being taken.
-    await cleanup(deps, { seq, microvmId, runnerId, repoFullName });
+    await cleanup(deps, {
+      seq,
+      microvmId,
+      runnerId,
+      repoFullName,
+      // Only a run we CONFIRMED was ours, and only if it never concluded. Cancelling on the strength
+      // of a timestamp window would let us cancel a bystander's dispatch of the same workflow.
+      ...(ourRunId !== undefined && !runConcluded ? { cancelRunId: ourRunId } : {}),
+    });
   }
 }
 
@@ -445,6 +488,7 @@ async function cleanup(
     microvmId?: string;
     runnerId?: number;
     repoFullName?: string;
+    cancelRunId?: number;
   },
 ): Promise<void> {
   if (input.microvmId) {
@@ -467,6 +511,17 @@ async function cleanup(
       deps.log({
         msg: 'smoke runner registration delete failed',
         runnerId: input.runnerId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (input.cancelRunId !== undefined && input.repoFullName) {
+    try {
+      await deps.cancelRun({ repoFullName: input.repoFullName, runId: input.cancelRunId });
+    } catch (err) {
+      deps.log({
+        msg: 'smoke workflow run cancel failed — GitHub expires a queued run after 24h',
+        runId: input.cancelRunId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -500,7 +555,8 @@ interface ObserveResult {
  *    runner list while connected and removes itself when its job ends, so a fast job can complete
  *    entirely between two polls. OUR CONFIRMED run reaching `in_progress` or a conclusion is
  *    therefore equally good proof — GitHub does not execute a job without a runner. Relying on the
- *    list alone would fail a perfectly good fast image.
+ *    list alone would fail a perfectly good fast image. The list check demands a CONNECTED runner
+ *    (`online`/`busy`), because minting the JIT config already created the registration.
  *  - **job conclusion**: can the image actually RUN a job, as opposed to merely boot one?
  *  - **self-terminated**: is the ADR-021 hook path wired? Only observable after the job ends, so it
  *    gets its own bounded window rather than being demanded at the same instant.
@@ -563,8 +619,16 @@ async function observeSmoke(
   for (;;) {
     if (!runnerRegistered) {
       const runners = await deps.listRunners(input.repoFullName);
-      const mine = runners.find((r) =>
-        r.labels.some((l) => l.toLowerCase() === input.label.toLowerCase()),
+      const mine = runners.find(
+        (r) =>
+          r.labels.some((l) => l.toLowerCase() === input.label.toLowerCase()) &&
+          // CONNECTED, not merely present. Minting the JIT config registers the runner up front
+          // (live-verified: `status: "offline"` the instant `generate-jitconfig` returns), so
+          // accepting any row carrying our label would score every image "the agent started" —
+          // including one whose `run.sh` exits 127, which is precisely the ADR-019/020 defect this
+          // observation exists to catch. Observed on 2026-08-20: the deliberately broken fixture
+          // was recorded `runnerRegistered: true` and condemned with the WRONG reason.
+          (r.status?.toLowerCase() === 'online' || r.busy === true),
       );
       if (mine) {
         runnerRegistered = true;

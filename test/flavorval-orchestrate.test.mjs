@@ -99,8 +99,8 @@ function scenario(opts = {}) {
       return { microvmId: 'mvm-1' };
     },
     stampVm: async () => record('stampVm'),
-    dispatch: async () => {
-      record('dispatch');
+    dispatch: async (input) => {
+      record('dispatch', input.nonce);
       if (opts.dispatchDelayMs) clock += opts.dispatchDelayMs;
       if (opts.throwOn === 'dispatch') throw new Error('GitHub 404 on workflow dispatch');
     },
@@ -132,6 +132,10 @@ function scenario(opts = {}) {
       if (opts.throwOn === 'terminate') throw new Error('already terminated');
     },
     deleteRunner: async (input) => record('deleteRunner', input.runnerId),
+    cancelRun: async (input) => {
+      record('cancelRun', input.runId);
+      if (opts.throwOn === 'cancelRun') throw new Error('GitHub 500 on run cancel');
+    },
     endSmoke: async (seq) => record('endSmoke', seq),
     now: () => clock,
     sleep: async (ms) => {
@@ -149,7 +153,11 @@ const FAST = { ...DEFAULT_ORCHESTRATOR_CONFIG, deadlineMs: 60_000, reserveMs: 5_
 /** A run that succeeds on the first poll: runner present, job green, VM gone. */
 function happyOpts(over = {}) {
   return {
-    runners: () => [{ id: 777, name: 'lca-validate-abc123', labels: ['lca-validate-abc123'] }],
+    // `status: 'online'` because minting the JIT config already registers the runner — see the
+    // connected-runner test below.
+    runners: () => [
+      { id: 777, name: 'lca-validate-abc123', labels: ['lca-validate-abc123'], status: 'online' },
+    ],
     runs: (_p, clock) => [{ id: 9001, status: 'completed', conclusion: 'success', createdAt: clock }],
     vms: () => [],
     ...over,
@@ -246,7 +254,9 @@ test('the runner never registering is invalid — the ADR-019/020 docker failure
 
 test('a registered runner whose job never concludes is invalid (timed out)', async () => {
   const s = scenario({
-    runners: () => [{ id: 777, name: 'r', labels: ['lca-validate-abc123'] }],
+    runners: () => [
+      { id: 777, name: 'r', labels: ['lca-validate-abc123'], status: 'online' },
+    ],
     runs: (_p, clock) => [{ id: 9001, status: 'queued', conclusion: null, createdAt: clock }],
     vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
   });
@@ -254,6 +264,61 @@ test('a registered runner whose job never concludes is invalid (timed out)', asy
 
   assert.equal(res.state, 'invalid');
   assert.match(res.reason, /never reached a conclusion/);
+});
+
+test('the job is dispatched with the LABEL the runner advertises, not the bare nonce', async () => {
+  // The live defect that made every good image look broken. The smoke workflow interpolates its
+  // `lca_nonce` input straight into `runs-on`, so the dispatched value IS the label GitHub matches
+  // against the runner's advertised labels — and the runner advertises `smokeLabel(nonce)`.
+  // Dispatching the bare hex leaves the job permanently unmatched: observed live on 2026-08-20 with
+  // job labels `[self-hosted, <hex>]` that no runner could ever satisfy.
+  const s = scenario(happyOpts());
+  await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+
+  const dispatched = s.calls.find((c) => c.name === 'dispatch')?.arg;
+  assert.equal(dispatched, smokeLabel('abc123'));
+  assert.equal(isSmokeLabel(dispatched), true);
+  // And it is exactly what was minted, so the two sides cannot drift apart again.
+  assert.equal(dispatched, s.calls.find((c) => c.name === 'mintSmokeRunner')?.arg);
+});
+
+test('a runner registration created by our own MINT is not evidence the agent started', async () => {
+  // `generate-jitconfig` registers the runner as a side effect of minting it — verified live: the
+  // row appears immediately with `status: "offline"`, before any agent connects. Matching on the
+  // label alone therefore observes OUR OWN MINT, which scored the deliberately broken fixture
+  // (`run.sh` exits 127) as `runnerRegistered: true` on 2026-08-20 and condemned it with the wrong
+  // reason. Only `online`/`busy` is evidence about the image.
+  const s = scenario({
+    runners: () => [
+      {
+        id: 777,
+        name: 'lca-validate-abc123',
+        labels: ['lca-validate-abc123'],
+        status: 'offline',
+        busy: false,
+      },
+    ],
+    runs: () => [],
+    vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+  });
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+
+  assert.equal(res.state, 'invalid');
+  assert.match(res.reason, /never registered with GitHub/);
+});
+
+test('a BUSY runner counts as registered even without an online status', async () => {
+  // Mid-job, GitHub can report the runner busy while its status field lags. Demanding `online`
+  // alone would fail a good image for taking the job too promptly.
+  const s = scenario({
+    ...happyOpts(),
+    runners: () => [
+      { id: 777, name: 'lca-validate-abc123', labels: ['lca-validate-abc123'], busy: true },
+    ],
+  });
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(res.state, 'valid');
+  assert.equal(res.evidence.runnerId, 777);
 });
 
 test('a failing job is invalid and names the conclusion', async () => {
@@ -314,7 +379,9 @@ test('a slow dispatch response cannot exclude the run created during the request
 
 test('a run created BEFORE our dispatch is not ours', async () => {
   const s = scenario({
-    runners: () => [{ id: 777, name: 'r', labels: ['lca-validate-abc123'] }],
+    runners: () => [
+      { id: 777, name: 'r', labels: ['lca-validate-abc123'], status: 'online' },
+    ],
     // An older workflow_dispatch run, green — must not be mistaken for this validation's job.
     runs: (_p, clock) => [
       { id: 8000, status: 'completed', conclusion: 'success', createdAt: clock - 3_600_000 },
@@ -466,6 +533,55 @@ test('a failing terminate does not prevent the runner/smoke cleanup or the verdi
   const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
   assert.equal(res.state, 'valid');
   assert.equal(s.names().includes('deleteRunner'), true);
+  assert.equal(s.names().includes('endSmoke'), true);
+});
+
+test('a smoke run that never concluded is CANCELLED, so no queued run is left behind', async () => {
+  // A dispatched run nothing can serve sits `queued` in the operator's Actions tab until GitHub
+  // expires it 24 hours later (live-observed: the 2026-08-20 run was auto-cancelled at 22:45 the
+  // NEXT day). Condemning an image must not also leave residue in someone else's repository — the
+  // same standard `deleteRunner` is held to.
+  const s = scenario({
+    ...happyOpts(),
+    runs: (_p, clock) => [{ id: 9001, status: 'queued', conclusion: null, createdAt: clock }],
+    vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+  });
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+
+  assert.equal(res.state, 'invalid');
+  assert.equal(s.calls.find((c) => c.name === 'cancelRun')?.arg, 9001);
+});
+
+test('a run that CONCLUDED on its own is never cancelled', async () => {
+  const s = scenario(happyOpts());
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(res.state, 'valid');
+  assert.equal(s.names().includes('cancelRun'), false);
+});
+
+test('a run never CONFIRMED ours is not cancelled — cleanup cannot touch a bystander', async () => {
+  // Only nonce-confirmed evidence may drive a cancel. A concurrent foreign dispatch satisfies the
+  // timestamp window, and cancelling it would mean this validation reached into an unrelated run.
+  const s = scenario({
+    ...happyOpts(),
+    runs: (_p, clock) => [{ id: 9999, status: 'queued', conclusion: null, createdAt: clock }],
+    runJobs: () => [{ id: 1, labels: ['self-hosted', 'lambda-ci'], runnerName: 'someone-else' }],
+    vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+  });
+  await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(s.names().includes('cancelRun'), false);
+});
+
+test('a failing cancel does not prevent the terminate, runner delete or smoke cleanup', async () => {
+  const s = scenario({
+    ...happyOpts(),
+    throwOn: 'cancelRun',
+    runs: (_p, clock) => [{ id: 9001, status: 'queued', conclusion: null, createdAt: clock }],
+    vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+  });
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(res.state, 'invalid');
+  assert.equal(s.calls.find((c) => c.name === 'terminateVm')?.arg, 'mvm-1');
   assert.equal(s.names().includes('endSmoke'), true);
 });
 
