@@ -50,7 +50,8 @@ export interface MgmtStackProps extends StackProps {
    *
    * Absent is a supported state, not a misconfiguration: without it registration still succeeds,
    * the flavor stays `pending`, and the API says validation could not be started. Nothing can
-   * reach `valid`, so nothing custom is routable.
+   * reach `valid`, so nothing custom is routable. With it, a trigger that is refused or dropped is
+   * resent by the Reaper's reconciliation sweep from the marker the registration wrote.
    */
   flavorvalFunctionName?: string;
   flavorvalFunctionArn?: string;

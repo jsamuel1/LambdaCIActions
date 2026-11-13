@@ -2283,19 +2283,35 @@ the static gates; the smoke run itself is verified against a live environment.
      it. A lease alone is only a permission for a later claim; the only producers of runs are
      registration and an operator's re-validate, so without a sweep such a row would wait for an
      operator forever. Every claim therefore also writes a sparse GSI1 entry (`gsi1pk =
-     FLAVORCLAIMS`, `gsi1sk` = zero-padded lease expiry) that every exit from `validating`
-     removes, so the partition holds exactly the live claims. The Reaper's existing 5-minute
-     schedule (`src/flavorval/sweep.ts`) queries it for leases that ended before now, releases
-     each `validating → pending` conditional on the same token AND an expired lease (so a row a
-     later run holds, or a run still in its budget, is never touched, however stale the index
-     read), and re-triggers validation with an async invoke of the smoke λ — the Reaper's only
-     new authority. The re-trigger is capped: a row's `autoRecoveries` counter is incremented only
-     by that release and removed by every verdict, repoint and operator-initiated claim, and past
-     3 consecutive recoveries the row is still released but left `pending` with a reason asking
-     for a re-validate, because each attempt launches a microVM and a run that dies
-     deterministically must not become one VM per sweep. The sweep is hosted by the Reaper, not
-     the smoke λ, because the smoke λ's reserved concurrency of 1 would throttle a scheduled
-     sweep behind the very run it is meant to recover.
+     FLAVORCLAIMS`, `gsi1sk` = zero-padded due time, here the lease expiry), and the partition
+     holds exactly the rows with recovery still owed: live claims and retrigger markers (below).
+     The Reaper's existing 5-minute schedule (`src/flavorval/sweep.ts`) queries it for entries due
+     before now. An expired claim is released `validating → pending` conditional on the same token,
+     an expired lease AND the recovery count the sweep's decision was based on (so a row a later
+     run holds, or a run still in its budget, is never touched, however stale the index read, and
+     the stored reason always matches the decision). That same write turns the row's index entry
+     into a **retrigger marker** (`retriggerToken`, due now) rather than removing it, so there is
+     no instant at which the row has left `validating` and nothing records that a restart is owed.
+     The restart itself is an async invoke of the smoke λ — the Reaper's only new authority — and
+     an invoke can be refused, accepted and then dropped (reserved concurrency 1 throttles a burst
+     past Lambda's async retries), or never sent because the Reaper died. So only a run's CLAIM
+     consumes the marker. Before each send the sweep records the attempt and pushes the marker out
+     by a 15-minute backoff (longer than an event can queue behind an in-flight run); a refused
+     send re-arms it for the next tick without spending the attempt; an accepted send that never
+     produces a claim falls due again after the backoff; after 3 accepted sends with no claim the
+     marker is abandoned with a reason asking for a re-validate. A late duplicate event is
+     harmless: its claim is a CAS on a row that is no longer `pending`. Marker bookkeeping does not
+     bump `rev`, since a bump would refuse the very claim the restart is trying to produce.
+     Operator actions that make a run owed (registration, re-validate, image repoint) write the
+     same marker in the same write, due after the backoff, because the Mgmt λ's own invoke has the
+     same failure modes. The re-trigger of a run that claimed and then died is capped separately:
+     a row's `autoRecoveries` counter is incremented only by the sweep's release and removed by
+     every verdict, repoint and operator-initiated claim, and past 3 consecutive recoveries the row
+     is still released but left `pending` with no marker and a reason asking for a re-validate,
+     because each attempt launches a microVM and a run that dies deterministically must not become
+     one VM per sweep. The sweep is hosted by the Reaper, not the smoke λ, because the smoke λ's
+     reserved concurrency of 1 would throttle a scheduled sweep behind the very run it is meant to
+     recover.
 
      Every GitHub listing the smoke run reads is **read to completion or fails**. Each caller is
      looking for one item — our nonce runner, our dispatched run, the job carrying our nonce — so
@@ -2314,8 +2330,9 @@ the static gates; the smoke run itself is verified against a live environment.
   assembled from OBSERVATIONS, and an observation never made is `undefined` — a run whose job never
   concluded has no `workflowConclusion`. Without the option the client refuses the whole write, and
   because that refusal happens INSIDE the verdict write it also defeats the `pending` fallback, whose
-  own write fails identically: the row is stranded in `validating`, which nothing but a manual
-  re-validate can leave. Live evidence (2026-08-20): a completed run classified `invalid`, logged its
+  own write fails identically: the row was stranded in `validating` (before the reconciliation
+  sweep existed nothing but a manual re-validate could leave it; now it costs a lease plus a sweep
+  interval). Live evidence (2026-08-20): a completed run classified `invalid`, logged its
   verdict, threw `Pass options.removeUndefinedValues=true`, and left the row `validating` for two
   days. Dropping an absent observation is the intended encoding — the field is optional — whereas
   failing the write loses the verdict entirely. A *false* observation is a real observation and is

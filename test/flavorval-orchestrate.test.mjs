@@ -1007,6 +1007,10 @@ function rowModel(clock) {
         validationRunId: input.runId,
         validationLeaseUntil: input.leaseUntil,
       });
+      // The claim consumes any owed restart; the index entry is now the live claim's.
+      delete row.retriggerToken;
+      delete row.retriggerAttempts;
+      row.due = input.leaseUntil;
       if (!input.autoRecovery) delete row.autoRecoveries;
       bump();
       return true;
@@ -1016,28 +1020,78 @@ function rowModel(clock) {
       if (!row || row.state !== 'validating') return undefined;
       if (row.validationRunId !== input.runId) return undefined;
       if (!(row.validationLeaseUntil < input.nowMs)) return undefined;
+      if ((row.autoRecoveries ?? 0) !== input.expectAutoRecoveries) return undefined;
       row.state = 'pending';
       row.reason = input.reason;
       delete row.validationRunId;
       delete row.validationLeaseUntil;
       row.autoRecoveries = (row.autoRecoveries ?? 0) + 1;
+      if (input.retrigger) {
+        row.retriggerToken = input.retrigger.token;
+        row.retriggerAttempts = 0;
+        row.due = input.retrigger.dueAtMs;
+      } else {
+        delete row.due;
+      }
       bump();
       return { autoRecoveries: row.autoRecoveries };
     },
-    /** What the live-claim index would return for `listExpiredFlavorClaims(nowMs)`. */
+    /** The guard every retrigger bookkeeping write shares (no `rev` bump, as in the store). */
+    owes(token) {
+      return Boolean(row) && row.state === 'pending' && row.retriggerToken === token;
+    },
+    markSent(input) {
+      if (!m.owes(input.token) || row.retriggerAttempts !== input.attempts) return false;
+      row.retriggerAttempts = input.attempts + 1;
+      row.due = input.nextDueAtMs;
+      return true;
+    },
+    rearm(input) {
+      if (!m.owes(input.token) || row.retriggerAttempts !== input.attempts) return false;
+      row.retriggerAttempts = Math.max(0, input.attempts - 1);
+      row.due = input.dueAtMs;
+      return true;
+    },
+    abandon(input) {
+      if (!m.owes(input.token)) return false;
+      row.reason = input.reason;
+      delete row.retriggerToken;
+      delete row.retriggerAttempts;
+      delete row.due;
+      return true;
+    },
+    /** An operator action that writes a marker in the same write (registration/re-validate). */
+    schedule(token, dueAtMs) {
+      if (row.state !== 'pending') return false;
+      row.retriggerToken = token;
+      row.retriggerAttempts = 0;
+      row.due = dueAtMs;
+      return true;
+    },
+    /** What the index would return for `listDueFlavorRecoveries(nowMs)`. */
     expired(nowMs) {
-      const claims =
-        row && row.state === 'validating' && row.validationLeaseUntil < nowMs
-          ? [
-              {
-                installationId: row.installationId,
-                name: row.name,
-                runId: row.validationRunId,
-                leaseUntil: row.validationLeaseUntil,
-                autoRecoveries: row.autoRecoveries ?? 0,
-              },
-            ]
-          : [];
+      const claims = [];
+      if (row && row.due !== undefined && row.due < nowMs) {
+        if (row.state === 'validating') {
+          claims.push({
+            kind: 'claim',
+            installationId: row.installationId,
+            name: row.name,
+            runId: row.validationRunId,
+            leaseUntil: row.validationLeaseUntil,
+            autoRecoveries: row.autoRecoveries ?? 0,
+          });
+        } else if (row.state === 'pending' && row.retriggerToken) {
+          claims.push({
+            kind: 'retrigger',
+            installationId: row.installationId,
+            name: row.name,
+            token: row.retriggerToken,
+            attempts: row.retriggerAttempts ?? 0,
+            autoRecoveries: row.autoRecoveries ?? 0,
+          });
+        }
+      }
       return { claims, truncated: false };
     },
     fence() {
@@ -1057,6 +1111,9 @@ function rowModel(clock) {
       delete row.validationRunId;
       delete row.validationLeaseUntil;
       delete row.autoRecoveries;
+      delete row.retriggerToken;
+      delete row.retriggerAttempts;
+      delete row.due;
       bump();
       return true;
     },
@@ -1066,6 +1123,9 @@ function rowModel(clock) {
       delete row.validationRunId;
       delete row.validationLeaseUntil;
       delete row.evidence;
+      delete row.retriggerToken;
+      delete row.retriggerAttempts;
+      delete row.due;
       bump();
     },
     /** DELETE then a fresh registration under the same name: `rev` starts over. */
@@ -1270,14 +1330,20 @@ async function strandingRun(m, nonce = 'dead01') {
 }
 
 /** Sweep deps over the row model; `onTrigger` receives every re-trigger request. */
+const SWEEP = { maxAutoRecoveries: 3, maxSends: 3, backoffMs: 900_000 };
 function sweepDeps(m, onTrigger) {
+  let n = 0;
   return {
-    listExpired: async (nowMs) => m.expired(nowMs),
+    listDue: async (nowMs) => m.expired(nowMs),
     release: async (input) => m.releaseExpired(input),
+    markSent: async (input) => m.markSent(input),
+    rearm: async (input) => m.rearm(input),
+    abandon: async (input) => m.abandon(input),
     trigger: async (input) => {
-      await onTrigger(input);
-      return true;
+      const r = await onTrigger(input);
+      return r === undefined ? true : r;
     },
+    token: () => `tok${++n}`,
     log: () => {},
   };
 }
@@ -1293,7 +1359,7 @@ test('an unsettled claim is released and re-validated automatically once its lea
   const early = await sweepExpiredFlavorClaims(
     sweepDeps(m, () => assert.fail('no re-trigger before the lease expires')),
     lease - 1,
-    3,
+    SWEEP,
   );
   assert.equal(early.released, 0);
   assert.equal(m.row.state, 'validating');
@@ -1305,20 +1371,178 @@ test('an unsettled claim is released and re-validated automatically once its lea
     sweepDeps(m, async (req) => {
       triggered.push(req);
       assert.equal(m.row.state, 'pending', 'released BEFORE the re-trigger, so the new claim can land');
+      assert.ok(m.row.retriggerToken, 'the restart is recorded on the row before it is sent');
       const s2 = scenario(happyOpts());
       useModel(s2, m);
       const out = await runValidation(s2.deps, req, FAST);
       assert.equal(out.state, 'valid');
     }),
     lease + 1,
-    3,
+    SWEEP,
   );
-  assert.deepEqual(res, { expired: 1, released: 1, retriggered: 1, leftPending: 0, truncated: false });
+  assert.deepEqual(res, {
+    expired: 1,
+    released: 1,
+    retriggered: 1,
+    deferred: 0,
+    leftPending: 0,
+    truncated: false,
+  });
   assert.equal(triggered.length, 1);
   assert.equal(triggered[0].actor, SWEEP_ACTOR);
   assert.equal(triggered[0].autoRecovery, true);
   assert.equal(m.row.state, 'valid', 'no operator action was needed to leave validating');
   assert.equal(m.row.autoRecoveries, undefined, 'a verdict resets the recovery counter');
+  assert.equal(m.row.retriggerToken, undefined, "the run's claim consumed the restart");
+  assert.equal(m.row.due, undefined, 'nothing left in the index');
+});
+
+// ---- the restart itself must be durable (review finding 1794563407714-749d46:1) --------------
+//
+// Releasing the claim and invoking the smoke λ are two effects. Between them the row has left
+// `validating`; if the invoke fails, is dropped, or the Reaper dies, nothing enumerated pending
+// rows, so the restart was lost until an operator noticed. These tests break each window and
+// require a LATER tick, with no operator action, to bring the row to a verdict.
+
+/** Strand a row and expire its lease; returns the clock setter. */
+async function expiredStrandedRow() {
+  const clock = { t: 1_700_000_000_000 };
+  const m = rowModel(() => clock.t);
+  await strandingRun(m);
+  clock.t = m.row.validationLeaseUntil + 1;
+  return { m, clock };
+}
+
+/** A sweep trigger that actually runs the smoke λ against the model. */
+function runsValidation(m) {
+  return async (req) => {
+    const s = scenario(happyOpts());
+    useModel(s, m);
+    await runValidation(s.deps, req, FAST);
+  };
+}
+
+for (const [label, failure] of [
+  ['throws', () => Promise.reject(new Error('TooManyRequestsException'))],
+  ['returns false (not configured)', () => false],
+]) {
+  test(`a restart whose invoke ${label} is resent on the next tick and reaches a verdict`, async () => {
+    const { m, clock } = await expiredStrandedRow();
+    const first = await sweepExpiredFlavorClaims(sweepDeps(m, failure), clock.t, SWEEP);
+    assert.equal(first.released, 1);
+    assert.equal(first.retriggered, 0);
+    assert.equal(first.deferred, 1);
+    assert.equal(m.row.state, 'pending');
+    assert.ok(m.row.retriggerToken, 'the owed restart survives the failed invoke');
+    assert.equal(m.row.retriggerAttempts, 0, 'a refused send does not spend the restart budget');
+    assert.doesNotMatch(m.row.reason, /restarted automatically/, 'the row never claims a restart happened');
+
+    clock.t += 300_000; // the next Reaper tick
+    const second = await sweepExpiredFlavorClaims(sweepDeps(m, runsValidation(m)), clock.t, SWEEP);
+    assert.equal(second.retriggered, 1);
+    assert.equal(m.row.state, 'valid', 'recovered with no operator action');
+    assert.equal(m.row.retriggerToken, undefined);
+  });
+}
+
+test('a Reaper that dies after the release, before any send, leaves the restart due', async () => {
+  const { m, clock } = await expiredStrandedRow();
+  // The crash window: the release has landed, then the process dies before markSent / invoke.
+  const deps = sweepDeps(m, () => assert.fail('the dead sweep sends nothing'));
+  deps.markSent = async () => {
+    throw new Error('Runtime exited');
+  };
+  const first = await sweepExpiredFlavorClaims(deps, clock.t, SWEEP);
+  assert.equal(first.released, 1);
+  assert.equal(m.row.state, 'pending');
+  assert.ok(m.row.retriggerToken);
+
+  clock.t += 300_000;
+  const second = await sweepExpiredFlavorClaims(sweepDeps(m, runsValidation(m)), clock.t, SWEEP);
+  assert.equal(second.retriggered, 1);
+  assert.equal(m.row.state, 'valid');
+});
+
+test('an invoke that is accepted but never runs is resent after the backoff, not before', async () => {
+  const { m, clock } = await expiredStrandedRow();
+  // Accepted by the Lambda API, then dropped (e.g. throttled past Lambda's async retries).
+  const dropped = [];
+  await sweepExpiredFlavorClaims(sweepDeps(m, (req) => void dropped.push(req)), clock.t, SWEEP);
+  assert.equal(dropped.length, 1);
+  assert.equal(m.row.retriggerAttempts, 1);
+
+  // A tick inside the backoff does not resend: the event may still be queued behind a run.
+  clock.t += 300_000;
+  const quiet = await sweepExpiredFlavorClaims(
+    sweepDeps(m, () => assert.fail('no resend inside the backoff')),
+    clock.t,
+    SWEEP,
+  );
+  assert.equal(quiet.expired, 0);
+
+  // Past the backoff with no claim having taken the marker: resent, and this one runs.
+  clock.t += SWEEP.backoffMs;
+  const res = await sweepExpiredFlavorClaims(sweepDeps(m, runsValidation(m)), clock.t, SWEEP);
+  assert.equal(res.retriggered, 1);
+  assert.equal(m.row.state, 'valid');
+});
+
+test('a late duplicate of a resent restart cannot start a second run', async () => {
+  const { m, clock } = await expiredStrandedRow();
+  const dropped = [];
+  await sweepExpiredFlavorClaims(sweepDeps(m, (req) => void dropped.push(req)), clock.t, SWEEP);
+  clock.t += SWEEP.backoffMs + 1;
+  await sweepExpiredFlavorClaims(sweepDeps(m, runsValidation(m)), clock.t, SWEEP);
+  assert.equal(m.row.state, 'valid');
+  const rev = m.row.rev;
+  // The first, "dropped" event finally arrives.
+  const s = scenario(happyOpts());
+  useModel(s, m);
+  const late = await runValidation(s.deps, dropped[0], FAST);
+  assert.equal(late.ran, false, 'the row is not pending, so its claim is refused');
+  assert.equal(m.row.rev, rev, 'and it wrote nothing');
+});
+
+test('accepted sends that never produce a claim are capped, then handed to the operator', async () => {
+  const { m, clock } = await expiredStrandedRow();
+  let sends = 0;
+  const deps = sweepDeps(m, () => void (sends += 1));
+  for (let i = 0; i < SWEEP.maxSends + 2; i++) {
+    await sweepExpiredFlavorClaims(deps, clock.t, SWEEP);
+    clock.t += SWEEP.backoffMs + 1;
+  }
+  assert.equal(sends, SWEEP.maxSends, 'no invoke past the send cap');
+  assert.equal(m.row.state, 'pending');
+  assert.equal(m.row.retriggerToken, undefined, 'the abandoned restart left the index');
+  assert.match(m.row.reason, /no run started.*re-validate to try again/);
+});
+
+test('an operator registration whose own invoke was dropped is recovered by the sweep', async () => {
+  // Same failure class on the Mgmt side: registration writes the marker in the same write, due
+  // after the backoff; the console's invoke is dropped; the sweep sends it.
+  let t = 1_700_000_000_000;
+  const m = rowModel(() => t);
+  assert.equal(m.schedule('op-tok', t + SWEEP.backoffMs), true);
+  t += SWEEP.backoffMs - 1;
+  const early = await sweepExpiredFlavorClaims(sweepDeps(m, () => assert.fail('too early')), t, SWEEP);
+  assert.equal(early.expired, 0, "the console's own invoke gets the first chance");
+  t += 2;
+  const res = await sweepExpiredFlavorClaims(sweepDeps(m, runsValidation(m)), t, SWEEP);
+  assert.equal(res.retriggered, 1);
+  assert.equal(m.row.state, 'valid');
+});
+
+test('an operator registration whose own invoke ran is not re-sent: the claim consumed the marker', async () => {
+  let t = 1_700_000_000_000;
+  const m = rowModel(() => t);
+  m.schedule('op-tok', t + SWEEP.backoffMs);
+  const s = scenario(happyOpts());
+  useModel(s, m);
+  await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(m.row.state, 'valid');
+  t += SWEEP.backoffMs + 1;
+  const res = await sweepExpiredFlavorClaims(sweepDeps(m, () => assert.fail('no resend')), t, SWEEP);
+  assert.equal(res.expired, 0);
 });
 
 test('the sweep never releases a claim a later run holds, even from a stale index read', async () => {
@@ -1332,16 +1556,9 @@ test('the sweep never releases a claim a later run holds, even from a stale inde
     m.claim({ runId: 'live02', leaseUntil: t + 900_000, expect: m.snap(), autoRecovery: false }),
     true,
   );
-  const res = await sweepExpiredFlavorClaims(
-    {
-      listExpired: async () => stale,
-      release: async (input) => m.releaseExpired(input),
-      trigger: async () => assert.fail('nothing was released, so nothing is re-triggered'),
-      log: () => {},
-    },
-    t,
-    3,
-  );
+  const deps = sweepDeps(m, () => assert.fail('nothing was released, so nothing is re-triggered'));
+  deps.listDue = async () => stale;
+  const res = await sweepExpiredFlavorClaims(deps, t, SWEEP);
   assert.equal(res.released, 0);
   assert.equal(m.row.state, 'validating');
   assert.equal(m.row.validationRunId, 'live02', 'the live claim is untouched');
@@ -1364,33 +1581,49 @@ test('a flavor whose runs keep dying is re-triggered at most N times, then left 
 
   strand(false); // the operator's registration
   for (let i = 1; i <= 3; i++) {
-    const r = await sweepExpiredFlavorClaims(deps, t, 3);
+    const r = await sweepExpiredFlavorClaims(deps, t, SWEEP);
     assert.equal(r.retriggered, 1, `recovery ${i} is re-triggered`);
     assert.equal(m.row.state, 'pending');
-    strand(true); // the re-triggered run dies the same way
+    strand(true); // the re-triggered run claims (consuming the marker) and dies the same way
+    assert.equal(m.row.retriggerToken, undefined);
   }
-  const last = await sweepExpiredFlavorClaims(deps, t, 3);
+  const last = await sweepExpiredFlavorClaims(deps, t, SWEEP);
   assert.equal(last.released, 1, 'the row still leaves validating');
   assert.equal(last.retriggered, 0, 'but no fourth smoke VM is launched');
   assert.equal(last.leftPending, 1);
   assert.equal(triggers, 3);
   assert.equal(m.row.state, 'pending');
+  assert.equal(m.row.retriggerToken, undefined, 'no restart is owed past the cap');
   assert.match(m.row.reason, /re-validate to try again/);
 
   // An operator's re-validate is a fresh decision: it resets the counter.
   strand(false);
-  const after = await sweepExpiredFlavorClaims(deps, t, 3);
+  const after = await sweepExpiredFlavorClaims(deps, t, SWEEP);
   assert.equal(after.retriggered, 1);
 });
 
-test('one row whose release throws does not stop the sweep releasing the others', async () => {
+test('a release decided on a stale recovery count is refused, so the stored reason cannot lie', async () => {
+  let t = 1_700_000_000_000;
+  const m = rowModel(() => t);
+  await strandingRun(m);
+  t = m.row.validationLeaseUntil + 1;
+  const stale = m.expired(t);
+  m.row.autoRecoveries = 3; // what the row really says, the index copy said 0
+  const deps = sweepDeps(m, () => assert.fail('no restart from a stale decision'));
+  deps.listDue = async () => stale;
+  const res = await sweepExpiredFlavorClaims(deps, t, SWEEP);
+  assert.equal(res.released, 0);
+  assert.equal(m.row.state, 'validating', 'left for the next tick, which reads the real count');
+});
+
+test('one row whose release throws does not stop the sweep processing the others', async () => {
   const released = [];
   const res = await sweepExpiredFlavorClaims(
     {
-      listExpired: async () => ({
+      listDue: async () => ({
         claims: [
-          { installationId: 1, name: 'custom-a', runId: 'a', leaseUntil: 1, autoRecoveries: 0 },
-          { installationId: 1, name: 'custom-b', runId: 'b', leaseUntil: 1, autoRecoveries: 0 },
+          { kind: 'claim', installationId: 1, name: 'custom-a', runId: 'a', leaseUntil: 1, autoRecoveries: 0 },
+          { kind: 'claim', installationId: 1, name: 'custom-b', runId: 'b', leaseUntil: 1, autoRecoveries: 0 },
         ],
         truncated: true,
       }),
@@ -1399,15 +1632,19 @@ test('one row whose release throws does not stop the sweep releasing the others'
         released.push(input.name);
         return { autoRecoveries: 1 };
       },
+      markSent: async () => true,
+      rearm: async () => true,
+      abandon: async () => true,
       trigger: async () => false,
+      token: () => 't',
       log: () => {},
     },
     10,
-    3,
+    SWEEP,
   );
   assert.deepEqual(released, ['custom-b']);
   assert.equal(res.released, 1);
-  assert.equal(res.leftPending, 1, 'a trigger that could not be sent leaves the row pending, not validating');
+  assert.equal(res.deferred, 1, 'a trigger that could not be sent is deferred, not dropped');
   assert.equal(res.truncated, true);
 });
 

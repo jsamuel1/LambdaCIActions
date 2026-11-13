@@ -878,3 +878,32 @@ test('an ordinary built-in route is still rewritten exactly as before', async ()
     assert.equal(preview.skipped, 0);
   }
 });
+
+// 5. Every operator action that makes a validation run owed records that IN THE SAME WRITE
+//    (review finding 1794563407714-749d46:1). The Mgmt λ's trigger is an async invoke that can be
+//    refused or dropped; without the marker the row sits `pending` with nothing coming back for it.
+//    No request-level harness exists for these routes, so this pins the source: each store write
+//    that precedes `triggerFlavorValidation` must pass `owedValidation()`.
+test('registration and every re-validate branch carry a retrigger marker into the store write', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/mgmt/handler.ts', import.meta.url), 'utf8');
+  const body = (fn) => {
+    const start = src.indexOf(`async function ${fn}(`);
+    assert.ok(start > 0, `${fn} not found`);
+    const end = src.indexOf('\nasync function ', start + 1);
+    return src.slice(start, end === -1 ? undefined : end);
+  };
+  const register = body('registerFlavorRoute');
+  assert.match(register, /registerCustomFlavor\([\s\S]*?owedValidation\(\)[\s\S]*?\);/);
+  assert.ok(register.indexOf('owedValidation()') < register.indexOf('triggerFlavorValidation('));
+
+  const revalidate = body('revalidateFlavorRoute');
+  assert.match(revalidate, /repointFlavorImage\(\{[\s\S]*?retrigger: owedValidation\(\)/);
+  assert.match(revalidate, /transitionFlavorValidation\(\{[\s\S]*?retrigger: owedValidation\(\)/);
+  // The already-pending branch has no transition to ride on, so it schedules the marker itself.
+  assert.match(revalidate, /scheduleFlavorRetrigger\(/);
+  const trigger = revalidate.indexOf('triggerFlavorValidation(');
+  for (const call of ['repointFlavorImage(', 'transitionFlavorValidation(', 'scheduleFlavorRetrigger(']) {
+    assert.ok(revalidate.indexOf(call) < trigger, `${call} must precede the invoke`);
+  }
+});

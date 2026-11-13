@@ -1,9 +1,15 @@
+import { randomBytes } from 'node:crypto';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { listMicroVMs, terminateMicroVM } from '../shared/microvm.js';
 import { listRunsByStatus, transitionRun } from '../shared/run-store.js';
 import {
+  FLAVOR_RETRIGGER_BACKOFF_MS,
   MAX_FLAVOR_AUTO_RECOVERIES,
-  listExpiredFlavorClaims,
+  MAX_FLAVOR_RETRIGGER_SENDS,
+  abandonFlavorRetrigger,
+  listDueFlavorRecoveries,
+  markFlavorRetriggerSent,
+  rearmFlavorRetrigger,
   releaseExpiredFlavorClaim,
 } from '../shared/flavor-store.js';
 import { sweepExpiredFlavorClaims, type SweepResult } from '../flavorval/sweep.js';
@@ -26,8 +32,9 @@ import type { RunRecord } from '../shared/types.js';
  *      tag VMs, ADR-015): `running` runs whose VM id is no longer live → `timed_out`
  *      (orphan); runs stuck in `queued`/`provisioning` → `failed` (likely a quota wall).
  *   4. If a closed ghost run still has a live VM (by its stored id), terminate it too.
- *   5. Release custom-flavor validation claims whose lease expired and re-trigger their validation
- *      (ADR-041, `src/flavorval/sweep.ts`). Isolated: a fault there never affects 1–4.
+ *   5. Release custom-flavor validation claims whose lease expired, and (re)send validation runs
+ *      that are owed but never started (ADR-041, `src/flavorval/sweep.ts`). Isolated: a fault there
+ *      never affects 1–4.
  *
  * Idempotent: transitions are guarded (forward-only) so re-running the sweep is safe, and
  * terminating an already-gone VM is treated as success.
@@ -127,15 +134,18 @@ const FLAVORVAL_FUNCTION_NAME = process.env.FLAVORVAL_FUNCTION_NAME ?? '';
 
 /**
  * Step 5. Never throws: the run reaping above is the Reaper's primary job and must not be failed by
- * a flavor-store fault. With no smoke λ configured the claims are still RELEASED (the row leaves
- * `validating`) but nothing is re-triggered.
+ * a flavor-store fault. With no smoke λ configured every send is refused, so expired claims are still
+ * RELEASED (the row leaves `validating`) and their restart markers stay due until one is.
  */
 async function sweepFlavorClaims(now: number): Promise<SweepResult | undefined> {
   try {
     return await sweepExpiredFlavorClaims(
       {
-        listExpired: (nowMs) => listExpiredFlavorClaims(nowMs),
+        listDue: (nowMs) => listDueFlavorRecoveries(nowMs),
         release: (input) => releaseExpiredFlavorClaim(input),
+        markSent: (input) => markFlavorRetriggerSent(input),
+        rearm: (input) => rearmFlavorRetrigger(input),
+        abandon: (input) => abandonFlavorRetrigger(input),
         trigger: async (input) => {
           if (!FLAVORVAL_FUNCTION_NAME) return false;
           await lambda.send(
@@ -147,10 +157,15 @@ async function sweepFlavorClaims(now: number): Promise<SweepResult | undefined> 
           );
           return true;
         },
+        token: () => randomBytes(12).toString('hex'),
         log: (record) => console.log(JSON.stringify(record)),
       },
       now,
-      MAX_FLAVOR_AUTO_RECOVERIES,
+      {
+        maxAutoRecoveries: MAX_FLAVOR_AUTO_RECOVERIES,
+        maxSends: MAX_FLAVOR_RETRIGGER_SENDS,
+        backoffMs: FLAVOR_RETRIGGER_BACKOFF_MS,
+      },
     );
   } catch (err) {
     console.error(

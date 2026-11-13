@@ -312,7 +312,9 @@ test('a claim enters the sparse live-claim index keyed by its lease; every exit 
   assert.deepEqual(claim.ExpressionAttributeValues[':claimsPk'], { S: store.FLAVOR_CLAIMS_GSI1PK });
   assert.deepEqual(claim.ExpressionAttributeValues[':claimsSk'], { S: '0001700000900000' });
   // An operator-initiated claim resets the automatic-recovery counter.
-  assert.match(claim.UpdateExpression, /REMOVE [^A]*autoRecoveries/);
+  assert.match(claim.UpdateExpression, /REMOVE [^]*\bautoRecoveries\b/);
+  // The claim consumes an owed restart: the marker goes, the index entry becomes the claim's.
+  assert.match(claim.UpdateExpression, /REMOVE [^]*retriggerToken, retriggerAttempts/);
   for (const req of [verdict, repoint]) {
     assert.match(req.UpdateExpression, /gsi1pk/);
     assert.match(req.UpdateExpression, /REMOVE .*gsi1pk, gsi1sk/);
@@ -346,7 +348,7 @@ test('the lease sort key orders numerically as a string', () => {
   ]);
 });
 
-test('the sweep release is guarded by token AND expired lease, bumps rev and the recovery counter', async () => {
+test('the sweep release is guarded by token, expired lease AND the decided count, bumps rev + counter', async () => {
   const w = interceptWire();
   try {
     await store.releaseExpiredFlavorClaim({
@@ -355,20 +357,112 @@ test('the sweep release is guarded by token AND expired lease, bumps rev and the
       runId: 'run-a',
       nowMs: 1_700_001_000_000,
       reason: 'expired',
+      expectAutoRecoveries: 0,
+    });
+    await store.releaseExpiredFlavorClaim({
+      installationId: 42,
+      name: 'custom-good',
+      runId: 'run-a',
+      nowMs: 1_700_001_000_000,
+      reason: 'expired',
+      expectAutoRecoveries: 2,
+      retrigger: { token: 'tok-1', dueAtMs: 1_700_001_000_000 },
     });
   } finally {
     w.restore();
   }
-  const req = w.bodies[0];
-  assert.match(req.ConditionExpression, /#state = :validating AND validationRunId = :runId/);
-  assert.match(req.ConditionExpression, /validationLeaseUntil < :nowMs/);
-  assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
-  assert.deepEqual(req.ExpressionAttributeValues[':nowMs'], { N: '1700001000000' });
-  assert.match(req.UpdateExpression, /REMOVE validationRunId, validationLeaseUntil, gsi1pk, gsi1sk/);
-  assert.match(req.UpdateExpression, /ADD rev :one, autoRecoveries :one$/);
+  const [capped, restart] = w.bodies;
+  for (const req of [capped, restart]) {
+    assert.match(req.ConditionExpression, /#state = :validating AND validationRunId = :runId/);
+    assert.match(req.ConditionExpression, /validationLeaseUntil < :nowMs/);
+    assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
+    assert.deepEqual(req.ExpressionAttributeValues[':nowMs'], { N: '1700001000000' });
+    assert.match(req.UpdateExpression, /ADD rev :one, autoRecoveries :one$/);
+  }
+  // Pinned to the count the reason was decided on, so the stored reason cannot contradict the row.
+  assert.match(capped.ConditionExpression, /attribute_not_exists\(autoRecoveries\) OR autoRecoveries = :recoveries/);
+  assert.match(restart.ConditionExpression, /AND autoRecoveries = :recoveries$/);
+  assert.deepEqual(restart.ExpressionAttributeValues[':recoveries'], { N: '2' });
+  // Past the cap: out of the index entirely, nothing owed.
+  assert.match(capped.UpdateExpression, /REMOVE validationRunId, validationLeaseUntil, gsi1pk, gsi1sk, retriggerToken/);
+  // With a restart: the index entry is KEPT and becomes the marker in the same write.
+  assert.doesNotMatch(restart.UpdateExpression, /REMOVE[^A]*gsi1/);
+  assert.match(restart.UpdateExpression, /retriggerToken = :tok, retriggerAttempts = :zero, gsi1sk = :due/);
+  assert.deepEqual(restart.ExpressionAttributeValues[':tok'], { S: 'tok-1' });
+  assert.deepEqual(restart.ExpressionAttributeValues[':due'], { S: '0001700001000000' });
 });
 
-test('the expired-claim read queries only the claim partition, below now, and follows pages', async () => {
+test('restart bookkeeping is guarded by the owed token on a pending row and never bumps rev', async () => {
+  const w = interceptWire();
+  const ids = { installationId: 42, name: 'custom-good', token: 'tok-1' };
+  try {
+    await store.markFlavorRetriggerSent({ ...ids, attempts: 1, nextDueAtMs: 9 });
+    await store.rearmFlavorRetrigger({ ...ids, attempts: 2, dueAtMs: 5 });
+    await store.abandonFlavorRetrigger({ ...ids, reason: 'gave up', nowMs: 1 });
+    await store.scheduleFlavorRetrigger({ ...ids, dueAtMs: 7 });
+  } finally {
+    w.restore();
+  }
+  const [mark, rearm, abandon, schedule] = w.bodies;
+  for (const req of [mark, rearm, abandon]) {
+    assert.match(req.ConditionExpression, /#state = :pending OR attribute_not_exists\(#state\)\) AND retriggerToken = :tok/);
+    assert.deepEqual(req.ExpressionAttributeValues[':tok'], { S: 'tok-1' });
+  }
+  for (const req of [mark, rearm, abandon, schedule]) {
+    // A rev bump would refuse the very claim the restart is trying to produce.
+    assert.doesNotMatch(req.UpdateExpression, /\brev\b/);
+  }
+  assert.match(mark.ConditionExpression, /retriggerAttempts = :attempts$/);
+  assert.deepEqual(mark.ExpressionAttributeValues[':next'], { N: '2' });
+  assert.deepEqual(mark.ExpressionAttributeValues[':due'], { S: '0000000000000009' });
+  assert.deepEqual(rearm.ExpressionAttributeValues[':prev'], { N: '1' });
+  assert.match(abandon.UpdateExpression, /REMOVE retriggerToken, retriggerAttempts, gsi1pk, gsi1sk$/);
+  assert.match(schedule.ConditionExpression, /#state = :pending/);
+  assert.deepEqual(schedule.ExpressionAttributeValues[':rtPk'], { S: store.FLAVOR_CLAIMS_GSI1PK });
+});
+
+test('operator writes that make a run owed record the restart in the SAME write', async () => {
+  const w = interceptWire();
+  const retrigger = { token: 'op-tok', dueAtMs: 1_700_000_900_000 };
+  try {
+    // Registration's Put is preceded by its cap query; the query answer is `{}` (no rows).
+    await store.registerCustomFlavor(
+      {
+        installationId: 42,
+        base: 'good',
+        vcpu: 2,
+        memoryMb: 4096,
+        capabilities: [],
+        description: '',
+        imageArn: 'arn:x',
+      },
+      new Date(1_700_000_000_000),
+      retrigger,
+    );
+    await store.transitionFlavorValidation({ installationId: 42, name: 'custom-good', to: 'pending', retrigger });
+    await store.repointFlavorImage({ installationId: 42, name: 'custom-good', imageArn: 'arn:y', retrigger });
+  } finally {
+    w.restore();
+  }
+  const [, put, transition, repoint] = w.bodies;
+  assert.deepEqual(put.Item.retriggerToken, { S: 'op-tok' });
+  assert.deepEqual(put.Item.gsi1pk, { S: store.FLAVOR_CLAIMS_GSI1PK });
+  assert.deepEqual(put.Item.gsi1sk, { S: '0001700000900000' });
+  for (const req of [transition, repoint]) {
+    assert.match(req.UpdateExpression, /retriggerToken = /);
+    assert.match(req.UpdateExpression, /gsi1pk = /);
+    // Not both set and removed (DynamoDB would refuse the expression).
+    assert.doesNotMatch(req.UpdateExpression, /REMOVE[^]*\bgsi1pk\b/);
+    assert.doesNotMatch(req.UpdateExpression, /REMOVE[^]*retriggerToken/);
+  }
+  // A marker can only accompany a move to `pending`; a verdict with one is refused unsent.
+  assert.equal(
+    await store.transitionFlavorValidation({ installationId: 42, name: 'custom-good', to: 'valid', retrigger }),
+    false,
+  );
+});
+
+test('the due-recovery read queries only the claim partition, below now, follows pages, reads both kinds', async () => {
   const original = NodeHttpHandler.prototype.handle;
   const bodies = [];
   const pages = [
@@ -394,6 +488,15 @@ test('the expired-claim read queries only the claim partition, below now, and fo
           validationLeaseUntil: { N: '6' },
           autoRecoveries: { N: '2' },
         },
+        {
+          installationId: { N: '44' },
+          name: { S: 'custom-c' },
+          state: { S: 'pending' },
+          retriggerToken: { S: 'tok-c' },
+          retriggerAttempts: { N: '1' },
+        },
+        // A stale index copy of a row that has since reached a verdict: ignored.
+        { installationId: { N: '45' }, name: { S: 'custom-d' }, state: { S: 'valid' } },
       ],
     },
   ];
@@ -409,7 +512,7 @@ test('the expired-claim read queries only the claim partition, below now, and fo
   };
   let out;
   try {
-    out = await store.listExpiredFlavorClaims(1_700_000_000_000);
+    out = await store.listDueFlavorRecoveries(1_700_000_000_000);
   } finally {
     NodeHttpHandler.prototype.handle = original;
   }
@@ -420,10 +523,12 @@ test('the expired-claim read queries only the claim partition, below now, and fo
   assert.ok(bodies[1].ExclusiveStartKey);
   assert.equal(out.truncated, false);
   assert.deepEqual(
-    out.claims.map((c) => [c.name, c.runId, c.autoRecoveries]),
+    out.claims.map((c) => [c.kind, c.name, c.runId ?? c.token, c.autoRecoveries ?? c.attempts]),
     [
-      ['custom-a', 'r1', 0],
-      ['custom-b', 'r2', 2],
+      ['claim', 'custom-a', 'r1', 0],
+      ['claim', 'custom-b', 'r2', 2],
+      ['retrigger', 'custom-c', 'tok-c', 0],
     ],
   );
+  assert.equal(out.claims[2].attempts, 1);
 });

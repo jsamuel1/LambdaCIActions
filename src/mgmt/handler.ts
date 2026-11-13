@@ -70,6 +70,7 @@ import {
   validateWebhookTestBody,
 } from './validate.js';
 import {
+  FLAVOR_RETRIGGER_BACKOFF_MS,
   FlavorExistsError,
   InvalidFlavorError,
   TooManyFlavorsError,
@@ -80,6 +81,7 @@ import {
   registerCustomFlavor,
   repointFlavorImage,
   routableCustomFlavors,
+  scheduleFlavorRetrigger,
   transitionFlavorValidation,
   type CustomFlavorRecord,
 } from '../shared/flavor-store.js';
@@ -1603,6 +1605,10 @@ async function routableCustomFlavorsFor(installationId: number): Promise<{ name:
  * flavor row is already `pending`, so the console has something truthful to render either way, and
  * a lost invoke leaves the row `pending` rather than falsely `valid`.
  *
+ * A lost invoke is not the end of it: every caller writes a retrigger marker ({@link
+ * owedValidation}) in the same write that makes the run owed, and the Reaper's sweep resends the
+ * invoke if no run has claimed the row by the marker's due time.
+ *
  * Returns false when the trigger could not be delivered, so the caller can say so instead of
  * implying validation has begun.
  */
@@ -1627,6 +1633,20 @@ async function triggerFlavorValidation(input: {
     );
     return false;
   }
+}
+
+/**
+ * A retrigger marker for a run this request is about to trigger: due after the backoff, so this
+ * request's own invoke gets the first chance and the sweep only resends if it never produced a claim.
+ * Only when the smoke λ is configured — with none, the sweep could not send anything either, and a
+ * marker would only cycle through the index.
+ */
+function owedValidation(): { token: string; dueAtMs: number } | undefined {
+  if (!FLAVORVAL_FUNCTION_NAME) return undefined;
+  return {
+    token: crypto.randomBytes(12).toString('hex'),
+    dueAtMs: Date.now() + FLAVOR_RETRIGGER_BACKOFF_MS,
+  };
 }
 
 /** Resolve + authorize the `?installation=<id>` scope every custom-flavor route requires. */
@@ -1726,11 +1746,15 @@ async function registerFlavorRoute(
 
   let rec: CustomFlavorRecord;
   try {
-    rec = await registerCustomFlavor({
-      ...parsed.value,
-      installationId: scope.installationId,
-      actor: session.login,
-    });
+    rec = await registerCustomFlavor(
+      {
+        ...parsed.value,
+        installationId: scope.installationId,
+        actor: session.login,
+      },
+      undefined,
+      owedValidation(),
+    );
   } catch (err) {
     if (err instanceof FlavorExistsError) return problem(409, err.message);
     // The per-installation cap (`MAX_CUSTOM_FLAVORS_PER_INSTALLATION`) is what keeps the
@@ -1852,6 +1876,7 @@ async function revalidateFlavorRoute(
       name,
       imageArn: parsed.value.imageArn,
       actor: session.login,
+      retrigger: owedValidation(),
     });
     if (!res.changed) return problem(404, 'custom flavor not found');
   } else if (existing.state !== 'pending') {
@@ -1860,8 +1885,17 @@ async function revalidateFlavorRoute(
       name,
       to: 'pending',
       actor: session.login,
+      retrigger: owedValidation(),
     });
     if (!moved) return problem(409, 'flavor state changed concurrently — retry');
+  } else {
+    // Already `pending` (an earlier trigger never produced a run): no transition, but the run this
+    // request asks for is still owed. Refused only if a run claimed the row meanwhile — then
+    // validation is under way and nothing needs scheduling.
+    const owed = owedValidation();
+    if (owed) {
+      await scheduleFlavorRetrigger({ installationId: scope.installationId, name, ...owed });
+    }
   }
 
   const triggered = await triggerFlavorValidation({

@@ -815,8 +815,9 @@ export class ControlStack extends Stack {
       // minutes, not seconds. This is why the trigger is a fire-and-forget async invoke rather
       // than something the console waits on. The λ's own deadline is set BELOW this (see
       // FLAVORVAL_DEADLINE_MS) so it always has time to write a verdict: a λ killed by its
-      // timeout writes nothing and leaves the row in `validating`, inert until an operator
-      // re-validates.
+      // timeout writes nothing and leaves the row in `validating` until its lease expires and the
+      // Reaper's reconciliation sweep (src/flavorval/sweep.ts) releases and restarts it — a
+      // whole lease plus a sweep interval of delay.
       timeout: Duration.minutes(12),
       memorySize: 256,
       // One smoke run at a time per environment. A smoke run consumes the SAME microVM memory
@@ -843,10 +844,12 @@ export class ControlStack extends Stack {
     this.flavorvalFunctionArn = flavorval.functionArn;
 
     // The Reaper's 5-minute sweep releases validation claims whose lease expired — a run that could
-    // not reach DynamoDB or was killed outright writes no verdict — and re-triggers them (ADR-041,
+    // not reach DynamoDB or was killed outright writes no verdict — and (re)sends validation runs
+    // that are owed but never started: a restart marker sits in the same index until a run's claim
+    // consumes it, so a refused or dropped invoke is resent on a later tick (ADR-041,
     // src/flavorval/sweep.ts). Without a producer of that later run, an expired lease would only
     // PERMIT recovery. The sweep needs exactly one more authority: an async invoke of this λ. The
-    // table grant it already holds covers the GSI1 query and the conditional release.
+    // table grant it already holds covers the GSI1 query and the conditional writes.
     reaper.addEnvironment('FLAVORVAL_FUNCTION_NAME', flavorval.functionName);
     reaper.addToRolePolicy(
       new iam.PolicyStatement({

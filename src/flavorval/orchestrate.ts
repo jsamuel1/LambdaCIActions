@@ -582,8 +582,9 @@ export async function runValidation(
 
   // From here the row is `validating`, and it is OUR responsibility to move it out of that state
   // before returning. `validating` is not routable, so a row stuck there is fail-safe rather than
-  // dangerous — but it is also inert until an operator re-validates, so every path below writes a
-  // verdict, including the catch.
+  // dangerous — but it then waits a whole lease plus a sweep interval for the Reaper's
+  // reconciliation sweep to release and restart it, so every path below writes a verdict,
+  // including the catch.
   let seq: number | undefined;
   let microvmId: string | undefined;
   let runnerId: number | undefined;

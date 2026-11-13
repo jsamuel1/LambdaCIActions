@@ -40,8 +40,9 @@ const client = DynamoDBClient ? new DynamoDBClient({}) : undefined;
  * made is `undefined` — a run whose job never concluded has no `workflowConclusion`. Without this
  * option the document client REFUSES the whole write ("Pass options.removeUndefinedValues=true"),
  * and because the refusal happens inside the verdict write it also defeats the orchestrator's
- * `pending` fallback: the row is then stranded in `validating`, which nothing but a manual
- * re-validate can leave. Observed live on 2026-08-20 against `custom-brokenagent`. Dropping an
+ * `pending` fallback: the row is then stranded in `validating` until the reconciliation sweep
+ * releases it a lease later (before the sweep existed, only a manual re-validate could). Observed
+ * live on 2026-08-20 against `custom-brokenagent`. Dropping an
  * absent observation is exactly the intended encoding — the field is optional on
  * {@link FlavorValidationEvidence} — whereas failing the write loses the verdict entirely.
  */
@@ -95,16 +96,23 @@ export const MAX_CUSTOM_FLAVORS_PER_INSTALLATION = 64;
 export const MAX_FLAVOR_REASON_LENGTH = 1024;
 
 /**
- * GSI1 partition holding every LIVE smoke-run claim (ADR-041), keyed by lease expiry.
+ * GSI1 partition holding every flavor row with OUTSTANDING recovery work (ADR-041), keyed by the
+ * time that work falls due. Two kinds of row live here:
  *
- * Sparse: {@link claimFlavorValidation} writes `gsi1pk`/`gsi1sk` and EVERY write that leaves
- * `validating` removes them, so the partition holds exactly the rows some run currently holds. Its
- * own partition-key namespace, disjoint from `RUNSTATUS#`/`INSTALLS`/`REFUSALS`, so no other GSI1
- * reader can see these rows.
+ * - a LIVE smoke-run claim (`validating`), due at its lease expiry. {@link claimFlavorValidation}
+ *   writes it; every write that leaves `validating` without scheduling a restart removes it.
+ * - a RETRIGGER marker (`pending` + `retriggerToken`), due when the sweep should next try to start
+ *   validation again. {@link releaseExpiredFlavorClaim} writes it in the SAME conditional write
+ *   that releases an expired claim, so there is no instant at which the row is neither claimed nor
+ *   scheduled for a restart. It is removed only by the next claim (the restart actually began), by
+ *   an operator transition or repoint, or by the sweep giving up with an operator-facing reason.
  *
- * It exists for one reader: the reconciliation sweep ({@link listExpiredFlavorClaims}). A lease
- * only makes a stranded row ELIGIBLE for takeover; nothing would ever come back to take it over
- * unless something enumerates expired claims. Without an index that enumeration is a table scan.
+ * Sparse, and its own partition-key namespace, disjoint from `RUNSTATUS#`/`INSTALLS`/`REFUSALS`, so
+ * no other GSI1 reader can see these rows.
+ *
+ * It exists for one reader: the reconciliation sweep ({@link listDueFlavorRecoveries}). A lease
+ * only makes a stranded row ELIGIBLE for takeover, and an async invoke can fail or be dropped; the
+ * index is the durable record that recovery is still owed. Without it that enumeration is a scan.
  */
 export const FLAVOR_CLAIMS_GSI1PK = 'FLAVORCLAIMS';
 
@@ -127,6 +135,26 @@ export function flavorClaimGsi1sk(leaseUntilMs: number): string {
  * is reset by a terminal verdict and by an image repoint (a new artifact).
  */
 export const MAX_FLAVOR_AUTO_RECOVERIES = 3;
+
+/**
+ * How many times the sweep may SEND the restart for one retrigger marker before giving up.
+ *
+ * Distinct from {@link MAX_FLAVOR_AUTO_RECOVERIES}: that caps runs that claimed and then died (each
+ * one a microVM); this caps invokes that were accepted but never produced a claim at all (the event
+ * was dropped, or the λ fails before its claim on every attempt). A send that is REFUSED is not
+ * counted — the marker is re-armed for the next tick, so a Lambda API outage delays recovery rather
+ * than abandoning it.
+ */
+export const MAX_FLAVOR_RETRIGGER_SENDS = 3;
+
+/**
+ * How long after a send its marker falls due again. Must comfortably exceed the time for an
+ * accepted async invoke to reach the smoke λ and claim the row: with reserved concurrency 1 a queued
+ * event can wait out a whole in-flight run (12-minute timeout). A send that fires again early is
+ * harmless — the restarted run's claim is a CAS, so a duplicate finds the row claimed and exits —
+ * but it is a wasted invoke.
+ */
+export const FLAVOR_RETRIGGER_BACKOFF_MS = 15 * 60_000;
 
 /** Clip a reason to {@link MAX_FLAVOR_REASON_LENGTH} characters, marking that it was cut. */
 export function clampReason(reason: string): string {
@@ -255,6 +283,15 @@ export interface CustomFlavorRecord {
    * every other transition; caps automatic re-triggering at {@link MAX_FLAVOR_AUTO_RECOVERIES}.
    */
   autoRecoveries?: number;
+  /**
+   * Present while the reconciliation sweep still owes this row an automatic restart (ADR-041): set
+   * by {@link releaseExpiredFlavorClaim}, required by every later sweep write about that restart,
+   * and removed by the next claim, every transition and every repoint. See
+   * {@link FLAVOR_CLAIMS_GSI1PK}.
+   */
+  retriggerToken?: string;
+  /** Accepted sends of the current restart (see {@link MAX_FLAVOR_RETRIGGER_SENDS}). */
+  retriggerAttempts?: number;
   /**
    * Monotonic row revision (ADR-041). Absent on a freshly registered row (read as 0) and bumped by
    * EVERY later write — claim, verdict, release, operator re-validate, image repoint, fence. A claim
@@ -419,6 +456,8 @@ export class TooManyFlavorsError extends Error {
 export async function registerCustomFlavor(
   input: RegisterFlavorInput,
   now: Date = new Date(),
+  /** Record, in the registration write itself, that a validation run is owed. */
+  retrigger?: { token: string; dueAtMs: number },
 ): Promise<CustomFlavorRecord> {
   const rec = buildFlavorRecord(input, now);
   // Deliberately AFTER `buildFlavorRecord`: a malformed name or a built-in collision is a 400 that
@@ -431,7 +470,7 @@ export async function registerCustomFlavor(
     await requireDoc().send(
       new PutCommand({
         TableName: TABLE,
-        Item: rec,
+        Item: retrigger ? { ...rec, ...retriggerMarker(retrigger.token, retrigger.dueAtMs) } : rec,
         ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
       }),
     );
@@ -577,9 +616,15 @@ export async function transitionFlavorValidation(
     evidence?: FlavorValidationEvidence;
     actor?: string;
     now?: Date;
+    /**
+     * `to: 'pending'` only: record, in this same write, that a validation run is owed (see
+     * {@link retriggerMarker}). Used by the operator's re-validate.
+     */
+    retrigger?: { token: string; dueAtMs: number };
   },
   signal?: AbortSignal,
 ): Promise<boolean> {
+  if (input.retrigger && input.to !== 'pending') return false;
   const from = FLAVOR_VALIDATION_STATES.filter(
     (s) => canTransitionValidation(s, input.to) && (!input.from || input.from.includes(s)),
   );
@@ -624,7 +669,27 @@ export async function transitionFlavorValidation(
   // The automatic-recovery counter is reset by every transition: a verdict, a run's own release and
   // an operator's re-validate all prove the loop the counter guards (sweep → re-trigger → the run
   // dies again) is not happening. Only the sweep's own release increments it.
-  removes.push('validationRunId', 'validationLeaseUntil', 'gsi1pk', 'gsi1sk', 'autoRecoveries');
+  //
+  // A pending restart (`retriggerToken`) goes too: an operator re-validate or a verdict supersedes
+  // it, so the sweep must not start another run on its own afterwards.
+  removes.push(
+    'validationRunId',
+    'validationLeaseUntil',
+    'gsi1pk',
+    'gsi1sk',
+    'autoRecoveries',
+    'retriggerToken',
+    'retriggerAttempts',
+  );
+  if (input.retrigger) {
+    // A fresh restart replaces whatever the row's index entry was (a live claim, an older marker).
+    const marker = retriggerMarker(input.retrigger.token, input.retrigger.dueAtMs);
+    for (const [attr, value] of Object.entries(marker)) {
+      removes.splice(removes.indexOf(attr), 1);
+      sets.push(`${attr} = :m_${attr}`);
+      values[`:m_${attr}`] = value;
+    }
+  }
   // Every write moves the revision, so a claim based on the row as it was BEFORE this write fails.
   values[':one'] = 1;
 
@@ -738,7 +803,9 @@ export async function claimFlavorValidation(
   values[':claimsPk'] = FLAVOR_CLAIMS_GSI1PK;
   values[':claimsSk'] = flavorClaimGsi1sk(input.leaseUntil);
   // `fencedRunId` is the scalar fence this revision replaced; drop it from rows that still carry it.
-  const removes: string[] = ['fencedRunId'];
+  // A pending automatic restart is consumed by THIS claim: the restart has begun, and the row's index
+  // entry is now the live claim's (due at its lease), so the marker must not fire again.
+  const removes: string[] = ['fencedRunId', 'retriggerToken', 'retriggerAttempts'];
   // A claim made for any reason other than the sweep's own re-trigger (registration, an operator's
   // re-validate) resets the automatic-recovery counter: it is a fresh decision to run, not the
   // repeat of a run that keeps dying.
@@ -827,6 +894,7 @@ export async function fenceFlavorValidationRun(
 
 /** A live claim whose lease has run out, as the reconciliation sweep sees it. */
 export interface ExpiredFlavorClaim {
+  kind: 'claim';
   installationId: number;
   name: string;
   /** The token of the run that held it — the release is conditional on it. */
@@ -836,24 +904,40 @@ export interface ExpiredFlavorClaim {
   autoRecoveries: number;
 }
 
+/** A released row whose automatic restart has not yet been taken up by a claim. */
+export interface DueFlavorRetrigger {
+  kind: 'retrigger';
+  installationId: number;
+  name: string;
+  /** Every sweep write about this restart is conditional on it. */
+  token: string;
+  /** Accepted sends so far (see {@link MAX_FLAVOR_RETRIGGER_SENDS}). */
+  attempts: number;
+  autoRecoveries: number;
+}
+
+export type DueFlavorRecovery = ExpiredFlavorClaim | DueFlavorRetrigger;
+
 /**
- * Every claim whose lease ended before `nowMs`, read from the sparse live-claim index.
+ * Every index entry due before `nowMs`: expired claims and restarts still owed.
  *
  * This is the enumeration that turns the lease from a passive permission ("a later claim MAY take
  * this row over") into an actual recovery: a run that could not reach DynamoDB for its whole budget,
  * or a λ killed outright, writes neither a verdict nor a release, and the only producers of new
  * runs are registration and an operator's re-validate. Without this read nothing ever comes back.
+ * Retrigger markers are read by the same query so that a restart whose invoke failed, was dropped,
+ * or was never sent because the sweep died is retried on a later tick rather than lost.
  *
  * Paginated to completion up to `maxPages`, and REPORTS truncation instead of hiding it: the index
- * is eventually consistent and every row is re-checked by the conditional release, so a partial
- * read is safe — the rest are found on the next sweep — but it must be visible in the log.
+ * is eventually consistent and every row is re-checked by a conditional write, so a partial read is
+ * safe — the rest are found on the next sweep — but it must be visible in the log.
  */
-export async function listExpiredFlavorClaims(
+export async function listDueFlavorRecoveries(
   nowMs: number,
   opts: { maxPages?: number } = {},
-): Promise<{ claims: ExpiredFlavorClaim[]; truncated: boolean }> {
+): Promise<{ claims: DueFlavorRecovery[]; truncated: boolean }> {
   const maxPages = opts.maxPages ?? 10;
-  const claims: ExpiredFlavorClaim[] = [];
+  const claims: DueFlavorRecovery[] = [];
   let startKey: Record<string, unknown> | undefined;
   for (let page = 0; page < maxPages; page++) {
     const res = await requireDoc().send(
@@ -868,22 +952,31 @@ export async function listExpiredFlavorClaims(
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
       }),
     );
-    for (const item of (res.Items ?? []) as Partial<CustomFlavorRecord & { autoRecoveries: number }>[]) {
-      if (
-        typeof item.installationId !== 'number' ||
-        typeof item.name !== 'string' ||
-        typeof item.validationRunId !== 'string' ||
-        item.state !== 'validating'
+    for (const item of (res.Items ?? []) as Partial<CustomFlavorRecord>[]) {
+      if (typeof item.installationId !== 'number' || typeof item.name !== 'string') continue;
+      const autoRecoveries = typeof item.autoRecoveries === 'number' ? item.autoRecoveries : 0;
+      if (item.state === 'validating' && typeof item.validationRunId === 'string') {
+        claims.push({
+          kind: 'claim',
+          installationId: item.installationId,
+          name: item.name,
+          runId: item.validationRunId,
+          leaseUntil: item.validationLeaseUntil ?? 0,
+          autoRecoveries,
+        });
+      } else if (
+        (item.state === 'pending' || item.state === undefined) &&
+        typeof item.retriggerToken === 'string'
       ) {
-        continue;
+        claims.push({
+          kind: 'retrigger',
+          installationId: item.installationId,
+          name: item.name,
+          token: item.retriggerToken,
+          attempts: typeof item.retriggerAttempts === 'number' ? item.retriggerAttempts : 0,
+          autoRecoveries,
+        });
       }
-      claims.push({
-        installationId: item.installationId,
-        name: item.name,
-        runId: item.validationRunId,
-        leaseUntil: item.validationLeaseUntil ?? 0,
-        autoRecoveries: typeof item.autoRecoveries === 'number' ? item.autoRecoveries : 0,
-      });
     }
     startKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
     if (!startKey) return { claims, truncated: false };
@@ -893,14 +986,22 @@ export async function listExpiredFlavorClaims(
 
 /**
  * Release a claim whose lease EXPIRED: `validating → pending`, conditional on the row still being
- * held by `runId` under a lease that ended before `nowMs`. The reconciliation sweep's one write.
+ * held by `runId` under a lease that ended before `nowMs`. The reconciliation sweep's first write.
  *
  * The guards are the claim's own, read the other way round. The token means a row some LATER run
  * has since claimed (new token) is never touched; the lease check means a claim whose run is still
  * inside its budget is never touched either, however stale the eventually-consistent index read
  * was. `ADD rev 1` fences any claim still in flight against the pre-release row, exactly as every
- * other write does. `autoRecoveries` is incremented here and ONLY here, so the caller can stop
- * re-triggering a flavor whose runs keep dying (see {@link MAX_FLAVOR_AUTO_RECOVERIES}).
+ * other state write does. `autoRecoveries` is incremented here and ONLY here, so the caller can stop
+ * re-triggering a flavor whose runs keep dying (see {@link MAX_FLAVOR_AUTO_RECOVERIES}); the
+ * condition pins the value the caller decided on, so the stored reason always matches the decision.
+ *
+ * With `retrigger`, the SAME write turns the row's index entry into a retrigger marker due at
+ * `retrigger.dueAtMs` instead of removing it. That is what makes the restart durable: there is no
+ * moment at which the row has left `validating` but nothing records that a restart is owed, so an
+ * invoke that fails, an event that is dropped, or a sweep that dies before sending is picked up by a
+ * later tick. Without `retrigger` (the cap was reached) the entry is removed and the row waits for
+ * an operator, as its `reason` says.
  *
  * Returns the counter's new value when released, or `undefined` when the condition refused (the
  * row moved on its own — nothing to do).
@@ -912,42 +1013,250 @@ export async function releaseExpiredFlavorClaim(
     runId: string;
     nowMs: number;
     reason: string;
+    /** The counter value the caller's decision was based on (from the index read). */
+    expectAutoRecoveries: number;
+    /** Schedule an automatic restart in the same write. */
+    retrigger?: { token: string; dueAtMs: number };
   },
   signal?: AbortSignal,
 ): Promise<{ autoRecoveries: number } | undefined> {
+  const values: Record<string, unknown> = {
+    ':pending': 'pending' satisfies FlavorValidationState,
+    ':validating': 'validating' satisfies FlavorValidationState,
+    ':reason': clampReason(input.reason),
+    ':now': new Date(input.nowMs).toISOString(),
+    ':actor': 'reconciliation-sweep',
+    ':runId': input.runId,
+    ':nowMs': input.nowMs,
+    ':one': 1,
+    ':recoveries': input.expectAutoRecoveries,
+  };
+  let update =
+    'SET #state = :pending, #reason = :reason, updatedAt = :now, updatedBy = :actor';
+  let removes = 'validationRunId, validationLeaseUntil';
+  if (input.retrigger) {
+    update += ', retriggerToken = :tok, retriggerAttempts = :zero, gsi1sk = :due';
+    values[':tok'] = input.retrigger.token;
+    values[':zero'] = 0;
+    values[':due'] = flavorClaimGsi1sk(input.retrigger.dueAtMs);
+  } else {
+    removes += ', gsi1pk, gsi1sk, retriggerToken, retriggerAttempts';
+  }
   try {
     const res = await requireDoc().send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
-        UpdateExpression:
-          'SET #state = :pending, #reason = :reason, updatedAt = :now, updatedBy = :actor' +
-          ' REMOVE validationRunId, validationLeaseUntil, gsi1pk, gsi1sk' +
-          ' ADD rev :one, autoRecoveries :one',
+        UpdateExpression: `${update} REMOVE ${removes} ADD rev :one, autoRecoveries :one`,
         ConditionExpression:
           'attribute_exists(pk) AND #state = :validating AND validationRunId = :runId' +
-          ' AND validationLeaseUntil < :nowMs',
+          ' AND validationLeaseUntil < :nowMs' +
+          (input.expectAutoRecoveries === 0
+            ? ' AND (attribute_not_exists(autoRecoveries) OR autoRecoveries = :recoveries)'
+            : ' AND autoRecoveries = :recoveries'),
         ExpressionAttributeNames: { '#state': 'state', '#reason': 'reason' },
-        ExpressionAttributeValues: {
-          ':pending': 'pending' satisfies FlavorValidationState,
-          ':validating': 'validating' satisfies FlavorValidationState,
-          ':reason': clampReason(input.reason),
-          ':now': new Date(input.nowMs).toISOString(),
-          ':actor': 'reconciliation-sweep',
-          ':runId': input.runId,
-          ':nowMs': input.nowMs,
-          ':one': 1,
-        },
+        ExpressionAttributeValues: values,
         ReturnValues: 'UPDATED_NEW',
       }),
       { abortSignal: signal },
     );
     const n = (res.Attributes as { autoRecoveries?: number } | undefined)?.autoRecoveries;
-    return { autoRecoveries: typeof n === 'number' ? n : 1 };
+    return { autoRecoveries: typeof n === 'number' ? n : input.expectAutoRecoveries + 1 };
   } catch (err) {
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return undefined;
     throw err;
   }
+}
+
+/**
+ * The condition every write about an outstanding restart shares: the row is still `pending` and
+ * still owes THIS restart. A claim (the restart began), a verdict, an operator re-validate or a
+ * repoint removes the token, after which none of these writes can land.
+ *
+ * Retrigger bookkeeping deliberately does NOT bump `rev`. The revision fences claims against
+ * changes to what a run inspects (state, artifact, identity); the marker is none of those, and
+ * bumping it would refuse the very claim the restart is trying to produce whenever a sweep write
+ * landed between the restarted run's read and its claim.
+ */
+const RETRIGGER_GUARD =
+  'attribute_exists(pk) AND (#state = :pending OR attribute_not_exists(#state))' +
+  ' AND retriggerToken = :tok';
+
+/**
+ * Record that the sweep is about to SEND restart `token`, before it sends it: bump the attempt
+ * count (CAS on the count it read) and move the marker's due time to `nextDueAtMs`. If the sweep
+ * then dies, or the invoke is accepted but the event never produces a claim, the marker falls due
+ * again at `nextDueAtMs` and is sent again. Returns false when the row no longer owes this restart
+ * or another sweep already recorded this attempt.
+ */
+export async function markFlavorRetriggerSent(
+  input: {
+    installationId: number;
+    name: string;
+    token: string;
+    /** The attempt count as read. */
+    attempts: number;
+    nextDueAtMs: number;
+  },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return conditionalRetriggerWrite(
+    input,
+    'SET retriggerAttempts = :next, gsi1sk = :due',
+    ' AND retriggerAttempts = :attempts',
+    {
+      ':attempts': input.attempts,
+      ':next': input.attempts + 1,
+      ':due': flavorClaimGsi1sk(input.nextDueAtMs),
+    },
+    signal,
+  );
+}
+
+/**
+ * The send recorded by {@link markFlavorRetriggerSent} was REFUSED (the invoke threw or the function
+ * is not configured): restore the attempt count and make the marker due at `dueAtMs`, so the next
+ * tick tries again. A refused send proves nothing ran, so it must not use up the restart's budget.
+ * If this write itself fails the marker is still due at the marked time — later, never lost.
+ */
+export async function rearmFlavorRetrigger(
+  input: {
+    installationId: number;
+    name: string;
+    token: string;
+    /** The attempt count {@link markFlavorRetriggerSent} wrote. */
+    attempts: number;
+    dueAtMs: number;
+  },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return conditionalRetriggerWrite(
+    input,
+    'SET retriggerAttempts = :prev, gsi1sk = :due',
+    ' AND retriggerAttempts = :attempts',
+    {
+      ':attempts': input.attempts,
+      ':prev': Math.max(0, input.attempts - 1),
+      ':due': flavorClaimGsi1sk(input.dueAtMs),
+    },
+    signal,
+  );
+}
+
+/**
+ * Give up on restart `token`: drop it from the index and say why on the row, so the operator sees
+ * that re-validating is now theirs to do. Used once {@link MAX_FLAVOR_RETRIGGER_SENDS} accepted sends
+ * have produced no claim.
+ */
+export async function abandonFlavorRetrigger(
+  input: { installationId: number; name: string; token: string; reason: string; nowMs: number },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return conditionalRetriggerWrite(
+    input,
+    'SET #reason = :reason, updatedAt = :now, updatedBy = :actor' +
+      ' REMOVE retriggerToken, retriggerAttempts, gsi1pk, gsi1sk',
+    '',
+    {
+      ':reason': clampReason(input.reason),
+      ':now': new Date(input.nowMs).toISOString(),
+      ':actor': 'reconciliation-sweep',
+    },
+    signal,
+  );
+}
+
+async function conditionalRetriggerWrite(
+  input: { installationId: number; name: string; token: string },
+  update: string,
+  extraCondition: string,
+  values: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
+        UpdateExpression: update,
+        ConditionExpression: RETRIGGER_GUARD + extraCondition,
+        ExpressionAttributeNames: {
+          '#state': 'state',
+          ...(update.includes('#reason') ? { '#reason': 'reason' } : {}),
+        },
+        ExpressionAttributeValues: {
+          ':pending': 'pending' satisfies FlavorValidationState,
+          ':tok': input.token,
+          ...values,
+        },
+      }),
+      { abortSignal: signal },
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Record that a validation run is owed on a row that is ALREADY `pending` (an operator re-validate
+ * of a pending flavor, which needs no state transition). Conditional on `pending`, so it never
+ * touches a row a run has claimed. Does not bump `rev`, for the reason given at RETRIGGER_GUARD.
+ */
+export async function scheduleFlavorRetrigger(
+  input: { installationId: number; name: string; token: string; dueAtMs: number },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const marker = retriggerMarker(input.token, input.dueAtMs);
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
+        UpdateExpression:
+          'SET retriggerToken = :rtTok, retriggerAttempts = :rtZero, gsi1pk = :rtPk, gsi1sk = :rtDue',
+        ConditionExpression:
+          'attribute_exists(pk) AND (#state = :pending OR attribute_not_exists(#state))',
+        ExpressionAttributeNames: { '#state': 'state' },
+        ExpressionAttributeValues: {
+          ':pending': 'pending' satisfies FlavorValidationState,
+          ':rtTok': marker.retriggerToken,
+          ':rtZero': 0,
+          ':rtPk': marker.gsi1pk,
+          ':rtDue': marker.gsi1sk,
+        },
+      }),
+      { abortSignal: signal },
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * The four attributes of a fresh retrigger marker. Written IN THE SAME WRITE as the operator action
+ * that makes a run owed (registration, re-validate, repoint), so the row is never `pending` with a
+ * run promised and nothing recording that promise: the Mgmt λ's async invoke has the same failure
+ * modes as the sweep's (refused, or accepted and dropped after Lambda's retries). The marker is due
+ * after a backoff, so the Mgmt λ's own send gets the first chance; the sweep resends only if no
+ * claim has consumed the marker by then.
+ */
+export function retriggerMarker(
+  token: string,
+  dueAtMs: number,
+): Pick<CustomFlavorRecord, 'retriggerToken' | 'retriggerAttempts'> & {
+  gsi1pk: string;
+  gsi1sk: string;
+} {
+  return {
+    retriggerToken: token,
+    retriggerAttempts: 0,
+    gsi1pk: FLAVOR_CLAIMS_GSI1PK,
+    gsi1sk: flavorClaimGsi1sk(dueAtMs),
+  };
 }
 
 /**
@@ -964,8 +1273,13 @@ export async function repointFlavorImage(input: {
   imageArn: string;
   actor?: string;
   now?: Date;
+  /** Record, in this same write, that a validation run of the new image is owed. */
+  retrigger?: { token: string; dueAtMs: number };
 }): Promise<{ changed: boolean; previousImageArn?: string }> {
   const iso = (input.now ?? new Date()).toISOString();
+  const marker = input.retrigger
+    ? retriggerMarker(input.retrigger.token, input.retrigger.dueAtMs)
+    : undefined;
   try {
     const res = await requireDoc().send(
       new UpdateCommand({
@@ -974,7 +1288,10 @@ export async function repointFlavorImage(input: {
         UpdateExpression:
           'SET imageArn = :arn, #state = :pending, updatedAt = :now' +
           (input.actor ? ', updatedBy = :actor' : '') +
-          ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil, gsi1pk, gsi1sk, autoRecoveries' +
+          (marker
+            ? ', retriggerToken = :rtTok, retriggerAttempts = :rtZero, gsi1pk = :rtPk, gsi1sk = :rtDue' +
+              ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil, autoRecoveries'
+            : ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil, gsi1pk, gsi1sk, autoRecoveries, retriggerToken, retriggerAttempts') +
           // A claim based on the row before the swap must fail: it read the OLD artifact.
           ' ADD rev :one',
         ConditionExpression: 'attribute_exists(pk)',
@@ -985,6 +1302,14 @@ export async function repointFlavorImage(input: {
           ':now': iso,
           ':one': 1,
           ...(input.actor ? { ':actor': input.actor } : {}),
+          ...(marker
+            ? {
+                ':rtTok': marker.retriggerToken,
+                ':rtZero': 0,
+                ':rtPk': marker.gsi1pk,
+                ':rtDue': marker.gsi1sk,
+              }
+            : {}),
         },
         ReturnValues: 'ALL_OLD',
       }),

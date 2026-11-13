@@ -336,6 +336,92 @@ test('a registration in flight when the installation changes reports to its own 
   await act(async () => root.unmount());
 });
 
+// ---- 1b. delete confirmation (review finding 1794563407714-749d46:2) -------------------------
+//
+// Delete is irreversible and immediately makes jobs naming the label unclaimable, so the first
+// click only ARMS an inline confirmation that names the flavor AND the installation, Cancel sends
+// nothing, and an armed confirmation can never survive into another installation's scope.
+
+const deletes = (api) => api.calls.filter((c) => c.method === 'DELETE');
+const confirmation = () => document.querySelector('[role="alertdialog"]');
+
+async function showRow(api, installationId, rows) {
+  await selectInstallation(installationId);
+  api.held('GET', `/api/flavors?installation=${installationId}`).answer(scopedBody(rows));
+  await flush();
+}
+
+test('Delete arms a confirmation naming the flavor, its label and the installation; nothing is sent', async () => {
+  const api = fakeApi(baseAuto);
+  const root = await mount();
+  await showRow(api, 2, [customRow('custom-gpu', 'valid', { imageArn: 'arn:B' })]);
+
+  assert.equal(Boolean(confirmation()), false, 'no confirmation before the first click');
+  await click(button('Delete'));
+  const dlg = confirmation();
+  assert.ok(Boolean(dlg), 'the first click arms an alertdialog');
+  assert.equal(dlg.getAttribute('aria-label'), 'Confirm deleting custom-gpu');
+  assert.match(dlg.textContent, /Delete custom-gpu from installation bravo \(2\)\?/);
+  assert.match(dlg.textContent, /cannot be undone/);
+  assert.match(dlg.textContent, /lambda-ci-custom-gpu will no longer be claimed/);
+  assert.equal(buttons('Delete').length, 0, 'the arming button is replaced while armed');
+  assert.equal(button('Re-validate').disabled, true, 'no other mutation while a delete is armed');
+  assert.equal(deletes(api).length, 0, 'arming sends no request');
+  await act(async () => root.unmount());
+});
+
+test('Cancel disarms the confirmation, sends no DELETE, and leaves the row usable', async () => {
+  const api = fakeApi(baseAuto);
+  const root = await mount();
+  await showRow(api, 2, [customRow('custom-gpu', 'valid', { imageArn: 'arn:B' })]);
+
+  await click(button('Delete'));
+  assert.ok(Boolean(confirmation()));
+  await click(button('Cancel'));
+  assert.equal(Boolean(confirmation()), false, 'Cancel closes the confirmation');
+  assert.equal(buttons('Delete permanently').length, 0);
+  assert.equal(deletes(api).length, 0, 'Cancel sends nothing');
+  assert.match(text(), /arn:B/, 'the row is still there');
+  assert.equal(buttons('Delete').length, 1, 'and can be armed again');
+  assert.equal(button('Re-validate').disabled, false);
+
+  // Arm again and confirm: exactly one DELETE, to this row's own installation.
+  await click(button('Delete'));
+  await click(button('Delete permanently'));
+  assert.equal(deletes(api).length, 1);
+  assert.equal(deletes(api)[0].url, '/api/flavors/custom-gpu?installation=2');
+  deletes(api)[0].answer({ deleted: 'custom-gpu' });
+  await flush();
+  await act(async () => root.unmount());
+});
+
+test('an armed confirmation does not survive an installation switch, even to a same-named flavor', async () => {
+  const api = fakeApi(baseAuto);
+  const root = await mount();
+  await showRow(api, 1, [customRow('custom-gpu', 'valid', { imageArn: 'arn:A' })]);
+  await click(button('Delete'));
+  assert.match(confirmation().textContent, /from installation alpha \(1\)/);
+
+  // While armed, switch to B, which ALSO has a `custom-gpu`. Its row must start disarmed: a
+  // carried-over confirmation would let one click delete B's flavor under A's prompt.
+  await selectInstallation(2);
+  assert.equal(Boolean(confirmation()), false, 'nothing armed while the new scope loads');
+  api.held('GET', '/api/flavors?installation=2').answer(
+    scopedBody([customRow('custom-gpu', 'valid', { imageArn: 'arn:B' })]),
+  );
+  await flush();
+  assert.match(text(), /arn:B/);
+  assert.equal(Boolean(confirmation()), false, "B's same-named row starts disarmed");
+  assert.equal(buttons('Delete permanently').length, 0);
+  assert.equal(deletes(api).length, 0, 'the switch sent no DELETE');
+
+  // Arming on B names B, never A.
+  await click(button('Delete'));
+  assert.match(confirmation().textContent, /from installation bravo \(2\)/);
+  assert.doesNotMatch(confirmation().textContent, /alpha/);
+  await act(async () => root.unmount());
+});
+
 // ---- 2. validation progress -------------------------------------------------
 
 test('validation progress polls pending → validating → invalid with the reason, then stops', async () => {
