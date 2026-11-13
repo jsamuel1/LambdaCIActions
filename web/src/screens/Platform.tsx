@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   api,
   type CustomFlavor,
@@ -95,49 +95,80 @@ const EMPTY_FORM: CustomFlavorInput = {
 const CAPABILITIES = ['docker', 'node', 'python', 'java', 'go', 'rust'];
 
 /**
+ * How often the selected installation's flavors are re-read while a custom flavor is still in
+ * flight (`pending`/`validating`) or the custom read was `degraded`. Validation is an async λ that
+ * takes minutes; without this the badge would freeze at whatever the post-register reload saw.
+ */
+export const FLAVOR_POLL_MS = 5000;
+
+/** Drop the optional empty strings so the API sees "absent", not "empty". */
+function toPayload(form: CustomFlavorInput): CustomFlavorInput {
+  return {
+    ...form,
+    base: form.base.trim(),
+    imageArn: form.imageArn.trim(),
+    description: form.description.trim(),
+    smokeRepoFullName: form.smokeRepoFullName?.trim() || undefined,
+    smokeWorkflowPath: form.smokeWorkflowPath?.trim() || undefined,
+  };
+}
+
+/**
+ * Identity of exactly what a preview was computed for: the installation AND the payload. A preview
+ * is only ever shown — and registration only ever enabled — when this matches the form as it is
+ * NOW, so a verdict can never be displayed for, or authorize, a different draft or installation.
+ */
+function previewKey(installationId: number, payload: CustomFlavorInput): string {
+  return JSON.stringify([installationId, payload]);
+}
+
+/**
  * Registration form for a bring-your-own image (ADR-040/041).
  *
- * Two-step by design: `Check` runs the server's static gate + rate estimate with no write, so the
- * operator sees the verdict and the cost before committing. It is the SERVER's gate, not a
- * re-implementation — a client-side copy would eventually disagree with what registration accepts.
- * In particular the description rule (ADR-038: a description must not advertise a vCPU shape) is
- * enforced server-side and its error is surfaced verbatim, rather than pre-empted here where a
- * looser client regex would let a rejected registration look like a bug.
+ * Two-step, and ENFORCED as two-step: `Check` runs the server's static gate + rate estimate with no
+ * write, and `Register` is only enabled while a passing preview exists for exactly the current
+ * installation + payload. Any edit drops the preview, and a preview response that resolves after an
+ * edit (or after a newer Check) is discarded rather than repopulating a verdict for values it was
+ * not computed from. The form is keyed by installation in `Flavors`, so switching installation
+ * remounts it with an empty draft and nothing in flight can write into it.
+ *
+ * It is the SERVER's gate, not a re-implementation — a client-side copy would eventually disagree
+ * with what registration accepts. In particular the description rule (ADR-038: a description must
+ * not advertise a vCPU shape) is enforced server-side and its error is surfaced verbatim, rather
+ * than pre-empted here where a looser client regex would let a rejected registration look like a
+ * bug.
  */
 function RegisterFlavorForm({
   installationId,
   onRegistered,
 }: {
   installationId: number;
-  onRegistered: (smokeWorkflow?: string) => void;
+  onRegistered: (installationId: number, smokeWorkflow?: string) => void;
 }): JSX.Element {
   const [form, setForm] = useState<CustomFlavorInput>(EMPTY_FORM);
-  const [preview, setPreview] = useState<FlavorPreview | undefined>(undefined);
-  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState<{ key: string; result: FlavorPreview } | undefined>(
+    undefined,
+  );
+  const [pending, setPending] = useState<'check' | 'register' | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
   const [details, setDetails] = useState<string[]>([]);
   const [note, setNote] = useState<string | undefined>(undefined);
+  /** Bumped by every edit and every Check; only the newest Check may write its result. */
+  const generation = useRef(0);
+
+  const currentKey = previewKey(installationId, toPayload(form));
+  const current = preview && preview.key === currentKey ? preview.result : undefined;
+  const canRegister = !pending && current?.staticGate.ok === true;
 
   const set = <K extends keyof CustomFlavorInput>(key: K, value: CustomFlavorInput[K]): void => {
     setForm((f) => ({ ...f, [key]: value }));
-    // Any edit invalidates the previous verdict — it was about a different flavor.
+    // Any edit invalidates the previous verdict — it was about a different flavor — and orphans
+    // an in-flight Check, whose answer is for the values before this edit.
+    generation.current += 1;
     setPreview(undefined);
+    setPending((p) => (p === 'check' ? undefined : p));
     setNote(undefined);
   };
-
-  /** Drop the optional empty strings so the API sees "absent", not "empty". */
-  const payload = (): CustomFlavorInput => ({
-    ...form,
-    base: form.base.trim(),
-    imageArn: form.imageArn.trim(),
-    description: form.description.trim(),
-    ...(form.smokeRepoFullName?.trim()
-      ? { smokeRepoFullName: form.smokeRepoFullName.trim() }
-      : { smokeRepoFullName: undefined }),
-    ...(form.smokeWorkflowPath?.trim()
-      ? { smokeWorkflowPath: form.smokeWorkflowPath.trim() }
-      : { smokeWorkflowPath: undefined }),
-  });
 
   /** Surface the API's own message + `details`; a 400 here is nearly always actionable. */
   const fail = (err: unknown): void => {
@@ -147,33 +178,47 @@ function RegisterFlavorForm({
   };
 
   const check = async (): Promise<void> => {
-    setBusy(true);
+    const body = toPayload(form);
+    const key = previewKey(installationId, body);
+    const gen = (generation.current += 1);
+    setPending('check');
+    setPreview(undefined);
     setError(undefined);
     setDetails([]);
     try {
-      setPreview(await api.previewFlavor(installationId, payload()));
+      const result = await api.previewFlavor(installationId, body);
+      if (generation.current !== gen) return; // superseded by an edit or a newer Check
+      setPreview({ key, result });
     } catch (err) {
-      setPreview(undefined);
+      if (generation.current !== gen) return;
       fail(err);
     } finally {
-      setBusy(false);
+      if (generation.current === gen) setPending(undefined);
     }
   };
 
   const register = async (): Promise<void> => {
-    setBusy(true);
+    const body = toPayload(form);
+    // Re-checked here, not only in `disabled`: the button state is a render behind the form.
+    if (!preview || preview.key !== previewKey(installationId, body) || !preview.result.staticGate.ok) {
+      setError('Run Check on the current values first — registration needs a passing static check.');
+      setDetails([]);
+      return;
+    }
+    setPending('register');
     setError(undefined);
     setDetails([]);
     try {
-      const res = await api.registerFlavor(installationId, payload());
+      const res = await api.registerFlavor(installationId, body);
+      generation.current += 1;
       setNote(res.note);
       setForm(EMPTY_FORM);
       setPreview(undefined);
-      onRegistered(res.smokeWorkflow);
+      onRegistered(installationId, res.smokeWorkflow);
     } catch (err) {
       fail(err);
     } finally {
-      setBusy(false);
+      setPending(undefined);
     }
   };
 
@@ -294,18 +339,32 @@ function RegisterFlavorForm({
       </div>
 
       <div className="row gap-top">
-        <button type="button" onClick={check} disabled={busy || !form.base || !form.imageArn}>
-          Check
+        <button
+          type="button"
+          onClick={check}
+          disabled={pending !== undefined || !form.base.trim() || !form.imageArn.trim()}
+        >
+          {pending === 'check' ? 'Checking…' : 'Check'}
         </button>
         <button
           type="button"
           className="primary"
           onClick={register}
-          disabled={busy || !form.base || !form.imageArn}
+          disabled={!canRegister}
+          title={
+            canRegister
+              ? undefined
+              : 'Run Check on the current values first — registration needs a passing static check.'
+          }
         >
           Register
         </button>
       </div>
+      {!current && pending === undefined && (
+        <p className="muted tight">
+          Register is enabled once <strong>Check</strong> passes for the values as they are now.
+        </p>
+      )}
 
       {error && <ErrorBox message={error} />}
       {details.length > 0 && (
@@ -317,14 +376,14 @@ function RegisterFlavorForm({
       )}
       {note && <p className="muted">{note}</p>}
 
-      {preview && (
+      {current && (
         <div className="subcard gap-top">
           <p className="tight">
-            <code>{preview.name}</code> · label <code>{preview.label}</code> · ~
-            {formatCost(preview.usdPerMinute)}/min{' '}
-            {preview.rateIsEstimate && <span className="muted">(estimate&dagger;)</span>}
+            <code>{current.name}</code> · label <code>{current.label}</code> · ~
+            {formatCost(current.usdPerMinute)}/min{' '}
+            {current.rateIsEstimate && <span className="muted">(estimate&dagger;)</span>}
           </p>
-          {preview.staticGate.ok ? (
+          {current.staticGate.ok ? (
             <p className="gap-top">
               <span className="badge ok">static checks pass</span>
             </p>
@@ -334,13 +393,13 @@ function RegisterFlavorForm({
                 <span className="badge block">static checks fail</span>
               </p>
               <ul className="error">
-                {preview.staticGate.failures.map((f) => (
+                {current.staticGate.failures.map((f) => (
                   <li key={f.code}>{f.message}</li>
                 ))}
               </ul>
             </>
           )}
-          <p className="muted tight">{preview.note}</p>
+          <p className="muted tight">{current.note}</p>
         </div>
       )}
     </div>
@@ -445,70 +504,109 @@ function CustomFlavorActions({
  *
  * The installation selector is not cosmetic: a custom flavor lives in its installation's partition
  * and is only addressable there, so an unscoped request genuinely cannot show one.
+ *
+ * Scope binding: every read is tagged with the installation it was issued for, and rows are only
+ * rendered when that tag matches the CURRENT selection. `useApi` keeps the previous `data` while a
+ * new read is in flight, so without the tag an A→B switch would keep A's rows on screen with
+ * B-scoped Delete/Re-validate buttons — and with a same-named flavor in both, a click on A's row
+ * would mutate B. Mutations take their installation from the tag, never from the selector, and
+ * per-row and form state are keyed by it so no draft survives into another installation.
+ *
+ * Validation is an async λ that takes minutes, so while any custom row is `pending`/`validating`
+ * (or the custom read was `degraded`) the read polls on the visibility-aware `useApi` interval and
+ * the badge + reason advance to the terminal verdict without a reload.
  */
 export function Flavors(): JSX.Element {
   const installs = useApi(() => api.installations(), []);
   const [selected, setSelected] = useState<number | undefined>(undefined);
   const [reloadTick, setReloadTick] = useState(0);
-  const [smokeWorkflowFromRegister, setSmokeWorkflowFromRegister] = useState<string | undefined>(
-    undefined,
-  );
+  const [smokeWorkflowFromRegister, setSmokeWorkflowFromRegister] = useState<
+    { installationId: number; yaml: string } | undefined
+  >(undefined);
   const flavors = useApi(
-    () => (selected ? api.flavorsFor(selected) : api.flavors()),
+    () => {
+      const scope = selected;
+      return (scope ? api.flavorsFor(scope) : api.flavors()).then((body) => ({ scope, body }));
+    },
     [selected, reloadTick],
+    (d) => (d && d.scope === selected && needsPoll(d.body) ? FLAVOR_POLL_MS : undefined),
+  );
+  const reload = (): void => setReloadTick((t) => t + 1);
+
+  const selector = (
+    <div className="card">
+      <label className="field">
+        <span>Installation</span>
+        <select
+          value={selected ?? ''}
+          onChange={(e) => setSelected(e.target.value ? Number(e.target.value) : undefined)}
+        >
+          <option value="">Built-in catalog only (no installation selected)</option>
+          {(installs.data?.installations ?? []).map((i: Installation) => (
+            <option key={i.installationId} value={i.installationId}>
+              {i.accountLogin} ({i.installationId})
+            </option>
+          ))}
+        </select>
+      </label>
+      {installs.error && <ErrorBox message={`Could not list installations: ${installs.error}`} />}
+      {!selected && (
+        <p className="muted">
+          Custom flavors belong to an installation. Select one to see, register or re-validate
+          them.
+        </p>
+      )}
+    </div>
   );
 
-  if (flavors.error) return <ErrorBox message={flavors.error} />;
-  if (!flavors.data) return <Loading what="flavors" />;
+  // Only data read for the CURRENT selection may render: anything else is another installation's
+  // rows, and every action on them would be mis-scoped.
+  const fresh = flavors.data && flavors.data.scope === selected ? flavors.data : undefined;
+  if (!fresh) {
+    return (
+      <>
+        {selector}
+        {!flavors.loading && flavors.error ? (
+          <ErrorBox message={flavors.error} />
+        ) : (
+          <Loading what="flavors" />
+        )}
+      </>
+    );
+  }
 
-  const readiness = flavors.data.readiness ?? [];
+  const scope = fresh.scope;
+  const data = fresh.body;
+  const readiness = data.readiness ?? [];
   const byFlavor = new Map(readiness.map((r) => [r.flavor, r]));
   const notRunnable = readiness.filter((r) => !r.runnable);
-  const rows = flavors.data.flavors;
+  const rows = data.flavors;
   const custom = rows.filter((f) => f.custom);
-  const scoped = flavors.data as { customFlavorsRead?: 'ok' | 'degraded'; smokeWorkflow?: string };
+  const scoped = data as { customFlavorsRead?: 'ok' | 'degraded'; smokeWorkflow?: string };
   const degraded = scoped.customFlavorsRead === 'degraded';
-  const smokeWorkflow = smokeWorkflowFromRegister ?? scoped.smokeWorkflow;
-  const reload = (): void => setReloadTick((t) => t + 1);
+  const smokeWorkflow =
+    (smokeWorkflowFromRegister && smokeWorkflowFromRegister.installationId === scope
+      ? smokeWorkflowFromRegister.yaml
+      : undefined) ?? scoped.smokeWorkflow;
 
   return (
     <>
-      <div className="card">
-        <label className="field">
-          <span>Installation</span>
-          <select
-            value={selected ?? ''}
-            onChange={(e) => {
-              setSelected(e.target.value ? Number(e.target.value) : undefined);
-              setSmokeWorkflowFromRegister(undefined);
-            }}
-          >
-            <option value="">Built-in catalog only (no installation selected)</option>
-            {(installs.data?.installations ?? []).map((i: Installation) => (
-              <option key={i.installationId} value={i.installationId}>
-                {i.accountLogin} ({i.installationId})
-              </option>
-            ))}
-          </select>
-        </label>
-        {installs.error && <ErrorBox message={`Could not list installations: ${installs.error}`} />}
-        {!selected && (
-          <p className="muted">
-            Custom flavors belong to an installation. Select one to see, register or re-validate
-            them.
-          </p>
-        )}
-        {degraded && (
+      {selector}
+      {flavors.error && (
+        <ErrorBox message={`Refresh failed — showing the last successful read: ${flavors.error}`} />
+      )}
+      {degraded && (
+        <div className="card">
           <p className="error">
             This installation&apos;s custom flavors could not be read. The rows below are built-ins
             only — the absence of a custom flavor here is <strong>not</strong> evidence that it does
             not exist. Retry before registering anything, or you may register a duplicate.
           </p>
-        )}
-      </div>
+        </div>
+      )}
 
       <div className="card">
-        {flavors.data.controlPlaneLive === false && (
+        {data.controlPlaneLive === false && (
           <p className="muted">
             Could not read the live control plane — the Runnable column reads <em>unchecked</em>, and
             any <em>unchecked</em> Image cell means the check did not run, not that the image is
@@ -605,7 +703,7 @@ export function Flavors(): JSX.Element {
         </p>
       </div>
 
-      {selected !== undefined && custom.length > 0 && (
+      {scope !== undefined && custom.length > 0 && (
         <div className="card">
           <h3>Custom flavor validation</h3>
           <table>
@@ -620,7 +718,7 @@ export function Flavors(): JSX.Element {
             </thead>
             <tbody>
               {custom.map((f) => (
-                <tr key={f.name}>
+                <tr key={`${scope}:${f.name}`}>
                   <td>
                     {f.name}
                     <div className="muted">{f.label}</div>
@@ -634,7 +732,7 @@ export function Flavors(): JSX.Element {
                   </td>
                   <td>
                     <CustomFlavorActions
-                      installationId={selected}
+                      installationId={scope}
                       flavor={f}
                       onChanged={reload}
                     />
@@ -651,17 +749,32 @@ export function Flavors(): JSX.Element {
         </div>
       )}
 
-      {selected !== undefined && (
+      {scope !== undefined && (
         <RegisterFlavorForm
-          installationId={selected}
-          onRegistered={(yaml) => {
-            setSmokeWorkflowFromRegister(yaml);
+          key={scope}
+          installationId={scope}
+          onRegistered={(installationId, yaml) => {
+            setSmokeWorkflowFromRegister(yaml ? { installationId, yaml } : undefined);
             reload();
           }}
         />
       )}
-      {selected !== undefined && smokeWorkflow && <SmokeWorkflow yaml={smokeWorkflow} />}
+      {scope !== undefined && smokeWorkflow && <SmokeWorkflow yaml={smokeWorkflow} />}
     </>
+  );
+}
+
+/**
+ * Whether the selected installation's read is still moving: a custom flavor not yet at a terminal
+ * verdict, or a custom read that failed and should be retried rather than left looking empty.
+ */
+function needsPoll(body: {
+  flavors: Flavor[];
+  customFlavorsRead?: 'ok' | 'degraded';
+}): boolean {
+  if (body.customFlavorsRead === 'degraded') return true;
+  return body.flavors.some(
+    (f) => f.custom && (f.validationState === undefined || f.validationState === 'pending' || f.validationState === 'validating'),
   );
 }
 

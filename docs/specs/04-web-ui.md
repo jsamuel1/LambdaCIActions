@@ -59,8 +59,13 @@ a management API over the same DynamoDB the control/compute planes write to.
 > custom row's Runnable cell is its ADR-041 validation state rather than the built-in
 > image/allowlist reconciliation: a custom image lives on its own row, not in this environment's
 > `image-arn-*` namespace, so reconciling it there would report `imageMissing` for an image that is
-> fine. Registration is two-step — `Check` calls the no-write preview for the server's static-gate
-> verdict and rate estimate before anything is written. Per ADR-038 every rate is labelled an
+> fine. Registration is two-step and the console enforces it — `Check` calls the no-write preview
+> for the server's static-gate verdict and rate estimate, and `Register` is enabled only while a
+> passing preview exists for exactly the current installation and form values (an edit, or a preview
+> that resolves after one, drops it). Rows render only for the installation their read was issued
+> for, so a switch never leaves another installation's rows wired to the new scope's actions. While
+> any custom flavor is `pending`/`validating` the screen polls (5 s, paused while the tab is hidden)
+> until every row is terminal. Per ADR-038 every rate is labelled an
 > **estimate** and `vcpu` is marked indicative.
 
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has

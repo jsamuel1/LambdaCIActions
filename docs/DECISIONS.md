@@ -2392,7 +2392,21 @@ the static gates; the smoke run itself is verified against a live environment.
   no-write static-gate + rate preview, re-validate/delete actions, and the smoke workflow YAML for
   the operator to commit. Per ADR-038 every rate is labelled an estimate and `vcpu` indicative; the
   server's description rule is surfaced verbatim rather than pre-empted by a client-side regex that
-  would eventually disagree with it.
+  would eventually disagree with it. Three screen-side invariants hold, each pinned by a jsdom render
+  test (`test/web-flavors-screen.test.mjs`):
+  - **Scope binding.** Every flavor read is tagged with the installation it was issued for and rows
+    render only when that tag equals the current selection, so during an A→B switch A's rows (whose
+    buttons would otherwise carry B's scope) are not shown and a late A response cannot overwrite
+    B. Row actions and the registration form take their installation from the tag, and the form is
+    keyed by it, so no draft, preview or in-flight registration crosses installations.
+  - **Progress polling.** While any custom row is `pending`/`validating` (or the custom read was
+    `degraded`) the read re-polls every 5 s on the visibility-aware `useApi` interval, and stops once
+    every row is terminal, so the badge and reason reach the verdict without a reload.
+  - **Enforced two-step registration.** `Register` is enabled only while a PASSING preview exists
+    for exactly the current installation + payload, and its handler re-checks that. A preview that
+    resolves after an edit or a newer `Check` is discarded. The server still accepts a direct `POST
+    /api/flavors` without a preview — the static gate is re-run authoritatively by the validation λ
+    — so the preview requirement is a console guarantee, not an API contract.
 
 **Residual risk, deliberately accepted.** The condition expression bounds the *record*, not the
 number of live VMs: a manual re-validate legitimately moves `validating → pending`, so an operator
