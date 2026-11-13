@@ -470,12 +470,14 @@ export async function loadRoutableCustomFlavors(
 export async function getCustomFlavor(
   installationId: number,
   name: string,
+  signal?: AbortSignal,
 ): Promise<CustomFlavorRecord | undefined> {
   const res = await requireDoc().send(
     new GetCommand({
       TableName: TABLE,
       Key: { pk: installPk(installationId), sk: flavorSk(name) },
     }),
+    { abortSignal: signal },
   );
   return res.Item as unknown as CustomFlavorRecord | undefined;
 }
@@ -490,18 +492,28 @@ export async function getCustomFlavor(
  * the winner's. `attribute_exists(pk)` additionally makes a write for a deleted flavor a no-op
  * instead of resurrecting it.
  *
+ * `from` narrows the accepted source states further than the state machine does (never widens
+ * it). The smoke λ uses it to release a possibly-stranded row `validating → pending` without
+ * overwriting a `valid`/`invalid` verdict that landed after all.
+ *
  * Returns false when the transition was refused (illegal, or the row moved underneath us).
  */
-export async function transitionFlavorValidation(input: {
-  installationId: number;
-  name: string;
-  to: FlavorValidationState;
-  reason?: string;
-  evidence?: FlavorValidationEvidence;
-  actor?: string;
-  now?: Date;
-}): Promise<boolean> {
-  const from = FLAVOR_VALIDATION_STATES.filter((s) => canTransitionValidation(s, input.to));
+export async function transitionFlavorValidation(
+  input: {
+    installationId: number;
+    name: string;
+    to: FlavorValidationState;
+    from?: readonly FlavorValidationState[];
+    reason?: string;
+    evidence?: FlavorValidationEvidence;
+    actor?: string;
+    now?: Date;
+  },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const from = FLAVOR_VALIDATION_STATES.filter(
+    (s) => canTransitionValidation(s, input.to) && (!input.from || input.from.includes(s)),
+  );
   if (from.length === 0) return false;
   const iso = (input.now ?? new Date()).toISOString();
 
@@ -560,6 +572,7 @@ export async function transitionFlavorValidation(input: {
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
       }),
+      { abortSignal: signal },
     );
     return true;
   } catch (err) {

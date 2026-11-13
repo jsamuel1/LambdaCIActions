@@ -102,8 +102,7 @@ export function awsDeps(): OrchestratorDeps {
    * the flavor row's `reason` — operator-visible in the console — and the λ's own log.
    */
   const tokens: string[] = [];
-  const scrub = (text: string): string =>
-    tokens.reduce((acc, t) => redactSecret(acc, t), text);
+  const scrub = (text: string): string => tokens.reduce((acc, t) => redactSecret(acc, t), text);
 
   /** App credentials, resolved once per invocation and cached by `getParam`. */
   const creds = async (): Promise<{ appId: string; pem: string }> => {
@@ -121,63 +120,73 @@ export function awsDeps(): OrchestratorDeps {
   };
 
   return {
-    getFlavor: (installationId, name) => getCustomFlavor(installationId, name),
-    transition: (input) => transitionFlavorValidation(input),
-    probeImage: (imageArn) => getMicroVMImageState(lambda, imageArn),
-    defaultBranch: async (repoFullName) => {
+    getFlavor: (installationId, name, signal) => getCustomFlavor(installationId, name, signal),
+    transition: (input, signal) => transitionFlavorValidation(input, signal),
+    probeImage: (imageArn, signal) => getMicroVMImageState(lambda, imageArn, signal),
+    defaultBranch: async (repoFullName, signal) => {
       const { appId, pem } = await creds();
       return getRepoDefaultBranch({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(repoFullName),
       });
     },
-    mintSmokeRunner: async (input) => {
+    mintSmokeRunner: async (input, signal) => {
       const { appId, pem } = await creds();
       return generateSmokeJitConfig({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(input.repoFullName),
         label: input.label,
         name: input.name,
       });
     },
-    beginSmoke: async (input) => {
+    beginSmoke: async (input, signal) => {
       // Minted here rather than passed in, so the plaintext exists in exactly one place: this
       // closure, which hands the hash to DynamoDB and the plaintext to the VM's launch payload.
       const token = randomBytes(32).toString('base64url');
       tokens.push(token);
-      const { ref } = await beginSmokeRun({
-        installationId: currentInstallationId,
-        seq: input.seq,
-        flavorName: currentFlavorName,
-        jitConfig: input.jitConfig,
-        repoFullName: input.repoFullName,
-        labels: input.labels,
-        hookTokenHash: hashHookToken(token),
-      });
+      const { ref } = await beginSmokeRun(
+        {
+          installationId: currentInstallationId,
+          seq: input.seq,
+          flavorName: currentFlavorName,
+          jitConfig: input.jitConfig,
+          repoFullName: input.repoFullName,
+          labels: input.labels,
+          hookTokenHash: hashHookToken(token),
+        },
+        undefined,
+        signal,
+      );
       return { ref, token };
     },
-    launch: async (input) => {
+    launch: async (input, signal) => {
       if (!brokerName) throw new Error('HOOK_BROKER_NAME is not set (ADR-021 brokered run hook)');
       try {
-        const res = await launchMicroVM(lambda, {
-          imageArn: input.imageArn,
-          // A smoke run has no GitHub run/job. Zeros keep the guest's logging path identical to a
-          // real job's rather than introducing a second shape for it to handle.
-          runId: 0,
-          jobId: 0,
-          payload: {
-            ref: input.ref,
-            region: process.env.AWS_REGION ?? 'us-west-2',
-            broker: brokerName,
-            token: input.token,
+        const res = await launchMicroVM(
+          lambda,
+          {
+            imageArn: input.imageArn,
+            // A smoke run has no GitHub run/job. Zeros keep the guest's logging path identical to a
+            // real job's rather than introducing a second shape for it to handle.
+            runId: 0,
+            jobId: 0,
+            payload: {
+              ref: input.ref,
+              region: process.env.AWS_REGION ?? 'us-west-2',
+              broker: brokerName,
+              token: input.token,
+            },
+            ...(runnerRoleArn ? { executionRoleArn: runnerRoleArn } : {}),
+            logGroup: SMOKE_LOG_GROUP,
           },
-          ...(runnerRoleArn ? { executionRoleArn: runnerRoleArn } : {}),
-          logGroup: SMOKE_LOG_GROUP,
-        });
+          signal,
+        );
         return { microvmId: res.microvmId };
       } catch (err) {
         // REDACT FIRST: this error text can quote the launch payload, token included, and it flows
@@ -185,75 +194,85 @@ export function awsDeps(): OrchestratorDeps {
         throw new Error(scrub(err instanceof Error ? err.message : String(err)));
       }
     },
-    stampVm: (input) =>
-      stampSmokeMicrovmId({
-        installationId: currentInstallationId,
-        seq: input.seq,
-        microvmId: input.microvmId,
-      }),
-    dispatch: async (input) => {
+    stampVm: (input, signal) =>
+      stampSmokeMicrovmId(
+        {
+          installationId: currentInstallationId,
+          seq: input.seq,
+          microvmId: input.microvmId,
+        },
+        signal,
+      ),
+    dispatch: async (input, signal) => {
       const { appId, pem } = await creds();
       await dispatchWorkflow({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(input.repoFullName),
         workflow: input.workflow,
         ref: input.ref,
         inputs: { lca_nonce: input.nonce },
       });
     },
-    listRunners: async (repoFullName) => {
+    listRunners: async (repoFullName, signal) => {
       const { appId, pem } = await creds();
       return listRepoRunners({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(repoFullName),
       });
     },
-    listDispatchRuns: async (input) => {
+    listDispatchRuns: async (input, signal) => {
       const { appId, pem } = await creds();
       return listWorkflowDispatchRuns({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(input.repoFullName),
         workflow: input.workflow,
       });
     },
-    listRunJobs: async (input) => {
+    listRunJobs: async (input, signal) => {
       const { appId, pem } = await creds();
       return listRunJobs({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(input.repoFullName),
         runId: input.runId,
       });
     },
-    listVms: () => listMicroVMs(lambda),    terminateVm: (microvmId) => terminateMicroVM(lambda, microvmId),
-    deleteRunner: async (input) => {
+    listVms: (signal) => listMicroVMs(lambda, { signal }),
+    terminateVm: (microvmId, signal) => terminateMicroVM(lambda, microvmId, signal),
+    deleteRunner: async (input, signal) => {
       const { appId, pem } = await creds();
       await deleteRepoRunner({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(input.repoFullName),
         runnerId: input.runnerId,
       });
     },
-    cancelRun: async (input) => {
+    cancelRun: async (input, signal) => {
       const { appId, pem } = await creds();
       await cancelWorkflowRun({
         appId,
         pem,
         installationId: currentInstallationId,
+        signal,
         ...repoParts(input.repoFullName),
         runId: input.runId,
       });
     },
-    endSmoke: (seq) => deleteSmokeRun(currentInstallationId, seq),
+    endSmoke: (seq, signal) => deleteSmokeRun(currentInstallationId, seq, signal),
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     nonce: () => randomBytes(8).toString('hex'),

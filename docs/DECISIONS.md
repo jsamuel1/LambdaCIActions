@@ -2236,8 +2236,17 @@ the static gates; the smoke run itself is verified against a live environment.
   2. **An orchestration fault returns the row to `pending`**, never terminal `invalid`. A GitHub
      5xx, a throttle or a lost budget says nothing about the image.
   3. **The row never stays in `validating` on a crash.** The λ's own deadline (10 min) sits inside
-     its Lambda timeout (12 min) with a reserve, so polling stops while there is still time to
-     write a verdict; a λ killed by its timeout would write nothing.
+     its Lambda timeout (12 min) with a 45 s reserve for the verdict write and cleanup; a λ killed
+     by its timeout would write nothing. The deadline is hard for every external call, not just for
+     polling: each GitHub, DynamoDB and microVM call runs inside `bounded()`, which races it against
+     a timer and aborts its `AbortSignal` on expiry (the GitHub client passes it to `fetch`, the AWS
+     clients as `abortSignal`) whether or not the call ever answers. A main-phase call is capped at
+     `min(30 s, time left before the reserve)` and its timeout is an orchestration fault, so a hung
+     GitHub returns the row to `pending`. The verdict write (8 s), its `validating → pending`
+     fallback (8 s) and each of the four cleanup steps (6 s) have fixed ceilings that sum to 40 s,
+     inside the reserve, which `reserveFits()` checks and the tests pin. The fallback is
+     conditional on the row still being `validating`, so a verdict write that did land late is
+     never overwritten.
 
   Property 3 additionally requires that the verdict write itself cannot throw, which is why the
   flavor store's document client sets `marshallOptions.removeUndefinedValues`. The evidence map is

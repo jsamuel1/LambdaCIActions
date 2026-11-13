@@ -117,3 +117,59 @@ test('a fully-observed verdict marshals every field', async () => {
   assert.deepEqual(evidence.M.runnerId, { N: '777' });
   assert.deepEqual(evidence.M.workflowRunId, { N: '9001' });
 });
+
+test('a `from`-restricted release can only leave validating — a landed verdict is never overwritten', async () => {
+  // The smoke λ's last line of defence: after a verdict write that did not answer, it releases the
+  // row to `pending`. Without `from` the state machine would also accept `valid|invalid → pending`,
+  // so a verdict that landed after all would be silently reset. The guard must be IN the condition
+  // expression — a read-then-write could race the late verdict.
+  const w = interceptWire();
+  try {
+    await store.transitionFlavorValidation({
+      installationId: 42,
+      name: 'custom-good',
+      to: 'pending',
+      from: ['validating'],
+      reason: 'verdict write failed',
+    });
+  } finally {
+    w.restore();
+  }
+  const req = w.bodies[0];
+  const fromValues = Object.entries(req.ExpressionAttributeValues)
+    .filter(([k]) => k.startsWith(':from'))
+    .map(([, v]) => v.S);
+  assert.deepEqual(fromValues, ['validating']);
+  // And the pre-field-row allowance (`attribute_not_exists(#state)`) is gone: that branch means
+  // "treat as pending", which is not a source this release may write from.
+  assert.doesNotMatch(req.ConditionExpression, /attribute_not_exists\(#state\)/);
+});
+
+test('a transition hands its AbortSignal to the HTTP layer, where the SDK honours it', async () => {
+  // The signal is what lets the smoke λ's `bounded` effect actually drop the request rather than
+  // merely stop waiting for it. The node HTTP handler is the layer that acts on `abortSignal`, so
+  // the assertion is that the caller's signal arrives THERE, through the document client's
+  // middleware stack, rather than being dropped on the way.
+  const original = NodeHttpHandler.prototype.handle;
+  let seen;
+  NodeHttpHandler.prototype.handle = async function (_req, opts) {
+    seen = opts?.abortSignal;
+    return {
+      response: {
+        statusCode: 200,
+        headers: { 'content-type': 'application/x-amz-json-1.0' },
+        body: Readable.from([Buffer.from('{}')]),
+      },
+    };
+  };
+  const ctl = new AbortController();
+  try {
+    await store.transitionFlavorValidation(
+      { installationId: 42, name: 'custom-good', to: 'pending' },
+      ctl.signal,
+    );
+  } finally {
+    NodeHttpHandler.prototype.handle = original;
+  }
+  assert.equal(seen, ctl.signal);
+});

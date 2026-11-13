@@ -83,6 +83,7 @@ async function loadCommand(name: string): Promise<CommandCtor> {
 export async function launchMicroVM(
   client: LambdaClient,
   params: LaunchParams,
+  signal?: AbortSignal,
 ): Promise<LaunchResult> {
   const payloadJson = JSON.stringify(params.payload);
   const payloadBytes = Buffer.byteLength(payloadJson, 'utf8');
@@ -116,7 +117,9 @@ export async function launchMicroVM(
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const res = (await client.send(new RunMicrovmCommand(input) as any)) as {
+  const res = (await client.send(new RunMicrovmCommand(input) as any, {
+    abortSignal: signal,
+  })) as {
     microvmId?: string;
     state?: string;
     endpoint?: string;
@@ -138,7 +141,7 @@ export async function launchMicroVM(
  */
 export async function listMicroVMs(
   client: LambdaClient,
-  opts: { imageIdentifier?: string } = {},
+  opts: { imageIdentifier?: string; signal?: AbortSignal } = {},
 ): Promise<LiveMicroVM[]> {
   const ListMicrovmsCommand = await loadCommand('ListMicrovmsCommand');
   const out: LiveMicroVM[] = [];
@@ -150,7 +153,9 @@ export async function listMicroVMs(
     if (nextToken) input.nextToken = nextToken;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const res = (await client.send(new ListMicrovmsCommand(input) as any)) as {
+    const res = (await client.send(new ListMicrovmsCommand(input) as any, {
+      abortSignal: opts.signal,
+    })) as {
       items?: RawMicroVM[];
       nextToken?: string;
     };
@@ -168,10 +173,13 @@ export async function listMicroVMs(
 export async function terminateMicroVM(
   client: LambdaClient,
   microvmId: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const TerminateMicrovmCommand = await loadCommand('TerminateMicrovmCommand');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await client.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId } as any) as any);
+  await client.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId } as any) as any, {
+    abortSignal: signal,
+  });
 }
 
 interface RawMicroVM {
@@ -234,6 +242,7 @@ export interface MicroVMImageState {
 export async function getMicroVMImageState(
   client: LambdaClient,
   imageArn: string,
+  signal?: AbortSignal,
 ): Promise<MicroVMImageState> {
   let GetMicrovmImageCommand: CommandCtor;
   try {
@@ -245,6 +254,7 @@ export async function getMicroVMImageState(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const res = (await client.send(
       new GetMicrovmImageCommand({ imageIdentifier: imageArn }) as any,
+      { abortSignal: signal },
     )) as {
       imageArn?: string;
       state?: string;

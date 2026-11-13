@@ -43,45 +43,92 @@ export interface OrchestratorVm {
 }
 
 /**
+ * An external effect did not answer inside the time the orchestrator could give it.
+ *
+ * Thrown by {@link bounded}, never by an effect itself. It is an ORCHESTRATION fault by definition
+ * (a GitHub or AWS endpoint that hangs says nothing about the operator's image), so the catch in
+ * {@link runValidation} turns it into `pending`, never `invalid`.
+ */
+export class EffectTimeoutError extends Error {
+  constructor(
+    readonly effect: string,
+    readonly ms: number,
+  ) {
+    super(
+      ms > 0
+        ? `${effect} did not answer within ${ms}ms`
+        : `${effect} not attempted — the validation budget was already spent`,
+    );
+    this.name = 'EffectTimeoutError';
+  }
+}
+
+/**
  * Every effect the orchestrator performs. Named for what it means to the run, not for the AWS
  * or GitHub call behind it, so a fake reads as a scenario rather than as a mock script.
+ *
+ * Every external effect takes an optional trailing `signal`. The orchestrator aborts it when the
+ * effect's time is up, so a real implementation can drop the socket instead of leaving it open —
+ * but the deadline does NOT depend on an implementation honouring it: {@link bounded} races the
+ * effect against its own timer and moves on regardless. A fake may ignore the signal entirely.
  */
 export interface OrchestratorDeps {
   /** Read the flavor row. `undefined` when it was deleted mid-flight. */
-  getFlavor(installationId: number, name: string): Promise<CustomFlavorRecord | undefined>;
+  getFlavor(
+    installationId: number,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<CustomFlavorRecord | undefined>;
   /**
    * Attempt a state transition. MUST be the conditional-write form: a `false` return is how the
    * orchestrator learns another run owns this flavor, and is the only concurrency guard it has.
    */
-  transition(input: {
-    installationId: number;
-    name: string;
-    to: 'validating' | 'valid' | 'invalid' | 'pending';
-    reason?: string;
-    evidence?: FlavorValidationEvidence;
-    actor?: string;
-  }): Promise<boolean>;
+  transition(
+    input: {
+      installationId: number;
+      name: string;
+      to: 'validating' | 'valid' | 'invalid' | 'pending';
+      /**
+       * Restrict the legal source states further than the state machine does. Used by the
+       * `validating → pending` release, which must not overwrite a verdict that landed after all.
+       */
+      from?: readonly ('pending' | 'validating' | 'valid' | 'invalid')[];
+      reason?: string;
+      evidence?: FlavorValidationEvidence;
+      actor?: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   /** Probe the candidate image (never throws — see `getMicroVMImageState`). */
-  probeImage(imageArn: string): Promise<MicroVMImageState>;
+  probeImage(imageArn: string, signal?: AbortSignal): Promise<MicroVMImageState>;
   /** Resolve the smoke repo's default branch, which the dispatch targets. */
-  defaultBranch(repoFullName: string): Promise<string>;
+  defaultBranch(repoFullName: string, signal?: AbortSignal): Promise<string>;
   /** Mint the nonce-labelled single-use JIT config. */
-  mintSmokeRunner(input: {
-    repoFullName: string;
-    label: string;
-    name: string;
-  }): Promise<{ jitConfig: string; runnerId?: number }>;
+  mintSmokeRunner(
+    input: {
+      repoFullName: string;
+      label: string;
+      name: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<{ jitConfig: string; runnerId?: number }>;
   /** Write the `SMOKE#` rows the broker serves, returning the launch ref + the token to embed. */
-  beginSmoke(input: {
-    seq: number;
-    jitConfig: string;
-    repoFullName: string;
-    labels: string[];
-  }): Promise<{ ref: string; token: string }>;
+  beginSmoke(
+    input: {
+      seq: number;
+      jitConfig: string;
+      repoFullName: string;
+      labels: string[];
+    },
+    signal?: AbortSignal,
+  ): Promise<{ ref: string; token: string }>;
   /** Launch ONE microVM from the candidate image. */
-  launch(input: { imageArn: string; ref: string; token: string }): Promise<{ microvmId: string }>;
+  launch(
+    input: { imageArn: string; ref: string; token: string },
+    signal?: AbortSignal,
+  ): Promise<{ microvmId: string }>;
   /** Record the launched VM id on the smoke row so a brokered terminate can resolve it. */
-  stampVm(input: { seq: number; microvmId: string }): Promise<void>;
+  stampVm(input: { seq: number; microvmId: string }, signal?: AbortSignal): Promise<void>;
   /**
    * Dispatch the operator's validation workflow with the nonce LABEL as its input.
    *
@@ -89,12 +136,15 @@ export interface OrchestratorDeps {
    * this value straight into `runs-on`, so it must be spelled exactly as the runner advertises it or
    * no runner can ever match the job.
    */
-  dispatch(input: {
-    repoFullName: string;
-    workflow: string;
-    ref: string;
-    nonce: string;
-  }): Promise<void>;
+  dispatch(
+    input: {
+      repoFullName: string;
+      workflow: string;
+      ref: string;
+      nonce: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<void>;
   /**
    * Names + labels of the repo's currently registered runners, with their connection state.
    *
@@ -105,12 +155,31 @@ export interface OrchestratorDeps {
    */
   listRunners(
     repoFullName: string,
-  ): Promise<{ id: number; name: string; labels: string[]; status?: string; busy?: boolean }[]>;
+    signal?: AbortSignal,
+  ): Promise<
+    {
+      id: number;
+      name: string;
+      labels: string[];
+      status?: string;
+      busy?: boolean;
+    }[]
+  >;
   /** `workflow_dispatch` runs of the validation workflow, newest first. */
-  listDispatchRuns(input: {
-    repoFullName: string;
-    workflow: string;
-  }): Promise<{ id: number; status?: string; conclusion?: string | null; createdAt: number }[]>;
+  listDispatchRuns(
+    input: {
+      repoFullName: string;
+      workflow: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<
+    {
+      id: number;
+      status?: string;
+      conclusion?: string | null;
+      createdAt: number;
+    }[]
+  >;
   /**
    * Jobs of a candidate run, carrying their resolved `runs-on` labels and runner name.
    *
@@ -118,16 +187,22 @@ export interface OrchestratorDeps {
    * label rather than bound to the job it was minted for, and the dispatch API returns no run id,
    * so a timestamp window alone cannot identify our run.
    */
-  listRunJobs(input: {
-    repoFullName: string;
-    runId: number;
-  }): Promise<{ id: number; labels: string[]; runnerName?: string }[]>;
+  listRunJobs(
+    input: {
+      repoFullName: string;
+      runId: number;
+    },
+    signal?: AbortSignal,
+  ): Promise<{ id: number; labels: string[]; runnerName?: string }[]>;
   /** The live fleet, for observing self-termination. */
-  listVms(): Promise<OrchestratorVm[]>;
+  listVms(signal?: AbortSignal): Promise<OrchestratorVm[]>;
   /** Terminate a VM. Best-effort: an already-gone VM is success. */
-  terminateVm(microvmId: string): Promise<void>;
+  terminateVm(microvmId: string, signal?: AbortSignal): Promise<void>;
   /** Remove a leftover runner registration. Must treat 404 as success. */
-  deleteRunner(input: { repoFullName: string; runnerId: number }): Promise<void>;
+  deleteRunner(
+    input: { repoFullName: string; runnerId: number },
+    signal?: AbortSignal,
+  ): Promise<void>;
   /**
    * Cancel a smoke run that never reached a conclusion. Must treat "already terminal" as success.
    *
@@ -135,9 +210,9 @@ export interface OrchestratorDeps {
    * stays `queued` in the operator's Actions tab for 24 hours (live-observed), so a validation that
    * condemns an image must not also leave a pending run in someone else's repository.
    */
-  cancelRun(input: { repoFullName: string; runId: number }): Promise<void>;
+  cancelRun(input: { repoFullName: string; runId: number }, signal?: AbortSignal): Promise<void>;
   /** Best-effort removal of the `SMOKE#` rows. */
-  endSmoke(seq: number): Promise<void>;
+  endSmoke(seq: number, signal?: AbortSignal): Promise<void>;
   /** Epoch ms. Injected so a deadline is testable without waiting. */
   now(): number;
   /** Sleep between polls. A fake resolves immediately. */
@@ -153,15 +228,32 @@ export interface OrchestratorConfig {
    * Hard wall-clock budget for the whole run, ms. MUST be comfortably inside the λ's own timeout:
    * the orchestrator's last act is to write a verdict, and a λ killed by its timeout writes
    * nothing — leaving the row in `validating`, which no later run can transition out of except
-   * through the deliberate `validating → pending` escape. Every polling loop is bounded by this,
-   * and the reserve below is what keeps the final write inside the budget.
+   * through the deliberate `validating → pending` escape.
+   *
+   * "Hard" means every awaited external effect, not just the polling loop: each one runs inside
+   * {@link bounded}, which gives up on it at its own timer whether or not the effect ever answers.
+   * A GitHub or AWS call that hangs therefore costs at most its slice of the budget, and the
+   * verdict write + cleanup still happen in-process.
    */
   deadlineMs: number;
   /**
-   * Time reserved for the verdict write + cleanup, ms. Polling stops this early so that hitting
-   * the deadline still produces a recorded outcome rather than a silent timeout.
+   * Time reserved for the verdict write + cleanup, ms. The main phase (claim → smoke run) must
+   * finish by `deadline − reserve`; every main-phase effect is capped at whatever is left of that,
+   * so the reserve is untouched when the verdict starts. MUST be at least
+   * `2 × verdictTimeoutMs + CLEANUP_STEPS × cleanupStepTimeoutMs` (verdict, its pending fallback,
+   * then every cleanup step) — see {@link reserveFits} — or a hung cleanup could run past the
+   * deadline.
    */
   reserveMs: number;
+  /**
+   * Ceiling for ONE main-phase external call, ms (further capped by the remaining main budget).
+   * Without it a single hung `defaultBranch` would silently consume the whole run before failing.
+   */
+  effectTimeoutMs: number;
+  /** Ceiling for the verdict write, ms. Spent from the reserve. */
+  verdictTimeoutMs: number;
+  /** Ceiling for EACH cleanup step (terminate, runner delete, run cancel, smoke rows), ms. */
+  cleanupStepTimeoutMs: number;
   /** Poll interval, ms. */
   pollIntervalMs: number;
   /**
@@ -176,12 +268,67 @@ export interface OrchestratorConfig {
   selfTerminateWaitMs: number;
 }
 
+/** How many independently bounded steps {@link cleanup} performs — sizes the reserve. */
+export const CLEANUP_STEPS = 4;
+
 export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
   deadlineMs: 10 * 60_000,
+  // Worst case every reserve-phase effect hangs: 2 × 8s (verdict + release) + 4 × 6s cleanup = 40s,
+  // inside the 45s reserve. `reserveFits` below is the invariant; the tests pin it.
   reserveMs: 45_000,
+  effectTimeoutMs: 30_000,
+  verdictTimeoutMs: 8_000,
+  cleanupStepTimeoutMs: 6_000,
   pollIntervalMs: 5_000,
   selfTerminateWaitMs: 90_000,
 };
+
+/**
+ * Whether the reserve covers the worst case: the verdict write AND its `pending` fallback both
+ * hang, then every cleanup step hangs. False means a config could run past its own deadline.
+ */
+export function reserveFits(config: OrchestratorConfig): boolean {
+  return (
+    config.reserveMs >= 2 * config.verdictTimeoutMs + CLEANUP_STEPS * config.cleanupStepTimeoutMs
+  );
+}
+
+/**
+ * Run one external effect with a hard time limit.
+ *
+ * Races the effect against a timer rather than trusting it to time itself out: the GitHub client is
+ * a bare `fetch` and the AWS SDK retries internally, and neither has a deadline of its own that is
+ * tied to THIS λ's budget. On expiry the effect's `signal` is aborted (so a well-behaved
+ * implementation releases its socket) and an {@link EffectTimeoutError} is thrown — whether or not
+ * the effect ever settles. A late settlement is swallowed so it cannot surface as an unhandled
+ * rejection after the run has moved on.
+ *
+ * `ms <= 0` means the budget is already spent: the effect is not started at all.
+ */
+export async function bounded<T>(
+  effect: string,
+  ms: number,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (!(ms > 0)) throw new EffectTimeoutError(effect, 0);
+  const ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new EffectTimeoutError(effect, ms);
+      ctl.abort(err);
+      reject(err);
+    }, ms);
+  });
+  // `Promise.resolve().then` so a SYNCHRONOUS throw from `run` becomes a rejection like any other.
+  const work = Promise.resolve().then(() => run(ctl.signal));
+  work.catch(() => {});
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** What the run did, for the λ's own log/metric — the operator-facing outcome is on the row. */
 export interface OrchestratorResult {
@@ -192,7 +339,12 @@ export interface OrchestratorResult {
   evidence?: FlavorValidationEvidence;
   /** Set when the row could not be moved to a terminal state — the verdict is on the record. */
   verdictWritten?: boolean;
-  skipped?: 'not-found' | 'not-pending' | 'no-smoke-repo';
+  /**
+   * - `not-found` / `not-pending`: the row was not ours to touch.
+   * - `claim-unknown`: the claim write did not answer in time, so whether it landed is unknown;
+   *   the row was returned to `pending` (see the claim step for why that is safe either way).
+   */
+  skipped?: 'not-found' | 'not-pending' | 'no-smoke-repo' | 'claim-unknown';
 }
 
 /** Split `owner/repo`. */
@@ -214,6 +366,18 @@ export function splitRepoFullName(full: string): { owner: string; repo: string }
  *   …with a `finally` that terminates the VM, removes the runner registration and drops the
  *   `SMOKE#` rows, and a `catch` that returns the row to `pending` rather than condemning an
  *   image for our own fault.
+ *
+ * The deadline is HARD, and that is a property of every await below, not just of the polling loop:
+ *
+ *   |<----------- main phase: claim → smoke run ----------->|<-- reserve: verdict + cleanup -->|
+ *   start                                   deadline − reserve                          deadline
+ *
+ * Every main-phase effect runs inside {@link bounded} with `min(effectTimeoutMs, time left in the
+ * main phase)`, so a hung GitHub or AWS call becomes an {@link EffectTimeoutError} — an
+ * orchestration fault, hence `pending` — no later than the end of the main phase. The verdict write
+ * and each cleanup step have their own fixed ceilings, and the config invariant {@link reserveFits}
+ * (`reserveMs ≥ 2 × verdictTimeoutMs + CLEANUP_STEPS × cleanupStepTimeoutMs`) keeps them inside
+ * the deadline even when every one of them hangs.
  */
 export async function runValidation(
   deps: OrchestratorDeps,
@@ -223,25 +387,61 @@ export async function runValidation(
   const startedAtMs = deps.now();
   const startedAt = new Date(startedAtMs).toISOString();
   const deadlineAt = startedAtMs + config.deadlineMs;
-  /** When polling must stop so the verdict write still fits in the budget. */
+  /** When the main phase must end so the verdict write + cleanup still fit in the budget. */
   const pollUntil = deadlineAt - config.reserveMs;
+  /** One main-phase effect, capped by its own ceiling AND by what is left of the main phase. */
+  const step = <T>(effect: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> =>
+    bounded(effect, Math.min(config.effectTimeoutMs, pollUntil - deps.now()), run);
 
-  const rec = await deps.getFlavor(req.installationId, req.name);
+  const rec = await step('getFlavor', (signal) =>
+    deps.getFlavor(req.installationId, req.name, signal),
+  );
   if (!rec) {
-    deps.log({ msg: 'flavor validation skipped — flavor not found', ...idOf(req) });
+    deps.log({
+      msg: 'flavor validation skipped — flavor not found',
+      ...idOf(req),
+    });
     return { ran: false, skipped: 'not-found' };
   }
 
   // Claim the run. The conditional write IS the guard (ADR-041): only one of two concurrent
   // runs can win `pending → validating`, and losing means another run owns this flavor — so
   // exit WITHOUT touching the row, because writing anything would be writing over the winner.
-  const claimed = await deps.transition({
-    installationId: req.installationId,
-    name: req.name,
-    to: 'validating',
-    reason: 'smoke run in progress',
-    actor: req.actor,
-  });
+  let claimed: boolean;
+  try {
+    claimed = await step('claim', (signal) =>
+      deps.transition(
+        {
+          installationId: req.installationId,
+          name: req.name,
+          to: 'validating',
+          reason: 'smoke run in progress',
+          actor: req.actor,
+        },
+        signal,
+      ),
+    );
+  } catch (err) {
+    // The claim did not answer, so whether it LANDED is unknown — and if it did, the row is now
+    // `validating` with nobody left to move it. Return it to `pending`, but ONLY from `validating`
+    // (`from`): if the claim never landed the row is still `pending` and the write is refused,
+    // and if another run has since finished it the `valid`/`invalid` verdict is left alone. A
+    // write that cannot tell "our claim" from "someone else's" is acceptable here only because the
+    // λ runs at reserved concurrency 1, so no other smoke run can be in flight.
+    const message = err instanceof Error ? err.message : String(err);
+    deps.log({
+      msg: 'flavor validation claim did not answer — releasing a possible claim',
+      ...idOf(req),
+      error: message,
+    });
+    const released = await releaseToPending(deps, req, config, `claim failed: ${message}`);
+    return {
+      ran: false,
+      skipped: 'claim-unknown',
+      state: 'pending',
+      verdictWritten: released,
+    };
+  }
   if (!claimed) {
     deps.log({
       msg: 'flavor validation skipped — another run owns this flavor',
@@ -259,11 +459,16 @@ export async function runValidation(
   let microvmId: string | undefined;
   let runnerId: number | undefined;
   let repoFullName: string | undefined;
-  /** Set once a run is CONFIRMED ours, so cleanup can never cancel a bystander's run. */
-  let ourRunId: number | undefined;
-  /** Whether that run finished on its own. An unconcluded run is ours to cancel. */
-  let runConcluded = false;
-  const evidence: FlavorValidationEvidence = { imageArn: rec.imageArn, startedAt };
+  /**
+   * Which run is CONFIRMED ours, and whether it concluded on its own. Shared with `observeSmoke`
+   * and updated the moment each fact is learned — not when observation returns — so a fault in a
+   * later poll still lets cleanup cancel our queued run, and never a bystander's.
+   */
+  const track: RunTrack = { concluded: false };
+  const evidence: FlavorValidationEvidence = {
+    imageArn: rec.imageArn,
+    startedAt,
+  };
 
   try {
     // ---- gate 1: static ----------------------------------------------------
@@ -271,7 +476,7 @@ export async function runValidation(
     // launch or a GitHub registration. `requireSmokeRepo: true` because THIS path needs a repo to
     // register the throwaway runner against — unlike the console's pre-save preview, which runs
     // the same gate with the requirement off.
-    const image = await deps.probeImage(rec.imageArn);
+    const image = await step('probeImage', (signal) => deps.probeImage(rec.imageArn, signal));
     const gate = staticGate({
       flavor: rec,
       image,
@@ -289,7 +494,7 @@ export async function runValidation(
         inconclusive: gate.inconclusive,
         failures: gate.failures.map((f) => f.code),
       });
-      return await writeVerdict(deps, req, verdict, {
+      return await writeVerdict(deps, req, config, verdict, {
         ...evidence,
         finishedAt: new Date(deps.now()).toISOString(),
       });
@@ -301,16 +506,21 @@ export async function runValidation(
       return await writeVerdict(
         deps,
         req,
+        config,
         {
           state: 'invalid',
           reason: formatStaticFailures([
-            { code: 'missing-smoke-repo', message: 'a smoke repository is required' },
+            {
+              code: 'missing-smoke-repo',
+              message: 'a smoke repository is required',
+            },
           ]),
         },
         evidence,
       );
     }
-    repoFullName = rec.smokeRepoFullName;
+    const repo = rec.smokeRepoFullName;
+    repoFullName = repo;
     const workflow = rec.smokeWorkflowPath ?? DEFAULT_SMOKE_WORKFLOW_PATH;
 
     // ---- gate 2: the smoke run --------------------------------------------
@@ -319,38 +529,62 @@ export async function runValidation(
     // `seq` discriminates the `SMOKE#<installationId>#<seq>` partition. Wall-clock ms rather than a
     // counter: it needs to be unique per run, not ordered, and a counter would need its own atomic
     // row for a value nothing reads.
-    seq = startedAtMs;
+    const runSeq = startedAtMs;
+    seq = runSeq;
 
-    const branch = await deps.defaultBranch(repoFullName);
-    const minted = await deps.mintSmokeRunner({
-      repoFullName,
-      label,
-      // Name carries the nonce so a leftover registration is identifiable in the operator's repo,
-      // and so the run's `runner_name` is second, independent proof of which run was ours.
-      name: `lca-validate-${nonce}`,
-    });
+    const branch = await step('defaultBranch', (signal) => deps.defaultBranch(repo, signal));
+    const minted = await step('mintSmokeRunner', (signal) =>
+      // A mint that times out may still have REGISTERED a runner whose id we never learn. It carries
+      // only the one-shot nonce label, so it can never take a real job, and GitHub removes an
+      // unused JIT registration on its own; it is residue, not a hazard.
+      deps.mintSmokeRunner(
+        {
+          repoFullName: repo,
+          label,
+          // Name carries the nonce so a leftover registration is identifiable in the operator's
+          // repo, and so the run's `runner_name` is second, independent proof of which run was ours.
+          name: `lca-validate-${nonce}`,
+        },
+        signal,
+      ),
+    );
     runnerId = minted.runnerId;
 
-    const smoke = await deps.beginSmoke({
-      seq,
-      jitConfig: minted.jitConfig,
-      repoFullName,
-      labels: [label],
-    });
+    const smoke = await step('beginSmoke', (signal) =>
+      deps.beginSmoke(
+        {
+          seq: runSeq,
+          jitConfig: minted.jitConfig,
+          repoFullName: repo,
+          labels: [label],
+        },
+        signal,
+      ),
+    );
 
     // ONE VM (ADR-041). Launch AFTER the rows exist: the guest asks the broker for its JIT config
     // as its first act, and a fast image can do that before a post-launch write would have landed.
-    const launched = await deps.launch({
-      imageArn: rec.imageArn,
-      ref: smoke.ref,
-      token: smoke.token,
-    });
-    microvmId = launched.microvmId;
-    evidence.microvmId = microvmId;
+    //
+    // A launch that times out may still have STARTED a VM whose id we never learn. That one is not
+    // ours to terminate by id; it is bounded by the guest's own failure path (no JIT config is
+    // served once `endSmoke` drops the rows) and, failing that, by the Reaper's lifetime cap.
+    const launched = await step('launch', (signal) =>
+      deps.launch(
+        {
+          imageArn: rec.imageArn,
+          ref: smoke.ref,
+          token: smoke.token,
+        },
+        signal,
+      ),
+    );
+    const vmId = launched.microvmId;
+    microvmId = vmId;
+    evidence.microvmId = vmId;
     // Unconditionally and immediately, for the same reason as the real provision path: the broker
     // reads `microvmId` off this row to authorize a self-terminate, and a fast-failing image can
     // call terminate almost at once.
-    await deps.stampVm({ seq, microvmId });
+    await step('stampVm', (signal) => deps.stampVm({ seq: runSeq, microvmId: vmId }, signal));
 
     // Dispatch AFTER the launch so the runner is on its way before the job is queued. The reverse
     // order also works (GitHub queues the job), but this way a launch failure costs no dispatch.
@@ -364,14 +598,16 @@ export async function runValidation(
     // bare hex leaves the job permanently unmatched: observed live on 2026-08-20, where the job sat
     // queued with `runs-on` labels `[self-hosted, <hex>]`, no runner could take it, and the run was
     // condemned for "never reached a conclusion" — a verdict about OUR dispatch, not the image.
-    await deps.dispatch({ repoFullName, workflow, ref: branch, nonce: label });
+    await step('dispatch', (signal) =>
+      deps.dispatch({ repoFullName: repo, workflow, ref: branch, nonce: label }, signal),
+    );
 
-    const obs = await observeSmoke(deps, config, {
-      repoFullName,
+    const obs = await observeSmoke(deps, config, step, track, {
+      repoFullName: repo,
       workflow,
       label,
       runnerName: `lca-validate-${nonce}`,
-      microvmId,
+      microvmId: vmId,
       dispatchedAtMs,
       pollUntil,
     });
@@ -379,8 +615,6 @@ export async function runValidation(
     evidence.workflowRunId = obs.workflowRunId;
     evidence.workflowConclusion = obs.observations.workflowConclusion;
     evidence.selfTerminated = obs.observations.selfTerminated;
-    ourRunId = obs.workflowRunId;
-    runConcluded = obs.observations.workflowConclusion !== undefined;
 
     const verdict = classifySmoke(obs.observations);
     deps.log({
@@ -394,7 +628,7 @@ export async function runValidation(
       selfTerminated: obs.observations.selfTerminated,
       timedOut: obs.observations.timedOut,
     });
-    return await writeVerdict(deps, req, verdict, {
+    return await writeVerdict(deps, req, config, verdict, {
       ...evidence,
       finishedAt: new Date(deps.now()).toISOString(),
     });
@@ -402,7 +636,8 @@ export async function runValidation(
     // OUR fault, not the image's. `classifySmoke` is given the error as `orchestrationError` so the
     // three-outcome rule has one implementation: it returns `pending`, which is a legal, retryable
     // transition out of `validating` and exists precisely for this. Writing `invalid` here would
-    // permanently condemn an image because GitHub 500'd.
+    // permanently condemn an image because GitHub 500'd — or because GitHub hung, which is what an
+    // `EffectTimeoutError` from `bounded` reports.
     const message = err instanceof Error ? err.message : String(err);
     const verdict = classifySmoke({
       launched: Boolean(microvmId),
@@ -414,26 +649,34 @@ export async function runValidation(
       msg: 'flavor validation orchestration failed — returning flavor to pending',
       ...idOf(req),
       error: message,
+      timedOut: err instanceof EffectTimeoutError,
       microvmId,
     });
-    return await writeVerdict(deps, req, verdict, {
+    return await writeVerdict(deps, req, config, verdict, {
       ...evidence,
+      ...(track.runId !== undefined ? { workflowRunId: track.runId } : {}),
       finishedAt: new Date(deps.now()).toISOString(),
     });
   } finally {
     // ALWAYS. A smoke VM that outlives its run is a leaked VM on the operator's quota, and a
     // leftover runner registration is residue we left in someone else's repository after
     // condemning their image. Neither may depend on the happy path being taken.
-    await cleanup(deps, {
+    await cleanup(deps, config, {
       seq,
       microvmId,
       runnerId,
       repoFullName,
       // Only a run we CONFIRMED was ours, and only if it never concluded. Cancelling on the strength
       // of a timestamp window would let us cancel a bystander's dispatch of the same workflow.
-      ...(ourRunId !== undefined && !runConcluded ? { cancelRunId: ourRunId } : {}),
+      ...(track.runId !== undefined && !track.concluded ? { cancelRunId: track.runId } : {}),
     });
   }
+}
+
+/** The confirmed-ours run, as far as observation has got. Mutated by `observeSmoke`. */
+interface RunTrack {
+  runId?: number;
+  concluded: boolean;
 }
 
 function idOf(req: FlavorValidationRequest): Record<string, unknown> {
@@ -446,21 +689,59 @@ function idOf(req: FlavorValidationRequest): Record<string, unknown> {
  * A refused write is not an error to retry: the condition expression refuses precisely when the
  * row moved underneath us (a manual re-validate reopened `validating → pending`), in which case the
  * winner's verdict is the correct one and ours is stale by definition.
+ *
+ * Bounded by `verdictTimeoutMs`, and NEVER throws. A verdict write that hangs or fails is followed by
+ * one bounded attempt to return the row to `pending` — conditional on it still being `validating`,
+ * so a verdict that did land after all is never overwritten. That is the "never leave a row in
+ * `validating`" guarantee in its last line of defence: it costs at most two verdict ceilings, both of
+ * which the reserve is sized for.
  */
 async function writeVerdict(
   deps: OrchestratorDeps,
   req: FlavorValidationRequest,
+  config: OrchestratorConfig,
   verdict: ValidationVerdict,
   evidence: FlavorValidationEvidence,
 ): Promise<OrchestratorResult> {
-  const written = await deps.transition({
-    installationId: req.installationId,
-    name: req.name,
-    to: verdict.state,
-    reason: verdict.reason,
-    evidence,
-    actor: req.actor,
-  });
+  let written: boolean;
+  try {
+    written = await bounded('verdict', config.verdictTimeoutMs, (signal) =>
+      deps.transition(
+        {
+          installationId: req.installationId,
+          name: req.name,
+          to: verdict.state,
+          reason: verdict.reason,
+          evidence,
+          actor: req.actor,
+        },
+        signal,
+      ),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    deps.log({
+      msg: 'flavor validation verdict write failed — releasing the row to pending',
+      ...idOf(req),
+      attempted: verdict.state,
+      error: message,
+    });
+    // A `pending` verdict that failed is retried as the release itself; there is nothing else to
+    // fall back to.
+    const released = await releaseToPending(
+      deps,
+      req,
+      config,
+      `verdict write failed (${verdict.state}): ${message}`,
+    );
+    return {
+      ran: true,
+      state: 'pending',
+      reason: verdict.reason,
+      evidence,
+      verdictWritten: released,
+    };
+  }
   if (!written) {
     deps.log({
       msg: 'flavor validation verdict refused — the row moved during the run',
@@ -478,11 +759,52 @@ async function writeVerdict(
 }
 
 /**
- * Best-effort teardown. Every step is independently guarded: a failure to delete a runner must not
- * prevent the VM from being terminated, which is the expensive one.
+ * Move the row `validating → pending`, and ONLY from `validating`. Bounded, never throws.
+ *
+ * `from: ['validating']` is what makes this safe to call when we do not know what the row looks
+ * like: a claim that never landed leaves `pending` (refused — nothing to do), a verdict that landed
+ * leaves `valid`/`invalid` (refused — the verdict stands), and only a row genuinely stranded in
+ * `validating` is released.
+ */
+async function releaseToPending(
+  deps: OrchestratorDeps,
+  req: FlavorValidationRequest,
+  config: OrchestratorConfig,
+  reason: string,
+): Promise<boolean> {
+  try {
+    return await bounded('release', config.verdictTimeoutMs, (signal) =>
+      deps.transition(
+        {
+          installationId: req.installationId,
+          name: req.name,
+          to: 'pending',
+          from: ['validating'],
+          reason,
+          actor: req.actor,
+        },
+        signal,
+      ),
+    );
+  } catch (err) {
+    deps.log({
+      msg: 'flavor validation could not release the row — an operator re-validate recovers it',
+      ...idOf(req),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * Best-effort teardown. Every step is independently guarded AND independently bounded: a failure or
+ * a hang deleting a runner must not prevent the VM from being terminated, which is the expensive
+ * one, and must not push the run past its deadline. {@link CLEANUP_STEPS} counts these steps so the
+ * reserve can be sized against them.
  */
 async function cleanup(
   deps: OrchestratorDeps,
+  config: OrchestratorConfig,
   input: {
     seq?: number;
     microvmId?: string;
@@ -491,50 +813,55 @@ async function cleanup(
     cancelRunId?: number;
   },
 ): Promise<void> {
-  if (input.microvmId) {
+  const attempt = async (
+    effect: string,
+    run: (signal: AbortSignal) => Promise<void>,
+    failure: Record<string, unknown>,
+  ): Promise<void> => {
     try {
-      // Unconditional, not "if still alive": a list-then-terminate would race the VM's own
-      // shutdown, and terminating an already-terminated VM is the documented no-op.
-      await deps.terminateVm(input.microvmId);
+      await bounded(effect, config.cleanupStepTimeoutMs, run);
     } catch (err) {
       deps.log({
-        msg: 'smoke VM terminate failed — the Reaper lifetime cap is the backstop',
-        microvmId: input.microvmId,
+        ...failure,
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  };
+
+  const vm = input.microvmId;
+  if (vm) {
+    // Unconditional, not "if still alive": a list-then-terminate would race the VM's own
+    // shutdown, and terminating an already-terminated VM is the documented no-op.
+    await attempt('terminateVm', (signal) => deps.terminateVm(vm, signal), {
+      msg: 'smoke VM terminate failed — the Reaper lifetime cap is the backstop',
+      microvmId: vm,
+    });
   }
-  if (input.runnerId !== undefined && input.repoFullName) {
-    try {
-      await deps.deleteRunner({ repoFullName: input.repoFullName, runnerId: input.runnerId });
-    } catch (err) {
-      deps.log({
-        msg: 'smoke runner registration delete failed',
-        runnerId: input.runnerId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+  const repo = input.repoFullName;
+  const runner = input.runnerId;
+  if (runner !== undefined && repo) {
+    await attempt(
+      'deleteRunner',
+      (signal) => deps.deleteRunner({ repoFullName: repo, runnerId: runner }, signal),
+      { msg: 'smoke runner registration delete failed', runnerId: runner },
+    );
   }
-  if (input.cancelRunId !== undefined && input.repoFullName) {
-    try {
-      await deps.cancelRun({ repoFullName: input.repoFullName, runId: input.cancelRunId });
-    } catch (err) {
-      deps.log({
+  const cancel = input.cancelRunId;
+  if (cancel !== undefined && repo) {
+    await attempt(
+      'cancelRun',
+      (signal) => deps.cancelRun({ repoFullName: repo, runId: cancel }, signal),
+      {
         msg: 'smoke workflow run cancel failed — GitHub expires a queued run after 24h',
-        runId: input.cancelRunId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+        runId: cancel,
+      },
+    );
   }
-  if (input.seq !== undefined) {
-    try {
-      await deps.endSmoke(input.seq);
-    } catch (err) {
-      deps.log({
-        msg: 'smoke row cleanup failed — the TTL is the backstop',
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+  const seq = input.seq;
+  if (seq !== undefined) {
+    await attempt('endSmoke', (signal) => deps.endSmoke(seq, signal), {
+      msg: 'smoke row cleanup failed — the TTL is the backstop',
+    });
   }
 }
 
@@ -567,6 +894,15 @@ interface ObserveResult {
 async function observeSmoke(
   deps: OrchestratorDeps,
   config: OrchestratorConfig,
+  /**
+   * The bounded-effect runner from `runValidation`. A poll that hangs past it throws
+   * {@link EffectTimeoutError}, which propagates to the caller's catch as an orchestration fault
+   * (`pending`): a GitHub that stops answering is not evidence that the image failed, so it must
+   * never be scored as "runner never registered".
+   */
+  step: <T>(effect: string, run: (signal: AbortSignal) => Promise<T>) => Promise<T>,
+  /** Updated the moment our run is confirmed / concludes, so cleanup sees it even on a fault. */
+  track: RunTrack,
   input: {
     repoFullName: string;
     workflow: string;
@@ -607,7 +943,9 @@ async function observeSmoke(
    * that never ran anything.
    */
   const isOurRun = async (runId: number): Promise<boolean> => {
-    const jobs = await deps.listRunJobs({ repoFullName: input.repoFullName, runId });
+    const jobs = await step('listRunJobs', (signal) =>
+      deps.listRunJobs({ repoFullName: input.repoFullName, runId }, signal),
+    );
     const wanted = input.label.toLowerCase();
     return jobs.some(
       (j) =>
@@ -618,7 +956,9 @@ async function observeSmoke(
 
   for (;;) {
     if (!runnerRegistered) {
-      const runners = await deps.listRunners(input.repoFullName);
+      const runners = await step('listRunners', (signal) =>
+        deps.listRunners(input.repoFullName, signal),
+      );
       const mine = runners.find(
         (r) =>
           r.labels.some((l) => l.toLowerCase() === input.label.toLowerCase()) &&
@@ -637,10 +977,15 @@ async function observeSmoke(
     }
 
     if (workflowConclusion === undefined) {
-      const runs = await deps.listDispatchRuns({
-        repoFullName: input.repoFullName,
-        workflow: input.workflow,
-      });
+      const runs = await step('listDispatchRuns', (signal) =>
+        deps.listDispatchRuns(
+          {
+            repoFullName: input.repoFullName,
+            workflow: input.workflow,
+          },
+          signal,
+        ),
+      );
       // Narrow by time first (a run created BEFORE our dispatch is never ours — `>=` because
       // GitHub's `created_at` has second granularity and can equal our millisecond timestamp's
       // second), then CONFIRM by nonce. Only a run we already confirmed, or one we confirm now,
@@ -655,13 +1000,17 @@ async function observeSmoke(
             continue;
           }
           workflowRunId = candidate.id;
+          track.runId = candidate.id;
         }
         // A run GitHub has started or finished necessarily had a runner, which is why this counts
         // as registration evidence for an ephemeral JIT runner we may never see in the list.
         if (candidate.status === 'in_progress' || candidate.status === 'completed') {
           runnerRegistered = true;
         }
-        if (candidate.conclusion) workflowConclusion = candidate.conclusion;
+        if (candidate.conclusion) {
+          workflowConclusion = candidate.conclusion;
+          track.concluded = true;
+        }
         break;
       }
     }
@@ -671,7 +1020,7 @@ async function observeSmoke(
     }
 
     if (!selfTerminated && (workflowConclusion !== undefined || runnerRegistered)) {
-      const vms = await deps.listVms();
+      const vms = await step('listVms', (signal) => deps.listVms(signal));
       const vm = vms.find((v) => v.microvmId === input.microvmId);
       // Gone from the fleet, or reported TERMINATED, both mean it shut itself down: nothing else
       // terminates it while the run is in flight (our own terminate is in `finally`, after this).
@@ -690,7 +1039,15 @@ async function observeSmoke(
     // leaves time for the verdict write.
     if (concludedAtMs !== undefined && now - concludedAtMs >= config.selfTerminateWaitMs) break;
 
-    await deps.sleep(config.pollIntervalMs);
+    // Never sleep past the end of the main phase: an uncapped final sleep would spend the reserve.
+    await deps.sleep(Math.min(config.pollIntervalMs, Math.max(0, input.pollUntil - now)));
+    // Re-check AFTER the sleep, before polling again: a poll started with no main-phase budget left
+    // would be refused by `step` and reported as an orchestration fault, when the true outcome is
+    // simply that the run timed out.
+    if (deps.now() >= input.pollUntil) {
+      timedOut = true;
+      break;
+    }
   }
 
   return {

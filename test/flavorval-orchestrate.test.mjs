@@ -19,6 +19,10 @@ import assert from 'node:assert/strict';
 import {
   runValidation,
   splitRepoFullName,
+  bounded,
+  reserveFits,
+  EffectTimeoutError,
+  CLEANUP_STEPS,
   DEFAULT_ORCHESTRATOR_CONFIG,
 } from '../dist/src/flavorval/orchestrate.js';
 import { smokeLabel, isSmokeLabel } from '../dist/src/flavorval/validate-core.js';
@@ -146,6 +150,69 @@ function scenario(opts = {}) {
     log: () => {},
   };
   return { deps, calls, transitions, names: () => calls.map((c) => c.name) };
+}
+
+/**
+ * Make the named effects NEVER settle — and ignore their AbortSignal, which is the worst case: the
+ * deadline must hold because `bounded` gives up on the effect, not because the effect cooperates.
+ * Each hung call records the signal it was handed, so a test can also check it was aborted.
+ *
+ * `transition` is keyed by its target state (`transition:validating`, `transition:valid`, …) so a
+ * test can hang the claim, the verdict or the release independently.
+ */
+function hang(s, effects) {
+  const signals = [];
+  const wanted = new Set(effects);
+  for (const name of Object.keys(s.deps)) {
+    if (name === 'transition' || !wanted.has(name)) continue;
+    const original = s.deps[name];
+    s.deps[name] = (...args) => {
+      s.calls.push({ name, arg: 'HUNG' });
+      signals.push({ name, signal: args.at(-1) });
+      void original;
+      return new Promise(() => {});
+    };
+  }
+  const transition = s.deps.transition;
+  s.deps.transition = (input, signal) => {
+    if (wanted.has(`transition:${input.to}`)) {
+      s.transitions.push(input);
+      s.calls.push({ name: 'transition', arg: `${input.to}:HUNG` });
+      signals.push({ name: `transition:${input.to}`, signal });
+      return new Promise(() => {});
+    }
+    return transition(input, signal);
+  };
+  return signals;
+}
+
+/**
+ * Real-time ceilings small enough that a hung effect costs milliseconds, against a virtual clock
+ * whose main phase is long — so a test that passes proves the EFFECT ceiling bounded the run, not
+ * the polling deadline.
+ */
+const HANG = {
+  ...DEFAULT_ORCHESTRATOR_CONFIG,
+  deadlineMs: 60_000,
+  reserveMs: 5_000,
+  pollIntervalMs: 1_000,
+  selfTerminateWaitMs: 5_000,
+  effectTimeoutMs: 25,
+  verdictTimeoutMs: 25,
+  cleanupStepTimeoutMs: 25,
+};
+
+/** Fail the test rather than hang the suite if the run does not end on its own. */
+async function withinMs(ms, promise) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`run did not finish within ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, guard]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const FAST = { ...DEFAULT_ORCHESTRATOR_CONFIG, deadlineMs: 60_000, reserveMs: 5_000, pollIntervalMs: 1_000, selfTerminateWaitMs: 5_000 };
@@ -656,6 +723,187 @@ test('splitRepoFullName accepts owner/repo and refuses anything else', () => {
   for (const bad of ['acme', 'acme/', '/ci', 'a/b/c', '']) {
     assert.equal(splitRepoFullName(bad), undefined, `should refuse '${bad}'`);
   }
+});
+
+// ---- the HARD deadline: effects that never answer ---------------------------
+//
+// Review finding (verdict 1794537767378-d17ee2:2): the deadline used to be checked only between
+// polls, so one GitHub/AWS call that never answered consumed the whole Lambda timeout, the λ was
+// killed, and the row stayed `validating` with the VM and runner registration left behind. The
+// deadline test above advances a fake clock through `sleep` and therefore could not see it. These
+// make the effect itself never settle.
+
+/** Every main-phase effect after the claim, in the order the run reaches them. */
+const MAIN_PHASE_EFFECTS = [
+  'probeImage',
+  'defaultBranch',
+  'mintSmokeRunner',
+  'beginSmoke',
+  'launch',
+  'stampVm',
+  'dispatch',
+  'listRunners',
+  'listDispatchRuns',
+  'listRunJobs',
+  'listVms',
+];
+
+for (const effect of MAIN_PHASE_EFFECTS) {
+  test(`a ${effect} that NEVER answers ends in pending, with cleanup, inside the budget`, async () => {
+    // `listVms` is only polled once the runner registered; keep the run going until then.
+    const s = scenario({
+      ...happyOpts(),
+      vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+    });
+    const signals = hang(s, [effect]);
+    const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+
+    assert.ok(s.calls.some((c) => c.name === effect && c.arg === 'HUNG'), `${effect} was not reached`);
+    // A hung GitHub/AWS call says nothing about the image: `pending`, never `invalid`.
+    assert.equal(res.state, 'pending');
+    assert.equal(res.verdictWritten, true);
+    assert.match(res.reason, new RegExp(`${effect} did not answer`));
+    assert.equal(s.transitions.at(-1).to, 'pending');
+    // The hung call was told to stop, so a real client drops its socket.
+    for (const { signal } of signals) assert.equal(signal?.aborted, true);
+    // Cleanup ran for whatever had been created by then.
+    const launched = MAIN_PHASE_EFFECTS.indexOf(effect) > MAIN_PHASE_EFFECTS.indexOf('launch');
+    assert.equal(
+      s.calls.some((c) => c.name === 'terminateVm'),
+      launched,
+      'terminate iff the launch had returned a VM id',
+    );
+    const minted = MAIN_PHASE_EFFECTS.indexOf(effect) > MAIN_PHASE_EFFECTS.indexOf('mintSmokeRunner');
+    assert.equal(s.calls.some((c) => c.name === 'deleteRunner'), minted);
+  });
+}
+
+test('a VERDICT write that never answers releases the row to pending, then still cleans up', async () => {
+  const s = scenario(happyOpts());
+  hang(s, ['transition:valid']);
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+
+  assert.equal(res.state, 'pending');
+  assert.equal(res.verdictWritten, true);
+  const release = s.transitions.at(-1);
+  assert.equal(release.to, 'pending');
+  // ONLY from `validating`: if the hung verdict did land after all, the release is refused and the
+  // verdict stands.
+  assert.deepEqual(release.from, ['validating']);
+  assert.equal(s.calls.find((c) => c.name === 'terminateVm')?.arg, 'mvm-1');
+});
+
+test('a hung verdict AND a hung release still return, still clean up', async () => {
+  const s = scenario(happyOpts());
+  hang(s, ['transition:valid', 'transition:pending']);
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.verdictWritten, false);
+  assert.ok(s.names().includes('terminateVm'));
+  assert.ok(s.names().includes('deleteRunner'));
+  assert.ok(s.names().includes('endSmoke'));
+});
+
+test('every cleanup step hanging cannot stop the next one, nor the run from returning', async () => {
+  // A smoke run that never concluded, so cleanup has all four steps to do (including the cancel).
+  const s = scenario({
+    runners: () => [{ id: 777, name: 'lca-validate-abc123', labels: ['lca-validate-abc123'], status: 'online' }],
+    runs: (_p, clock) => [{ id: 9001, status: 'in_progress', conclusion: null, createdAt: clock }],
+    vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+  });
+  const signals = hang(s, ['terminateVm', 'deleteRunner', 'cancelRun', 'endSmoke']);
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+
+  assert.equal(res.state, 'invalid');
+  assert.equal(res.verdictWritten, true);
+  assert.deepEqual(
+    signals.map((x) => x.name),
+    ['terminateVm', 'deleteRunner', 'cancelRun', 'endSmoke'],
+  );
+  for (const { signal } of signals) assert.equal(signal?.aborted, true);
+});
+
+test('a hung CLAIM releases a possible claim from validating only, and launches nothing', async () => {
+  const s = scenario(happyOpts());
+  hang(s, ['transition:validating']);
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+
+  assert.equal(res.ran, false);
+  assert.equal(res.skipped, 'claim-unknown');
+  const release = s.transitions.at(-1);
+  assert.equal(release.to, 'pending');
+  assert.deepEqual(release.from, ['validating']);
+  assert.equal(s.names().includes('launch'), false);
+  assert.equal(s.names().includes('probeImage'), false);
+});
+
+test('a hung flavor READ ends the run without touching the row', async () => {
+  const s = scenario(happyOpts());
+  hang(s, ['getFlavor']);
+  await assert.rejects(
+    withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG)),
+    EffectTimeoutError,
+  );
+  // Nothing was claimed, so nothing is ours to write: the async invoke's retry re-runs it.
+  assert.equal(s.transitions.length, 0);
+});
+
+test('a main-phase effect is capped by what is left of the MAIN phase, not just its own ceiling', async () => {
+  // The virtual clock jumps past the end of the main phase during dispatch. The next poll must not
+  // be given a fresh effect ceiling that would eat into the reserve: it is not started at all, and
+  // the run reports the timeout it actually had.
+  const s = scenario({
+    runners: () => [],
+    runs: () => [],
+    vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }],
+    dispatchDelayMs: 60_000,
+  });
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.verdictWritten, true);
+  assert.equal(s.names().includes('listRunners'), false);
+});
+
+test('bounded() gives up on a never-settling effect and aborts its signal', async () => {
+  let seen;
+  await assert.rejects(
+    bounded('probe', 20, (signal) => {
+      seen = signal;
+      return new Promise(() => {});
+    }),
+    (err) => err instanceof EffectTimeoutError && err.effect === 'probe' && err.ms === 20,
+  );
+  assert.equal(seen.aborted, true);
+});
+
+test('bounded() with no budget left does not start the effect', async () => {
+  let started = false;
+  await assert.rejects(
+    bounded('late', 0, async () => {
+      started = true;
+    }),
+    EffectTimeoutError,
+  );
+  assert.equal(started, false);
+});
+
+test('bounded() passes through a value and an error unchanged', async () => {
+  assert.equal(await bounded('ok', 1_000, async () => 7), 7);
+  await assert.rejects(
+    bounded('boom', 1_000, async () => {
+      throw new Error('GitHub 500');
+    }),
+    /GitHub 500/,
+  );
+});
+
+test('the default reserve covers the verdict, its fallback and every cleanup step all hanging', () => {
+  const c = DEFAULT_ORCHESTRATOR_CONFIG;
+  assert.equal(CLEANUP_STEPS, 4);
+  assert.ok(reserveFits(c));
+  assert.ok(c.reserveMs >= 2 * c.verdictTimeoutMs + CLEANUP_STEPS * c.cleanupStepTimeoutMs);
+  // And a config that does not fit is reported as such.
+  assert.equal(reserveFits({ ...c, cleanupStepTimeoutMs: c.reserveMs }), false);
+  // One main-phase call must not be able to eat the whole run on its own.
+  assert.ok(c.effectTimeoutMs < c.deadlineMs - c.reserveMs);
 });
 
 test('the default deadline leaves a reserve inside it', () => {

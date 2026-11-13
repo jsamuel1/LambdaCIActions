@@ -112,6 +112,12 @@ async function githubJson<T>(
      * opaque secret like a webhook secret has no shape the pattern guard can recognize.
      */
     redactValues?: readonly (string | undefined)[];
+    /**
+     * Abort the request (and its body read). A bare `fetch` has no deadline of its own, so a
+     * caller on a budget — the ADR-041 smoke λ — passes one rather than hanging on a stalled
+     * socket until the Lambda timeout.
+     */
+    signal?: AbortSignal;
   },
 ): Promise<{ status: number; body: T }> {
   const clean = (text: string): string => redactLiterals(text, init.redactValues ?? []);
@@ -125,6 +131,7 @@ async function githubJson<T>(
       ...(init.body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: init.body ? JSON.stringify(init.body) : undefined,
+    ...(init.signal ? { signal: init.signal } : {}),
   });
   const text = await res.text();
   let body: T;
@@ -172,6 +179,7 @@ export async function getInstallationToken(
   appId: string,
   pem: string,
   installationId: number,
+  signal?: AbortSignal,
 ): Promise<string> {
   const cached = tokenCache.get(installationId);
   if (cached && cached.expiresAt - Date.now() > 5 * 60 * 1000) return cached.token;
@@ -179,7 +187,7 @@ export async function getInstallationToken(
   const jwt = createAppJwt(appId, pem);
   const { body } = await githubJson<{ token: string; expires_at: string }>(
     `/app/installations/${installationId}/access_tokens`,
-    { method: 'POST', token: jwt, tokenType: 'Bearer' },
+    { method: 'POST', token: jwt, tokenType: 'Bearer', signal },
   );
   tokenCache.set(installationId, {
     token: body.token,
@@ -576,13 +584,20 @@ export async function getRepoDefaultBranch(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
 }): Promise<string> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   const { body } = await githubJson<{ default_branch?: string }>(
     `/repos/${params.owner}/${params.repo}`,
-    { token, tokenType: 'token' },
+    { token, tokenType: 'token', signal: params.signal },
   );
   if (!body.default_branch) throw new Error('GitHub repo response has no default_branch');
   return body.default_branch;
@@ -799,6 +814,8 @@ export async function generateSmokeJitConfig(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
   /** The one-shot nonce label. MUST be the only non-default label (see `smokeLabel`). */
@@ -806,14 +823,19 @@ export async function generateSmokeJitConfig(params: {
   /** Runner name, so a leftover registration is identifiable in the repo's runner list. */
   name: string;
 }): Promise<{ jitConfig: string; runnerId?: number }> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   const { body } = await githubJson<{
     encoded_jit_config: string;
     runner?: { id?: number };
   }>(`/repos/${params.owner}/${params.repo}/actions/runners/generate-jitconfig`, {
     method: 'POST',
     token,
-    tokenType: 'token',
+    tokenType: 'token', signal: params.signal,
     body: {
       name: params.name,
       runner_group_id: 1,
@@ -836,6 +858,8 @@ export async function dispatchWorkflow(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
   /** Workflow file path (`.github/workflows/x.yml`) or its numeric id. */
@@ -843,13 +867,18 @@ export async function dispatchWorkflow(params: {
   ref: string;
   inputs?: Record<string, string>;
 }): Promise<void> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   await githubJson<Record<string, never>>(
     `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/dispatches`,
     {
       method: 'POST',
       token,
-      tokenType: 'token',
+      tokenType: 'token', signal: params.signal,
       body: { ref: params.ref, ...(params.inputs ? { inputs: params.inputs } : {}) },
     },
   );
@@ -878,12 +907,19 @@ export async function listWorkflowDispatchRuns(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
   workflow: string;
   perPage?: number;
 }): Promise<WorkflowDispatchRun[]> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   const per = Math.min(Math.max(params.perPage ?? 10, 1), 100);
   const { body } = await githubJson<{
     workflow_runs?: {
@@ -896,7 +932,7 @@ export async function listWorkflowDispatchRuns(params: {
   }>(
     `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/runs` +
       `?event=workflow_dispatch&per_page=${per}`,
-    { token, tokenType: 'token' },
+    { token, tokenType: 'token', signal: params.signal },
   );
   return (body.workflow_runs ?? [])
     .filter((r): r is { id: number } & typeof r => typeof r.id === 'number')
@@ -937,11 +973,18 @@ export async function listRunJobs(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
   runId: number;
 }): Promise<WorkflowRunJob[]> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   const { body } = await githubJson<{
     jobs?: {
       id?: number;
@@ -953,7 +996,7 @@ export async function listRunJobs(params: {
     }[];
   }>(`/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/jobs?per_page=100`, {
     token,
-    tokenType: 'token',
+    tokenType: 'token', signal: params.signal,
   });
   return (body.jobs ?? [])
     .filter((j): j is { id: number } & typeof j => typeof j.id === 'number')
@@ -990,15 +1033,22 @@ export async function listRepoRunners(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
 }): Promise<RepoRunner[]> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   const { body } = await githubJson<{
     runners?: { id?: number; name?: string; status?: string; busy?: boolean; labels?: { name?: string }[] }[];
   }>(`/repos/${params.owner}/${params.repo}/actions/runners?per_page=100`, {
     token,
-    tokenType: 'token',
+    tokenType: 'token', signal: params.signal,
   });
   return (body.runners ?? [])
     .filter((r): r is { id: number; name: string } & typeof r =>
@@ -1038,15 +1088,22 @@ export async function cancelWorkflowRun(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
   runId: number;
 }): Promise<void> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   try {
     await githubJson<Record<string, never>>(
       `/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/cancel`,
-      { method: 'POST', token, tokenType: 'token' },
+      { method: 'POST', token, tokenType: 'token', signal: params.signal },
     );
   } catch (err) {
     const status = githubErrorStatus(err);
@@ -1059,15 +1116,22 @@ export async function deleteRepoRunner(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
   runnerId: number;
 }): Promise<void> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   try {
     await githubJson<Record<string, never>>(
       `/repos/${params.owner}/${params.repo}/actions/runners/${params.runnerId}`,
-      { method: 'DELETE', token, tokenType: 'token' },
+      { method: 'DELETE', token, tokenType: 'token', signal: params.signal },
     );
   } catch (err) {
     if (githubErrorStatus(err) === 404) return;
