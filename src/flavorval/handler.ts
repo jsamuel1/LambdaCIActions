@@ -13,16 +13,23 @@ import {
 } from '../shared/github-app.js';
 import {
   getMicroVMImageState,
+  isDefinitiveLaunchRejection,
   launchMicroVM,
   listMicroVMs,
   terminateMicroVM,
 } from '../shared/microvm.js';
-import { getCustomFlavor, transitionFlavorValidation } from '../shared/flavor-store.js';
+import {
+  claimFlavorValidation,
+  fenceFlavorValidationRun,
+  getCustomFlavor,
+  transitionFlavorValidation,
+} from '../shared/flavor-store.js';
 import { beginSmokeRun, deleteSmokeRun, stampSmokeMicrovmId } from '../shared/smoke-store.js';
 import { hashHookToken } from '../hook/broker-core.js';
 import { redactSecret } from '../shared/redact.js';
 import {
   DEFAULT_ORCHESTRATOR_CONFIG,
+  LaunchRejectedError,
   runValidation,
   splitRepoFullName,
   type FlavorValidationRequest,
@@ -121,6 +128,8 @@ export function awsDeps(): OrchestratorDeps {
 
   return {
     getFlavor: (installationId, name, signal) => getCustomFlavor(installationId, name, signal),
+    claim: (input, signal) => claimFlavorValidation(input, signal),
+    fence: (input, signal) => fenceFlavorValidationRun(input, signal),
     transition: (input, signal) => transitionFlavorValidation(input, signal),
     probeImage: (imageArn, signal) => getMicroVMImageState(lambda, imageArn, signal),
     defaultBranch: async (repoFullName, signal) => {
@@ -184,6 +193,10 @@ export function awsDeps(): OrchestratorDeps {
             },
             ...(runnerRoleArn ? { executionRoleArn: runnerRoleArn } : {}),
             logGroup: SMOKE_LOG_GROUP,
+            // Idempotency: a retry after a lost response returns the SAME VM (orchestrator cleanup).
+            clientToken: input.clientToken,
+            // Platform-enforced backstop: the service terminates the VM even if we never learn its id.
+            maximumDurationInSeconds: input.maximumDurationInSeconds,
           },
           signal,
         );
@@ -191,7 +204,9 @@ export function awsDeps(): OrchestratorDeps {
       } catch (err) {
         // REDACT FIRST: this error text can quote the launch payload, token included, and it flows
         // into the row's operator-visible `reason` via the orchestrator's catch.
-        throw new Error(scrub(err instanceof Error ? err.message : String(err)));
+        const message = scrub(err instanceof Error ? err.message : String(err));
+        // Only a 4xx proves nothing was created; everything else may have created a VM.
+        throw isDefinitiveLaunchRejection(err) ? new LaunchRejectedError(message) : new Error(message);
       }
     },
     stampVm: (input, signal) =>

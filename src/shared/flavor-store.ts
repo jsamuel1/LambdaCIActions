@@ -206,6 +206,20 @@ export interface CustomFlavorRecord {
   /** Operator-facing reason for `invalid` (and progress detail while `validating`). */
   reason?: string;
   evidence?: FlavorValidationEvidence;
+  /**
+   * Ownership token of the smoke run holding `validating` (ADR-041). Set by
+   * {@link claimFlavorValidation}, required by the run's own verdict and release, and removed on
+   * every transition out of `validating` — so a write from an EARLIER run can never land on a later
+   * run's claim.
+   */
+  validationRunId?: string;
+  /** Epoch ms after which a `validating` claim may be taken over (its λ is provably gone). */
+  validationLeaseUntil?: number;
+  /**
+   * The last run token whose claim was ABANDONED by its own run (the claim write did not answer).
+   * A claim carrying this token is refused, so a claim that lands late cannot strand the row.
+   */
+  fencedRunId?: string;
   createdAt: string;
   updatedAt: string;
   createdBy?: string;
@@ -504,6 +518,11 @@ export async function transitionFlavorValidation(
     name: string;
     to: FlavorValidationState;
     from?: readonly FlavorValidationState[];
+    /**
+     * Require the row to be held by THIS run (`validationRunId`). The smoke λ passes it on its
+     * verdict and release so a write that lands late cannot touch a later run's claim.
+     */
+    runId?: string;
     reason?: string;
     evidence?: FlavorValidationEvidence;
     actor?: string;
@@ -548,6 +567,9 @@ export async function transitionFlavorValidation(
     sets.push('updatedBy = :actor');
     values[':actor'] = input.actor;
   }
+  // Ownership ends with `validating`. Claims are made only by `claimFlavorValidation`, so every
+  // target this function writes leaves the state and drops the token + lease with it.
+  removes.push('validationRunId', 'validationLeaseUntil');
 
   // `state` may be absent on a row written before this field existed; treat that as `pending`.
   const stateGuard = from
@@ -557,6 +579,11 @@ export async function transitionFlavorValidation(
     })
     .join(' OR ');
   const allowsPending = from.includes('pending');
+  let ownerGuard = '';
+  if (input.runId !== undefined) {
+    values[':runId'] = input.runId;
+    ownerGuard = ' AND validationRunId = :runId';
+  }
 
   try {
     await requireDoc().send(
@@ -568,7 +595,8 @@ export async function transitionFlavorValidation(
         ConditionExpression:
           `attribute_exists(pk) AND (${stateGuard}` +
           (allowsPending ? ' OR attribute_not_exists(#state)' : '') +
-          ')',
+          ')' +
+          ownerGuard,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
       }),
@@ -577,6 +605,116 @@ export async function transitionFlavorValidation(
     return true;
   } catch (err) {
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Claim a flavor for ONE smoke run: `pending → validating`, stamped with the run's token + lease.
+ *
+ * The conditional write is the concurrency guard (ADR-041). Three clauses beyond the state check:
+ *
+ * - `fencedRunId <> :runId` — a run whose claim did not answer fences its own token before
+ *   releasing (see {@link fenceFlavorValidationRun}). Without it, a claim that settles AFTER that
+ *   release would set `validating` with nobody left to move it out (reproduced live by review).
+ * - an EXPIRED `validating` claim may be taken over. The lease outlives the claiming λ's own
+ *   timeout, so its owner is provably dead; this is how a row stranded by a run that could not
+ *   reach DynamoDB at all recovers on the next trigger, rather than only via an operator. A
+ *   `validating` row with no lease predates leases and is treated as expired.
+ * - `attribute_exists(pk)` — never resurrect a deleted flavor.
+ *
+ * Returns false when refused.
+ */
+export async function claimFlavorValidation(
+  input: {
+    installationId: number;
+    name: string;
+    runId: string;
+    /** Epoch ms. */
+    leaseUntil: number;
+    reason?: string;
+    actor?: string;
+    now?: Date;
+  },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const now = input.now ?? new Date();
+  const values: Record<string, unknown> = {
+    ':validating': 'validating' satisfies FlavorValidationState,
+    ':pending': 'pending' satisfies FlavorValidationState,
+    ':runId': input.runId,
+    ':lease': input.leaseUntil,
+    ':nowMs': now.getTime(),
+    ':now': now.toISOString(),
+  };
+  const sets = [
+    '#state = :validating',
+    'validationRunId = :runId',
+    'validationLeaseUntil = :lease',
+    'updatedAt = :now',
+  ];
+  const removes: string[] = [];
+  if (input.reason !== undefined) {
+    sets.push('#reason = :reason');
+    values[':reason'] = clampReason(input.reason);
+  } else {
+    removes.push('#reason');
+  }
+  if (input.actor) {
+    sets.push('updatedBy = :actor');
+    values[':actor'] = input.actor;
+  }
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
+        UpdateExpression:
+          `SET ${sets.join(', ')}` + (removes.length ? ` REMOVE ${removes.join(', ')}` : ''),
+        ConditionExpression:
+          'attribute_exists(pk)' +
+          ' AND (attribute_not_exists(fencedRunId) OR fencedRunId <> :runId)' +
+          ' AND (#state = :pending OR attribute_not_exists(#state)' +
+          ' OR (#state = :validating AND (attribute_not_exists(validationLeaseUntil)' +
+          ' OR validationLeaseUntil < :nowMs)))',
+        ExpressionAttributeNames: { '#state': 'state', '#reason': 'reason' },
+        ExpressionAttributeValues: values,
+      }),
+      { abortSignal: signal },
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Fence a run token so a claim carrying it can never land. Idempotent; touches nothing else.
+ *
+ * Used by the smoke λ when its own claim did not answer: whether that claim landed is unknown, and
+ * it may still be in flight. Once the fence holds, a late-settling claim fails its condition; a
+ * claim that landed BEFORE the fence is then undone by the token-guarded release that follows.
+ * Either way the row cannot be left `validating` by that run.
+ */
+export async function fenceFlavorValidationRun(
+  input: { installationId: number; name: string; runId: string },
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
+        UpdateExpression: 'SET fencedRunId = :runId',
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeValues: { ':runId': input.runId },
+      }),
+      { abortSignal: signal },
+    );
+  } catch (err) {
+    // A deleted flavor needs no fence: there is no row for a late claim to land on.
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return;
     throw err;
   }
 }
@@ -605,7 +743,7 @@ export async function repointFlavorImage(input: {
         UpdateExpression:
           'SET imageArn = :arn, #state = :pending, updatedAt = :now' +
           (input.actor ? ', updatedBy = :actor' : '') +
-          ' REMOVE #reason, evidence',
+          ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil',
         ConditionExpression: 'attribute_exists(pk)',
         ExpressionAttributeNames: { '#state': 'state', '#reason': 'reason' },
         ExpressionAttributeValues: {

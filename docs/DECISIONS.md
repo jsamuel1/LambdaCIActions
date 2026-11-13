@@ -2232,21 +2232,40 @@ the static gates; the smoke run itself is verified against a live environment.
   interface:
   1. **The VM is terminated on every exit path**, including the throwing ones — a `finally` also
      removes a leftover runner registration from the operator's repo, cancels an unconcluded smoke
-     run, and drops the `SMOKE#` rows.
+     run, and drops the `SMOKE#` rows. "Every exit path" includes a create whose RESPONSE was lost
+     (a timed-out or dropped request can still have taken effect): `RunMicrovm` carries a
+     deterministic per-run `clientToken`, so cleanup re-issues an unanswered launch and the
+     idempotent retry returns the id of the VM the lost call created, which is then terminated. A
+     4xx refusal proves no VM and is not retried. The launch also sets a smoke-specific
+     `maximumDurationInSeconds` (12 min) so the platform itself terminates a VM even if that retry
+     fails. A runner registration whose mint response was lost is found by its nonce-bearing name;
+     a dispatched run whose response was lost is found by the nonce on its job (never by timestamp
+     alone) and cancelled if unconcluded.
   2. **An orchestration fault returns the row to `pending`**, never terminal `invalid`. A GitHub
      5xx, a throttle or a lost budget says nothing about the image.
   3. **The row never stays in `validating` on a crash.** The λ's own deadline (10 min) sits inside
-     its Lambda timeout (12 min) with a 45 s reserve for the verdict write and cleanup; a λ killed
+     its Lambda timeout (12 min) with a 60 s reserve for the verdict write and cleanup; a λ killed
      by its timeout would write nothing. The deadline is hard for every external call, not just for
      polling: each GitHub, DynamoDB and microVM call runs inside `bounded()`, which races it against
      a timer and aborts its `AbortSignal` on expiry (the GitHub client passes it to `fetch`, the AWS
      clients as `abortSignal`) whether or not the call ever answers. A main-phase call is capped at
      `min(30 s, time left before the reserve)` and its timeout is an orchestration fault, so a hung
      GitHub returns the row to `pending`. The verdict write (8 s), its `validating → pending`
-     fallback (8 s) and each of the four cleanup steps (6 s) have fixed ceilings that sum to 40 s,
-     inside the reserve, which `reserveFits()` checks and the tests pin. The fallback is
-     conditional on the row still being `validating`, so a verdict write that did land late is
-     never overwritten.
+     fallback (8 s) and each of the five cleanup steps (6 s) have fixed ceilings that sum to 46 s,
+     inside the reserve, which `reserveFits()` checks and the tests pin.
+
+     Giving up on a write does not stop it landing, so the row is fenced by **run ownership**, not
+     by ordering. The claim (`claimFlavorValidation`) stamps `validationRunId` + a
+     `validationLeaseUntil` lease on the row; the run's verdict and its release both require that
+     token in their condition, and every transition out of `validating` removes it. So a late
+     verdict can never overwrite an operator's re-validate or a later run's claim. A claim that did
+     not answer is handled in two writes: first `fenceFlavorValidationRun` records the token as
+     `fencedRunId` (a claim carrying it fails its condition from then on, so one still in flight
+     can no longer land), then the token-guarded release undoes a claim that landed before the
+     fence. Reserved concurrency alone did not order those two in-flight writes. Finally, the
+     lease (15 min, longer than the λ timeout) means that a `validating` row whose λ is provably
+     gone, because it could not reach DynamoDB at all, is taken over by the next claim instead of
+     waiting for an operator.
 
   Property 3 additionally requires that the verdict write itself cannot throw, which is why the
   flavor store's document client sets `marshallOptions.removeUndefinedValues`. The evidence map is
@@ -2276,13 +2295,15 @@ the static gates; the smoke run itself is verified against a live environment.
   GitHub can report a runner busy mid-job while its status field lags.
 
   **The dispatched input is the LABEL, not the bare nonce.** The generated workflow's `runs-on` is
-  `[self-hosted, "${{ inputs.lca_nonce }}"]`, so the value dispatched IS the label GitHub matches
-  against the runner's advertised labels — and the runner advertises `lca-validate-<nonce>`.
+  `["${{ inputs.lca_nonce }}"]` (the nonce label ONLY — see below), so the value dispatched IS the
+  label GitHub matches against the runner's advertised labels — and the runner advertises
+  `lca-validate-<nonce>`.
   Dispatching the bare nonce leaves the job permanently unmatchable, which is invisible to a unit
   test that fakes the dispatch: both sides were internally consistent, and only GitHub's matcher
-  disagreed. Live evidence (2026-08-20): the job carried `runs-on` labels
-  `[self-hosted, 0daa6de266ff4eb3]`, sat `queued` with no runner able to take it, and was condemned
-  for a timeout that was OUR fault. No good image could have passed this gate.
+  disagreed. Live evidence (2026-08-20, while the template still also required `self-hosted`): the
+  job carried `runs-on` labels `[self-hosted, 0daa6de266ff4eb3]`, sat `queued` with no runner able
+  to take it, and was condemned for a timeout that was OUR fault. No good image could have passed
+  this gate.
 
   **A smoke run that never concluded is cancelled during cleanup.** A dispatched run nothing can
   serve otherwise sits `queued` in the operator's Actions tab until GitHub expires it 24 hours later

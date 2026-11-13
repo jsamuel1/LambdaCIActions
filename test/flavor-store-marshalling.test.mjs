@@ -173,3 +173,72 @@ test('a transition hands its AbortSignal to the HTTP layer, where the SDK honour
   }
   assert.equal(seen, ctl.signal);
 });
+
+// ---- run ownership (review finding 1794540192020-d27a17:2) ------------------
+//
+// A timed-out claim can still land AFTER the run released the row. The fence against that lives in
+// these condition expressions, so they are pinned on the wire rather than only in the orchestrator's
+// row model.
+
+test('the claim stamps a run token + lease and refuses a fenced token', async () => {
+  const w = interceptWire();
+  try {
+    await store.claimFlavorValidation({
+      installationId: 42,
+      name: 'custom-good',
+      runId: 'run-a',
+      leaseUntil: 1_700_000_900_000,
+      now: new Date(1_700_000_000_000),
+    });
+  } finally {
+    w.restore();
+  }
+  const req = w.bodies[0];
+  assert.match(req.UpdateExpression, /validationRunId = :runId/);
+  assert.match(req.UpdateExpression, /validationLeaseUntil = :lease/);
+  assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
+  // A fenced token can never claim: this is what stops a late-landing claim stranding the row.
+  assert.match(req.ConditionExpression, /fencedRunId <> :runId/);
+  // Only from pending — or from a validating claim whose lease has EXPIRED (its λ is gone).
+  assert.match(req.ConditionExpression, /#state = :pending/);
+  assert.match(req.ConditionExpression, /validationLeaseUntil < :nowMs/);
+  assert.deepEqual(req.ExpressionAttributeValues[':nowMs'], { N: '1700000000000' });
+  assert.match(req.ConditionExpression, /attribute_exists\(pk\)/);
+});
+
+test('the fence records the token and nothing else', async () => {
+  const w = interceptWire();
+  try {
+    await store.fenceFlavorValidationRun({ installationId: 42, name: 'custom-good', runId: 'run-a' });
+  } finally {
+    w.restore();
+  }
+  const req = w.bodies[0];
+  assert.equal(req.UpdateExpression, 'SET fencedRunId = :runId');
+  assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
+});
+
+test('a run-owned verdict requires the token, and every transition drops ownership', async () => {
+  const w = interceptWire();
+  try {
+    await store.transitionFlavorValidation({
+      installationId: 42,
+      name: 'custom-good',
+      to: 'valid',
+      runId: 'run-a',
+      reason: 'smoke run passed',
+    });
+    // An operator re-validate (no token) must also end any run's ownership, so a stale verdict from
+    // that run is refused afterwards.
+    await store.transitionFlavorValidation({ installationId: 42, name: 'custom-good', to: 'pending' });
+  } finally {
+    w.restore();
+  }
+  const [owned, operator] = w.bodies;
+  assert.match(owned.ConditionExpression, /AND validationRunId = :runId$/);
+  assert.deepEqual(owned.ExpressionAttributeValues[':runId'], { S: 'run-a' });
+  for (const req of [owned, operator]) {
+    assert.match(req.UpdateExpression, /REMOVE .*validationRunId, validationLeaseUntil/);
+  }
+  assert.doesNotMatch(operator.ConditionExpression, /validationRunId/);
+});

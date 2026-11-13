@@ -42,6 +42,12 @@ export interface LaunchParams {
   };
   /** Optional hard cap on total VM lifetime, seconds. */
   maximumDurationInSeconds?: number;
+  /**
+   * RunMicrovm idempotency token. A retry with the same token + input returns the VM the first call
+   * created instead of creating a second one — which is how a caller whose launch response was lost
+   * learns the id of the VM it must terminate.
+   */
+  clientToken?: string;
 }
 
 export interface LaunchResult {
@@ -115,6 +121,7 @@ export async function launchMicroVM(
   if (params.maximumDurationInSeconds !== undefined) {
     input.maximumDurationInSeconds = params.maximumDurationInSeconds;
   }
+  if (params.clientToken) input.clientToken = params.clientToken;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const res = (await client.send(new RunMicrovmCommand(input) as any, {
@@ -283,6 +290,19 @@ export async function getMicroVMImageState(
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Whether a failed RunMicrovm DEFINITIVELY created nothing: the service answered with a client
+ * error (4xx — validation, quota, throttle, access). Anything else (a timeout, an abort, a dropped
+ * connection, a 5xx) is ambiguous: the VM may exist and its response may simply never have arrived.
+ */
+export function isDefinitiveLaunchRejection(err: unknown): boolean {
+  const e = err as { $fault?: string; $metadata?: { httpStatusCode?: number }; name?: string };
+  if (e?.name === 'AbortError' || e?.name === 'TimeoutError') return false;
+  const status = e?.$metadata?.httpStatusCode;
+  if (typeof status === 'number') return status >= 400 && status < 500;
+  return e?.$fault === 'client';
 }
 
 function normalizeMicroVM(vm: RawMicroVM): LiveMicroVM {

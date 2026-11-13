@@ -22,6 +22,7 @@ import {
   bounded,
   reserveFits,
   EffectTimeoutError,
+  LaunchRejectedError,
   CLEANUP_STEPS,
   DEFAULT_ORCHESTRATOR_CONFIG,
 } from '../dist/src/flavorval/orchestrate.js';
@@ -72,11 +73,18 @@ function scenario(opts = {}) {
       record('getFlavor');
       return flavor;
     },
+    // The claim is recorded in `transitions` as `to: 'validating'` so a test reads the whole state
+    // sequence from one list.
+    claim: async (input) => {
+      transitions.push({ ...input, to: 'validating' });
+      record('transition', 'validating');
+      return !opts.claimRefused;
+    },
+    fence: async (input) => record('fence', input.runId),
     transition: async (input) => {
       transitions.push(input);
       record('transition', input.to);
-      if (input.to === 'validating' && opts.claimRefused) return false;
-      if (input.to !== 'validating' && opts.verdictRefused) return false;
+      if (opts.verdictRefused) return false;
       return true;
     },
     probeImage: async () => {
@@ -97,9 +105,9 @@ function scenario(opts = {}) {
       record('beginSmoke', input.seq);
       return { ref: `SMOKE#${INSTALL}#${input.seq}#JITCONFIG`, token: 'tok' };
     },
-    launch: async () => {
-      record('launch');
-      if (opts.throwOn === 'launch') throw new Error('RunMicrovm quota exceeded');
+    launch: async (input) => {
+      record('launch', input);
+      if (opts.throwOn === 'launch') throw new LaunchRejectedError('RunMicrovm quota exceeded');
       return { microvmId: 'mvm-1' };
     },
     stampVm: async () => record('stampVm'),
@@ -164,7 +172,7 @@ function hang(s, effects) {
   const signals = [];
   const wanted = new Set(effects);
   for (const name of Object.keys(s.deps)) {
-    if (name === 'transition' || !wanted.has(name)) continue;
+    if (name === 'transition' || name === 'claim' || !wanted.has(name)) continue;
     const original = s.deps[name];
     s.deps[name] = (...args) => {
       s.calls.push({ name, arg: 'HUNG' });
@@ -182,6 +190,16 @@ function hang(s, effects) {
       return new Promise(() => {});
     }
     return transition(input, signal);
+  };
+  const claim = s.deps.claim;
+  s.deps.claim = (input, signal) => {
+    if (wanted.has('transition:validating')) {
+      s.transitions.push({ ...input, to: 'validating' });
+      s.calls.push({ name: 'transition', arg: 'validating:HUNG' });
+      signals.push({ name: 'transition:validating', signal });
+      return new Promise(() => {});
+    }
+    return claim(input, signal);
   };
   return signals;
 }
@@ -767,13 +785,20 @@ for (const effect of MAIN_PHASE_EFFECTS) {
     // The hung call was told to stop, so a real client drops its socket.
     for (const { signal } of signals) assert.equal(signal?.aborted, true);
     // Cleanup ran for whatever had been created by then.
-    const launched = MAIN_PHASE_EFFECTS.indexOf(effect) > MAIN_PHASE_EFFECTS.indexOf('launch');
+    const at = MAIN_PHASE_EFFECTS.indexOf(effect);
+    const launched = at > MAIN_PHASE_EFFECTS.indexOf('launch');
     assert.equal(
       s.calls.some((c) => c.name === 'terminateVm'),
       launched,
-      'terminate iff the launch had returned a VM id',
+      'terminate iff a VM id is known (a hung launch is RETRIED, see below)',
     );
-    const minted = MAIN_PHASE_EFFECTS.indexOf(effect) > MAIN_PHASE_EFFECTS.indexOf('mintSmokeRunner');
+    if (effect === 'launch') {
+      // The hung launch may have created a VM: cleanup re-issues it under the same clientToken.
+      const launches = s.calls.filter((c) => c.name === 'launch');
+      assert.equal(launches.length, 2, 'cleanup must retry a launch whose response was lost');
+    }
+    // From the mint on, the registration may exist — deleted by id, or found by its nonce name.
+    const minted = at >= MAIN_PHASE_EFFECTS.indexOf('mintSmokeRunner');
     assert.equal(s.calls.some((c) => c.name === 'deleteRunner'), minted);
   });
 }
@@ -822,16 +847,22 @@ test('every cleanup step hanging cannot stop the next one, nor the run from retu
   for (const { signal } of signals) assert.equal(signal?.aborted, true);
 });
 
-test('a hung CLAIM releases a possible claim from validating only, and launches nothing', async () => {
+test('a hung CLAIM fences its token, releases from validating only, and launches nothing', async () => {
   const s = scenario(happyOpts());
   hang(s, ['transition:validating']);
   const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
 
   assert.equal(res.ran, false);
   assert.equal(res.skipped, 'claim-unknown');
+  const claim = s.transitions.find((t) => t.to === 'validating');
+  // The fence comes BEFORE the release, and both name the claim's own token.
+  const names = s.names();
+  assert.ok(names.indexOf('fence') < names.lastIndexOf('transition'));
+  assert.equal(s.calls.find((c) => c.name === 'fence')?.arg, claim.runId);
   const release = s.transitions.at(-1);
   assert.equal(release.to, 'pending');
   assert.deepEqual(release.from, ['validating']);
+  assert.equal(release.runId, claim.runId);
   assert.equal(s.names().includes('launch'), false);
   assert.equal(s.names().includes('probeImage'), false);
 });
@@ -897,7 +928,7 @@ test('bounded() passes through a value and an error unchanged', async () => {
 
 test('the default reserve covers the verdict, its fallback and every cleanup step all hanging', () => {
   const c = DEFAULT_ORCHESTRATOR_CONFIG;
-  assert.equal(CLEANUP_STEPS, 4);
+  assert.equal(CLEANUP_STEPS, 5);
   assert.ok(reserveFits(c));
   assert.ok(c.reserveMs >= 2 * c.verdictTimeoutMs + CLEANUP_STEPS * c.cleanupStepTimeoutMs);
   // And a config that does not fit is reported as such.
@@ -912,4 +943,281 @@ test('the default deadline leaves a reserve inside it', () => {
   // The CDK function timeout is 12 minutes; the deadline must be comfortably inside it so the
   // verdict write always happens in-process.
   assert.ok(DEFAULT_ORCHESTRATOR_CONFIG.deadlineMs <= 11 * 60_000);
+});
+
+test('the claim lease outlives the λ timeout, and the VM cap outlives the run but not by much', () => {
+  const c = DEFAULT_ORCHESTRATOR_CONFIG;
+  // An expired lease is how a later run knows the claimer is gone — it must never expire while the
+  // claiming λ (12 min timeout, lib/control-stack.ts) could still be writing.
+  assert.ok(c.leaseMs > 12 * 60_000);
+  // The platform cap must not kill a VM whose job is still being observed…
+  assert.ok(c.vmMaxDurationSeconds * 1000 > c.deadlineMs);
+  // …and is the smoke-specific backstop, far below the Reaper's job-sized lifetime cap.
+  assert.ok(c.vmMaxDurationSeconds <= 15 * 60);
+});
+
+// ---- ambiguous side effects: the call landed, the answer did not -------------
+//
+// Review finding (verdict 1794540192020-d27a17): `bounded` stops WAITING, but a timed-out request
+// can still have taken effect. A fake that merely never resolves models a call that did nothing;
+// these fakes perform the effect on a shared model of DynamoDB / the fleet / GitHub and THEN lose
+// the response, or settle it only after the orchestrator has moved on.
+
+/**
+ * A model of the flavor row that applies the same conditions as `claimFlavorValidation` /
+ * `fenceFlavorValidationRun` / `transitionFlavorValidation` (whose real condition expressions are
+ * pinned on the wire in flavor-store-marshalling.test.mjs).
+ */
+function rowModel(clock) {
+  const row = { state: 'pending' };
+  return {
+    row,
+    claim(input) {
+      if (row.fencedRunId === input.runId) return false;
+      const expired =
+        row.state === 'validating' &&
+        (row.validationLeaseUntil === undefined || row.validationLeaseUntil < clock());
+      if (row.state !== 'pending' && !expired) return false;
+      Object.assign(row, {
+        state: 'validating',
+        validationRunId: input.runId,
+        validationLeaseUntil: input.leaseUntil,
+      });
+      return true;
+    },
+    fence(input) {
+      row.fencedRunId = input.runId;
+    },
+    transition(input) {
+      const legal =
+        row.state === 'validating'
+          ? ['valid', 'invalid', 'pending'].includes(input.to)
+          : input.to === 'pending';
+      if (!legal) return false;
+      if (input.from && !input.from.includes(row.state)) return false;
+      if (input.runId !== undefined && row.validationRunId !== input.runId) return false;
+      row.state = input.to;
+      delete row.validationRunId;
+      delete row.validationLeaseUntil;
+      return true;
+    },
+  };
+}
+
+/** A promise settled by hand, so a test chooses WHEN a lost write finally lands. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+const settle = () => new Promise((r) => setImmediate(r));
+
+test('a claim that lands AFTER its own release cannot strand the row in validating', async () => {
+  // The reviewer's reproduction: the claim times out, the release sees `pending` and does nothing,
+  // then the claim settles and sets `validating` with nobody left to move it.
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  const late = deferred();
+  let claimInput;
+  s.deps.claim = (input) => {
+    claimInput = input;
+    // The request is in flight: it reaches DynamoDB only when the test says so.
+    return late.promise.then(() => m.claim(input));
+  };
+  s.deps.fence = async (input) => m.fence(input);
+  s.deps.transition = async (input) => m.transition(input);
+
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.skipped, 'claim-unknown');
+  assert.equal(m.row.state, 'pending', 'the release saw pending: nothing to undo yet');
+
+  // NOW the timed-out claim lands.
+  late.resolve();
+  await settle();
+  assert.equal(m.row.state, 'pending', 'the fenced token makes the late claim fail its condition');
+  assert.equal(m.row.fencedRunId, claimInput.runId);
+  assert.equal(res.verdictWritten, true);
+
+  // The fence is per-RUN: the next validation (a new token) can still claim the row.
+  assert.equal(m.claim({ runId: 'next-run', leaseUntil: s.deps.now() + 1 }), true);
+});
+
+test('a claim that landed BEFORE the release is undone by the token-guarded release', async () => {
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  s.deps.claim = (input) => {
+    m.claim(input); // it landed …
+    return new Promise(() => {}); // … and the answer never came back
+  };
+  s.deps.fence = async (input) => m.fence(input);
+  s.deps.transition = async (input) => m.transition(input);
+
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.skipped, 'claim-unknown');
+  assert.equal(m.row.state, 'pending');
+  assert.equal(m.row.validationRunId, undefined);
+});
+
+test('a late VERDICT cannot land on a later run that claimed the row after our release', async () => {
+  // Our verdict write times out; we release; a NEW run claims the row. Only then does our stale
+  // verdict reach DynamoDB. The run token refuses it.
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  const late = deferred();
+  s.deps.claim = async (input) => m.claim(input);
+  s.deps.fence = async (input) => m.fence(input);
+  let staleVerdict;
+  s.deps.transition = (input) => {
+    if (input.to === 'valid') {
+      staleVerdict = input;
+      return late.promise.then(() => m.transition(input));
+    }
+    return Promise.resolve(m.transition(input));
+  };
+
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.state, 'pending');
+  assert.equal(m.row.state, 'pending');
+
+  assert.equal(m.claim({ runId: 'later-run', leaseUntil: s.deps.now() + 600_000 }), true);
+  late.resolve();
+  await settle();
+  assert.equal(m.row.state, 'validating', 'the later run still owns its claim');
+  assert.equal(m.row.validationRunId, 'later-run');
+  assert.ok(staleVerdict.runId && staleVerdict.runId !== 'later-run');
+});
+
+test('a validating row whose claimer is gone is reclaimed once its lease has expired', () => {
+  let now = 1_000;
+  const m = rowModel(() => now);
+  assert.equal(m.claim({ runId: 'dead', leaseUntil: 2_000 }), true);
+  // Still inside the lease: the claimer may be alive, so no takeover.
+  assert.equal(m.claim({ runId: 'next', leaseUntil: 9_000 }), false);
+  now = 2_001;
+  assert.equal(m.claim({ runId: 'next', leaseUntil: 9_000 }), true);
+  // The dead run's late writes are now refused.
+  assert.equal(m.transition({ to: 'valid', runId: 'dead' }), false);
+});
+
+/** A fleet that honours RunMicrovm's clientToken idempotency, as the service does. */
+function fleetModel() {
+  const vms = new Map();
+  const byToken = new Map();
+  let n = 0;
+  return {
+    vms,
+    create(input) {
+      if (byToken.has(input.clientToken)) return byToken.get(input.clientToken);
+      const id = `mvm-${++n}`;
+      byToken.set(input.clientToken, id);
+      vms.set(id, { state: 'RUNNING', maximumDurationInSeconds: input.maximumDurationInSeconds });
+      return id;
+    },
+    terminate(id) {
+      vms.delete(id);
+    },
+  };
+}
+
+for (const [loss, lose] of [
+  ['times out', () => new Promise(() => {})],
+  ['fails ambiguously (dropped connection)', () => Promise.reject(new Error('socket hang up'))],
+]) {
+  test(`a launch that CREATED the VM and then ${loss} still gets that VM terminated`, async () => {
+    const s = scenario({ ...happyOpts(), vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }] });
+    const fleet = fleetModel();
+    let first = true;
+    const launches = [];
+    s.deps.launch = async (input) => {
+      launches.push(input);
+      const id = fleet.create(input); // the VM exists either way
+      if (first) {
+        first = false;
+        return lose();
+      }
+      return { microvmId: id };
+    };
+    s.deps.terminateVm = async (id) => {
+      s.calls.push({ name: 'terminateVm', arg: id });
+      fleet.terminate(id);
+    };
+
+    const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+    assert.equal(res.state, 'pending');
+    // The retry reused the SAME idempotency token and input, so it found the VM rather than making
+    // a second one — and that VM is gone.
+    assert.equal(launches.length, 2);
+    assert.deepEqual(launches[1], launches[0]);
+    assert.equal(fleet.vms.size, 0, 'no VM outlives the run');
+    assert.equal(s.calls.find((c) => c.name === 'terminateVm')?.arg, 'mvm-1');
+  });
+}
+
+test('a DEFINITIVELY rejected launch is not retried — it proves no VM exists', async () => {
+  const s = scenario({ ...happyOpts(), throwOn: 'launch' });
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(res.state, 'pending');
+  assert.equal(s.calls.filter((c) => c.name === 'launch').length, 1);
+  assert.equal(s.names().includes('terminateVm'), false);
+});
+
+test('only a 4xx RunMicrovm answer counts as a definitive refusal', async () => {
+  const { isDefinitiveLaunchRejection } = await import('../dist/src/shared/microvm.js');
+  const svc = (status, fault) =>
+    Object.assign(new Error('x'), { $metadata: { httpStatusCode: status }, $fault: fault });
+  assert.equal(isDefinitiveLaunchRejection(svc(400, 'client')), true);
+  assert.equal(isDefinitiveLaunchRejection(svc(429, 'client')), true);
+  // A 5xx may have created the VM before failing; so may anything with no HTTP answer at all.
+  assert.equal(isDefinitiveLaunchRejection(svc(500, 'server')), false);
+  assert.equal(isDefinitiveLaunchRejection(Object.assign(new Error('aborted'), { name: 'AbortError' })), false);
+  assert.equal(isDefinitiveLaunchRejection(new Error('socket hang up')), false);
+  assert.equal(isDefinitiveLaunchRejection(Object.assign(new Error('q'), { $fault: 'client' })), true);
+});
+
+test('every launch carries a run-unique clientToken and the smoke-specific lifetime cap', async () => {
+  const s = scenario(happyOpts());
+  await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  const input = s.calls.find((c) => c.name === 'launch').arg;
+  assert.match(input.clientToken, new RegExp(`^lca-validate-${INSTALL}-\\d+-abc123$`));
+  assert.ok(input.clientToken.length <= 64, 'idempotency tokens are length-capped');
+  assert.equal(input.maximumDurationInSeconds, FAST.vmMaxDurationSeconds);
+});
+
+test('a mint that REGISTERED the runner and then lost its response is found by name and deleted', async () => {
+  const s = scenario(happyOpts());
+  const registered = [];
+  s.deps.mintSmokeRunner = (input) => {
+    registered.push({ id: 4242, name: input.name, labels: [input.label], status: 'offline' });
+    return new Promise(() => {});
+  };
+  s.deps.listRunners = async () => [
+    { id: 1, name: 'someone-elses-runner', labels: ['self-hosted'] },
+    ...registered,
+  ];
+  await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  const deleted = s.calls.filter((c) => c.name === 'deleteRunner').map((c) => c.arg);
+  assert.deepEqual(deleted, [4242], 'ours, and only ours');
+});
+
+test('a dispatch that CREATED the run and then lost its response gets that run cancelled', async () => {
+  const s = scenario({ ...happyOpts(), vms: () => [{ microvmId: 'mvm-1', state: 'RUNNING' }] });
+  const runs = [];
+  s.deps.dispatch = () => {
+    // A bystander's dispatch in the same second, plus ours.
+    runs.push({ id: 5000, status: 'queued', conclusion: null, createdAt: s.deps.now() });
+    runs.push({ id: 5001, status: 'queued', conclusion: null, createdAt: s.deps.now() });
+    return new Promise(() => {});
+  };
+  s.deps.listDispatchRuns = async () => runs;
+  s.deps.listRunJobs = async ({ runId }) =>
+    runId === 5001
+      ? [{ id: 1, labels: [smokeLabel('abc123')] }]
+      : [{ id: 2, labels: ['self-hosted'], runnerName: 'someone-else' }];
+
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.state, 'pending');
+  const cancelled = s.calls.filter((c) => c.name === 'cancelRun').map((c) => c.arg);
+  assert.deepEqual(cancelled, [5001], 'confirmed ours by nonce — never the bystander');
+  assert.equal(s.calls.find((c) => c.name === 'terminateVm')?.arg, 'mvm-1');
 });
