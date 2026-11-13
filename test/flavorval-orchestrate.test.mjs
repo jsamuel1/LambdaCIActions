@@ -1119,6 +1119,117 @@ test('two generations of timed-out claims: a later fence never re-admits an olde
   }
 });
 
+// ---- late-settling fence (review finding 1794546887390-27dea6:1) -----------------------------
+//
+// The fence is itself an ambiguous write. If one fence attempt times out and the run releases
+// anyway, this order strands the row: release (sees `pending`) → claim lands → late fence (only
+// bumps `rev`). The run must therefore not release until a fence is CONFIRMED.
+
+/** Wire a model, then make the claim and the FIRST fence attempt land only when the test says. */
+function lateClaimAndFirstFence() {
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  useModel(s, m);
+  const claim = deferred();
+  const firstFence = deferred();
+  const order = [];
+  s.deps.claim = (input) => claim.promise.then(() => m.claim(input));
+  let fences = 0;
+  s.deps.fence = () => {
+    fences += 1;
+    if (fences === 1) return firstFence.promise.then(() => m.fence());
+    order.push('fence-confirmed');
+    m.fence();
+    return Promise.resolve();
+  };
+  s.deps.transition = async (input) => {
+    order.push(`transition:${input.to}`);
+    return m.transition(input);
+  };
+  return { s, m, claim, firstFence, order, fenceCount: () => fences };
+}
+
+test('claim → fence → release, the fence settling LATE: the row is never left validating', async () => {
+  // The reviewer's exact order: the claim is in flight, the first fence times out and is still in
+  // flight, then the claim lands, then the late fence lands.
+  const t = lateClaimAndFirstFence();
+  const res = await withinMs(
+    2_000,
+    runValidation(t.s.deps, { installationId: INSTALL, name: NAME }, HANG),
+  );
+  assert.equal(res.skipped, 'claim-unknown');
+  assert.ok(t.fenceCount() >= 2, 'the timed-out fence was retried');
+  // The release never ran ahead of a confirmed fence.
+  assert.deepEqual(t.order, ['fence-confirmed', 'transition:pending']);
+  assert.equal(res.verdictWritten, true);
+
+  t.claim.resolve();
+  await settle();
+  assert.equal(t.m.row.state, 'pending', 'the confirmed fence refuses the late claim');
+  t.firstFence.resolve();
+  await settle();
+  assert.equal(t.m.row.state, 'pending', 'the late fence only bumps the revision');
+  assert.equal(t.m.row.validationRunId, undefined);
+});
+
+test('claim lands while the first fence is in flight: the confirmed fence is followed by its release', async () => {
+  const t = lateClaimAndFirstFence();
+  // The claim lands BEFORE any fence takes effect — the case only the release can undo.
+  t.s.deps.claim = (input) => {
+    t.m.claim(input);
+    return new Promise(() => {});
+  };
+  const res = await withinMs(
+    2_000,
+    runValidation(t.s.deps, { installationId: INSTALL, name: NAME }, HANG),
+  );
+  assert.equal(res.skipped, 'claim-unknown');
+  assert.equal(res.verdictWritten, true);
+  assert.equal(t.m.row.state, 'pending', 'our landed claim was released');
+  t.firstFence.resolve();
+  await settle();
+  assert.equal(t.m.row.state, 'pending');
+});
+
+test('a fence that never answers: no release is sent ahead of it, and the run reports unsettled', async () => {
+  const s = scenario(happyOpts());
+  hang(s, ['transition:validating', 'fence']);
+  // A short virtual budget so the retry loop gives up quickly in real time.
+  const res = await withinMs(
+    2_000,
+    runValidation(s.deps, { installationId: INSTALL, name: NAME }, { ...HANG, deadlineMs: 10_000 }),
+  );
+  assert.equal(res.skipped, 'claim-unknown');
+  assert.equal(res.verdictWritten, false, 'unproven settlement is never reported as settled');
+  assert.ok(s.names().filter((n) => n === 'fence').length >= 2, 'the fence was retried');
+  assert.equal(
+    s.transitions.some((t) => t.to === 'pending'),
+    false,
+    'a release before a confirmed fence could be overtaken by the claim',
+  );
+  assert.equal(s.names().includes('launch'), false);
+});
+
+test('a confirmed fence whose release times out is retried until the release answers', async () => {
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  useModel(s, m);
+  s.deps.claim = (input) => {
+    m.claim(input); // landed; the answer is lost
+    return new Promise(() => {});
+  };
+  let releases = 0;
+  s.deps.transition = async (input) => {
+    releases += 1;
+    if (releases === 1) return new Promise(() => {});
+    return m.transition(input);
+  };
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.verdictWritten, true);
+  assert.equal(releases, 2);
+  assert.equal(m.row.state, 'pending');
+});
+
 test('a repoint between the read and the claim: the stale run claims nothing and launches nothing', async () => {
   // Review finding 1794543259290-b6c209:1. The run reads image A; the operator repoints the row to
   // image B; the run's claim must not land, or it would launch A and mark the row — now naming B —

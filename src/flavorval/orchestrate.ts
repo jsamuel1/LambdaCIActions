@@ -524,32 +524,31 @@ export async function runValidation(
     );
   } catch (err) {
     // The claim did not answer, so whether it LANDED is unknown — and it may still be in flight,
-    // able to land AFTER anything we write now. Releasing alone is not enough: a release that runs
-    // before the late claim sees `pending`, does nothing, and the claim then strands the row in
-    // `validating` (reproduced by review). So, in order:
-    //   1. FENCE: advance the row's revision. The claim is a CAS on the revision we read, so once
-    //      the bump lands it — and any older run's claim still in flight — fails its condition
-    //      forever. The revision only grows, so no later fence can re-admit it (a single overwritable
-    //      fenced-token field could: run B's fence would replace run A's).
-    //   2. Release `validating → pending` guarded by our token. It now only has the one case left to
-    //      handle — a claim that landed before the fence — and DynamoDB orders the two writes.
-    // If the fence itself cannot be confirmed, the claim's lease is the backstop: an expired lease
-    // lets the next trigger take the row over (and an operator re-validate always can).
+    // able to land AFTER anything we write now. See {@link settleUnknownClaim} for why the fence
+    // must be CONFIRMED before the release runs, and why neither may be fire-and-forget.
     const message = err instanceof Error ? err.message : String(err);
     deps.log({
       msg: 'flavor validation claim did not answer — fencing and releasing a possible claim',
       ...idOf(req),
       error: message,
     });
-    const fenced = await fenceRun(deps, req, config);
-    const released = await releaseToPending(deps, req, config, runId, `claim failed: ${message}`);
+    const settled = await settleUnknownClaim(
+      deps,
+      req,
+      config,
+      runId,
+      `claim failed: ${message}`,
+      // Nothing was launched on this path, so there is no cleanup to reserve time for: the whole
+      // remaining budget is available to settle the row.
+      deadlineAt,
+    );
     return {
       ran: false,
       skipped: 'claim-unknown',
       state: 'pending',
-      // `released` is true only when our claim HAD landed. Otherwise the fence is what guarantees
-      // the row cannot end up `validating`, so a confirmed fence counts as settled too.
-      verdictWritten: released || fenced,
+      // True only when the row is PROVABLY not left `validating` by this run: a fence confirmed
+      // applied, followed by a release that answered. Anything less leaves the lease as backstop.
+      verdictWritten: settled,
     };
   }
   if (!claimed) {
@@ -951,24 +950,110 @@ async function releaseToPending(
   }
 }
 
-/** Fence every claim based on an earlier read. Bounded, never throws; true when confirmed. */
-async function fenceRun(
+/**
+ * Settle a claim whose outcome is unknown, so the row cannot be left `validating` by this run.
+ * Never throws; true only when that is PROVEN.
+ *
+ * The claim may still be in flight, so any write of ours can be overtaken by it. Two writes are
+ * needed, and the ORDER IN WHICH THEY TAKE EFFECT is what matters — not the order they were sent:
+ *
+ *   1. FENCE (`ADD rev 1`). The claim is a CAS on the revision this run read, so once a fence has
+ *      taken effect the claim can never land; and `rev` only grows, so no later write re-admits it.
+ *      A fence does nothing to a claim that ALREADY landed.
+ *   2. RELEASE `validating → pending`, guarded by our token. Undoes a claim that landed before the
+ *      fence.
+ *
+ * The release is only meaningful once the fence is KNOWN to have taken effect. A fence that merely
+ * timed out may still be in flight, and then this order is reachable (reproduced by review):
+ * release (sees `pending`, does nothing) → claim lands → late fence lands (only bumps `rev`) → the
+ * row is stranded. So the fence is retried until one attempt is confirmed. A confirmed fence fixes
+ * the claim's fate — it landed before the fence (and is ours to release, holding our token) or it
+ * never will — and only then does the release run, retried until it ANSWERS: `true` released our
+ * claim, `false` means the row is not held by us (the claim never landed, or someone else has since
+ * moved it). Either answer is settled. A timed-out fence or release attempt that lands later is
+ * harmless: a fence only bumps `rev`, and a release only ever touches a row holding our token.
+ *
+ * If `until` passes first (DynamoDB unreachable for the whole budget), nothing more can be proven
+ * from here: the claim's lease is the backstop — an expired lease lets the next trigger take a
+ * stranded row over, and an operator re-validate always can.
+ */
+async function settleUnknownClaim(
   deps: OrchestratorDeps,
   req: FlavorValidationRequest,
   config: OrchestratorConfig,
+  runId: string,
+  reason: string,
+  until: number,
 ): Promise<boolean> {
-  try {
-    await bounded('fence', config.verdictTimeoutMs, (signal) =>
-      deps.fence({ installationId: req.installationId, name: req.name }, signal),
-    );
+  const ctx = idOf(req);
+  const fenced = await retryUntil(deps, config, until, 'fence', ctx, async (signal) => {
+    await deps.fence({ installationId: req.installationId, name: req.name }, signal);
     return true;
-  } catch (err) {
+  });
+  if (fenced === undefined) {
     deps.log({
-      msg: 'flavor validation could not fence its claim — the claim lease is the backstop',
+      msg: 'flavor validation could not confirm a fence for its unanswered claim — the claim lease is the backstop',
       ...idOf(req),
-      error: err instanceof Error ? err.message : String(err),
     });
     return false;
+  }
+  const released = await retryUntil(deps, config, until, 'release', ctx, (signal) =>
+    deps.transition(
+      {
+        installationId: req.installationId,
+        name: req.name,
+        to: 'pending',
+        from: ['validating'],
+        runId,
+        reason,
+        actor: req.actor,
+      },
+      signal,
+    ),
+  );
+  if (released === undefined) {
+    deps.log({
+      msg: 'flavor validation fenced its unanswered claim but could not release it — the claim lease is the backstop',
+      ...idOf(req),
+    });
+    return false;
+  }
+  deps.log({
+    msg: 'flavor validation settled its unanswered claim',
+    ...idOf(req),
+    claimHadLanded: released,
+  });
+  return true;
+}
+
+/**
+ * Repeat one row write, each attempt bounded by `verdictTimeoutMs`, until an attempt ANSWERS or
+ * `until` passes. Returns the answer, or `undefined` when none came. Never throws.
+ *
+ * Only for writes whose late-landing earlier attempts are harmless (see {@link settleUnknownClaim}).
+ */
+async function retryUntil<T>(
+  deps: OrchestratorDeps,
+  config: OrchestratorConfig,
+  until: number,
+  effect: string,
+  ctx: Record<string, unknown>,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T | undefined> {
+  for (let attempt = 1; ; attempt++) {
+    const left = until - deps.now();
+    if (!(left > 0)) return undefined;
+    try {
+      return await bounded(effect, Math.min(config.verdictTimeoutMs, left), run);
+    } catch (err) {
+      deps.log({
+        msg: `flavor validation ${effect} attempt did not answer — retrying`,
+        ...ctx,
+        attempt,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    await deps.sleep(Math.min(config.pollIntervalMs, Math.max(0, until - deps.now())));
   }
 }
 

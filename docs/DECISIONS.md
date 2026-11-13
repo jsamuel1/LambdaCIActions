@@ -2265,10 +2265,18 @@ the static gates; the smoke run itself is verified against a live environment.
      that token AND the launched `imageArn`, the release requires the token, and every transition
      out of `validating` removes the token. So a late verdict can never overwrite an operator's
      re-validate or a later run's claim, nor describe an image the row no longer names. A claim
-     that did not answer is handled in two writes: first `fenceFlavorValidationRun` advances `rev`
-     (every claim based on an older read, however many generations of them are still in flight,
-     fails its condition from then on, and because `rev` never decreases no later fence can
-     re-admit one), then the token-guarded release undoes a claim that landed before the fence.
+     that did not answer is handled in two writes whose EFFECT order is what matters: first
+     `fenceFlavorValidationRun` advances `rev` (every claim based on an older read, however many
+     generations of them are still in flight, fails its condition from then on, and because `rev`
+     never decreases no later fence can re-admit one), then the token-guarded release undoes a claim
+     that landed before the fence. The release runs only after a fence attempt has been CONFIRMED:
+     a fence that merely timed out may still be in flight, and releasing before it lands allows
+     release (sees `pending`) → claim lands → late fence (only bumps `rev`) → row stranded in
+     `validating`. So the fence is retried, each attempt bounded, until one answers, and the release
+     is then retried until it answers; both may use the run's whole remaining budget, because
+     nothing was launched on that path. Late duplicates of either are harmless (a fence only bumps
+     `rev`; a release only touches a row holding this run's token). Only when no fence or release
+     answers before the deadline does the run report the row unsettled.
      Reserved concurrency alone did not order those in-flight writes. Finally, the lease (15 min,
      longer than the λ timeout) means that a `validating` row whose λ is provably gone, because it
      could not reach DynamoDB at all, is taken over by the next claim instead of waiting for an

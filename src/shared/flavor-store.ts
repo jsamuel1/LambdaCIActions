@@ -737,10 +737,13 @@ export async function claimFlavorValidation(
  *
  * Used by the smoke λ when its own claim did not answer: whether that claim landed is unknown, and
  * it may still be in flight. A claim is a compare-and-swap on the revision its run read, so once the
- * bump lands a late-settling claim fails its condition; a claim that landed BEFORE the bump is then
- * undone by the token-guarded release that follows. Either way the row cannot be left `validating`
- * by that run. The revision is MONOTONIC, so a later run's fence can never re-admit an older one's
- * claim — the defect of a single overwritable `fencedRunId`.
+ * bump has TAKEN EFFECT a late-settling claim fails its condition; a claim that landed before it is
+ * then undone by the token-guarded release. That release is only sound after a fence the caller
+ * has CONFIRMED: a fence that timed out may itself still be in flight, and a release run before it
+ * lands can be overtaken by the claim (release → claim → late fence strands `validating`). So the
+ * caller retries the fence until one attempt answers, and only then releases. A late duplicate
+ * fence is harmless — it only bumps `rev`. The revision is MONOTONIC, so a later run's fence can
+ * never re-admit an older one's claim — the defect of a single overwritable `fencedRunId`.
  */
 export async function fenceFlavorValidationRun(
   input: { installationId: number; name: string },
