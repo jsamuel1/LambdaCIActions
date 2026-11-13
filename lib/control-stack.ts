@@ -842,6 +842,20 @@ export class ControlStack extends Stack {
     this.flavorvalFunctionName = flavorval.functionName;
     this.flavorvalFunctionArn = flavorval.functionArn;
 
+    // The Reaper's 5-minute sweep releases validation claims whose lease expired — a run that could
+    // not reach DynamoDB or was killed outright writes no verdict — and re-triggers them (ADR-041,
+    // src/flavorval/sweep.ts). Without a producer of that later run, an expired lease would only
+    // PERMIT recovery. The sweep needs exactly one more authority: an async invoke of this λ. The
+    // table grant it already holds covers the GSI1 query and the conditional release.
+    reaper.addEnvironment('FLAVORVAL_FUNCTION_NAME', flavorval.functionName);
+    reaper.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'RetriggerStrandedFlavorValidation',
+        actions: ['lambda:InvokeFunction'],
+        resources: [flavorval.functionArn],
+      }),
+    );
+
     // Reads the flavor row + writes its verdict, and writes/deletes the `SMOKE#` JIT+RUN rows the
     // broker serves the validation VM.
     table.grantReadWriteData(flavorval);

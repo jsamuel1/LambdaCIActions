@@ -2278,9 +2278,36 @@ the static gates; the smoke run itself is verified against a live environment.
      `rev`; a release only touches a row holding this run's token). Only when no fence or release
      answers before the deadline does the run report the row unsettled.
      Reserved concurrency alone did not order those in-flight writes. Finally, the lease (15 min,
-     longer than the λ timeout) means that a `validating` row whose λ is provably gone, because it
-     could not reach DynamoDB at all, is taken over by the next claim instead of waiting for an
-     operator.
+     longer than the λ timeout) marks a `validating` row whose λ is provably gone — one that could
+     not reach DynamoDB at all, or was killed outright — and the **reconciliation sweep** acts on
+     it. A lease alone is only a permission for a later claim; the only producers of runs are
+     registration and an operator's re-validate, so without a sweep such a row would wait for an
+     operator forever. Every claim therefore also writes a sparse GSI1 entry (`gsi1pk =
+     FLAVORCLAIMS`, `gsi1sk` = zero-padded lease expiry) that every exit from `validating`
+     removes, so the partition holds exactly the live claims. The Reaper's existing 5-minute
+     schedule (`src/flavorval/sweep.ts`) queries it for leases that ended before now, releases
+     each `validating → pending` conditional on the same token AND an expired lease (so a row a
+     later run holds, or a run still in its budget, is never touched, however stale the index
+     read), and re-triggers validation with an async invoke of the smoke λ — the Reaper's only
+     new authority. The re-trigger is capped: a row's `autoRecoveries` counter is incremented only
+     by that release and removed by every verdict, repoint and operator-initiated claim, and past
+     3 consecutive recoveries the row is still released but left `pending` with a reason asking
+     for a re-validate, because each attempt launches a microVM and a run that dies
+     deterministically must not become one VM per sweep. The sweep is hosted by the Reaper, not
+     the smoke λ, because the smoke λ's reserved concurrency of 1 would throttle a scheduled
+     sweep behind the very run it is meant to recover.
+
+     Every GitHub listing the smoke run reads is **read to completion or fails**. Each caller is
+     looking for one item — our nonce runner, our dispatched run, the job carrying our nonce — so
+     on a first-page-only read "not on page 1" would look like "not there": a busy repository
+     could push our run off the newest page before a poll (never attributed, never cancelled), and
+     a repository with more than 100 runners could hide a registration whose mint response was
+     lost (residue left behind). Runner lookups pass the exact AgentName as GitHub's `name`
+     filter (and re-check it exactly); run listings pass the dispatch floor as `created>=` and stop
+     paging once a newest-first page crosses it; every listing follows `Link: rel="next"` (only on
+     `api.github.com`). A listing still advertising a next page at its page cap throws
+     `GithubListingIncompleteError`, which the orchestrator treats as an orchestration fault —
+     `pending`, never a verdict and never "runner never registered".
 
   Property 3 additionally requires that the verdict write itself cannot throw, which is why the
   flavor store's document client sets `marshallOptions.removeUndefinedValues`. The evidence map is

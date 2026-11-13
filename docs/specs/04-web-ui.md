@@ -65,7 +65,10 @@ a management API over the same DynamoDB the control/compute planes write to.
 > that resolves after one, drops it). Rows render only for the installation their read was issued
 > for, so a switch never leaves another installation's rows wired to the new scope's actions. While
 > any custom flavor is `pending`/`validating` the screen polls (5 s, paused while the tab is hidden)
-> until every row is terminal. Per ADR-038 every rate is labelled an
+> until every row is terminal. Delete is irreversible and immediately makes jobs naming the flavor
+> unclaimable, so it is two-step: the first click only arms an inline confirmation naming the flavor
+> and its installation (`account (id)`), and `DELETE` is sent only from that confirmation; Cancel
+> or an installation switch disarms it with no request. Per ADR-038 every rate is labelled an
 > **estimate** and `vcpu` is marked indicative.
 
 Workflow detail is rendered inline on Repo detail rather than as its own screen: a repo has

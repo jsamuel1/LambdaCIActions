@@ -27,6 +27,7 @@ import {
   DEFAULT_ORCHESTRATOR_CONFIG,
 } from '../dist/src/flavorval/orchestrate.js';
 import { smokeLabel, isSmokeLabel } from '../dist/src/flavorval/validate-core.js';
+import { sweepExpiredFlavorClaims, SWEEP_ACTOR } from '../dist/src/flavorval/sweep.js';
 
 const INSTALL = 42;
 const NAME = 'custom-gpu';
@@ -176,7 +177,7 @@ function hang(s, effects) {
     const original = s.deps[name];
     s.deps[name] = (...args) => {
       s.calls.push({ name, arg: 'HUNG' });
-      signals.push({ name, signal: args.at(-1) });
+      signals.push({ name, signal: args.find((a) => a instanceof AbortSignal) });
       void original;
       return new Promise(() => {});
     };
@@ -1006,8 +1007,38 @@ function rowModel(clock) {
         validationRunId: input.runId,
         validationLeaseUntil: input.leaseUntil,
       });
+      if (!input.autoRecovery) delete row.autoRecoveries;
       bump();
       return true;
+    },
+    /** `releaseExpiredFlavorClaim`: the reconciliation sweep's guarded release. */
+    releaseExpired(input) {
+      if (!row || row.state !== 'validating') return undefined;
+      if (row.validationRunId !== input.runId) return undefined;
+      if (!(row.validationLeaseUntil < input.nowMs)) return undefined;
+      row.state = 'pending';
+      row.reason = input.reason;
+      delete row.validationRunId;
+      delete row.validationLeaseUntil;
+      row.autoRecoveries = (row.autoRecoveries ?? 0) + 1;
+      bump();
+      return { autoRecoveries: row.autoRecoveries };
+    },
+    /** What the live-claim index would return for `listExpiredFlavorClaims(nowMs)`. */
+    expired(nowMs) {
+      const claims =
+        row && row.state === 'validating' && row.validationLeaseUntil < nowMs
+          ? [
+              {
+                installationId: row.installationId,
+                name: row.name,
+                runId: row.validationRunId,
+                leaseUntil: row.validationLeaseUntil,
+                autoRecoveries: row.autoRecoveries ?? 0,
+              },
+            ]
+          : [];
+      return { claims, truncated: false };
     },
     fence() {
       if (row) bump();
@@ -1025,6 +1056,7 @@ function rowModel(clock) {
       row.state = input.to;
       delete row.validationRunId;
       delete row.validationLeaseUntil;
+      delete row.autoRecoveries;
       bump();
       return true;
     },
@@ -1208,6 +1240,175 @@ test('a fence that never answers: no release is sent ahead of it, and the run re
     'a release before a confirmed fence could be overtaken by the claim',
   );
   assert.equal(s.names().includes('launch'), false);
+});
+
+// ---- automatic recovery of an unsettled claim (review finding 1794555970246-5ee1de:1) ---------
+//
+// The run above ends with the row possibly `validating` and nobody coming back for it: the lease only
+// PERMITS a later claim, and the only producers of runs were registration and an operator's
+// re-validate. The Reaper's sweep is that producer. These tests drive the whole chain through the
+// same row model: an unsettled run, the lease expiring, the sweep's release + re-trigger, and the
+// re-triggered run reaching a verdict — with no operator action anywhere.
+
+/** A run whose claim LANDS (answer lost) and whose DynamoDB then never answers again. */
+async function strandingRun(m, nonce = 'dead01') {
+  const s = scenario(happyOpts());
+  useModel(s, m);
+  s.deps.nonce = () => nonce;
+  s.deps.claim = (input) => {
+    m.claim(input);
+    return new Promise(() => {});
+  };
+  s.deps.fence = () => new Promise(() => {});
+  const res = await withinMs(
+    2_000,
+    runValidation(s.deps, { installationId: INSTALL, name: NAME }, { ...HANG, deadlineMs: 10_000 }),
+  );
+  assert.equal(res.verdictWritten, false);
+  assert.equal(m.row.state, 'validating', 'precondition: this run strands the row');
+  return s;
+}
+
+/** Sweep deps over the row model; `onTrigger` receives every re-trigger request. */
+function sweepDeps(m, onTrigger) {
+  return {
+    listExpired: async (nowMs) => m.expired(nowMs),
+    release: async (input) => m.releaseExpired(input),
+    trigger: async (input) => {
+      await onTrigger(input);
+      return true;
+    },
+    log: () => {},
+  };
+}
+
+test('an unsettled claim is released and re-validated automatically once its lease expires', async () => {
+  let t = 1_700_000_000_000;
+  const m = rowModel(() => t);
+  const s1 = await strandingRun(m);
+  const lease = m.row.validationLeaseUntil;
+  assert.ok(lease > s1.deps.now(), 'the lease outlives the run that took it');
+
+  // Before expiry the sweep must not touch the row: its run might still be alive.
+  const early = await sweepExpiredFlavorClaims(
+    sweepDeps(m, () => assert.fail('no re-trigger before the lease expires')),
+    lease - 1,
+    3,
+  );
+  assert.equal(early.released, 0);
+  assert.equal(m.row.state, 'validating');
+
+  // After expiry: released, then re-triggered, and the re-triggered run proves the image.
+  const triggered = [];
+  t = lease + 1;
+  const res = await sweepExpiredFlavorClaims(
+    sweepDeps(m, async (req) => {
+      triggered.push(req);
+      assert.equal(m.row.state, 'pending', 'released BEFORE the re-trigger, so the new claim can land');
+      const s2 = scenario(happyOpts());
+      useModel(s2, m);
+      const out = await runValidation(s2.deps, req, FAST);
+      assert.equal(out.state, 'valid');
+    }),
+    lease + 1,
+    3,
+  );
+  assert.deepEqual(res, { expired: 1, released: 1, retriggered: 1, leftPending: 0, truncated: false });
+  assert.equal(triggered.length, 1);
+  assert.equal(triggered[0].actor, SWEEP_ACTOR);
+  assert.equal(triggered[0].autoRecovery, true);
+  assert.equal(m.row.state, 'valid', 'no operator action was needed to leave validating');
+  assert.equal(m.row.autoRecoveries, undefined, 'a verdict resets the recovery counter');
+});
+
+test('the sweep never releases a claim a later run holds, even from a stale index read', async () => {
+  let t = 1_700_000_000_000;
+  const m = rowModel(() => t);
+  await strandingRun(m, 'dead01');
+  const stale = m.expired(m.row.validationLeaseUntil + 1);
+  // A later run took the expired row over between the index read and the release.
+  t = m.row.validationLeaseUntil + 1;
+  assert.equal(
+    m.claim({ runId: 'live02', leaseUntil: t + 900_000, expect: m.snap(), autoRecovery: false }),
+    true,
+  );
+  const res = await sweepExpiredFlavorClaims(
+    {
+      listExpired: async () => stale,
+      release: async (input) => m.releaseExpired(input),
+      trigger: async () => assert.fail('nothing was released, so nothing is re-triggered'),
+      log: () => {},
+    },
+    t,
+    3,
+  );
+  assert.equal(res.released, 0);
+  assert.equal(m.row.state, 'validating');
+  assert.equal(m.row.validationRunId, 'live02', 'the live claim is untouched');
+});
+
+test('a flavor whose runs keep dying is re-triggered at most N times, then left pending for an operator', async () => {
+  let t = 1_700_000_000_000;
+  const m = rowModel(() => t);
+  const strand = (autoRecovery) => {
+    assert.equal(
+      m.claim({ runId: `r${t}`, leaseUntil: t + 1000, expect: m.snap(), autoRecovery }),
+      true,
+    );
+    t += 2000; // the run dies; its lease expires
+  };
+  let triggers = 0;
+  const deps = sweepDeps(m, () => {
+    triggers += 1;
+  });
+
+  strand(false); // the operator's registration
+  for (let i = 1; i <= 3; i++) {
+    const r = await sweepExpiredFlavorClaims(deps, t, 3);
+    assert.equal(r.retriggered, 1, `recovery ${i} is re-triggered`);
+    assert.equal(m.row.state, 'pending');
+    strand(true); // the re-triggered run dies the same way
+  }
+  const last = await sweepExpiredFlavorClaims(deps, t, 3);
+  assert.equal(last.released, 1, 'the row still leaves validating');
+  assert.equal(last.retriggered, 0, 'but no fourth smoke VM is launched');
+  assert.equal(last.leftPending, 1);
+  assert.equal(triggers, 3);
+  assert.equal(m.row.state, 'pending');
+  assert.match(m.row.reason, /re-validate to try again/);
+
+  // An operator's re-validate is a fresh decision: it resets the counter.
+  strand(false);
+  const after = await sweepExpiredFlavorClaims(deps, t, 3);
+  assert.equal(after.retriggered, 1);
+});
+
+test('one row whose release throws does not stop the sweep releasing the others', async () => {
+  const released = [];
+  const res = await sweepExpiredFlavorClaims(
+    {
+      listExpired: async () => ({
+        claims: [
+          { installationId: 1, name: 'custom-a', runId: 'a', leaseUntil: 1, autoRecoveries: 0 },
+          { installationId: 1, name: 'custom-b', runId: 'b', leaseUntil: 1, autoRecoveries: 0 },
+        ],
+        truncated: true,
+      }),
+      release: async (input) => {
+        if (input.name === 'custom-a') throw new Error('ProvisionedThroughputExceeded');
+        released.push(input.name);
+        return { autoRecoveries: 1 };
+      },
+      trigger: async () => false,
+      log: () => {},
+    },
+    10,
+    3,
+  );
+  assert.deepEqual(released, ['custom-b']);
+  assert.equal(res.released, 1);
+  assert.equal(res.leftPending, 1, 'a trigger that could not be sent leaves the row pending, not validating');
+  assert.equal(res.truncated, true);
 });
 
 test('a confirmed fence whose release times out is retried until the release answers', async () => {
@@ -1506,5 +1707,55 @@ for (const [effect, before, recovery] of [
       `${effect} was never sent, so cleanup has nothing to recover`,
     );
     assert.equal(s.names().includes(effect), false, `${effect} itself was not started`);
+  });
+}
+
+// ---- complete GitHub listings (review finding 1794555970246-5ee1de:2) --------------------------
+
+test('every runner lookup names our exact runner, and every run listing carries the dispatch floor', async () => {
+  const s = scenario(happyOpts());
+  const runnerArgs = [];
+  const runArgs = [];
+  const listRunners = s.deps.listRunners;
+  s.deps.listRunners = async (repo, signal, name) => {
+    runnerArgs.push(name);
+    return listRunners(repo, signal, name);
+  };
+  const listDispatchRuns = s.deps.listDispatchRuns;
+  s.deps.listDispatchRuns = async (input, signal) => {
+    runArgs.push(input.createdAtOrAfterMs);
+    return listDispatchRuns(input, signal);
+  };
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(res.state, 'valid');
+  assert.ok(runnerArgs.length > 0 && runnerArgs.every((n) => n === 'lca-validate-abc123'));
+  assert.ok(runArgs.length > 0 && runArgs.every((ms) => Number.isFinite(ms)));
+});
+
+test('the lost-mint recovery looks the runner up by its exact name', async () => {
+  const s = scenario(happyOpts());
+  s.deps.mintSmokeRunner = () => new Promise(() => {});
+  const asked = [];
+  s.deps.listRunners = async (_repo, _signal, name) => {
+    asked.push(name);
+    return name === 'lca-validate-abc123' ? [{ id: 4242, name, labels: [], status: 'offline' }] : [];
+  };
+  await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.deepEqual(asked, ['lca-validate-abc123']);
+  assert.deepEqual(s.calls.filter((c) => c.name === 'deleteRunner').map((c) => c.arg), [4242]);
+});
+
+for (const effect of ['listRunners', 'listDispatchRuns', 'listRunJobs']) {
+  test(`an incomplete ${effect} listing is an orchestration fault (pending), never a verdict`, async () => {
+    const s = scenario({ ...happyOpts(), runners: () => [] });
+    s.deps[effect] = async () => {
+      const err = new Error(`GitHub ${effect} has more than 10 page(s); the listing was not read to its end`);
+      err.name = 'GithubListingIncompleteError';
+      throw err;
+    };
+    const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+    assert.equal(res.state, 'pending', 'a partial read must not score "runner never registered"');
+    assert.match(res.reason, /not a verdict about the image/);
+    assert.equal(s.calls.find((c) => c.name === 'terminateVm')?.arg, 'mvm-1', 'cleanup still runs');
   });
 }

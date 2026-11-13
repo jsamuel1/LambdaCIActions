@@ -263,7 +263,7 @@ Transitions written to DynamoDB `Run` rows for the UI.
 ## Reaping & timeouts
 
 - **Per-runner cap**: `MAX_RUNNER_LIFETIME` (default well under 8h) enforced by the runner itself and by the Reaper.
-- **Reaper λ** (EventBridge schedule): lists live microVMs (no tags on the GA API — correlates by the run store's persisted `microvmId`, ADR-015); terminates any past cap; closes `Run` rows with no live microVM (`timed_out`/`orphaned`). Backstop only — the primary teardown is the hook's self-terminate (ADR-019).
+- **Reaper λ** (EventBridge schedule): lists live microVMs (no tags on the GA API — correlates by the run store's persisted `microvmId`, ADR-015); terminates any past cap; closes `Run` rows with no live microVM (`timed_out`/`orphaned`). Backstop only — the primary teardown is the hook's self-terminate (ADR-019). The same tick releases custom-flavor validation claims whose lease expired (a smoke run that wrote no verdict) back to `pending` and re-triggers validation, capped at 3 consecutive automatic recoveries (ADR-041).
 - **Stuck-queue signal**: `Run` in `provisioning` beyond threshold ⇒ UI health warning (likely a quota wall — see [05](05-infrastructure.md)).
 
 ## Caching & pre-warming

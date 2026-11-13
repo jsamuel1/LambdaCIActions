@@ -94,6 +94,40 @@ export const MAX_CUSTOM_FLAVORS_PER_INSTALLATION = 64;
  */
 export const MAX_FLAVOR_REASON_LENGTH = 1024;
 
+/**
+ * GSI1 partition holding every LIVE smoke-run claim (ADR-041), keyed by lease expiry.
+ *
+ * Sparse: {@link claimFlavorValidation} writes `gsi1pk`/`gsi1sk` and EVERY write that leaves
+ * `validating` removes them, so the partition holds exactly the rows some run currently holds. Its
+ * own partition-key namespace, disjoint from `RUNSTATUS#`/`INSTALLS`/`REFUSALS`, so no other GSI1
+ * reader can see these rows.
+ *
+ * It exists for one reader: the reconciliation sweep ({@link listExpiredFlavorClaims}). A lease
+ * only makes a stranded row ELIGIBLE for takeover; nothing would ever come back to take it over
+ * unless something enumerates expired claims. Without an index that enumeration is a table scan.
+ */
+export const FLAVOR_CLAIMS_GSI1PK = 'FLAVORCLAIMS';
+
+/**
+ * The claim index's sort key: the lease expiry, zero-padded so lexicographic order IS numeric order
+ * (GSI1's sort key is a string). 16 digits covers every epoch-ms value this side of year 2286.
+ */
+export function flavorClaimGsi1sk(leaseUntilMs: number): string {
+  return String(Math.max(0, Math.floor(leaseUntilMs))).padStart(16, '0');
+}
+
+/**
+ * How many times the sweep may automatically re-trigger validation for one flavor before it stops
+ * and waits for an operator.
+ *
+ * A claim only expires when its run wrote neither a verdict nor a release — DynamoDB unreachable
+ * for the whole budget, or the λ killed outright. The second can repeat deterministically (a
+ * container that is OOM-killed at the same step every time), and each attempt launches a microVM.
+ * An uncapped re-trigger would turn that into a smoke VM every sweep interval, forever. The counter
+ * is reset by a terminal verdict and by an image repoint (a new artifact).
+ */
+export const MAX_FLAVOR_AUTO_RECOVERIES = 3;
+
 /** Clip a reason to {@link MAX_FLAVOR_REASON_LENGTH} characters, marking that it was cut. */
 export function clampReason(reason: string): string {
   return reason.length <= MAX_FLAVOR_REASON_LENGTH
@@ -215,6 +249,12 @@ export interface CustomFlavorRecord {
   validationRunId?: string;
   /** Epoch ms after which a `validating` claim may be taken over (its λ is provably gone). */
   validationLeaseUntil?: number;
+  /**
+   * How many times the reconciliation sweep has released an expired claim on this row with no
+   * verdict in between (ADR-041). Incremented only by {@link releaseExpiredFlavorClaim}, removed by
+   * every other transition; caps automatic re-triggering at {@link MAX_FLAVOR_AUTO_RECOVERIES}.
+   */
+  autoRecoveries?: number;
   /**
    * Monotonic row revision (ADR-041). Absent on a freshly registered row (read as 0) and bumped by
    * EVERY later write — claim, verdict, release, operator re-validate, image repoint, fence. A claim
@@ -578,8 +618,13 @@ export async function transitionFlavorValidation(
     values[':actor'] = input.actor;
   }
   // Ownership ends with `validating`. Claims are made only by `claimFlavorValidation`, so every
-  // target this function writes leaves the state and drops the token + lease with it.
-  removes.push('validationRunId', 'validationLeaseUntil');
+  // target this function writes leaves the state and drops the token + lease with it — and the
+  // row's entry in the live-claim index, which must hold exactly the rows some run holds.
+  //
+  // The automatic-recovery counter is reset by every transition: a verdict, a run's own release and
+  // an operator's re-validate all prove the loop the counter guards (sweep → re-trigger → the run
+  // dies again) is not happening. Only the sweep's own release increments it.
+  removes.push('validationRunId', 'validationLeaseUntil', 'gsi1pk', 'gsi1sk', 'autoRecoveries');
   // Every write moves the revision, so a claim based on the row as it was BEFORE this write fails.
   values[':one'] = 1;
 
@@ -662,6 +707,8 @@ export async function claimFlavorValidation(
     expect: { rev?: number; createdAt: string; imageArn: string };
     reason?: string;
     actor?: string;
+    /** Set when this run was started by the reconciliation sweep: keep its recovery counter. */
+    autoRecovery?: boolean;
     now?: Date;
   },
   signal?: AbortSignal,
@@ -683,9 +730,19 @@ export async function claimFlavorValidation(
     'validationRunId = :runId',
     'validationLeaseUntil = :lease',
     'updatedAt = :now',
+    // Into the sparse live-claim index, so the reconciliation sweep can find this claim if its run
+    // never writes a verdict or a release (see FLAVOR_CLAIMS_GSI1PK).
+    'gsi1pk = :claimsPk',
+    'gsi1sk = :claimsSk',
   ];
+  values[':claimsPk'] = FLAVOR_CLAIMS_GSI1PK;
+  values[':claimsSk'] = flavorClaimGsi1sk(input.leaseUntil);
   // `fencedRunId` is the scalar fence this revision replaced; drop it from rows that still carry it.
   const removes: string[] = ['fencedRunId'];
+  // A claim made for any reason other than the sweep's own re-trigger (registration, an operator's
+  // re-validate) resets the automatic-recovery counter: it is a fresh decision to run, not the
+  // repeat of a run that keeps dying.
+  if (!input.autoRecovery) removes.push('autoRecoveries');
   if (input.reason !== undefined) {
     sets.push('#reason = :reason');
     values[':reason'] = clampReason(input.reason);
@@ -768,6 +825,131 @@ export async function fenceFlavorValidationRun(
   }
 }
 
+/** A live claim whose lease has run out, as the reconciliation sweep sees it. */
+export interface ExpiredFlavorClaim {
+  installationId: number;
+  name: string;
+  /** The token of the run that held it — the release is conditional on it. */
+  runId: string;
+  leaseUntil: number;
+  /** How many times the sweep has already released this flavor without an intervening verdict. */
+  autoRecoveries: number;
+}
+
+/**
+ * Every claim whose lease ended before `nowMs`, read from the sparse live-claim index.
+ *
+ * This is the enumeration that turns the lease from a passive permission ("a later claim MAY take
+ * this row over") into an actual recovery: a run that could not reach DynamoDB for its whole budget,
+ * or a λ killed outright, writes neither a verdict nor a release, and the only producers of new
+ * runs are registration and an operator's re-validate. Without this read nothing ever comes back.
+ *
+ * Paginated to completion up to `maxPages`, and REPORTS truncation instead of hiding it: the index
+ * is eventually consistent and every row is re-checked by the conditional release, so a partial
+ * read is safe — the rest are found on the next sweep — but it must be visible in the log.
+ */
+export async function listExpiredFlavorClaims(
+  nowMs: number,
+  opts: { maxPages?: number } = {},
+): Promise<{ claims: ExpiredFlavorClaim[]; truncated: boolean }> {
+  const maxPages = opts.maxPages ?? 10;
+  const claims: ExpiredFlavorClaim[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const res = await requireDoc().send(
+      new QueryCommand({
+        TableName: TABLE,
+        IndexName: 'gsi1',
+        KeyConditionExpression: 'gsi1pk = :pk AND gsi1sk < :now',
+        ExpressionAttributeValues: {
+          ':pk': FLAVOR_CLAIMS_GSI1PK,
+          ':now': flavorClaimGsi1sk(nowMs),
+        },
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }),
+    );
+    for (const item of (res.Items ?? []) as Partial<CustomFlavorRecord & { autoRecoveries: number }>[]) {
+      if (
+        typeof item.installationId !== 'number' ||
+        typeof item.name !== 'string' ||
+        typeof item.validationRunId !== 'string' ||
+        item.state !== 'validating'
+      ) {
+        continue;
+      }
+      claims.push({
+        installationId: item.installationId,
+        name: item.name,
+        runId: item.validationRunId,
+        leaseUntil: item.validationLeaseUntil ?? 0,
+        autoRecoveries: typeof item.autoRecoveries === 'number' ? item.autoRecoveries : 0,
+      });
+    }
+    startKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
+    if (!startKey) return { claims, truncated: false };
+  }
+  return { claims, truncated: true };
+}
+
+/**
+ * Release a claim whose lease EXPIRED: `validating → pending`, conditional on the row still being
+ * held by `runId` under a lease that ended before `nowMs`. The reconciliation sweep's one write.
+ *
+ * The guards are the claim's own, read the other way round. The token means a row some LATER run
+ * has since claimed (new token) is never touched; the lease check means a claim whose run is still
+ * inside its budget is never touched either, however stale the eventually-consistent index read
+ * was. `ADD rev 1` fences any claim still in flight against the pre-release row, exactly as every
+ * other write does. `autoRecoveries` is incremented here and ONLY here, so the caller can stop
+ * re-triggering a flavor whose runs keep dying (see {@link MAX_FLAVOR_AUTO_RECOVERIES}).
+ *
+ * Returns the counter's new value when released, or `undefined` when the condition refused (the
+ * row moved on its own — nothing to do).
+ */
+export async function releaseExpiredFlavorClaim(
+  input: {
+    installationId: number;
+    name: string;
+    runId: string;
+    nowMs: number;
+    reason: string;
+  },
+  signal?: AbortSignal,
+): Promise<{ autoRecoveries: number } | undefined> {
+  try {
+    const res = await requireDoc().send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
+        UpdateExpression:
+          'SET #state = :pending, #reason = :reason, updatedAt = :now, updatedBy = :actor' +
+          ' REMOVE validationRunId, validationLeaseUntil, gsi1pk, gsi1sk' +
+          ' ADD rev :one, autoRecoveries :one',
+        ConditionExpression:
+          'attribute_exists(pk) AND #state = :validating AND validationRunId = :runId' +
+          ' AND validationLeaseUntil < :nowMs',
+        ExpressionAttributeNames: { '#state': 'state', '#reason': 'reason' },
+        ExpressionAttributeValues: {
+          ':pending': 'pending' satisfies FlavorValidationState,
+          ':validating': 'validating' satisfies FlavorValidationState,
+          ':reason': clampReason(input.reason),
+          ':now': new Date(input.nowMs).toISOString(),
+          ':actor': 'reconciliation-sweep',
+          ':runId': input.runId,
+          ':nowMs': input.nowMs,
+          ':one': 1,
+        },
+        ReturnValues: 'UPDATED_NEW',
+      }),
+      { abortSignal: signal },
+    );
+    const n = (res.Attributes as { autoRecoveries?: number } | undefined)?.autoRecoveries;
+    return { autoRecoveries: typeof n === 'number' ? n : 1 };
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return undefined;
+    throw err;
+  }
+}
+
 /**
  * Repoint a custom flavor at a new image ARN, resetting it to `pending`.
  *
@@ -792,7 +974,7 @@ export async function repointFlavorImage(input: {
         UpdateExpression:
           'SET imageArn = :arn, #state = :pending, updatedAt = :now' +
           (input.actor ? ', updatedBy = :actor' : '') +
-          ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil' +
+          ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil, gsi1pk, gsi1sk, autoRecoveries' +
           // A claim based on the row before the swap must fail: it read the OLD artifact.
           ' ADD rev :one',
         ConditionExpression: 'attribute_exists(pk)',

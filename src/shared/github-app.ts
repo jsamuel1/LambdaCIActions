@@ -119,7 +119,7 @@ async function githubJson<T>(
      */
     signal?: AbortSignal;
   },
-): Promise<{ status: number; body: T }> {
+): Promise<{ status: number; body: T; link?: string }> {
   const clean = (text: string): string => redactLiterals(text, init.redactValues ?? []);
   const res = await fetch(`${GITHUB_API}${path}`, {
     method: init.method ?? 'GET',
@@ -162,7 +162,67 @@ async function githubJson<T>(
     const detail = typeof message === 'string' ? clean(message).slice(0, 200) : '';
     throw new GithubApiError(path, res.status, `${detail}${requestIdOf(res)}`);
   }
-  return { status: res.status, body };
+  return { status: res.status, body, link: res.headers?.get?.('link') ?? undefined };
+}
+
+/**
+ * A paginated GitHub listing that could not be read to its end within the caller's page cap.
+ *
+ * Thrown rather than returning what was read: every smoke-run caller of a listing is looking for ONE
+ * specific item (our nonce runner, our dispatched run, the job that carries our nonce), and on a
+ * partial read "not found" would be indistinguishable from "not there". Treating that as absence
+ * would score an image "the runner never registered" or leave registration residue behind. As an
+ * error it is an orchestration fault, which the smoke λ maps to `pending` — never to a verdict.
+ */
+export class GithubListingIncompleteError extends Error {
+  constructor(
+    readonly path: string,
+    readonly pagesRead: number,
+  ) {
+    super(`GitHub ${path} has more than ${pagesRead} page(s); the listing was not read to its end`);
+    this.name = 'GithubListingIncompleteError';
+  }
+}
+
+/** The `rel="next"` target of a GitHub `Link` header, as a path under {@link GITHUB_API}. */
+export function nextPagePath(link: string | undefined): string | undefined {
+  if (!link) return undefined;
+  for (const part of link.split(',')) {
+    const m = /<([^>]+)>\s*;\s*rel="?next"?/.exec(part);
+    if (!m) continue;
+    const url = m[1];
+    // Only ever follow GitHub's own API host: the header is response data, not something to trust
+    // as an arbitrary URL to send an installation token to.
+    if (!url.startsWith(`${GITHUB_API}/`)) return undefined;
+    return url.slice(GITHUB_API.length);
+  }
+  return undefined;
+}
+
+/**
+ * Read every page of a GitHub list endpoint by following `Link: rel="next"`.
+ *
+ * `stop` lets a caller end early once a page proves nothing further can match (a newest-first run
+ * list that has gone past the dispatch floor). Reaching `maxPages` with a next page still
+ * advertised throws {@link GithubListingIncompleteError}; it is never reported as a complete read.
+ */
+async function githubPaged<TItem>(
+  firstPath: string,
+  pick: (body: unknown) => TItem[],
+  init: { token: string; tokenType: 'Bearer' | 'token'; signal?: AbortSignal },
+  opts: { maxPages: number; stop?: (page: TItem[]) => boolean },
+): Promise<TItem[]> {
+  const out: TItem[] = [];
+  let path: string | undefined = firstPath;
+  for (let page = 0; path; page++) {
+    if (page >= opts.maxPages) throw new GithubListingIncompleteError(firstPath, page);
+    const res: { body: unknown; link?: string } = await githubJson<unknown>(path, init);
+    const items = pick(res.body);
+    out.push(...items);
+    if (opts.stop?.(items)) break;
+    path = nextPagePath(res.link);
+  }
+  return out;
 }
 
 /** GitHub's request id, so an operator-facing error is still traceable in a support ticket. */
@@ -897,11 +957,19 @@ export interface WorkflowDispatchRun {
 /**
  * List a workflow's `workflow_dispatch` runs, newest first.
  *
- * Scoped by `event=workflow_dispatch` and one page. The caller uses "created at or after the moment
- * I dispatched" only to NARROW the candidates — the dispatch API returns no run id, so there is
- * nothing to match on directly. The window is not sufficient on its own and must not be treated as
- * identification: a concurrent or manual dispatch of the same workflow in the same second would
- * satisfy it. {@link listRunJobs} supplies the nonce-bearing evidence that confirms a candidate.
+ * Scoped by `event=workflow_dispatch` and, when `createdAtOrAfterMs` is given, by GitHub's own
+ * `created>=` filter, and read to completion: a busy repository can have pushed the run we are
+ * looking for off the first page between our dispatch and a poll, and a partial read must not look
+ * like "our run does not exist". Pages are followed via `Link: rel="next"` up to `maxPages`; a
+ * listing still advertising a next page there throws {@link GithubListingIncompleteError} rather
+ * than returning a truncated set. Paging also stops early once a (newest-first) page reaches a run
+ * created before the floor, because nothing after it can match.
+ *
+ * The caller uses "created at or after the moment I dispatched" only to NARROW the candidates — the
+ * dispatch API returns no run id, so there is nothing to match on directly. The window is not
+ * sufficient on its own and must not be treated as identification: a concurrent or manual dispatch
+ * of the same workflow in the same second would satisfy it. {@link listRunJobs} supplies the
+ * nonce-bearing evidence that confirms a candidate.
  */
 export async function listWorkflowDispatchRuns(params: {
   appId: string;
@@ -912,7 +980,10 @@ export async function listWorkflowDispatchRuns(params: {
   owner: string;
   repo: string;
   workflow: string;
+  /** Only runs created at/after this epoch-ms instant (second granularity, floored). */
+  createdAtOrAfterMs?: number;
   perPage?: number;
+  maxPages?: number;
 }): Promise<WorkflowDispatchRun[]> {
   const token = await getInstallationToken(
     params.appId,
@@ -920,29 +991,48 @@ export async function listWorkflowDispatchRuns(params: {
     params.installationId,
     params.signal,
   );
-  const per = Math.min(Math.max(params.perPage ?? 10, 1), 100);
-  const { body } = await githubJson<{
-    workflow_runs?: {
-      id?: number;
-      status?: string;
-      conclusion?: string | null;
-      created_at?: string;
-      html_url?: string;
-    }[];
-  }>(
+  const per = Math.min(Math.max(params.perPage ?? 100, 1), 100);
+  const floor =
+    params.createdAtOrAfterMs !== undefined
+      ? Math.floor(params.createdAtOrAfterMs / 1000) * 1000
+      : undefined;
+  const created =
+    floor !== undefined
+      ? `&created=${encodeURIComponent(`>=${new Date(floor).toISOString().replace(/\.\d{3}Z$/, 'Z')}`)}`
+      : '';
+  type Raw = {
+    id?: number;
+    status?: string;
+    conclusion?: string | null;
+    created_at?: string;
+    html_url?: string;
+  };
+  const toRun = (r: Raw): WorkflowDispatchRun | undefined =>
+    typeof r.id === 'number'
+      ? {
+          id: r.id,
+          status: r.status,
+          conclusion: r.conclusion ?? null,
+          createdAt: r.created_at ? new Date(r.created_at).getTime() : 0,
+          htmlUrl: r.html_url,
+        }
+      : undefined;
+  const runs = await githubPaged<WorkflowDispatchRun>(
     `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/runs` +
-      `?event=workflow_dispatch&per_page=${per}`,
+      `?event=workflow_dispatch&per_page=${per}${created}`,
+    (body) =>
+      ((body as { workflow_runs?: Raw[] }).workflow_runs ?? [])
+        .map(toRun)
+        .filter((r): r is WorkflowDispatchRun => r !== undefined),
     { token, tokenType: 'token', signal: params.signal },
+    {
+      maxPages: params.maxPages ?? 10,
+      // Newest first: once a page holds a run older than the floor, every later page is older too.
+      stop: (page) => floor !== undefined && page.some((r) => r.createdAt < floor),
+    },
   );
-  return (body.workflow_runs ?? [])
-    .filter((r): r is { id: number } & typeof r => typeof r.id === 'number')
-    .map((r) => ({
-      id: r.id,
-      status: r.status,
-      conclusion: r.conclusion ?? null,
-      createdAt: r.created_at ? new Date(r.created_at).getTime() : 0,
-      htmlUrl: r.html_url,
-    }))
+  return runs
+    .filter((r) => floor === undefined || r.createdAt >= floor)
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
@@ -978,6 +1068,7 @@ export async function listRunJobs(params: {
   owner: string;
   repo: string;
   runId: number;
+  maxPages?: number;
 }): Promise<WorkflowRunJob[]> {
   const token = await getInstallationToken(
     params.appId,
@@ -985,20 +1076,23 @@ export async function listRunJobs(params: {
     params.installationId,
     params.signal,
   );
-  const { body } = await githubJson<{
-    jobs?: {
-      id?: number;
-      name?: string;
-      status?: string;
-      conclusion?: string | null;
-      runner_name?: string | null;
-      labels?: string[];
-    }[];
-  }>(`/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/jobs?per_page=100`, {
-    token,
-    tokenType: 'token', signal: params.signal,
-  });
-  return (body.jobs ?? [])
+  type RawJob = {
+    id?: number;
+    name?: string;
+    status?: string;
+    conclusion?: string | null;
+    runner_name?: string | null;
+    labels?: string[];
+  };
+  // Every page: the job carrying our nonce is the attribution evidence, and "not on page 1" is not
+  // "not there". A run that exceeds the cap throws rather than reading as "not ours".
+  const jobs = await githubPaged<RawJob>(
+    `/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/jobs?per_page=100`,
+    (body) => (body as { jobs?: RawJob[] }).jobs ?? [],
+    { token, tokenType: 'token', signal: params.signal },
+    { maxPages: params.maxPages ?? 5 },
+  );
+  return jobs
     .filter((j): j is { id: number } & typeof j => typeof j.id === 'number')
     .map((j) => ({
       id: j.id,
@@ -1022,12 +1116,16 @@ export interface RepoRunner {
 }
 
 /**
- * List a repository's self-hosted runners.
+ * List a repository's self-hosted runners, optionally only the one with an exact `name`.
  *
- * One page at the API maximum. The smoke run uses this to observe that its runner REGISTERED —
- * the single fact that distinguishes "the image booted but the agent never started" (ADR-019/020)
- * from "the agent came up and something later went wrong", and the two have completely different
- * operator remedies.
+ * The smoke run uses this to observe that its runner REGISTERED — the single fact that
+ * distinguishes "the image booted but the agent never started" (ADR-019/020) from "the agent came
+ * up and something later went wrong", and the two have completely different operator remedies —
+ * and to find a registration whose mint response was lost, so it can be deleted. Both look for ONE
+ * runner whose name we chose, so they pass `name`: GitHub filters server-side, and a repository
+ * with hundreds of runners cannot push ours off the first page. Every page is still followed, and
+ * a listing that exceeds `maxPages` throws {@link GithubListingIncompleteError} instead of reading
+ * as "not registered".
  */
 export async function listRepoRunners(params: {
   appId: string;
@@ -1037,6 +1135,9 @@ export async function listRepoRunners(params: {
   signal?: AbortSignal;
   owner: string;
   repo: string;
+  /** Exact runner name to filter on (GitHub's `name` query parameter). */
+  name?: string;
+  maxPages?: number;
 }): Promise<RepoRunner[]> {
   const token = await getInstallationToken(
     params.appId,
@@ -1044,16 +1145,27 @@ export async function listRepoRunners(params: {
     params.installationId,
     params.signal,
   );
-  const { body } = await githubJson<{
-    runners?: { id?: number; name?: string; status?: string; busy?: boolean; labels?: { name?: string }[] }[];
-  }>(`/repos/${params.owner}/${params.repo}/actions/runners?per_page=100`, {
-    token,
-    tokenType: 'token', signal: params.signal,
-  });
-  return (body.runners ?? [])
+  type RawRunner = {
+    id?: number;
+    name?: string;
+    status?: string;
+    busy?: boolean;
+    labels?: { name?: string }[];
+  };
+  const runners = await githubPaged<RawRunner>(
+    `/repos/${params.owner}/${params.repo}/actions/runners?per_page=100` +
+      (params.name ? `&name=${encodeURIComponent(params.name)}` : ''),
+    (body) => (body as { runners?: RawRunner[] }).runners ?? [],
+    { token, tokenType: 'token', signal: params.signal },
+    { maxPages: params.maxPages ?? 10 },
+  );
+  return runners
     .filter((r): r is { id: number; name: string } & typeof r =>
       typeof r.id === 'number' && typeof r.name === 'string',
     )
+    // The server-side filter is the scalability fix; the exact client-side match is the guarantee,
+    // so a filter GitHub ever widens to a prefix match can never hand back a bystander's runner.
+    .filter((r) => !params.name || r.name.toLowerCase() === params.name.toLowerCase())
     .map((r) => ({
       id: r.id,
       name: r.name,

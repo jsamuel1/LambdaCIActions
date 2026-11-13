@@ -276,6 +276,8 @@ test('installation switch: A rows never render with B scope, and a late A read c
   assert.doesNotMatch(text(), /arn:A/);
 
   await click(button('Delete'));
+  assert.equal(api.calls.filter((c) => c.method === 'DELETE').length, 0, 'the first click only arms the confirmation');
+  await click(button('Delete permanently'));
   const del = api.calls.filter((c) => c.method === 'DELETE');
   assert.equal(del.length, 1);
   assert.equal(del[0].url, '/api/flavors/custom-gpu?installation=2', 'the click targets the row it was rendered from');

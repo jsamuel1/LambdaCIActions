@@ -288,3 +288,142 @@ test('a run-owned verdict requires the token AND the launched image', async () =
   assert.doesNotMatch(operator.ConditionExpression, /validationRunId/);
   assert.doesNotMatch(operator.ConditionExpression, /imageArn/);
 });
+
+// ---- live-claim index + sweep release (review finding 1794555970246-5ee1de:1) -----------------
+
+test('a claim enters the sparse live-claim index keyed by its lease; every exit removes it', async () => {
+  const w = interceptWire();
+  try {
+    await store.claimFlavorValidation({
+      installationId: 42,
+      name: 'custom-good',
+      runId: 'run-a',
+      leaseUntil: 1_700_000_900_000,
+      expect: { createdAt: '2026-01-01T00:00:00.000Z', imageArn: 'arn:x' },
+      now: new Date(1_700_000_000_000),
+    });
+    await store.transitionFlavorValidation({ installationId: 42, name: 'custom-good', to: 'valid', runId: 'run-a' });
+    await store.repointFlavorImage({ installationId: 42, name: 'custom-good', imageArn: 'arn:y' });
+  } finally {
+    w.restore();
+  }
+  const [claim, verdict, repoint] = w.bodies;
+  assert.match(claim.UpdateExpression, /gsi1pk = :claimsPk, gsi1sk = :claimsSk/);
+  assert.deepEqual(claim.ExpressionAttributeValues[':claimsPk'], { S: store.FLAVOR_CLAIMS_GSI1PK });
+  assert.deepEqual(claim.ExpressionAttributeValues[':claimsSk'], { S: '0001700000900000' });
+  // An operator-initiated claim resets the automatic-recovery counter.
+  assert.match(claim.UpdateExpression, /REMOVE [^A]*autoRecoveries/);
+  for (const req of [verdict, repoint]) {
+    assert.match(req.UpdateExpression, /gsi1pk/);
+    assert.match(req.UpdateExpression, /REMOVE .*gsi1pk, gsi1sk/);
+  }
+});
+
+test('a sweep-triggered claim keeps the recovery counter', async () => {
+  const w = interceptWire();
+  try {
+    await store.claimFlavorValidation({
+      installationId: 42,
+      name: 'custom-good',
+      runId: 'run-b',
+      leaseUntil: 1_700_000_900_000,
+      expect: { createdAt: '2026-01-01T00:00:00.000Z', imageArn: 'arn:x' },
+      autoRecovery: true,
+    });
+  } finally {
+    w.restore();
+  }
+  assert.doesNotMatch(w.bodies[0].UpdateExpression, /autoRecoveries/);
+});
+
+test('the lease sort key orders numerically as a string', () => {
+  const keys = [9, 1_700_000_000_000, 99_999, 1_800_000_000_000].map(store.flavorClaimGsi1sk);
+  assert.deepEqual([...keys].sort(), [
+    store.flavorClaimGsi1sk(9),
+    store.flavorClaimGsi1sk(99_999),
+    store.flavorClaimGsi1sk(1_700_000_000_000),
+    store.flavorClaimGsi1sk(1_800_000_000_000),
+  ]);
+});
+
+test('the sweep release is guarded by token AND expired lease, bumps rev and the recovery counter', async () => {
+  const w = interceptWire();
+  try {
+    await store.releaseExpiredFlavorClaim({
+      installationId: 42,
+      name: 'custom-good',
+      runId: 'run-a',
+      nowMs: 1_700_001_000_000,
+      reason: 'expired',
+    });
+  } finally {
+    w.restore();
+  }
+  const req = w.bodies[0];
+  assert.match(req.ConditionExpression, /#state = :validating AND validationRunId = :runId/);
+  assert.match(req.ConditionExpression, /validationLeaseUntil < :nowMs/);
+  assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
+  assert.deepEqual(req.ExpressionAttributeValues[':nowMs'], { N: '1700001000000' });
+  assert.match(req.UpdateExpression, /REMOVE validationRunId, validationLeaseUntil, gsi1pk, gsi1sk/);
+  assert.match(req.UpdateExpression, /ADD rev :one, autoRecoveries :one$/);
+});
+
+test('the expired-claim read queries only the claim partition, below now, and follows pages', async () => {
+  const original = NodeHttpHandler.prototype.handle;
+  const bodies = [];
+  const pages = [
+    {
+      Items: [
+        {
+          installationId: { N: '42' },
+          name: { S: 'custom-a' },
+          state: { S: 'validating' },
+          validationRunId: { S: 'r1' },
+          validationLeaseUntil: { N: '5' },
+        },
+      ],
+      LastEvaluatedKey: { pk: { S: 'x' }, sk: { S: 'y' }, gsi1pk: { S: 'FLAVORCLAIMS' }, gsi1sk: { S: '1' } },
+    },
+    {
+      Items: [
+        {
+          installationId: { N: '43' },
+          name: { S: 'custom-b' },
+          state: { S: 'validating' },
+          validationRunId: { S: 'r2' },
+          validationLeaseUntil: { N: '6' },
+          autoRecoveries: { N: '2' },
+        },
+      ],
+    },
+  ];
+  NodeHttpHandler.prototype.handle = async function (req) {
+    bodies.push(JSON.parse(req.body));
+    return {
+      response: {
+        statusCode: 200,
+        headers: { 'content-type': 'application/x-amz-json-1.0' },
+        body: Readable.from([Buffer.from(JSON.stringify(pages[bodies.length - 1]))]),
+      },
+    };
+  };
+  let out;
+  try {
+    out = await store.listExpiredFlavorClaims(1_700_000_000_000);
+  } finally {
+    NodeHttpHandler.prototype.handle = original;
+  }
+  assert.equal(bodies.length, 2, 'the second page was read');
+  assert.equal(bodies[0].IndexName, 'gsi1');
+  assert.match(bodies[0].KeyConditionExpression, /gsi1pk = :pk AND gsi1sk < :now/);
+  assert.deepEqual(bodies[0].ExpressionAttributeValues[':pk'], { S: 'FLAVORCLAIMS' });
+  assert.ok(bodies[1].ExclusiveStartKey);
+  assert.equal(out.truncated, false);
+  assert.deepEqual(
+    out.claims.map((c) => [c.name, c.runId, c.autoRecoveries]),
+    [
+      ['custom-a', 'r1', 0],
+      ['custom-b', 'r2', 2],
+    ],
+  );
+});

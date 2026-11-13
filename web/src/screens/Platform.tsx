@@ -422,18 +422,30 @@ function SmokeWorkflow({ yaml }: { yaml: string }): JSX.Element {
   );
 }
 
-/** One custom flavor row's actions: re-validate (optionally repointing the image) and delete. */
+/**
+ * One custom flavor row's actions: re-validate (optionally repointing the image) and delete.
+ *
+ * Delete is irreversible and immediately makes every job naming the flavor unclaimable, so it is a
+ * two-step action: the first click only arms an inline confirmation that names the flavor AND the
+ * installation it belongs to, and the request is sent only from that confirmation's own button.
+ * Cancel disarms it without a request. Re-validate needs no such guard: it is recoverable (it only
+ * returns the flavor to `pending` and starts a new run).
+ */
 function CustomFlavorActions({
   installationId,
+  installationLabel,
   flavor,
   onChanged,
 }: {
   installationId: number;
+  /** How the operator knows the installation, for the delete confirmation. */
+  installationLabel: string;
   flavor: Flavor;
   onChanged: () => void;
 }): JSX.Element {
   const [imageArn, setImageArn] = useState('');
   const [busy, setBusy] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
   const [note, setNote] = useState<string | undefined>(undefined);
 
@@ -462,7 +474,7 @@ function CustomFlavorActions({
       />
       <button
         type="button"
-        disabled={busy}
+        disabled={busy || confirmingDelete}
         onClick={() =>
           run(async () => {
             const res = await api.revalidateFlavor(
@@ -479,19 +491,45 @@ function CustomFlavorActions({
       >
         Re-validate
       </button>
-      <button
-        type="button"
-        className="danger"
-        disabled={busy}
-        onClick={() =>
-          run(async () => {
-            await api.deleteFlavor(installationId, flavor.name);
-            return `${flavor.name} deleted`;
-          })
-        }
-      >
-        Delete
-      </button>
+      {!confirmingDelete ? (
+        <button
+          type="button"
+          className="danger"
+          disabled={busy}
+          onClick={() => {
+            setError(undefined);
+            setNote(undefined);
+            setConfirmingDelete(true);
+          }}
+        >
+          Delete
+        </button>
+      ) : (
+        <span role="alertdialog" aria-label={`Confirm deleting ${flavor.name}`} className="row">
+          <span className="error">
+            Delete <code>{flavor.name}</code> from installation <strong>{installationLabel}</strong>?
+            This cannot be undone. Jobs that name <code>{flavor.label}</code> will no longer be
+            claimed.
+          </span>
+          <button
+            type="button"
+            className="danger"
+            disabled={busy}
+            onClick={() =>
+              run(async () => {
+                await api.deleteFlavor(installationId, flavor.name);
+                setConfirmingDelete(false);
+                return `${flavor.name} deleted`;
+              })
+            }
+          >
+            Delete permanently
+          </button>
+          <button type="button" disabled={busy} onClick={() => setConfirmingDelete(false)}>
+            Cancel
+          </button>
+        </span>
+      )}
       {error && <span className="error">{error}</span>}
       {note && <span className="muted">{note}</span>}
     </div>
@@ -733,6 +771,7 @@ export function Flavors(): JSX.Element {
                   <td>
                     <CustomFlavorActions
                       installationId={scope}
+                      installationLabel={installationLabel(installs.data?.installations, scope)}
                       flavor={f}
                       onChanged={reload}
                     />
@@ -762,6 +801,15 @@ export function Flavors(): JSX.Element {
       {scope !== undefined && smokeWorkflow && <SmokeWorkflow yaml={smokeWorkflow} />}
     </>
   );
+}
+
+/**
+ * The installation as the operator sees it in the selector (`account (id)`), for confirmations that
+ * must say WHICH installation an irreversible action targets. Falls back to the id alone.
+ */
+function installationLabel(installations: Installation[] | undefined, id: number): string {
+  const i = installations?.find((x) => x.installationId === id);
+  return i ? `${i.accountLogin} (${i.installationId})` : String(id);
 }
 
 /**

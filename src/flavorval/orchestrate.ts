@@ -34,6 +34,12 @@ export interface FlavorValidationRequest {
   installationId: number;
   name: string;
   actor?: string;
+  /**
+   * Set by the reconciliation sweep (`sweep.ts`) when it re-triggers a flavor whose previous run
+   * ended without a verdict. Carried onto the claim so the row's automatic-recovery counter
+   * survives; any other trigger resets it.
+   */
+  autoRecovery?: boolean;
 }
 
 /**
@@ -110,6 +116,8 @@ export interface OrchestratorDeps {
       expect: { rev?: number; createdAt: string; imageArn: string };
       reason?: string;
       actor?: string;
+      /** Keep the row's automatic-recovery counter (see {@link FlavorValidationRequest}). */
+      autoRecovery?: boolean;
     },
     signal?: AbortSignal,
   ): Promise<boolean>;
@@ -213,10 +221,15 @@ export interface OrchestratorDeps {
    * runner as a side effect of minting it (verified live: the row appears immediately with
    * `status: "offline"`), so a label match alone observes OUR OWN MINT and proves nothing about
    * the image. Only a runner that reached `online`/`busy` is evidence that the agent started.
+   *
+   * `name` is the exact AgentName this run minted; every caller passes it, so the read is filtered
+   * server-side and a repository with many runners cannot hide ours past a page boundary. MUST read
+   * the listing to completion or throw — a partial read must never look like "not registered".
    */
   listRunners(
     repoFullName: string,
     signal?: AbortSignal,
+    name?: string,
   ): Promise<
     {
       id: number;
@@ -226,11 +239,16 @@ export interface OrchestratorDeps {
       busy?: boolean;
     }[]
   >;
-  /** `workflow_dispatch` runs of the validation workflow, newest first. */
+  /**
+   * `workflow_dispatch` runs of the validation workflow created at/after `createdAtOrAfterMs`,
+   * newest first. MUST read to completion (or throw): our run can be anywhere in a busy repo's
+   * history, and a partial read must never look like "our run does not exist".
+   */
   listDispatchRuns(
     input: {
       repoFullName: string;
       workflow: string;
+      createdAtOrAfterMs: number;
     },
     signal?: AbortSignal,
   ): Promise<
@@ -246,7 +264,7 @@ export interface OrchestratorDeps {
    *
    * This is the nonce-bearing evidence that a candidate run is OURS. A GitHub runner is matched by
    * label rather than bound to the job it was minted for, and the dispatch API returns no run id,
-   * so a timestamp window alone cannot identify our run.
+   * so a timestamp window alone cannot identify our run. MUST return every job (or throw).
    */
   listRunJobs(
     input: {
@@ -288,8 +306,8 @@ export interface OrchestratorConfig {
   /**
    * Hard wall-clock budget for the whole run, ms. MUST be comfortably inside the λ's own timeout:
    * the orchestrator's last act is to write a verdict, and a λ killed by its timeout writes
-   * nothing — leaving the row in `validating`, which no later run can transition out of except
-   * through the deliberate `validating → pending` escape.
+   * nothing — leaving the row in `validating` until its lease expires and the reconciliation sweep
+   * releases it, which costs the flavor a whole lease plus a sweep interval.
    *
    * "Hard" means every awaited external effect, not just the polling loop: each one runs inside
    * {@link bounded}, which gives up on it at its own timer whether or not the effect ever answers.
@@ -320,8 +338,9 @@ export interface OrchestratorConfig {
   cleanupStepTimeoutMs: number;
   /**
    * How long a claim holds the row, ms from the run's start. MUST exceed the λ's own timeout: an
-   * expired lease is how a later run knows the claiming λ is gone and may take a stranded
-   * `validating` row over (see `claimFlavorValidation`).
+   * expired lease is how the reconciliation sweep (`sweep.ts`) and any later run know the claiming
+   * λ is gone, so the sweep may release a stranded `validating` row and re-trigger it (see
+   * `releaseExpiredFlavorClaim`, `claimFlavorValidation`).
    */
   leaseMs: number;
   /**
@@ -518,6 +537,7 @@ export async function runValidation(
           expect: { rev: rec.rev, createdAt: rec.createdAt, imageArn: rec.imageArn },
           reason: 'smoke run in progress',
           actor: req.actor,
+          ...(req.autoRecovery ? { autoRecovery: true } : {}),
         },
         signal,
       ),
@@ -547,7 +567,7 @@ export async function runValidation(
       skipped: 'claim-unknown',
       state: 'pending',
       // True only when the row is PROVABLY not left `validating` by this run: a fence confirmed
-      // applied, followed by a release that answered. Anything less leaves the lease as backstop.
+      // applied, followed by a release that answered. Anything less is left to the sweep.
       verdictWritten: settled,
     };
   }
@@ -951,7 +971,7 @@ async function releaseToPending(
     );
   } catch (err) {
     deps.log({
-      msg: 'flavor validation could not release the row — the claim lease (or an operator re-validate) recovers it',
+      msg: 'flavor validation could not release the row — the reconciliation sweep recovers it after the lease',
       ...idOf(req),
       error: err instanceof Error ? err.message : String(err),
     });
@@ -983,8 +1003,10 @@ async function releaseToPending(
  * harmless: a fence only bumps `rev`, and a release only ever touches a row holding our token.
  *
  * If `until` passes first (DynamoDB unreachable for the whole budget), nothing more can be proven
- * from here: the claim's lease is the backstop — an expired lease lets the next trigger take a
- * stranded row over, and an operator re-validate always can.
+ * from here. The row is then recovered by the reconciliation sweep (`sweep.ts`, on the Reaper's
+ * schedule): once the claim's lease expires it enumerates the claim from the live-claim index,
+ * releases it under the same token, and re-triggers validation. A lease alone would only permit a
+ * later claim to take the row over; the sweep is what makes that later claim happen.
  */
 async function settleUnknownClaim(
   deps: OrchestratorDeps,
@@ -1001,7 +1023,7 @@ async function settleUnknownClaim(
   });
   if (fenced === undefined) {
     deps.log({
-      msg: 'flavor validation could not confirm a fence for its unanswered claim — the claim lease is the backstop',
+      msg: 'flavor validation could not confirm a fence for its unanswered claim — the reconciliation sweep recovers it after the lease',
       ...idOf(req),
     });
     return false;
@@ -1022,7 +1044,7 @@ async function settleUnknownClaim(
   );
   if (released === undefined) {
     deps.log({
-      msg: 'flavor validation fenced its unanswered claim but could not release it — the claim lease is the backstop',
+      msg: 'flavor validation fenced its unanswered claim but could not release it — the reconciliation sweep recovers it after the lease',
       ...idOf(req),
     });
     return false;
@@ -1148,7 +1170,7 @@ async function cleanup(
     await attempt(
       'recoverRunner',
       async (signal) => {
-        const found = (await deps.listRunners(repo, signal)).find(
+        const found = (await deps.listRunners(repo, signal, name)).find(
           (r) => r.name.toLowerCase() === name.toLowerCase(),
         );
         if (found) await deps.deleteRunner({ repoFullName: repo, runnerId: found.id }, signal);
@@ -1173,7 +1195,7 @@ async function cleanup(
       async (signal) => {
         const floor = Math.floor(recover.dispatchedAtMs / 1000) * 1000;
         const runs = await deps.listDispatchRuns(
-          { repoFullName: repo, workflow: recover.workflow },
+          { repoFullName: repo, workflow: recover.workflow, createdAtOrAfterMs: floor },
           signal,
         );
         const wanted = recover.label.toLowerCase();
@@ -1296,11 +1318,12 @@ async function observeSmoke(
   for (;;) {
     if (!runnerRegistered) {
       const runners = await step('listRunners', (signal) =>
-        deps.listRunners(input.repoFullName, signal),
+        deps.listRunners(input.repoFullName, signal, input.runnerName),
       );
       const mine = runners.find(
         (r) =>
-          r.labels.some((l) => l.toLowerCase() === input.label.toLowerCase()) &&
+          (r.labels.some((l) => l.toLowerCase() === input.label.toLowerCase()) ||
+            r.name.toLowerCase() === input.runnerName.toLowerCase()) &&
           // CONNECTED, not merely present. Minting the JIT config registers the runner up front
           // (live-verified: `status: "offline"` the instant `generate-jitconfig` returns), so
           // accepting any row carrying our label would score every image "the agent started" —
@@ -1316,11 +1339,15 @@ async function observeSmoke(
     }
 
     if (workflowConclusion === undefined) {
+      const floor = Math.floor(input.dispatchedAtMs / 1000) * 1000;
       const runs = await step('listDispatchRuns', (signal) =>
         deps.listDispatchRuns(
           {
             repoFullName: input.repoFullName,
             workflow: input.workflow,
+            // Server-side window, so older history is never paged through; the listing is read to
+            // completion above it, so a burst of later dispatches cannot push ours off a page.
+            createdAtOrAfterMs: floor,
           },
           signal,
         ),
@@ -1328,8 +1355,8 @@ async function observeSmoke(
       // Narrow by time first (a run created BEFORE our dispatch is never ours — `>=` because
       // GitHub's `created_at` has second granularity and can equal our millisecond timestamp's
       // second), then CONFIRM by nonce. Only a run we already confirmed, or one we confirm now,
-      // may contribute an observation.
-      const floor = Math.floor(input.dispatchedAtMs / 1000) * 1000;
+      // may contribute an observation. The filter is re-applied here rather than trusted to the
+      // listing: it is the safety property, the server filter is an optimisation.
       const candidates = runs.filter((r) => r.createdAt >= floor && !notOurs.has(r.id));
       for (const candidate of candidates) {
         if (workflowRunId !== undefined && candidate.id !== workflowRunId) continue;

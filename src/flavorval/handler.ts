@@ -82,7 +82,12 @@ function orchestratorConfig(): OrchestratorConfig {
 
 /** Parse + validate the async invoke payload. */
 function parseRequest(event: unknown): FlavorValidationRequest {
-  const e = (event ?? {}) as { installationId?: unknown; name?: unknown; actor?: unknown };
+  const e = (event ?? {}) as {
+    installationId?: unknown;
+    name?: unknown;
+    actor?: unknown;
+    autoRecovery?: unknown;
+  };
   const installationId = Number(e.installationId);
   if (!Number.isInteger(installationId) || installationId <= 0) {
     throw new Error('flavor validation request: installationId must be a positive integer');
@@ -94,6 +99,7 @@ function parseRequest(event: unknown): FlavorValidationRequest {
     installationId,
     name: e.name,
     ...(typeof e.actor === 'string' && e.actor ? { actor: e.actor } : {}),
+    ...(e.autoRecovery === true ? { autoRecovery: true } : {}),
   };
 }
 
@@ -231,7 +237,7 @@ export function awsDeps(): OrchestratorDeps {
         inputs: { lca_nonce: input.nonce },
       });
     },
-    listRunners: async (repoFullName, signal) => {
+    listRunners: async (repoFullName, signal, name) => {
       const { appId, pem } = await creds();
       return listRepoRunners({
         appId,
@@ -239,6 +245,7 @@ export function awsDeps(): OrchestratorDeps {
         installationId: currentInstallationId,
         signal,
         ...repoParts(repoFullName),
+        ...(name ? { name } : {}),
       });
     },
     listDispatchRuns: async (input, signal) => {
@@ -250,6 +257,7 @@ export function awsDeps(): OrchestratorDeps {
         signal,
         ...repoParts(input.repoFullName),
         workflow: input.workflow,
+        createdAtOrAfterMs: input.createdAtOrAfterMs,
       });
     },
     listRunJobs: async (input, signal) => {

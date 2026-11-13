@@ -253,3 +253,23 @@ test('an unwired validator is a supported state, not a broken template', () => {
     0,
   );
 });
+
+test('the Reaper re-triggers stranded validations: flavorval name in env, invoke on that ARN only', () => {
+  // Review finding 1794555970246-5ee1de:1. A run that wrote neither a verdict nor a release leaves
+  // its row `validating`; the lease only PERMITS a later claim. The Reaper's sweep is the producer
+  // of that later run, and it needs exactly this one grant to be it.
+  const { template } = controlStack();
+  const reaper = Object.values(template.findResources('AWS::Lambda::Function')).find(
+    (f) => f.Properties.FunctionName === 'lca-test-reaper',
+  );
+  assert.ok(reaper, 'reaper function exists');
+  const name = reaper.Properties.Environment.Variables.FLAVORVAL_FUNCTION_NAME;
+  assert.ok(name, 'reaper knows which λ to re-trigger');
+  const invokes = statementsWith(template, 'lambda:InvokeFunction').filter(
+    (s) => s.Sid === 'RetriggerStrandedFlavorValidation',
+  );
+  assert.equal(invokes.length, 1);
+  const arn = JSON.stringify(invokes[0].Resource);
+  assert.match(arn, /FlavorValFn/, 'scoped to the flavorval function, not *');
+  assert.doesNotMatch(arn, /"\*"/);
+});
