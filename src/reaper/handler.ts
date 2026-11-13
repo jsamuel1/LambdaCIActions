@@ -1,6 +1,18 @@
-import { LambdaClient } from '@aws-sdk/client-lambda';
+import { randomBytes } from 'node:crypto';
+import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { listMicroVMs, terminateMicroVM } from '../shared/microvm.js';
 import { listRunsByStatus, transitionRun } from '../shared/run-store.js';
+import {
+  FLAVOR_RETRIGGER_BACKOFF_MS,
+  MAX_FLAVOR_AUTO_RECOVERIES,
+  MAX_FLAVOR_RETRIGGER_SENDS,
+  abandonFlavorRetrigger,
+  listDueFlavorRecoveries,
+  markFlavorRetriggerSent,
+  rearmFlavorRetrigger,
+  releaseExpiredFlavorClaim,
+} from '../shared/flavor-store.js';
+import { sweepExpiredFlavorClaims, type SweepResult } from '../flavorval/sweep.js';
 import {
   reconcileRuns,
   overCapVms,
@@ -19,12 +31,16 @@ import type { RunRecord } from '../shared/types.js';
  *   3. Reconcile via the run store's persisted `microvmId` (NOT tags — the GA API doesn't
  *      tag VMs, ADR-015): `running` runs whose VM id is no longer live → `timed_out`
  *      (orphan); runs stuck in `queued`/`provisioning` → `failed` (likely a quota wall).
- *   4. If a closed ghost run still has a live VM (by its stored id), terminate it.
+ *   4. If a closed ghost run still has a live VM (by its stored id), terminate it too.
+ *   5. Release custom-flavor validation claims whose lease expired, and (re)send validation runs
+ *      that are owed but never started (ADR-041, `src/flavorval/sweep.ts`). Isolated: a fault there
+ *      never affects 1–4.
  *
  * Idempotent: transitions are guarded (forward-only) so re-running the sweep is safe, and
  * terminating an already-gone VM is treated as success.
  *
- * Env: TABLE_NAME, [MAX_LIFETIME_MS], [STUCK_PROVISIONING_MS], [ORPHAN_GRACE_MS].
+ * Env: TABLE_NAME, [FLAVORVAL_FUNCTION_NAME], [MAX_LIFETIME_MS], [STUCK_PROVISIONING_MS],
+ *      [ORPHAN_GRACE_MS].
  */
 
 const lambda = new LambdaClient({});
@@ -47,6 +63,7 @@ function configFromEnv(): ReaperConfig {
 export async function handler(): Promise<{
   terminated: number;
   reconciled: number;
+  flavorClaims?: SweepResult;
 }> {
   const cfg = configFromEnv();
   const now = Date.now();
@@ -110,5 +127,53 @@ export async function handler(): Promise<{
     }
   }
 
-  return { terminated, reconciled };
+  return { terminated, reconciled, flavorClaims: await sweepFlavorClaims(now) };
+}
+
+const FLAVORVAL_FUNCTION_NAME = process.env.FLAVORVAL_FUNCTION_NAME ?? '';
+
+/**
+ * Step 5. Never throws: the run reaping above is the Reaper's primary job and must not be failed by
+ * a flavor-store fault. With no smoke λ configured every send is refused, so expired claims are still
+ * RELEASED (the row leaves `validating`) and their restart markers stay due until one is.
+ */
+async function sweepFlavorClaims(now: number): Promise<SweepResult | undefined> {
+  try {
+    return await sweepExpiredFlavorClaims(
+      {
+        listDue: (nowMs) => listDueFlavorRecoveries(nowMs),
+        release: (input) => releaseExpiredFlavorClaim(input),
+        markSent: (input) => markFlavorRetriggerSent(input),
+        rearm: (input) => rearmFlavorRetrigger(input),
+        abandon: (input) => abandonFlavorRetrigger(input),
+        trigger: async (input) => {
+          if (!FLAVORVAL_FUNCTION_NAME) return false;
+          await lambda.send(
+            new InvokeCommand({
+              FunctionName: FLAVORVAL_FUNCTION_NAME,
+              InvocationType: 'Event',
+              Payload: Buffer.from(JSON.stringify(input), 'utf8'),
+            }),
+          );
+          return true;
+        },
+        token: () => randomBytes(12).toString('hex'),
+        log: (record) => console.log(JSON.stringify(record)),
+      },
+      now,
+      {
+        maxAutoRecoveries: MAX_FLAVOR_AUTO_RECOVERIES,
+        maxSends: MAX_FLAVOR_RETRIGGER_SENDS,
+        backoffMs: FLAVOR_RETRIGGER_BACKOFF_MS,
+      },
+    );
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        msg: 'reaper flavor claim sweep failed — retried next tick',
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return undefined;
+  }
 }

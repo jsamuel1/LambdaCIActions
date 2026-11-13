@@ -42,6 +42,19 @@ export interface MgmtStackProps extends StackProps {
    */
   appcfgBrokerName?: string;
   appcfgBrokerArn?: string;
+  /**
+   * Flavor-validation λ (ControlStack, ADR-041). Registration + manual re-validate invoke it
+   * fire-and-forget to run the smoke gates. It holds the App PEM and `RunMicrovm` the management
+   * plane deliberately lacks, so — exactly like the appcfg broker — the console's whole
+   * involvement is `lambda:InvokeFunction` on this one ARN.
+   *
+   * Absent is a supported state, not a misconfiguration: without it registration still succeeds,
+   * the flavor stays `pending`, and the API says validation could not be started. Nothing can
+   * reach `valid`, so nothing custom is routable. With it, a trigger that is refused or dropped is
+   * resent by the Reaper's reconciliation sweep from the marker the registration wrote.
+   */
+  flavorvalFunctionName?: string;
+  flavorvalFunctionArn?: string;
   /** Deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
   webhookUrl?: string;
   /**
@@ -143,6 +156,7 @@ export class MgmtStack extends Stack {
         RUNNER_LABELS_PARAM: `${ssmPrefix}/config/runner-labels`,
         PLATFORM_ADMINS_PARAM: `${ssmPrefix}/config/platform-admins`,
         APPCFG_BROKER_NAME: props.appcfgBrokerName ?? '',
+        FLAVORVAL_FUNCTION_NAME: props.flavorvalFunctionName ?? '',
         WEBHOOK_URL: props.webhookUrl ?? '',
         // Reports assistant (ADR-044). Enabled by default; `-c reportsNl=false` turns the NL
         // path off (and drops the Bedrock grant below), and the console degrades to the manual
@@ -257,6 +271,19 @@ export class MgmtStack extends Stack {
           sid: 'InvokeAppConfigBroker',
           actions: ['lambda:InvokeFunction'],
           resources: [props.appcfgBrokerArn],
+        }),
+      );
+    }
+
+    // Flavor validation (ADR-041): the console can ASK for a smoke run and nothing more. The
+    // authority a smoke run needs — the App PEM, RunMicrovm, TerminateMicrovm — stays in the
+    // control plane, so the management role gains one action on one ARN, mirroring ADR-034.
+    if (props.flavorvalFunctionArn) {
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeFlavorValidation',
+          actions: ['lambda:InvokeFunction'],
+          resources: [props.flavorvalFunctionArn],
         }),
       );
     }

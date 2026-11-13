@@ -112,8 +112,14 @@ async function githubJson<T>(
      * opaque secret like a webhook secret has no shape the pattern guard can recognize.
      */
     redactValues?: readonly (string | undefined)[];
+    /**
+     * Abort the request (and its body read). A bare `fetch` has no deadline of its own, so a
+     * caller on a budget — the ADR-041 smoke λ — passes one rather than hanging on a stalled
+     * socket until the Lambda timeout.
+     */
+    signal?: AbortSignal;
   },
-): Promise<{ status: number; body: T }> {
+): Promise<{ status: number; body: T; link?: string }> {
   const clean = (text: string): string => redactLiterals(text, init.redactValues ?? []);
   const res = await fetch(`${GITHUB_API}${path}`, {
     method: init.method ?? 'GET',
@@ -125,6 +131,7 @@ async function githubJson<T>(
       ...(init.body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: init.body ? JSON.stringify(init.body) : undefined,
+    ...(init.signal ? { signal: init.signal } : {}),
   });
   const text = await res.text();
   let body: T;
@@ -155,7 +162,67 @@ async function githubJson<T>(
     const detail = typeof message === 'string' ? clean(message).slice(0, 200) : '';
     throw new GithubApiError(path, res.status, `${detail}${requestIdOf(res)}`);
   }
-  return { status: res.status, body };
+  return { status: res.status, body, link: res.headers?.get?.('link') ?? undefined };
+}
+
+/**
+ * A paginated GitHub listing that could not be read to its end within the caller's page cap.
+ *
+ * Thrown rather than returning what was read: every smoke-run caller of a listing is looking for ONE
+ * specific item (our nonce runner, our dispatched run, the job that carries our nonce), and on a
+ * partial read "not found" would be indistinguishable from "not there". Treating that as absence
+ * would score an image "the runner never registered" or leave registration residue behind. As an
+ * error it is an orchestration fault, which the smoke λ maps to `pending` — never to a verdict.
+ */
+export class GithubListingIncompleteError extends Error {
+  constructor(
+    readonly path: string,
+    readonly pagesRead: number,
+  ) {
+    super(`GitHub ${path} has more than ${pagesRead} page(s); the listing was not read to its end`);
+    this.name = 'GithubListingIncompleteError';
+  }
+}
+
+/** The `rel="next"` target of a GitHub `Link` header, as a path under {@link GITHUB_API}. */
+export function nextPagePath(link: string | undefined): string | undefined {
+  if (!link) return undefined;
+  for (const part of link.split(',')) {
+    const m = /<([^>]+)>\s*;\s*rel="?next"?/.exec(part);
+    if (!m) continue;
+    const url = m[1];
+    // Only ever follow GitHub's own API host: the header is response data, not something to trust
+    // as an arbitrary URL to send an installation token to.
+    if (!url.startsWith(`${GITHUB_API}/`)) return undefined;
+    return url.slice(GITHUB_API.length);
+  }
+  return undefined;
+}
+
+/**
+ * Read every page of a GitHub list endpoint by following `Link: rel="next"`.
+ *
+ * `stop` lets a caller end early once a page proves nothing further can match (a newest-first run
+ * list that has gone past the dispatch floor). Reaching `maxPages` with a next page still
+ * advertised throws {@link GithubListingIncompleteError}; it is never reported as a complete read.
+ */
+async function githubPaged<TItem>(
+  firstPath: string,
+  pick: (body: unknown) => TItem[],
+  init: { token: string; tokenType: 'Bearer' | 'token'; signal?: AbortSignal },
+  opts: { maxPages: number; stop?: (page: TItem[]) => boolean },
+): Promise<TItem[]> {
+  const out: TItem[] = [];
+  let path: string | undefined = firstPath;
+  for (let page = 0; path; page++) {
+    if (page >= opts.maxPages) throw new GithubListingIncompleteError(firstPath, page);
+    const res: { body: unknown; link?: string } = await githubJson<unknown>(path, init);
+    const items = pick(res.body);
+    out.push(...items);
+    if (opts.stop?.(items)) break;
+    path = nextPagePath(res.link);
+  }
+  return out;
 }
 
 /** GitHub's request id, so an operator-facing error is still traceable in a support ticket. */
@@ -172,6 +239,7 @@ export async function getInstallationToken(
   appId: string,
   pem: string,
   installationId: number,
+  signal?: AbortSignal,
 ): Promise<string> {
   const cached = tokenCache.get(installationId);
   if (cached && cached.expiresAt - Date.now() > 5 * 60 * 1000) return cached.token;
@@ -179,7 +247,7 @@ export async function getInstallationToken(
   const jwt = createAppJwt(appId, pem);
   const { body } = await githubJson<{ token: string; expires_at: string }>(
     `/app/installations/${installationId}/access_tokens`,
-    { method: 'POST', token: jwt, tokenType: 'Bearer' },
+    { method: 'POST', token: jwt, tokenType: 'Bearer', signal },
   );
   tokenCache.set(installationId, {
     token: body.token,
@@ -576,13 +644,20 @@ export async function getRepoDefaultBranch(params: {
   appId: string;
   pem: string;
   installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
   owner: string;
   repo: string;
 }): Promise<string> {
-  const token = await getInstallationToken(params.appId, params.pem, params.installationId);
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
   const { body } = await githubJson<{ default_branch?: string }>(
     `/repos/${params.owner}/${params.repo}`,
-    { token, tokenType: 'token' },
+    { token, tokenType: 'token', signal: params.signal },
   );
   if (!body.default_branch) throw new Error('GitHub repo response has no default_branch');
   return body.default_branch;
@@ -775,4 +850,403 @@ export async function ensurePullRequest(params: {
     body: { title: params.title, body: params.body, head: params.branch, base: params.base },
   });
   return { url: pr.html_url, number: pr.number, created: true };
+}
+
+// ---- custom-flavor smoke validation (ADR-041) -------------------------------
+
+/**
+ * Mint the single-use JIT runner config for a smoke run.
+ *
+ * Separate from {@link generateJitConfig} rather than a flag on it, because the two differ in the
+ * one field that matters for safety. A real job's runner is minted with the job's OWN `runs-on`
+ * labels, verbatim, so GitHub can assign it that job; a smoke runner is minted with ONLY the
+ * one-shot nonce label, so the sole job it can ever be assigned is the validation workflow this
+ * run dispatches. Sharing a code path would make that the caller's discipline instead of the
+ * function's contract — and a smoke runner that accidentally advertised `lambda-ci-*` would run a
+ * customer's production job on an image nothing has validated.
+ *
+ * `runnerId` is returned alongside the config because the smoke run has to be able to DELETE the
+ * registration in its cleanup: a runner that registered and then never took its job (the
+ * ADR-019/020 failure mode) stays in the repo's runner list as offline residue, in someone else's
+ * repository, after we condemned the image.
+ */
+export async function generateSmokeJitConfig(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  /** The one-shot nonce label. MUST be the only non-default label (see `smokeLabel`). */
+  label: string;
+  /** Runner name, so a leftover registration is identifiable in the repo's runner list. */
+  name: string;
+}): Promise<{ jitConfig: string; runnerId?: number }> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  const { body } = await githubJson<{
+    encoded_jit_config: string;
+    runner?: { id?: number };
+  }>(`/repos/${params.owner}/${params.repo}/actions/runners/generate-jitconfig`, {
+    method: 'POST',
+    token,
+    tokenType: 'token', signal: params.signal,
+    body: {
+      name: params.name,
+      runner_group_id: 1,
+      // Exactly one label. Not the job's labels, not `lambda-ci*` — see the note above.
+      labels: [params.label],
+      work_folder: '_work',
+    },
+  });
+  return { jitConfig: body.encoded_jit_config, runnerId: body.runner?.id };
+}
+
+/**
+ * Dispatch a `workflow_dispatch` workflow on a ref, with inputs.
+ *
+ * GitHub answers 204 with NO body — it does not tell you which run it created, which is why
+ * {@link listWorkflowDispatchRuns} exists and why the caller must record the dispatch time
+ * before calling this.
+ */
+export async function dispatchWorkflow(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  /** Workflow file path (`.github/workflows/x.yml`) or its numeric id. */
+  workflow: string;
+  ref: string;
+  inputs?: Record<string, string>;
+}): Promise<void> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  await githubJson<Record<string, never>>(
+    `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/dispatches`,
+    {
+      method: 'POST',
+      token,
+      tokenType: 'token', signal: params.signal,
+      body: { ref: params.ref, ...(params.inputs ? { inputs: params.inputs } : {}) },
+    },
+  );
+}
+
+/** One `workflow_dispatch`-triggered run of a workflow. */
+export interface WorkflowDispatchRun {
+  id: number;
+  status?: string;
+  conclusion?: string | null;
+  /** Epoch ms of `created_at`, for "created at/after my dispatch" matching. */
+  createdAt: number;
+  htmlUrl?: string;
+}
+
+/**
+ * List a workflow's `workflow_dispatch` runs, newest first.
+ *
+ * Scoped by `event=workflow_dispatch` and, when `createdAtOrAfterMs` is given, by GitHub's own
+ * `created>=` filter, and read to completion: a busy repository can have pushed the run we are
+ * looking for off the first page between our dispatch and a poll, and a partial read must not look
+ * like "our run does not exist". Pages are followed via `Link: rel="next"` up to `maxPages`; a
+ * listing still advertising a next page there throws {@link GithubListingIncompleteError} rather
+ * than returning a truncated set. Paging also stops early once a (newest-first) page reaches a run
+ * created before the floor, because nothing after it can match.
+ *
+ * The caller uses "created at or after the moment I dispatched" only to NARROW the candidates — the
+ * dispatch API returns no run id, so there is nothing to match on directly. The window is not
+ * sufficient on its own and must not be treated as identification: a concurrent or manual dispatch
+ * of the same workflow in the same second would satisfy it. {@link listRunJobs} supplies the
+ * nonce-bearing evidence that confirms a candidate.
+ */
+export async function listWorkflowDispatchRuns(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  workflow: string;
+  /** Only runs created at/after this epoch-ms instant (second granularity, floored). */
+  createdAtOrAfterMs?: number;
+  perPage?: number;
+  maxPages?: number;
+}): Promise<WorkflowDispatchRun[]> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  const per = Math.min(Math.max(params.perPage ?? 100, 1), 100);
+  const floor =
+    params.createdAtOrAfterMs !== undefined
+      ? Math.floor(params.createdAtOrAfterMs / 1000) * 1000
+      : undefined;
+  const created =
+    floor !== undefined
+      ? `&created=${encodeURIComponent(`>=${new Date(floor).toISOString().replace(/\.\d{3}Z$/, 'Z')}`)}`
+      : '';
+  type Raw = {
+    id?: number;
+    status?: string;
+    conclusion?: string | null;
+    created_at?: string;
+    html_url?: string;
+  };
+  const toRun = (r: Raw): WorkflowDispatchRun | undefined =>
+    typeof r.id === 'number'
+      ? {
+          id: r.id,
+          status: r.status,
+          conclusion: r.conclusion ?? null,
+          createdAt: r.created_at ? new Date(r.created_at).getTime() : 0,
+          htmlUrl: r.html_url,
+        }
+      : undefined;
+  const runs = await githubPaged<WorkflowDispatchRun>(
+    `/repos/${params.owner}/${params.repo}/actions/workflows/${encodeURIComponent(params.workflow)}/runs` +
+      `?event=workflow_dispatch&per_page=${per}${created}`,
+    (body) =>
+      ((body as { workflow_runs?: Raw[] }).workflow_runs ?? [])
+        .map(toRun)
+        .filter((r): r is WorkflowDispatchRun => r !== undefined),
+    { token, tokenType: 'token', signal: params.signal },
+    {
+      maxPages: params.maxPages ?? 10,
+      // Newest first: once a page holds a run older than the floor, every later page is older too.
+      stop: (page) => floor !== undefined && page.some((r) => r.createdAt < floor),
+    },
+  );
+  return runs
+    .filter((r) => floor === undefined || r.createdAt >= floor)
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/** One job of a workflow run, with the fields that identify which runner served it. */
+export interface WorkflowRunJob {
+  id: number;
+  name: string;
+  status?: string;
+  conclusion?: string | null;
+  /** The runner that took the job. Empty while queued. */
+  runnerName?: string;
+  /** The job's resolved `runs-on` labels — where a validation nonce becomes observable. */
+  labels: string[];
+}
+
+/**
+ * List a workflow run's jobs.
+ *
+ * This is what makes smoke-run attribution sound rather than presumed. A GitHub JIT runner is
+ * matched by LABEL, not bound to the job that caused it to be minted, and the dispatch API returns
+ * no run id — so "the newest run created after I dispatched" is a candidate, not an identification.
+ * A job's `labels` carry its resolved `runs-on`, which for the validation workflow contains the
+ * one-shot nonce, and `runner_name` is the agent that actually served it. Either is positive
+ * evidence that a given run is OURS; without one, a concurrent or manual dispatch of the same
+ * workflow could lend its green conclusion to an image that never ran anything.
+ */
+export async function listRunJobs(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  runId: number;
+  maxPages?: number;
+}): Promise<WorkflowRunJob[]> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  type RawJob = {
+    id?: number;
+    name?: string;
+    status?: string;
+    conclusion?: string | null;
+    runner_name?: string | null;
+    labels?: string[];
+  };
+  // Every page: the job carrying our nonce is the attribution evidence, and "not on page 1" is not
+  // "not there". A run that exceeds the cap throws rather than reading as "not ours".
+  const jobs = await githubPaged<RawJob>(
+    `/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/jobs?per_page=100`,
+    (body) => (body as { jobs?: RawJob[] }).jobs ?? [],
+    { token, tokenType: 'token', signal: params.signal },
+    { maxPages: params.maxPages ?? 5 },
+  );
+  return jobs
+    .filter((j): j is { id: number } & typeof j => typeof j.id === 'number')
+    .map((j) => ({
+      id: j.id,
+      name: typeof j.name === 'string' ? j.name : '',
+      status: j.status,
+      conclusion: j.conclusion ?? null,
+      ...(typeof j.runner_name === 'string' && j.runner_name
+        ? { runnerName: j.runner_name }
+        : {}),
+      labels: (j.labels ?? []).filter((l): l is string => typeof l === 'string'),
+    }));
+}
+
+/** A self-hosted runner registered against a repository. */
+export interface RepoRunner {
+  id: number;
+  name: string;
+  status?: string;
+  busy?: boolean;
+  labels: string[];
+}
+
+/**
+ * List a repository's self-hosted runners, optionally only the one with an exact `name`.
+ *
+ * The smoke run uses this to observe that its runner REGISTERED — the single fact that
+ * distinguishes "the image booted but the agent never started" (ADR-019/020) from "the agent came
+ * up and something later went wrong", and the two have completely different operator remedies —
+ * and to find a registration whose mint response was lost, so it can be deleted. Both look for ONE
+ * runner whose name we chose, so they pass `name`: GitHub filters server-side, and a repository
+ * with hundreds of runners cannot push ours off the first page. Every page is still followed, and
+ * a listing that exceeds `maxPages` throws {@link GithubListingIncompleteError} instead of reading
+ * as "not registered".
+ */
+export async function listRepoRunners(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  /** Exact runner name to filter on (GitHub's `name` query parameter). */
+  name?: string;
+  maxPages?: number;
+}): Promise<RepoRunner[]> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  type RawRunner = {
+    id?: number;
+    name?: string;
+    status?: string;
+    busy?: boolean;
+    labels?: { name?: string }[];
+  };
+  const runners = await githubPaged<RawRunner>(
+    `/repos/${params.owner}/${params.repo}/actions/runners?per_page=100` +
+      (params.name ? `&name=${encodeURIComponent(params.name)}` : ''),
+    (body) => (body as { runners?: RawRunner[] }).runners ?? [],
+    { token, tokenType: 'token', signal: params.signal },
+    { maxPages: params.maxPages ?? 10 },
+  );
+  return runners
+    .filter((r): r is { id: number; name: string } & typeof r =>
+      typeof r.id === 'number' && typeof r.name === 'string',
+    )
+    // The server-side filter is the scalability fix; the exact client-side match is the guarantee,
+    // so a filter GitHub ever widens to a prefix match can never hand back a bystander's runner.
+    .filter((r) => !params.name || r.name.toLowerCase() === params.name.toLowerCase())
+    .map((r) => ({
+      id: r.id,
+      name: r.name,
+      status: r.status,
+      busy: r.busy,
+      labels: (r.labels ?? [])
+        .map((l) => l.name)
+        .filter((n): n is string => typeof n === 'string'),
+    }));
+}
+
+/**
+ * Cancel a workflow run.
+ *
+ * Cleanup for a smoke run whose job was never served. A dispatched run with nothing to take it sits
+ * `queued` in the operator's Actions tab until GitHub expires it 24 hours later (observed live), so
+ * a validation that condemns an image would otherwise leave a pending run behind as residue in
+ * someone else's repository — the same reason `deleteRepoRunner` exists.
+ *
+ * Tolerates 404 (the run is already gone) and 409, which is what GitHub answers when the run has
+ * already reached a terminal state and there is therefore nothing to cancel.
+ */
+export async function cancelWorkflowRun(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  runId: number;
+}): Promise<void> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  try {
+    await githubJson<Record<string, never>>(
+      `/repos/${params.owner}/${params.repo}/actions/runs/${params.runId}/cancel`,
+      { method: 'POST', token, tokenType: 'token', signal: params.signal },
+    );
+  } catch (err) {
+    const status = githubErrorStatus(err);
+    if (status === 404 || status === 409) return;
+    throw err;
+  }
+}
+
+/**
+ * Delete a runner registration.
+ *
+ * Cleanup, and the reason it must not throw on 404: the normal path is that the runner ALREADY
+ * removed itself when its single-use JIT registration was consumed, so "not found" is the success
+ * case. Any other error is surfaced, because a registration we failed to remove is residue we left
+ * in an operator's repository.
+ */
+export async function deleteRepoRunner(params: {
+  appId: string;
+  pem: string;
+  installationId: number;
+  /** Abort the request(s) — see `githubJson`. */
+  signal?: AbortSignal;
+  owner: string;
+  repo: string;
+  runnerId: number;
+}): Promise<void> {
+  const token = await getInstallationToken(
+    params.appId,
+    params.pem,
+    params.installationId,
+    params.signal,
+  );
+  try {
+    await githubJson<Record<string, never>>(
+      `/repos/${params.owner}/${params.repo}/actions/runners/${params.runnerId}`,
+      { method: 'DELETE', token, tokenType: 'token', signal: params.signal },
+    );
+  } catch (err) {
+    if (githubErrorStatus(err) === 404) return;
+    throw err;
+  }
 }

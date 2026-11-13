@@ -43,10 +43,11 @@ export class DataStack extends Stack {
       removalPolicy: envName === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
     });
 
-    // GSI1 — status/time index. Sparse: only rows that set gsi1pk/gsi1sk appear. Three tenants,
+    // GSI1 — status/time index. Sparse: only rows that set gsi1pk/gsi1sk appear. Four tenants,
     // each in its OWN partition-key namespace so no query can ever read another's rows:
     // run rows (`RUNSTATUS#<status>`), installation rows (`INSTALLS`, so the UI can enumerate
-    // them), and refusal rows (`REFUSALS`, ADR-050).
+    // them), refusal rows (`REFUSALS`, ADR-050), and live custom-flavor validation claims
+    // (`FLAVORCLAIMS`, keyed by lease expiry, ADR-041 — the Reaper's stranded-claim sweep).
     this.table.addGlobalSecondaryIndex({
       indexName: 'gsi1',
       partitionKey: { name: 'gsi1pk', type: ddb.AttributeType.STRING },

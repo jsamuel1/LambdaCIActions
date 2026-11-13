@@ -29,11 +29,20 @@ export interface AsyncState<T> {
  * Fetch-with-polling hook. Polling (not WebSocket/SSE) is the v1 live-update mechanism
  * (ADR-026 / spec 04 OQ-1): a plain interval re-fetch, paused while the tab is hidden so a
  * background console doesn't bill DynamoDB reads forever.
+ *
+ * `pollMs` may be a function of the latest data, so a screen can poll only while the server is
+ * still working on something (e.g. a custom flavor in `pending`/`validating`) and stop once every
+ * row is terminal. Returning `undefined` stops polling.
+ *
+ * A dependency change cancels the in-flight fetch, so a slow response for an OLD dependency set
+ * can never overwrite the newer one. `data` is deliberately retained across that change; a screen
+ * whose actions are scoped by a dependency must therefore tag its data with the scope that
+ * produced it and refuse to render stale-scoped rows (see `Flavors`).
  */
 export function useApi<T>(
   fetcher: () => Promise<T>,
   deps: unknown[],
-  pollMs?: number,
+  pollMs?: number | ((data: T | undefined) => number | undefined),
 ): AsyncState<T> {
   const [data, setData] = useState<T | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -68,13 +77,14 @@ export function useApi<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, tick]);
 
+  const effectivePollMs = typeof pollMs === 'function' ? pollMs(data) : pollMs;
   useEffect(() => {
-    if (!pollMs) return;
+    if (!effectivePollMs) return;
     const id = window.setInterval(() => {
       if (document.visibilityState === 'visible') setTick((t) => t + 1);
-    }, pollMs);
+    }, effectivePollMs);
     return () => window.clearInterval(id);
-  }, [pollMs]);
+  }, [effectivePollMs]);
 
   return { data, error, loading, unauthorized, reload: () => setTick((t) => t + 1) };
 }

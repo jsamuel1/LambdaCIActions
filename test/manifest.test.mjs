@@ -11,7 +11,7 @@ import { buildManifest, manifestFormPage } from '../scripts/create-github-app.mj
 test('manifest declares the exact permissions spec 01 requires', () => {
   const m = buildManifest();
   assert.deepEqual(m.default_permissions, {
-    actions: 'read',
+    actions: 'write',
     administration: 'write',
     contents: 'read',
     metadata: 'read',

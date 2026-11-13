@@ -42,6 +42,12 @@ export interface LaunchParams {
   };
   /** Optional hard cap on total VM lifetime, seconds. */
   maximumDurationInSeconds?: number;
+  /**
+   * RunMicrovm idempotency token. A retry with the same token + input returns the VM the first call
+   * created instead of creating a second one — which is how a caller whose launch response was lost
+   * learns the id of the VM it must terminate.
+   */
+  clientToken?: string;
 }
 
 export interface LaunchResult {
@@ -83,6 +89,7 @@ async function loadCommand(name: string): Promise<CommandCtor> {
 export async function launchMicroVM(
   client: LambdaClient,
   params: LaunchParams,
+  signal?: AbortSignal,
 ): Promise<LaunchResult> {
   const payloadJson = JSON.stringify(params.payload);
   const payloadBytes = Buffer.byteLength(payloadJson, 'utf8');
@@ -114,9 +121,12 @@ export async function launchMicroVM(
   if (params.maximumDurationInSeconds !== undefined) {
     input.maximumDurationInSeconds = params.maximumDurationInSeconds;
   }
+  if (params.clientToken) input.clientToken = params.clientToken;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const res = (await client.send(new RunMicrovmCommand(input) as any)) as {
+  const res = (await client.send(new RunMicrovmCommand(input) as any, {
+    abortSignal: signal,
+  })) as {
     microvmId?: string;
     state?: string;
     endpoint?: string;
@@ -138,7 +148,7 @@ export async function launchMicroVM(
  */
 export async function listMicroVMs(
   client: LambdaClient,
-  opts: { imageIdentifier?: string } = {},
+  opts: { imageIdentifier?: string; signal?: AbortSignal } = {},
 ): Promise<LiveMicroVM[]> {
   const ListMicrovmsCommand = await loadCommand('ListMicrovmsCommand');
   const out: LiveMicroVM[] = [];
@@ -150,7 +160,9 @@ export async function listMicroVMs(
     if (nextToken) input.nextToken = nextToken;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const res = (await client.send(new ListMicrovmsCommand(input) as any)) as {
+    const res = (await client.send(new ListMicrovmsCommand(input) as any, {
+      abortSignal: opts.signal,
+    })) as {
       items?: RawMicroVM[];
       nextToken?: string;
     };
@@ -168,10 +180,13 @@ export async function listMicroVMs(
 export async function terminateMicroVM(
   client: LambdaClient,
   microvmId: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const TerminateMicrovmCommand = await loadCommand('TerminateMicrovmCommand');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await client.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId } as any) as any);
+  await client.send(new TerminateMicrovmCommand({ microvmIdentifier: microvmId } as any) as any, {
+    abortSignal: signal,
+  });
 }
 
 interface RawMicroVM {
@@ -234,6 +249,7 @@ export interface MicroVMImageState {
 export async function getMicroVMImageState(
   client: LambdaClient,
   imageArn: string,
+  signal?: AbortSignal,
 ): Promise<MicroVMImageState> {
   let GetMicrovmImageCommand: CommandCtor;
   try {
@@ -245,6 +261,7 @@ export async function getMicroVMImageState(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const res = (await client.send(
       new GetMicrovmImageCommand({ imageIdentifier: imageArn }) as any,
+      { abortSignal: signal },
     )) as {
       imageArn?: string;
       state?: string;
@@ -273,6 +290,19 @@ export async function getMicroVMImageState(
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Whether a failed RunMicrovm DEFINITIVELY created nothing: the service answered with a client
+ * error (4xx — validation, quota, throttle, access). Anything else (a timeout, an abort, a dropped
+ * connection, a 5xx) is ambiguous: the VM may exist and its response may simply never have arrived.
+ */
+export function isDefinitiveLaunchRejection(err: unknown): boolean {
+  const e = err as { $fault?: string; $metadata?: { httpStatusCode?: number }; name?: string };
+  if (e?.name === 'AbortError' || e?.name === 'TimeoutError') return false;
+  const status = e?.$metadata?.httpStatusCode;
+  if (typeof status === 'number') return status >= 400 && status < 500;
+  return e?.$fault === 'client';
 }
 
 function normalizeMicroVM(vm: RawMicroVM): LiveMicroVM {

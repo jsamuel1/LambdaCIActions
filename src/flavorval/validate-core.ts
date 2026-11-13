@@ -371,9 +371,19 @@ export function classifySmoke(obs: SmokeObservations): SmokeVerdict {
  * auto-rewrite path (ADR-031) already establishes that we propose file changes rather than push
  * them. The console shows this text for the operator to commit.
  *
- * `runs-on` carries ONLY the nonce label (plus `self-hosted`), so this workflow is inert until a
- * validation run dispatches it with a matching nonce — it cannot be triggered into running on
- * ordinary infrastructure, and it cannot be claimed by ingest.
+ * `runs-on` carries ONLY the nonce label, so this workflow is inert until a validation run
+ * dispatches it with a matching nonce — it cannot be triggered into running on ordinary
+ * infrastructure, and it cannot be claimed by ingest.
+ *
+ * `self-hosted` is deliberately ABSENT. GitHub adds its default labels only to a runner that
+ * configures itself; a JIT runner minted with an explicit `labels` array carries exactly that array
+ * and nothing else (verified live: `generate-jitconfig` with `labels: [nonce]` produces a runner
+ * whose label set is `[nonce]`). A `runs-on: [self-hosted, <nonce>]` job therefore demands a label
+ * the smoke runner does not have and can never be assigned — observed live on 2026-08-22, where a
+ * healthy agent connected, logged `Listening for Jobs`, and was never given the job. Requiring only
+ * the nonce is also the STRONGER safety position: the runner advertises one unguessable label, so
+ * adding `self-hosted` to the mint instead would have let a plain `runs-on: self-hosted` job in the
+ * operator's repo land on an unvalidated image.
  */
 export function smokeWorkflowYaml(): string {
   return `# LambdaCIActions custom-flavor validation (ADR-041).
@@ -391,8 +401,10 @@ on:
 jobs:
   validate:
     # Only the runner carrying this exact nonce can take the job, and that runner advertises
-    # nothing else — so it can never pick up a real CI job from this repo.
-    runs-on: [self-hosted, "\${{ inputs.lca_nonce }}"]
+    # nothing else — so it can never pick up a real CI job from this repo. Do NOT add
+    # \`self-hosted\`: a JIT runner minted with explicit labels carries ONLY those labels, so
+    # requiring \`self-hosted\` here makes the job unassignable.
+    runs-on: ["\${{ inputs.lca_nonce }}"]
     timeout-minutes: 10
     steps:
       - name: Prove the runner can execute a job

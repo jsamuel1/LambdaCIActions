@@ -263,6 +263,78 @@ export interface Flavor {
   usdPerMinute: number;
   /** `null` when the image-presence check did not run — unknown, NOT absent (ADR-051). */
   imageAvailable: boolean | null;
+  /** True for an operator-registered bring-your-own image (ADR-040). Absent for a built-in. */
+  custom?: boolean;
+  /** Validation state (ADR-041). Absent for a built-in — built-ins are not validated. */
+  validationState?: FlavorValidationState;
+  /** Operator-facing reason for `invalid`, or progress detail while `validating`. */
+  validationReason?: string;
+  /** Whether this flavor may be routed to. Always true for a built-in; `state === 'valid'`
+   *  for a custom one (ADR-041). */
+  routable?: boolean;
+  /** The operator-supplied image ARN. Custom flavors only. */
+  imageArn?: string;
+}
+
+/** Custom-flavor validation state (ADR-041). Mirrors src/shared/flavor-store.ts. */
+export type FlavorValidationState = 'pending' | 'validating' | 'valid' | 'invalid';
+
+/** What a validation run observed. Every field is control-plane observed. */
+export interface FlavorValidationEvidence {
+  imageArn?: string;
+  microvmId?: string;
+  runnerId?: number;
+  workflowRunId?: number;
+  workflowConclusion?: string;
+  selfTerminated?: boolean;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+/** A registered custom flavor, in every state (ADR-040/041). */
+export interface CustomFlavor {
+  name: string;
+  label: string;
+  arch: string;
+  vcpu: number;
+  memoryMb: number;
+  capabilities: string[];
+  description: string;
+  imageArn: string;
+  smokeRepoFullName: string | null;
+  smokeWorkflowPath: string | null;
+  state: FlavorValidationState;
+  /** Operator-facing failure reason / progress detail. */
+  reason: string | null;
+  evidence: FlavorValidationEvidence | null;
+  /** `state === 'valid'`, stamped by the API so no client re-derives the rule. */
+  routable: boolean;
+  /** ESTIMATE for the requested shape (ADR-038) — vCPU is not requestable. */
+  usdPerMinute: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Static-gate verdict on a PROPOSED flavor. A pass is NOT validation (ADR-041). */
+export interface FlavorPreview {
+  name: string;
+  label: string;
+  usdPerMinute: number;
+  rateIsEstimate: boolean;
+  staticGate: { ok: true } | { ok: false; failures: { code: string; message: string }[] };
+  note: string;
+}
+
+/** Body of a registration / preview request. */
+export interface CustomFlavorInput {
+  base: string;
+  vcpu: number;
+  memoryMb: number;
+  capabilities: string[];
+  description: string;
+  imageArn: string;
+  smokeRepoFullName?: string;
+  smokeWorkflowPath?: string;
 }
 
 export interface AppLinkage {
@@ -771,6 +843,66 @@ export const api = {
       unmatchedAllowlistLabels?: string[];
       controlPlaneLive?: boolean;
     }>('/api/flavors'),
+  /**
+   * Installation-scoped catalog: built-ins PLUS this installation's custom flavors in every state.
+   *
+   * `customFlavorsRead` is load-bearing (ADR-040): `degraded` means the custom rows could not be
+   * read, so the absence of a flavor here is NOT evidence it does not exist. The UI must say so
+   * rather than showing an operator who just registered one an empty list.
+   */
+  flavorsFor: (installationId: number) =>
+    request<{
+      /**
+       * Built-ins PLUS this installation's custom flavors, in EVERY state — they are one array,
+       * with `custom`/`validationState`/`routable` distinguishing them per row rather than a
+       * separate list. Omission is not how a non-routable flavor is expressed here: the console's
+       * job is to show `pending`/`invalid` and why.
+       */
+      flavors: Flavor[];
+      customFlavorsRead?: 'ok' | 'degraded';
+      readiness?: FlavorReadiness[];
+      allowlist?: string[];
+      unmatchedAllowlistLabels?: string[];
+      controlPlaneLive?: boolean;
+      /** The workflow the operator must commit to their smoke repo (ADR-041). */
+      smokeWorkflow?: string;
+    }>(`/api/flavors?installation=${installationId}`),
+  /** Static gate + rate estimate for a proposed flavor. Writes nothing, probes nothing. */
+  previewFlavor: (installationId: number, body: CustomFlavorInput) =>
+    request<FlavorPreview>(`/api/flavors/preview?installation=${installationId}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** Register a custom flavor. It is born `pending` and is not routable (ADR-041). */
+  registerFlavor: (installationId: number, body: CustomFlavorInput) =>
+    request<{
+      flavor: CustomFlavor;
+      validationTriggered: boolean;
+      note: string;
+      smokeWorkflow?: string;
+    }>(`/api/flavors?installation=${installationId}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  deleteFlavor: (installationId: number, name: string) =>
+    request<{ deleted: string }>(
+      `/api/flavors/${encodeURIComponent(name)}?installation=${installationId}`,
+      { method: 'DELETE' },
+    ),
+  /**
+   * Re-run validation, optionally repointing the image ARN in the same call. Either way the
+   * flavor returns to `pending` first, so it stops being routable the moment its evidence is
+   * withdrawn. This is also the only way out of terminal `invalid`.
+   */
+  revalidateFlavor: (installationId: number, name: string, body: { imageArn?: string } = {}) =>
+    request<{
+      flavor: CustomFlavor | null;
+      validationTriggered: boolean;
+      note?: string;
+    }>(`/api/flavors/${encodeURIComponent(name)}/revalidate?installation=${installationId}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   health: () => request<Health>('/api/health'),
   settings: () => request<Settings>('/api/settings'),
   /**

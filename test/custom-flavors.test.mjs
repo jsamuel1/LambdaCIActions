@@ -723,10 +723,31 @@ test('the smoke workflow template binds the job to the nonce and asserts arm64',
   const yaml = smokeWorkflowYaml();
   assert.match(yaml, /workflow_dispatch/);
   assert.match(yaml, /lca_nonce/);
-  assert.match(yaml, /runs-on: \[self-hosted, "\$\{\{ inputs\.lca_nonce \}\}"\]/);
+  // The nonce is the ONLY label required. A JIT runner minted with an explicit `labels` array
+  // carries exactly that array — GitHub's default labels are added only by a runner that configures
+  // itself — so a `[self-hosted, <nonce>]` job demands a label the smoke runner does not have and can
+  // never be assigned. Observed live on 2026-08-22: a healthy agent connected, logged "Listening for
+  // Jobs", and the job sat queued until the deadline condemned a working image.
+  assert.match(yaml, /runs-on: \["\$\{\{ inputs\.lca_nonce \}\}"\]/);
+  assert.equal(
+    /runs-on:.*self-hosted/.test(yaml),
+    false,
+    'requiring self-hosted makes the job unassignable to a nonce-only JIT runner',
+  );
   assert.match(yaml, /aarch64/);
   assert.match(yaml, /timeout-minutes/);
   assert.ok(DEFAULT_SMOKE_WORKFLOW_PATH.endsWith('.yml'));
+});
+
+test('the smoke job requires exactly the label the smoke runner is minted with', () => {
+  // The two sides of the match, asserted against each other rather than against a literal: the
+  // workflow's `runs-on` is the dispatched input, and the dispatched input is `smokeLabel(nonce)`.
+  const yaml = smokeWorkflowYaml();
+  const runsOn = /runs-on: \[(.+)\]/.exec(yaml)?.[1] ?? '';
+  const required = runsOn.split(',').map((s) => s.trim().replace(/^"|"$/g, ''));
+  assert.deepEqual(required, ['${{ inputs.lca_nonce }}']);
+  // And that single required label is satisfied by the nonce label the orchestrator dispatches.
+  assert.ok(isSmokeLabel(smokeLabel('abc123')));
 });
 
 test('the broker accepts a SMOKE ref without loosening the RUN ref grammar', () => {
@@ -942,6 +963,32 @@ test('the flavor cap is orders of magnitude below a DynamoDB query page', () => 
     worstCaseBytes * MAX_CUSTOM_FLAVORS_PER_INSTALLATION < pageBytes / 4,
     `${MAX_CUSTOM_FLAVORS_PER_INSTALLATION} × ${worstCaseBytes}B must stay well under a ${pageBytes}B page`,
   );
+});
+
+test('colon-delimited service ARN and slash-delimited ARN are accepted', () => {
+  // `lambda-microvms` returns the colon form from create/get-microvm-image; this must survive the
+  // full registration validator, not only the structural ARN predicate.
+  const serviceArn = 'arn:aws:lambda:us-west-2:123456789012:microvm-image:lca-dev-custom';
+  assert.equal(isMicrovmImageArn(serviceArn), true);
+
+  const res = validateCustomFlavor({
+    name: 'operator-node',
+    vcpu: 2,
+    memoryMb: 4096,
+    capabilities: [],
+    description: 'operator image built outside the catalog',
+    imageArn: serviceArn,
+    smokeRepoFullName: 'acme/ci',
+  });
+  assert.equal(res.ok, true, `service ARN refused: ${JSON.stringify(res.errors ?? [])}`);
+
+  assert.equal(
+    isMicrovmImageArn('arn:aws:lambda:us-west-2:123456789012:microvm-image/operator-gpu'),
+    true,
+  );
+  assert.equal(isMicrovmImageArn('arn:aws:lambda:us-west-2:123456789012:microvm-image'), false);
+  assert.equal(isMicrovmImageArn('arn:aws:lambda:us-west-2:123456789012:microvm-image:'), false);
+  assert.equal(isMicrovmImageArn('arn:aws:lambda:us-west-2:12345678901:microvm-image:x'), false);
 });
 
 test('every operator-supplied persisted field is length-bounded', () => {

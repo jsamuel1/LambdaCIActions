@@ -85,7 +85,9 @@ export interface SmokeRunInit {
 export async function beginSmokeRun(
   init: SmokeRunInit,
   now: Date = new Date(),
+  signal?: AbortSignal,
 ): Promise<{ ref: string; pk: string }> {
+  const opts = { abortSignal: signal };
   const pk = smokePk(init.installationId, init.seq);
   const ttl = Math.floor(now.getTime() / 1000) + SMOKE_TTL_SECONDS;
   const d = requireDoc();
@@ -110,6 +112,7 @@ export async function beginSmokeRun(
         ttl,
       },
     }),
+    opts,
   );
   await d.send(
     new PutCommand({
@@ -125,6 +128,7 @@ export async function beginSmokeRun(
         ttl,
       },
     }),
+    opts,
   );
   return { ref: smokeRef(init.installationId, init.seq), pk };
 }
@@ -136,11 +140,14 @@ export async function beginSmokeRun(
  * after launch and unconditionally, because the broker reads `microvmId` off this row and a
  * fast-failing image can call terminate almost at once.
  */
-export async function stampSmokeMicrovmId(input: {
-  installationId: number;
-  seq: number;
-  microvmId: string;
-}): Promise<void> {
+export async function stampSmokeMicrovmId(
+  input: {
+    installationId: number;
+    seq: number;
+    microvmId: string;
+  },
+  signal?: AbortSignal,
+): Promise<void> {
   await requireDoc().send(
     new UpdateCommand({
       TableName: TABLE,
@@ -149,15 +156,21 @@ export async function stampSmokeMicrovmId(input: {
       ConditionExpression: 'attribute_exists(pk)',
       ExpressionAttributeValues: { ':id': input.microvmId },
     }),
+    { abortSignal: signal },
   );
 }
 
 /** Best-effort cleanup once a verdict is recorded; the TTL is the real guarantee. */
-export async function deleteSmokeRun(installationId: number, seq: number): Promise<void> {
+export async function deleteSmokeRun(
+  installationId: number,
+  seq: number,
+  signal?: AbortSignal,
+): Promise<void> {
   const pk = smokePk(installationId, seq);
   const d = requireDoc();
+  const opts = { abortSignal: signal };
   await Promise.all([
-    d.send(new DeleteCommand({ TableName: TABLE, Key: { pk, sk: JITCONFIG_SK } })).catch(() => {}),
-    d.send(new DeleteCommand({ TableName: TABLE, Key: { pk, sk: RUN_SK } })).catch(() => {}),
+    d.send(new DeleteCommand({ TableName: TABLE, Key: { pk, sk: JITCONFIG_SK } }), opts).catch(() => {}),
+    d.send(new DeleteCommand({ TableName: TABLE, Key: { pk, sk: RUN_SK } }), opts).catch(() => {}),
   ]);
 }

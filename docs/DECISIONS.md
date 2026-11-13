@@ -2117,12 +2117,12 @@ as bugs:
   `staticGate`'s `maxMemoryMb` parameter has **no production caller**. So an obvious typo
   (`655360`) is caught, but a request that merely exceeds the account's real headroom is not — it
   fails later, at launch. Closing this needs a quota read (there is no `getMicroVMQuota` helper in
-  `src/shared/microvm.ts`), so it belongs with the validator λ that would consume it.
-- **(4) rate before save — implemented in the API, not in the console.** `POST
-  /api/flavors/preview` returns `usdPerMinute` for the proposed shape with `rateIsEstimate: true`
-  (ADR-038), and `buildFlavorViews` carries it per row; no screen renders either yet. The Flavors
-  screen is deferred to the same successor card as the ADR-041 smoke-run λ, because a registration
-  form whose flavors can never reach `valid` would be a control with no outcome.
+  `src/shared/microvm.ts`); the validator λ that would consume it now exists, so this is a
+  standalone follow-up rather than a blocked one.
+- **(4) rate before save — implemented.** `POST /api/flavors/preview` returns `usdPerMinute` for the
+  proposed shape with `rateIsEstimate: true` (ADR-038), `buildFlavorViews` carries it per row, and
+  the Flavors screen renders both: the registration form's `Check` button calls the preview endpoint
+  for the server's static-gate verdict plus the rate before anything is written.
 
 - **Custom labels are NOT added to `/lca/<env>/config/runner-labels`.** That parameter is
   environment-scoped while a custom flavor is per-installation, so seeding it would make
@@ -2134,7 +2134,7 @@ as bugs:
   we could not confirm strands it.
 
 ## ADR-041 — A custom flavor is not routable until a smoke run proves it (M5)
-**Status**: Accepted (v1) · **enforcement implemented; smoke-run orchestrator deferred** ·
+**Status**: Accepted (v1) · **implemented** ·
 depends on [ADR-040](#adr-040); reuses the broker from [ADR-021](#adr-021)
 **Context**: ADR-019/020 are the case study: the `docker` flavor **built successfully**,
 published its image ARN, resolved correctly from its label, and then failed every single job
@@ -2171,8 +2171,7 @@ so it consumes quota, costs money, and needs a repo to register against; it is t
 **deploy-touching** and cannot run in a local test. Unit tests can cover the state machine and
 the static gates; the smoke run itself is verified against a live environment.
 
-**As implemented — and what is NOT yet.** The *enforcement* half is complete and is what makes the
-rule true rather than advisory:
+**As implemented.** The *enforcement* half is what makes the rule true rather than advisory:
 
 - The state machine lives in `src/shared/flavor-store.ts`. Legal transitions are enforced **in the
   DynamoDB condition expression**, not in a read-then-write, so only one of two concurrent runs can
@@ -2180,8 +2179,9 @@ rule true rather than advisory:
   That is narrower than "two runs can never both launch a VM": a manual re-validate deliberately
   moves `validating → pending`, which re-opens the transition, so an operator who re-validates a run
   in flight can have two VMs alive at once. The loser's verdict is still refused, so the *record*
-  stays correct; bounding the duplicate LAUNCH belongs to the λ that owns the run's deadline, and is
-  called out on the successor card. `valid → validating` and `invalid → validating`
+  stays correct; bounding the duplicate LAUNCH belongs to the λ that owns the run's deadline, and
+  remains an accepted residual risk — see ADR-041's "Residual risk". `valid → validating` and
+  `invalid → validating`
   are deliberately absent: re-validation must pass through `pending` so a flavor stops being
   routable the moment its evidence is withdrawn.
 - Only `valid` rows are composed into the catalog (`routableCustomFlavors`), so an unvalidated
@@ -2196,11 +2196,10 @@ rule true rather than advisory:
   ANSWER (`ABSENT`/`FORBIDDEN`) from a probe that could not run, and `staticGate` preserves the
   distinction as `image-probe-failed` + an `inconclusive` flag, with `staticFailureVerdict` mapping
   it to `pending`. Collapsing them would let one throttled `GetMicrovmImage` permanently condemn a
-  working image. Note what this does NOT yet mean in a deployed environment: the gate's only
-  production caller is the no-write preview endpoint, which deliberately passes no `image`, so
-  `getMicroVMImageState` has **no production caller** and the image half of the gate first executes
-  when the λ below lands. It is tested directly against all three outcomes so that it is a
-  contract rather than an assumption.
+  working image. The gate's image half now has a production caller: the λ below probes the ARN and
+  passes the result in, so `getMicroVMImageState` executes on every validation run. The console's
+  no-write preview still deliberately passes no image, which is why a preview pass is explicitly not
+  reported as validation.
 - The Mgmt API exposes registration, a no-write static-gate + rate preview, delete, and the manual
   re-validate trigger; a new image ARN atomically repoints and resets to `pending`. Those routes
   needed an IAM grant the Mgmt role deliberately did not have: `PatchRepoConfig` is `UpdateItem`
@@ -2212,23 +2211,259 @@ rule true rather than advisory:
   `RUN#<repoId>#<runId>#<jobId>` partitions and therefore stay unaddressable: the Mgmt role still
   cannot forge or delete a run, which is the property `test/mgmt-stack.test.mjs` pins.
 
-**Not implemented:** the λ that actually *runs* a smoke run — launching the microVM, dispatching the
-nonce-bound workflow and observing registration/conclusion/self-termination — and its CDK wiring.
-Until it lands, `FLAVORVAL_FUNCTION_NAME` is unset, so registration honestly reports that validation
-could not be started and the flavor stays `pending`; **nothing can reach `valid`, therefore nothing
-custom is routable.** That is the safe direction, and it is the state this ADR mandates for a flavor
-without evidence. The console surface is deferred with it, since its main job is showing validation
-progress. Both are tracked as the successor card to this one, and both are **deploy-touching**.
+- The smoke-run λ (`src/flavorval/handler.ts` + `orchestrate.ts`) performs the run: it claims
+  `pending → validating` (the conditional write IS the concurrency guard — losing it means another
+  run owns the flavor, so it exits without writing), runs the static gate with the image probe,
+  mints a JIT runner carrying **only** a one-shot nonce label, launches ONE microVM, dispatches the
+  operator's `workflow_dispatch` validation workflow with that nonce, then observes three
+  independent facts and hands them to `classifySmoke`. ControlStack deploys it as
+  `lca-<env>-flavorval` with `RunMicrovm`/`ListMicrovms`/`TerminateMicrovm`/`GetMicrovmImage`, the
+  App PEM, and the table; MgmtStack gains `lambda:InvokeFunction` on that one ARN and nothing else,
+  mirroring ADR-034 — the console can ASK for a smoke run and still cannot launch anything itself.
 
-Two pieces of that λ's scaffolding *did* land here, and are recorded so the successor card finds
-them instead of rebuilding them: `src/shared/smoke-store.ts` (the `SMOKE#<installationId>#<seq>`
-JIT/RUN row pair, in the shapes the broker already reads) and the broker's `isSmokeRef` grammar
-extension. Neither has a production caller yet — nothing writes a `SMOKE#` row, so the widened
-grammar admits a ref that resolves to no item, and the store is tree-shaken out of every bundle.
-The cross-module ref contract between them is pinned by test, because a drift there would otherwise
-only surface during the live smoke run. `getMicroVMImageState` is in the same category: implemented
-and tested against all three of its outcomes, but with no production caller until the λ passes its
-result to `staticGate`.
+  The App manifest grants `actions: write`, not `read`: reading run metadata needs only `read`, but
+  `POST /actions/workflows/{workflow}/dispatches` requires `write`. Existing installations do not
+  inherit that authority silently — GitHub holds the permission upgrade pending until an account
+  administrator approves it. Until approval, dispatch returns 403 and the orchestrator correctly
+  restores the flavor to `pending`; built-in flavors remain unaffected.
+
+  Three properties of that λ are load-bearing and are unit-tested against injected effects rather
+  than only observed live, which is why the sequencing lives in `orchestrate.ts` behind an effects
+  interface:
+  1. **The VM is terminated on every exit path**, including the throwing ones — a `finally` also
+     removes a leftover runner registration from the operator's repo, cancels an unconcluded smoke
+     run, and drops the `SMOKE#` rows. "Every exit path" includes a create whose RESPONSE was lost
+     (a timed-out or dropped request can still have taken effect): `RunMicrovm` carries a
+     deterministic per-run `clientToken`, so cleanup re-issues an unanswered launch and the
+     idempotent retry returns the id of the VM the lost call created, which is then terminated. A
+     4xx refusal proves no VM and is not retried. The launch also sets a smoke-specific
+     `maximumDurationInSeconds` (12 min) so the platform itself terminates a VM even if that retry
+     fails. A runner registration whose mint response was lost is found by its nonce-bearing name;
+     a dispatched run whose response was lost is found by the nonce on its job (never by timestamp
+     alone) and cancelled if unconcluded.
+  2. **An orchestration fault returns the row to `pending`**, never terminal `invalid`. A GitHub
+     5xx, a throttle or a lost budget says nothing about the image.
+  3. **The row never stays in `validating` on a crash.** The λ's own deadline (10 min) sits inside
+     its Lambda timeout (12 min) with a 60 s reserve for the verdict write and cleanup; a λ killed
+     by its timeout would write nothing. The deadline is hard for every external call, not just for
+     polling: each GitHub, DynamoDB and microVM call runs inside `bounded()`, which races it against
+     a timer and aborts its `AbortSignal` on expiry (the GitHub client passes it to `fetch`, the AWS
+     clients as `abortSignal`) whether or not the call ever answers. A main-phase call is capped at
+     `min(30 s, time left before the reserve)` and its timeout is an orchestration fault, so a hung
+     GitHub returns the row to `pending`. The verdict write (8 s), its `validating → pending`
+     fallback (8 s) and each of the five cleanup steps (6 s) have fixed ceilings that sum to 46 s,
+     inside the reserve, which `reserveFits()` checks and the tests pin.
+
+     Giving up on a write does not stop it landing, so the row is fenced by **run ownership and a
+     monotonic revision**, not by ordering. Every write to a `FLAVOR#` row (claim, verdict, release,
+     operator re-validate, image repoint) does `ADD rev 1`. The claim (`claimFlavorValidation`) is a
+     compare-and-swap on the row the run READ: its `rev`, its `createdAt` (record identity, because
+     a deleted and re-registered flavor restarts `rev`) and its `imageArn`. So a run validates only
+     the exact record and artifact it inspected; a repoint or delete+recreate between its read and
+     its claim makes the claim fail, and the write that changed the row triggers its own run. The
+     claim stamps `validationRunId` + a `validationLeaseUntil` lease; the run's verdict requires
+     that token AND the launched `imageArn`, the release requires the token, and every transition
+     out of `validating` removes the token. So a late verdict can never overwrite an operator's
+     re-validate or a later run's claim, nor describe an image the row no longer names. A claim
+     that did not answer is handled in two writes whose EFFECT order is what matters: first
+     `fenceFlavorValidationRun` advances `rev` (every claim based on an older read, however many
+     generations of them are still in flight, fails its condition from then on, and because `rev`
+     never decreases no later fence can re-admit one), then the token-guarded release undoes a claim
+     that landed before the fence. The release runs only after a fence attempt has been CONFIRMED:
+     a fence that merely timed out may still be in flight, and releasing before it lands allows
+     release (sees `pending`) → claim lands → late fence (only bumps `rev`) → row stranded in
+     `validating`. So the fence is retried, each attempt bounded, until one answers, and the release
+     is then retried until it answers; both may use the run's whole remaining budget, because
+     nothing was launched on that path. Late duplicates of either are harmless (a fence only bumps
+     `rev`; a release only touches a row holding this run's token). Only when no fence or release
+     answers before the deadline does the run report the row unsettled.
+     Reserved concurrency alone did not order those in-flight writes. Finally, the lease (15 min,
+     longer than the λ timeout) marks a `validating` row whose λ is provably gone — one that could
+     not reach DynamoDB at all, or was killed outright — and the **reconciliation sweep** acts on
+     it. A lease alone is only a permission for a later claim; the only producers of runs are
+     registration and an operator's re-validate, so without a sweep such a row would wait for an
+     operator forever. Every claim therefore also writes a sparse GSI1 entry (`gsi1pk =
+     FLAVORCLAIMS`, `gsi1sk` = zero-padded due time, here the lease expiry), and the partition
+     holds exactly the rows with recovery still owed: live claims and retrigger markers (below).
+     The Reaper's existing 5-minute schedule (`src/flavorval/sweep.ts`) queries it for entries due
+     before now. An expired claim is released `validating → pending` conditional on the same token,
+     an expired lease AND the recovery count the sweep's decision was based on (so a row a later
+     run holds, or a run still in its budget, is never touched, however stale the index read, and
+     the stored reason always matches the decision). That same write turns the row's index entry
+     into a **retrigger marker** (`retriggerToken`, due now) rather than removing it, so there is
+     no instant at which the row has left `validating` and nothing records that a restart is owed.
+     The restart itself is an async invoke of the smoke λ — the Reaper's only new authority — and
+     an invoke can be refused, accepted and then dropped (reserved concurrency 1 throttles a burst
+     past Lambda's async retries), or never sent because the Reaper died. So only a run's CLAIM
+     consumes the marker. Before each send the sweep records the attempt and pushes the marker out
+     by a 15-minute backoff (longer than an event can queue behind an in-flight run); a refused
+     send re-arms it for the next tick without spending the attempt; an accepted send that never
+     produces a claim falls due again after the backoff; after 3 accepted sends with no claim the
+     marker is abandoned with a reason asking for a re-validate. A late duplicate event is
+     harmless: its claim is a CAS on a row that is no longer `pending`. Marker bookkeeping does not
+     bump `rev`, since a bump would refuse the very claim the restart is trying to produce.
+     Operator actions that make a run owed (registration, re-validate, image repoint) write the
+     same marker in the same write, due after the backoff, because the Mgmt λ's own invoke has the
+     same failure modes. The re-trigger of a run that claimed and then died is capped separately:
+     a row's `autoRecoveries` counter is incremented only by the sweep's release and removed by
+     every verdict, repoint and operator-initiated claim, and past 3 consecutive recoveries the row
+     is still released but left `pending` with no marker and a reason asking for a re-validate,
+     because each attempt launches a microVM and a run that dies deterministically must not become
+     one VM per sweep. The sweep is hosted by the Reaper, not the smoke λ, because the smoke λ's
+     reserved concurrency of 1 would throttle a scheduled sweep behind the very run it is meant to
+     recover.
+
+     Every GitHub listing the smoke run reads is **read to completion or fails**. Each caller is
+     looking for one item — our nonce runner, our dispatched run, the job carrying our nonce — so
+     on a first-page-only read "not on page 1" would look like "not there": a busy repository
+     could push our run off the newest page before a poll (never attributed, never cancelled), and
+     a repository with more than 100 runners could hide a registration whose mint response was
+     lost (residue left behind). Runner lookups pass the exact AgentName as GitHub's `name`
+     filter (and re-check it exactly); run listings pass the dispatch floor as `created>=` and stop
+     paging once a newest-first page crosses it; every listing follows `Link: rel="next"` (only on
+     `api.github.com`). A listing still advertising a next page at its page cap throws
+     `GithubListingIncompleteError`, which the orchestrator treats as an orchestration fault —
+     `pending`, never a verdict and never "runner never registered".
+
+  Property 3 additionally requires that the verdict write itself cannot throw, which is why the
+  flavor store's document client sets `marshallOptions.removeUndefinedValues`. The evidence map is
+  assembled from OBSERVATIONS, and an observation never made is `undefined` — a run whose job never
+  concluded has no `workflowConclusion`. Without the option the client refuses the whole write, and
+  because that refusal happens INSIDE the verdict write it also defeats the `pending` fallback, whose
+  own write fails identically: the row was stranded in `validating` (before the reconciliation
+  sweep existed nothing but a manual re-validate could leave it; now it costs a lease plus a sweep
+  interval). Live evidence (2026-08-20): a completed run classified `invalid`, logged its
+  verdict, threw `Pass options.removeUndefinedValues=true`, and left the row `validating` for two
+  days. Dropping an absent observation is the intended encoding — the field is optional — whereas
+  failing the write loses the verdict entirely. A *false* observation is a real observation and is
+  preserved: `selfTerminated: false` is the difference between "the VM leaked" and "we never looked".
+
+  Runner registration is observed two ways, because a single-use JIT runner is ephemeral: it leaves
+  the repo's runner list when its job ends, so a fast job can complete entirely between polls. A run
+  that reached `in_progress`/`completed` is therefore equally good proof — GitHub does not execute a
+  job without a runner. Relying on the list alone would fail a perfectly good fast image.
+
+  The list check demands a **CONNECTED** runner (`online`, or `busy`), not merely a row carrying the
+  nonce label. `POST /actions/runners/generate-jitconfig` REGISTERS the runner as a side effect of
+  minting it — the row appears immediately with `status: "offline"`, before any agent exists — so a
+  plain label match observes OUR OWN MINT and is true for every image, working or not. Live evidence
+  (2026-08-20): the deliberately broken fixture, whose `run.sh` exits 127 so no agent can ever
+  connect, was recorded `runnerRegistered: true` and then condemned for the WRONG reason — "the job
+  never reached a conclusion" instead of "the agent never started", which sends an operator looking
+  at their workflow rather than their entrypoint. `busy` is accepted alongside `online` because
+  GitHub can report a runner busy mid-job while its status field lags.
+
+  **The dispatched input is the LABEL, not the bare nonce.** The generated workflow's `runs-on` is
+  `["${{ inputs.lca_nonce }}"]` (the nonce label ONLY — see below), so the value dispatched IS the
+  label GitHub matches against the runner's advertised labels — and the runner advertises
+  `lca-validate-<nonce>`.
+  Dispatching the bare nonce leaves the job permanently unmatchable, which is invisible to a unit
+  test that fakes the dispatch: both sides were internally consistent, and only GitHub's matcher
+  disagreed. Live evidence (2026-08-20, while the template still also required `self-hosted`): the
+  job carried `runs-on` labels `[self-hosted, 0daa6de266ff4eb3]`, sat `queued` with no runner able
+  to take it, and was condemned for a timeout that was OUR fault. No good image could have passed
+  this gate.
+
+  **A smoke run that never concluded is cancelled during cleanup.** A dispatched run nothing can
+  serve otherwise sits `queued` in the operator's Actions tab until GitHub expires it 24 hours later
+  (live-observed), so a validation that condemns an image would leave a pending run behind as residue
+  — the same standard the leftover runner registration is held to. Only a run **confirmed ours by
+  nonce** and **not yet concluded** is cancelled: cancelling on the strength of the timestamp window
+  would reach into a bystander's dispatch, and cancelling a concluded run would destroy the evidence
+  the verdict rests on.
+
+  **Run attribution is by nonce, never by timestamp.** `workflow_dispatch` returns no run id, so the
+  λ narrows candidates to runs created at/after its dispatch and then CONFIRMS one by the nonce: the
+  candidate's job must carry the nonce in its resolved `runs-on` labels, or have been served by the
+  AgentName we minted (`lca-validate-<nonce>`). The window alone is not identification — a concurrent
+  or manual dispatch of the same workflow in the same second satisfies it, and GitHub's runners are
+  label-matched rather than bound to the job they were minted for. Accepting an unconfirmed candidate
+  would let a foreign run's green conclusion mark an unproven image `valid`, which is precisely the
+  outcome this ADR exists to prevent. It fails **closed**: no nonce evidence means "not confirmed
+  ours", so an unreachable jobs API yields a retryable `pending` rather than a false pass.
+
+  The λ is capped at `reservedConcurrentExecutions: 1`: a smoke run spends the same regional microVM
+  memory quota real jobs do, so an operator registering several flavors must not be able to starve
+  customer jobs of capacity. Its guest output goes to `/aws/lambda/microvms/validate/lca-<env>`, NOT
+  the per-run group real jobs write to — a validation attempt is not a customer job, and the console's
+  log pane reads the run group by run id.
+  **The smoke job requires ONLY the nonce label** — `runs-on: ["${{ inputs.lca_nonce }}"]`, with no
+  `self-hosted`. GitHub adds its default labels only to a runner that configures itself; a JIT runner
+  minted with an explicit `labels` array carries exactly that array and nothing else (verified live).
+  A `[self-hosted, <nonce>]` job therefore demands a label the smoke runner does not have and can
+  never be assigned: observed live on 2026-08-22, where a healthy agent connected, logged `Listening
+  for Jobs`, and the job sat queued until the deadline condemned a working image. Requiring only the
+  nonce is also the stronger safety position — adding `self-hosted` to the MINT instead would have let
+  a plain `runs-on: self-hosted` job in the operator's repo land on an unvalidated image.
+
+  **The guest accepts the smoke run's synthetic ids.** A smoke run has no `workflow_job`, so
+  `smoke-store` stores `runId: 0, jobId: 0` — "present and numeric so the guest's own logging path
+  behaves identically to a real job". The guest's `/run` guard validated them with `!payload.runId`,
+  and zero is falsy: it answered 400 and returned WITHOUT logging, so the only evidence was a guest
+  log that stopped after the `/run` request line and a control plane reporting "the runner never
+  registered". Live evidence (2026-08-22): the proven `lca-dev-node` image, registered unchanged as a
+  custom flavor, was condemned `invalid` this way. The guard now tests presence and type
+  (`Number.isFinite`) and LOGS its refusal — the silence was itself half the difficulty. Real jobs are
+  unaffected: GitHub ids are never zero. Note this lives in the baked guest image, so the fix reaches
+  an environment only when its images are rebuilt.
+
+  **Live verification (2026-11-13, dev, final tree).** Both halves of this ADR's acceptance criterion
+  hold against the real control plane running the shipped implementation (revisioned claim CAS,
+  monotonic fence, run-token + image-bound verdict, `clientToken` and `maximumDurationInSeconds` on
+  RunMicrovm). Both rows started without a `rev` attribute (written by the earlier deploy), so the
+  claim's absent-revision branch ran against real DynamoDB too:
+  - A deliberately broken image (`lca-dev-val-brokenagent`, whose `run.sh` exits 127) reached terminal
+    `invalid` with the actionable reason "the image booted but its entrypoint/run-hook did not start
+    the agent", evidence `runnerRegistered: false`, `selfTerminated: false`. Its VM is `TERMINATED`,
+    its dispatched run `43366663525` was cancelled by cleanup, and no runner registration is left.
+  - `custom-goodnode` was REPOINTED through `POST /api/flavors/{name}/revalidate` at a node image
+    built with runner 2.338.2 (`lca-dev-val-goodnode-r2338`), and reached `valid` / `routable: true`
+    in under a minute (first poll `validating` 05:01:33Z, `valid` by 05:02:19Z). The raw row holds `rev: 6`, evidence `imageArn` equal to the row's `imageArn`,
+    `workflowConclusion: success`, `selfTerminated: true`, `workflowRunId: 43369267615` — whose job
+    `validate` ran on runner `lca-validate-bba114884dad2929`, the exact AgentName that run minted. Its
+    guest log shows `Connected to GitHub` → `Running job: validate` → `completed with result:
+    Succeeded` → `self-terminate requested`, and the VM is `TERMINATED`.
+
+  The same pass also showed the gate doing its job on a real defect: the catalog's `lca-dev-node`
+  image (runner 2.335.1) was condemned `invalid`, correctly — its agent connected and then exited with
+  "Runner version v2.335.1 is deprecated and cannot receive messages". An image that cannot take a
+  job is not routable, whatever produced it.
+
+  An earlier pass (2026-08-22) proved the same two outcomes on the pre-revision tree.
+
+- The console's Flavors screen renders custom flavors in every state behind an installation selector
+  (a custom flavor is unaddressable without its installation), with the registration form, the
+  no-write static-gate + rate preview, re-validate/delete actions, and the smoke workflow YAML for
+  the operator to commit. Per ADR-038 every rate is labelled an estimate and `vcpu` indicative; the
+  server's description rule is surfaced verbatim rather than pre-empted by a client-side regex that
+  would eventually disagree with it. Three screen-side invariants hold, each pinned by a jsdom render
+  test (`test/web-flavors-screen.test.mjs`):
+  - **Scope binding.** Every flavor read is tagged with the installation it was issued for and rows
+    render only when that tag equals the current selection, so during an A→B switch A's rows (whose
+    buttons would otherwise carry B's scope) are not shown and a late A response cannot overwrite
+    B. Row actions and the registration form take their installation from the tag, and the form is
+    keyed by it, so no draft, preview or in-flight registration crosses installations.
+  - **Progress polling.** While any custom row is `pending`/`validating` (or the custom read was
+    `degraded`) the read re-polls every 5 s on the visibility-aware `useApi` interval, and stops once
+    every row is terminal, so the badge and reason reach the verdict without a reload.
+  - **Enforced two-step registration.** `Register` is enabled only while a PASSING preview exists
+    for exactly the current installation + payload, and its handler re-checks that. A preview that
+    resolves after an edit or a newer `Check` is discarded. The server still accepts a direct `POST
+    /api/flavors` without a preview — the static gate is re-run authoritatively by the validation λ
+    — so the preview requirement is a console guarantee, not an API contract.
+
+**Residual risk, deliberately accepted.** The condition expression bounds the *record*, not the
+number of live VMs: a manual re-validate legitimately moves `validating → pending`, so an operator
+who re-validates a run already in flight can have two smoke VMs alive at once. The loser's verdict is
+still refused, so the row stays correct, and each λ terminates its own VM in its `finally` — but for
+the overlap window both consume quota. Tightening it would need a run-scoped lease with cancellation,
+which buys little against a bounded, operator-initiated action.
+
+The scaffolding the predecessor card landed is now live rather than inert:
+`src/shared/smoke-store.ts`'s `SMOKE#<installationId>#<seq>` JIT/RUN row pair is written by the λ and
+served to the validation VM through the broker's `isSmokeRef` grammar, so the smoke run exercises the
+byte-identical guest contract a real job does. `getMicroVMImageState` likewise has a production
+caller for the first time.
 
 > **ADR numbering note.** This block was originally authored as 030..034 and has been renumbered
 > to **042..046** to vacate a collision, following the same convention as the 038..041 block

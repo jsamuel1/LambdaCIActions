@@ -59,6 +59,13 @@ export class ControlStack extends Stack {
    */
   public readonly appcfgBrokerName: string;
   public readonly appcfgBrokerArn: string;
+  /**
+   * Flavor-validation λ coordinates (ADR-041), consumed by MgmtStack so registration /
+   * re-validate can trigger a smoke run. Until Mgmt has this name, `FLAVORVAL_FUNCTION_NAME` is
+   * unset and registration honestly reports that validation could not be started.
+   */
+  public readonly flavorvalFunctionName: string;
+  public readonly flavorvalFunctionArn: string;
   /** The deployed webhook receiver URL, so Settings can flag a configured-vs-deployed mismatch. */
   public readonly webhookUrl: string;
   /** Rewrite queue coordinates, consumed by MgmtStack's rewrite-PR endpoint (M5). */
@@ -782,6 +789,146 @@ export class ControlStack extends Stack {
       }),
     );
 
+    // ---- Flavor-validation λ (ADR-041, M5) ----
+    // The gate that makes "a custom flavor is not routable until a smoke run proves it" true:
+    // it launches ONE microVM from an operator-supplied image, dispatches a nonce-bound job and
+    // requires a runner to register, the job to succeed and the VM to self-terminate. It is the
+    // ONLY thing that can move a flavor to `valid`, so without this function no custom flavor is
+    // routable at all — which is the safe direction and the state ADR-041 mandates without
+    // evidence.
+    //
+    // It lives in the CONTROL plane, not with the Mgmt API, because it needs exactly the
+    // authority the management plane is deliberately denied: the App PEM, RunMicrovm, and
+    // TerminateMicrovm. Mgmt reaches it the same way it reaches the appcfg broker (ADR-034) —
+    // `lambda:InvokeFunction` on one ARN and nothing else.
+    const flavorvalLogGroup = new logs.LogGroup(this, 'FlavorValLogGroup', {
+      logGroupName: `/aws/lambda/lca-${envName}-flavorval`,
+      ...logDefaults,
+    });
+    const flavorval = new NodejsFunction(this, 'FlavorValFn', {
+      functionName: `lca-${envName}-flavorval`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(SRC, 'flavorval', 'handler.ts'),
+      handler: 'handler',
+      // A smoke run is a real microVM boot + a real GitHub job + observing self-termination:
+      // minutes, not seconds. This is why the trigger is a fire-and-forget async invoke rather
+      // than something the console waits on. The λ's own deadline is set BELOW this (see
+      // FLAVORVAL_DEADLINE_MS) so it always has time to write a verdict: a λ killed by its
+      // timeout writes nothing and leaves the row in `validating` until its lease expires and the
+      // Reaper's reconciliation sweep (src/flavorval/sweep.ts) releases and restarts it — a
+      // whole lease plus a sweep interval of delay.
+      timeout: Duration.minutes(12),
+      memorySize: 256,
+      // One smoke run at a time per environment. A smoke run consumes the SAME microVM memory
+      // quota real jobs do (spec 05), so an operator bulk-registering flavors must not be able
+      // to launch a dozen validation VMs and starve customer jobs of capacity.
+      reservedConcurrentExecutions: 1,
+      logGroup: flavorvalLogGroup,
+      tracing,
+      bundling,
+      environment: {
+        LCA_ENV: envName,
+        TABLE_NAME: table.tableName,
+        APP_ID_PARAM: `${ssmPrefix}/github/app-id`,
+        APP_PEM_PARAM: `${ssmPrefix}/github/app-pem`,
+        HOOK_BROKER_NAME: hookBroker.functionName,
+        RUNNER_ROLE_ARN: microvmExecRole.roleArn,
+        // Deliberately inside the 12-minute function timeout: the orchestrator stops polling
+        // with its reserve remaining so the verdict write always fits.
+        FLAVORVAL_DEADLINE_MS: String(10 * 60_000),
+        SMOKE_LOG_GROUP: `/aws/lambda/microvms/validate/lca-${envName}`,
+      },
+    });
+    this.flavorvalFunctionName = flavorval.functionName;
+    this.flavorvalFunctionArn = flavorval.functionArn;
+
+    // The Reaper's 5-minute sweep releases validation claims whose lease expired — a run that could
+    // not reach DynamoDB or was killed outright writes no verdict — and (re)sends validation runs
+    // that are owed but never started: a restart marker sits in the same index until a run's claim
+    // consumes it, so a refused or dropped invoke is resent on a later tick (ADR-041,
+    // src/flavorval/sweep.ts). Without a producer of that later run, an expired lease would only
+    // PERMIT recovery. The sweep needs exactly one more authority: an async invoke of this λ. The
+    // table grant it already holds covers the GSI1 query and the conditional writes.
+    reaper.addEnvironment('FLAVORVAL_FUNCTION_NAME', flavorval.functionName);
+    reaper.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'RetriggerStrandedFlavorValidation',
+        actions: ['lambda:InvokeFunction'],
+        resources: [flavorval.functionArn],
+      }),
+    );
+
+    // Reads the flavor row + writes its verdict, and writes/deletes the `SMOKE#` JIT+RUN rows the
+    // broker serves the validation VM.
+    table.grantReadWriteData(flavorval);
+    // Mints the throwaway JIT runner registration against the operator's smoke repo.
+    flavorval.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ReadAppCredentialsForValidation',
+        actions: ['ssm:GetParameter'],
+        resources: [
+          paramArn(`${ssmPrefix}/github/app-id`),
+          paramArn(`${ssmPrefix}/github/app-pem`),
+        ],
+      }),
+    );
+    // Same launch authority Provision holds, and for the same reason it cannot be narrower: the
+    // GA microVM API has no VM-level ARNs and cannot tag at launch (ADR-015).
+    flavorval.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'LaunchValidationMicroVMs',
+        actions: ['lambda:RunMicrovm'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:RequestedRegion': this.region },
+        },
+      }),
+    );
+    flavorval.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'PassMicrovmExecRoleForValidation',
+        actions: ['iam:PassRole'],
+        resources: [microvmExecRole.roleArn],
+      }),
+    );
+    flavorval.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'PassNetworkConnectorsForValidation',
+        actions: ['lambda:PassNetworkConnector'],
+        resources: ['arn:aws:lambda:*:aws:network-connector:aws-network-connector:*'],
+      }),
+    );
+    // `ListMicrovms` is how self-termination is OBSERVED (the VM disappearing from the fleet),
+    // and `TerminateMicrovm` is the `finally` that guarantees no validation VM outlives its run.
+    // `GetMicrovmImage` is the static gate's image probe — the check that distinguishes an ARN
+    // resolving to nothing from one the provisioner cannot read.
+    flavorval.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'ObserveAndTerminateValidationMicroVMs',
+        actions: [
+          'lambda:ListMicrovms',
+          'lambda:TerminateMicrovm',
+          'lambda:GetMicrovm',
+          'lambda:GetMicrovmImage',
+        ],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:RequestedRegion': this.region },
+        },
+      }),
+    );
+    // The smoke VM's guest log group. Its OWN group, not the per-run group real jobs write to: a
+    // validation attempt is not a customer job, and the console's log pane reads the run group by
+    // run id. `LogRetention` rather than `logs.LogGroup` for the same reason as the run group —
+    // the launch path itself creates the group on first use, so a construct that CREATES it would
+    // fail the second deploy with `ResourceAlreadyExistsException`.
+    new logs.LogRetention(this, 'ValidateLogRetention', {
+      logGroupName: `/aws/lambda/microvms/validate/lca-${envName}`,
+      retention: config.runLogRetention,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
     new CfnOutput(this, 'WebhookUrl', {
       value: this.webhookUrl,
       description: 'Set this as the GitHub App hook_attributes.url (scripts/create-github-app.mjs --webhook-url)',
@@ -797,6 +944,7 @@ export class ControlStack extends Stack {
     new CfnOutput(this, 'ReaperFunctionName', { value: reaper.functionName });
     new CfnOutput(this, 'HookBrokerFunctionName', { value: hookBroker.functionName });
     new CfnOutput(this, 'AppConfigBrokerName', { value: appcfg.functionName });
+    new CfnOutput(this, 'FlavorValFunctionName', { value: flavorval.functionName });
     new CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn });
   }
 }

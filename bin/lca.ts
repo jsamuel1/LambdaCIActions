@@ -167,6 +167,8 @@ const mgmtStack = new MgmtStack(app, `LCA-Mgmt-${envName}`, {
   discoveryQueueArn: controlStack.discoveryQueueArn,
   appcfgBrokerName: controlStack.appcfgBrokerName,
   appcfgBrokerArn: controlStack.appcfgBrokerArn,
+  flavorvalFunctionName: controlStack.flavorvalFunctionName,
+  flavorvalFunctionArn: controlStack.flavorvalFunctionArn,
   webhookUrl: controlStack.webhookUrl,
   rewriteQueueUrl: controlStack.rewriteQueueUrl,
   rewriteQueueArn: controlStack.rewriteQueueArn,

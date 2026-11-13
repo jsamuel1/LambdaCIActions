@@ -45,7 +45,7 @@ Manifest highlights:
   "redirect_url": "https://<console-domain>/setup/callback",
   "public": false,
   "default_permissions": {
-    "actions": "read",
+    "actions": "write",         // read run metadata AND dispatch the ADR-041 smoke workflow
     "administration": "write",   // required to register self-hosted runners
     "contents": "read",          // read .github/workflows for ingestion
     "metadata": "read"
@@ -65,9 +65,31 @@ Generated on creation and stored in SSM SecureString:
 | Permission | Level | Why |
 |---|---|---|
 | `administration` | write | Create/remove self-hosted runner JIT config |
-| `actions` | read | Read workflow/run metadata |
+| `actions` | write | Read workflow/run metadata **and dispatch the custom-flavor smoke workflow** (ADR-041) |
 | `contents` | read | Fetch `.github/workflows/*.yml` for ingestion |
 | `metadata` | read | Baseline (mandatory) |
+
+### `actions` is `write` because of ADR-041, and that is the whole reason
+
+Everything else this platform does with Actions is a read: ingest parses workflow files,
+provisioning reacts to `workflow_job`, the console reads run and job metadata. `read` covered all
+of it. A **custom-flavor smoke run** is the exception — it must `POST
+/repos/{owner}/{repo}/actions/workflows/{file}/dispatches` to make the candidate microVM execute a
+real job, and GitHub gates `workflow_dispatch` behind `actions: write`.
+
+This was found live, not in review: with `actions: read` the validation λ reaches dispatch and gets
+`HTTP 403: Resource not accessible by integration`. The λ handles it correctly (an orchestration
+fault returns the flavor to `pending` rather than spending terminal `invalid` on our own
+misconfiguration) — but no custom flavor could ever reach `valid`, so the feature was inert. Every
+unit test passed, because they drive dispatch through an injected fake.
+
+**Existing installations do not get this silently.** A permission change on an App puts every
+installation into "pending approval" until an account admin accepts it, and until they do, the
+installation token keeps its old `actions: read` scope. So for an already-installed App the upgrade
+is a two-step operator action: update the permission in the App's settings, then approve the request
+on each installation. Until approved, custom flavors stay `pending` with the 403 recorded as the
+reason — which is the honest state, not a failure. Built-in flavors are unaffected: they need no
+dispatch.
 
 | Event | Why |
 |---|---|
