@@ -80,7 +80,7 @@ function scenario(opts = {}) {
       record('transition', 'validating');
       return !opts.claimRefused;
     },
-    fence: async (input) => record('fence', input.runId),
+    fence: async () => record('fence'),
     transition: async (input) => {
       transitions.push(input);
       record('transition', input.to);
@@ -855,10 +855,16 @@ test('a hung CLAIM fences its token, releases from validating only, and launches
   assert.equal(res.ran, false);
   assert.equal(res.skipped, 'claim-unknown');
   const claim = s.transitions.find((t) => t.to === 'validating');
-  // The fence comes BEFORE the release, and both name the claim's own token.
+  // The fence comes BEFORE the release, which names the claim's own token.
   const names = s.names();
+  assert.ok(names.includes('fence'));
   assert.ok(names.indexOf('fence') < names.lastIndexOf('transition'));
-  assert.equal(s.calls.find((c) => c.name === 'fence')?.arg, claim.runId);
+  // The claim was a CAS on the row this run READ.
+  assert.deepEqual(claim.expect, {
+    rev: undefined,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    imageArn: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:gpu',
+  });
   const release = s.transitions.at(-1);
   assert.equal(release.to, 'pending');
   assert.deepEqual(release.from, ['validating']);
@@ -965,15 +971,32 @@ test('the claim lease outlives the λ timeout, and the VM cap outlives the run b
 
 /**
  * A model of the flavor row that applies the same conditions as `claimFlavorValidation` /
- * `fenceFlavorValidationRun` / `transitionFlavorValidation` (whose real condition expressions are
- * pinned on the wire in flavor-store-marshalling.test.mjs).
+ * `fenceFlavorValidationRun` / `transitionFlavorValidation` / `repointFlavorImage` (whose real
+ * condition expressions are pinned on the wire in flavor-store-marshalling.test.mjs): every write
+ * bumps a monotonic `rev`, and a claim is a compare-and-swap on the `rev`, `createdAt` and `imageArn`
+ * its run READ.
  */
 function rowModel(clock) {
-  const row = { state: 'pending' };
-  return {
-    row,
+  const IMAGE_A = goodFlavor().imageArn;
+  let row = goodFlavor();
+  const bump = () => (row.rev = (row.rev ?? 0) + 1);
+  const m = {
+    get row() {
+      return row;
+    },
+    /** What `getFlavor` returns: a snapshot, as DynamoDB would. */
+    read() {
+      return row ? structuredClone(row) : undefined;
+    },
+    /** The `expect` a run that read the row NOW would send. */
+    snap() {
+      return { rev: row.rev, createdAt: row.createdAt, imageArn: row.imageArn };
+    },
     claim(input) {
-      if (row.fencedRunId === input.runId) return false;
+      if (!row) return false;
+      const e = input.expect;
+      if ((row.rev ?? 0) !== (e.rev ?? 0)) return false;
+      if (row.createdAt !== e.createdAt || row.imageArn !== e.imageArn) return false;
       const expired =
         row.state === 'validating' &&
         (row.validationLeaseUntil === undefined || row.validationLeaseUntil < clock());
@@ -983,12 +1006,14 @@ function rowModel(clock) {
         validationRunId: input.runId,
         validationLeaseUntil: input.leaseUntil,
       });
+      bump();
       return true;
     },
-    fence(input) {
-      row.fencedRunId = input.runId;
+    fence() {
+      if (row) bump();
     },
     transition(input) {
+      if (!row) return false;
       const legal =
         row.state === 'validating'
           ? ['valid', 'invalid', 'pending'].includes(input.to)
@@ -996,12 +1021,36 @@ function rowModel(clock) {
       if (!legal) return false;
       if (input.from && !input.from.includes(row.state)) return false;
       if (input.runId !== undefined && row.validationRunId !== input.runId) return false;
+      if (input.imageArn !== undefined && row.imageArn !== input.imageArn) return false;
       row.state = input.to;
       delete row.validationRunId;
       delete row.validationLeaseUntil;
+      bump();
       return true;
     },
+    /** The operator's re-validate with a NEW image ARN (`repointFlavorImage`). */
+    repoint(imageArn) {
+      Object.assign(row, { imageArn, state: 'pending' });
+      delete row.validationRunId;
+      delete row.validationLeaseUntil;
+      delete row.evidence;
+      bump();
+    },
+    /** DELETE then a fresh registration under the same name: `rev` starts over. */
+    recreate(over = {}) {
+      row = goodFlavor({ createdAt: '2026-02-02T00:00:00.000Z', updatedAt: '2026-02-02T00:00:00.000Z', ...over });
+    },
+    IMAGE_A,
   };
+  return m;
+}
+
+/** Wire a scenario's row-touching effects to a {@link rowModel}. */
+function useModel(s, m) {
+  s.deps.getFlavor = async () => m.read();
+  s.deps.claim = async (input) => m.claim(input);
+  s.deps.fence = async () => m.fence();
+  s.deps.transition = async (input) => m.transition(input);
 }
 
 /** A promise settled by hand, so a test chooses WHEN a lost write finally lands. */
@@ -1018,15 +1067,11 @@ test('a claim that lands AFTER its own release cannot strand the row in validati
   // then the claim settles and sets `validating` with nobody left to move it.
   const s = scenario(happyOpts());
   const m = rowModel(s.deps.now);
+  useModel(s, m);
   const late = deferred();
-  let claimInput;
-  s.deps.claim = (input) => {
-    claimInput = input;
+  s.deps.claim = (input) =>
     // The request is in flight: it reaches DynamoDB only when the test says so.
-    return late.promise.then(() => m.claim(input));
-  };
-  s.deps.fence = async (input) => m.fence(input);
-  s.deps.transition = async (input) => m.transition(input);
+    late.promise.then(() => m.claim(input));
 
   const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
   assert.equal(res.skipped, 'claim-unknown');
@@ -1035,23 +1080,122 @@ test('a claim that lands AFTER its own release cannot strand the row in validati
   // NOW the timed-out claim lands.
   late.resolve();
   await settle();
-  assert.equal(m.row.state, 'pending', 'the fenced token makes the late claim fail its condition');
-  assert.equal(m.row.fencedRunId, claimInput.runId);
+  assert.equal(m.row.state, 'pending', 'the fence moved the revision, so the late claim fails');
   assert.equal(res.verdictWritten, true);
 
-  // The fence is per-RUN: the next validation (a new token) can still claim the row.
-  assert.equal(m.claim({ runId: 'next-run', leaseUntil: s.deps.now() + 1 }), true);
+  // The fence refuses only claims based on an OLDER read: a run that reads the row now can claim.
+  assert.equal(m.claim({ runId: 'next-run', leaseUntil: s.deps.now() + 1, expect: m.snap() }), true);
+});
+
+test('two generations of timed-out claims: a later fence never re-admits an older claim', async () => {
+  // Review finding 1794543259290-b6c209:2. With a single overwritable fenced-token field, run B's
+  // fence REPLACED run A's, and A's claim — still in flight — then landed after both runs returned.
+  // Here A and B both time out with their claims in flight, B fences after A, and the claims land
+  // in either order. Neither may ever land.
+  for (const order of [['A', 'B'], ['B', 'A']]) {
+    const m = rowModel(() => 1_700_000_000_000);
+    const inFlight = {};
+    const runOne = async (id) => {
+      const s = scenario(happyOpts());
+      useModel(s, m);
+      s.deps.nonce = () => `run${id}`;
+      const d = deferred();
+      inFlight[id] = d;
+      s.deps.claim = (input) => d.promise.then(() => m.claim(input));
+      return withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+    };
+    const a = await runOne('A');
+    const b = await runOne('B');
+    assert.equal(a.skipped, 'claim-unknown');
+    assert.equal(b.skipped, 'claim-unknown');
+    assert.equal(m.row.state, 'pending');
+
+    for (const id of order) {
+      inFlight[id].resolve();
+      await settle();
+      assert.equal(m.row.state, 'pending', `late claim ${id} (order ${order}) must not land`);
+      assert.equal(m.row.validationRunId, undefined);
+    }
+  }
+});
+
+test('a repoint between the read and the claim: the stale run claims nothing and launches nothing', async () => {
+  // Review finding 1794543259290-b6c209:1. The run reads image A; the operator repoints the row to
+  // image B; the run's claim must not land, or it would launch A and mark the row — now naming B —
+  // valid, making an image nothing has run routable.
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  useModel(s, m);
+  const IMAGE_B = 'arn:aws:lambda:us-west-2:123456789012:microvm-image:gpu-v2';
+  s.deps.getFlavor = async () => {
+    const snapshot = m.read();
+    m.repoint(IMAGE_B); // lands after the read, before the claim
+    return snapshot;
+  };
+
+  const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+  assert.equal(res.ran, false);
+  assert.equal(res.skipped, 'not-pending');
+  assert.equal(s.names().includes('launch'), false);
+  assert.equal(s.names().includes('probeImage'), false);
+  assert.equal(m.row.state, 'pending', 'B awaits its own validation');
+  assert.equal(m.row.imageArn, IMAGE_B);
+});
+
+test('a repoint that is an image swap with the SAME revision count still fails the claim', async () => {
+  // Defence in depth: the claim pins the ARN itself, not only the revision.
+  const m = rowModel(() => 0);
+  const stale = m.snap();
+  m.repoint('arn:aws:lambda:us-west-2:123456789012:microvm-image:other');
+  m.row.rev = stale.rev; // pretend the revision did not move
+  assert.equal(m.claim({ runId: 'r', leaseUntil: 1, expect: stale }), false);
+});
+
+test('delete + re-register between the read and the claim: the stale run claims nothing', async () => {
+  // A re-registered row starts its revision over, so it can carry the SAME `rev` (and even the same
+  // ARN) as the row the run read. Only the record identity tells them apart.
+  for (const imageArn of [undefined, 'arn:aws:lambda:us-west-2:123456789012:microvm-image:new']) {
+    const s = scenario(happyOpts());
+    const m = rowModel(s.deps.now);
+    useModel(s, m);
+    s.deps.getFlavor = async () => {
+      const snapshot = m.read();
+      m.recreate(imageArn ? { imageArn } : {});
+      return snapshot;
+    };
+    const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+    assert.equal(res.skipped, 'not-pending');
+    assert.equal(s.names().includes('launch'), false);
+    assert.equal(m.row.state, 'pending');
+    assert.equal(m.row.rev, undefined, 'the new row was not touched');
+  }
+});
+
+test('a passing run against the model: the verdict names the launched image, and only that one', async () => {
+  const s = scenario(happyOpts());
+  const m = rowModel(s.deps.now);
+  useModel(s, m);
+  const res = await runValidation(s.deps, { installationId: INSTALL, name: NAME }, FAST);
+  assert.equal(res.state, 'valid');
+  assert.equal(m.row.state, 'valid');
+  assert.equal(m.row.imageArn, m.IMAGE_A);
+  assert.equal(s.calls.find((c) => c.name === 'launch').arg.imageArn, m.IMAGE_A);
+
+  // And a verdict for an image the row no longer names is refused at the store.
+  const m2 = rowModel(() => 0);
+  assert.equal(m2.claim({ runId: 'r', leaseUntil: 1, expect: m2.snap() }), true);
+  m2.row.imageArn = 'arn:aws:lambda:us-west-2:123456789012:microvm-image:swapped';
+  assert.equal(m2.transition({ to: 'valid', runId: 'r', imageArn: m2.IMAGE_A }), false);
 });
 
 test('a claim that landed BEFORE the release is undone by the token-guarded release', async () => {
   const s = scenario(happyOpts());
   const m = rowModel(s.deps.now);
+  useModel(s, m);
   s.deps.claim = (input) => {
     m.claim(input); // it landed …
     return new Promise(() => {}); // … and the answer never came back
   };
-  s.deps.fence = async (input) => m.fence(input);
-  s.deps.transition = async (input) => m.transition(input);
 
   const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
   assert.equal(res.skipped, 'claim-unknown');
@@ -1064,9 +1208,8 @@ test('a late VERDICT cannot land on a later run that claimed the row after our r
   // verdict reach DynamoDB. The run token refuses it.
   const s = scenario(happyOpts());
   const m = rowModel(s.deps.now);
+  useModel(s, m);
   const late = deferred();
-  s.deps.claim = async (input) => m.claim(input);
-  s.deps.fence = async (input) => m.fence(input);
   let staleVerdict;
   s.deps.transition = (input) => {
     if (input.to === 'valid') {
@@ -1080,7 +1223,10 @@ test('a late VERDICT cannot land on a later run that claimed the row after our r
   assert.equal(res.state, 'pending');
   assert.equal(m.row.state, 'pending');
 
-  assert.equal(m.claim({ runId: 'later-run', leaseUntil: s.deps.now() + 600_000 }), true);
+  assert.equal(
+    m.claim({ runId: 'later-run', leaseUntil: s.deps.now() + 600_000, expect: m.snap() }),
+    true,
+  );
   late.resolve();
   await settle();
   assert.equal(m.row.state, 'validating', 'the later run still owns its claim');
@@ -1091,11 +1237,11 @@ test('a late VERDICT cannot land on a later run that claimed the row after our r
 test('a validating row whose claimer is gone is reclaimed once its lease has expired', () => {
   let now = 1_000;
   const m = rowModel(() => now);
-  assert.equal(m.claim({ runId: 'dead', leaseUntil: 2_000 }), true);
+  assert.equal(m.claim({ runId: 'dead', leaseUntil: 2_000, expect: m.snap() }), true);
   // Still inside the lease: the claimer may be alive, so no takeover.
-  assert.equal(m.claim({ runId: 'next', leaseUntil: 9_000 }), false);
+  assert.equal(m.claim({ runId: 'next', leaseUntil: 9_000, expect: m.snap() }), false);
   now = 2_001;
-  assert.equal(m.claim({ runId: 'next', leaseUntil: 9_000 }), true);
+  assert.equal(m.claim({ runId: 'next', leaseUntil: 9_000, expect: m.snap() }), true);
   // The dead run's late writes are now refused.
   assert.equal(m.transition({ to: 'valid', runId: 'dead' }), false);
 });

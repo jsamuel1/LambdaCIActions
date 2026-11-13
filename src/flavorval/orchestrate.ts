@@ -96,7 +96,9 @@ export interface OrchestratorDeps {
   /**
    * Claim the flavor for this run: `pending → validating`, stamped with `runId` and a lease. MUST be
    * the conditional-write form: `false` is how the orchestrator learns another run owns the flavor,
-   * and is the only concurrency guard it has. MUST refuse a `runId` that {@link fence} has fenced.
+   * and is the only concurrency guard it has. MUST be a compare-and-swap on `expect` — the row as
+   * this run READ it (revision, identity, artifact) — so the run only ever validates the record it
+   * inspected, and so {@link fence} can refuse it.
    */
   claim(
     input: {
@@ -105,14 +107,18 @@ export interface OrchestratorDeps {
       runId: string;
       /** Epoch ms after which another run may take a stranded claim over. */
       leaseUntil: number;
+      expect: { rev?: number; createdAt: string; imageArn: string };
       reason?: string;
       actor?: string;
     },
     signal?: AbortSignal,
   ): Promise<boolean>;
-  /** Fence `runId` so a claim carrying it can never land (idempotent). */
+  /**
+   * Advance the row's monotonic revision so every claim based on an earlier read — including one
+   * still in flight — can never land.
+   */
   fence(
-    input: { installationId: number; name: string; runId: string },
+    input: { installationId: number; name: string },
     signal?: AbortSignal,
   ): Promise<void>;
   /**
@@ -132,6 +138,8 @@ export interface OrchestratorDeps {
       from?: readonly ('pending' | 'validating' | 'valid' | 'invalid')[];
       /** The claiming run's token; the write is refused unless the row is still ours. */
       runId?: string;
+      /** The image the run launched; a verdict is refused unless the row still names it. */
+      imageArn?: string;
       reason?: string;
       evidence?: FlavorValidationEvidence;
       actor?: string;
@@ -484,10 +492,18 @@ export async function runValidation(
   // runs can win `pending → validating`, and losing means another run owns this flavor — so
   // exit WITHOUT touching the row, because writing anything would be writing over the winner.
   //
-  // The claim carries THIS run's token. Every later write of ours (verdict, release) requires the
-  // row to still hold it, and every transition out of `validating` removes it, so no write of ours
-  // that lands late can ever touch a row some other actor has since moved — or a later run's claim.
-  // One nonce serves as both the run token and the smoke label: both identify this one run.
+  // The claim is a compare-and-swap on `rec` itself (its revision, registration timestamp and image
+  // ARN). Everything this run does after the claim — the probe, the launch, the evidence — uses
+  // `rec`, so the claim must only land on exactly that row: if an operator repointed the image, or
+  // deleted and re-registered the flavor, between the read and the claim, launching `rec.imageArn`
+  // would validate the OLD image and the verdict would land on a row naming the NEW one, making an
+  // image nothing has run routable. With the CAS that claim is refused and this run exits; the
+  // write that changed the row triggers its own validation.
+  //
+  // The claim also carries THIS run's token. Every later write of ours (verdict, release) requires
+  // the row to still hold it, and every transition out of `validating` removes it, so no write of
+  // ours that lands late can ever touch a row some other actor has since moved — or a later run's
+  // claim. One nonce serves as both the run token and the smoke label: both identify this one run.
   const nonce = deps.nonce();
   const runId = nonce;
   let claimed: boolean;
@@ -499,6 +515,7 @@ export async function runValidation(
           name: req.name,
           runId,
           leaseUntil: startedAtMs + config.leaseMs,
+          expect: { rev: rec.rev, createdAt: rec.createdAt, imageArn: rec.imageArn },
           reason: 'smoke run in progress',
           actor: req.actor,
         },
@@ -510,7 +527,10 @@ export async function runValidation(
     // able to land AFTER anything we write now. Releasing alone is not enough: a release that runs
     // before the late claim sees `pending`, does nothing, and the claim then strands the row in
     // `validating` (reproduced by review). So, in order:
-    //   1. FENCE our token. Once that lands, a claim carrying it fails its condition forever.
+    //   1. FENCE: advance the row's revision. The claim is a CAS on the revision we read, so once
+    //      the bump lands it — and any older run's claim still in flight — fails its condition
+    //      forever. The revision only grows, so no later fence can re-admit it (a single overwritable
+    //      fenced-token field could: run B's fence would replace run A's).
     //   2. Release `validating → pending` guarded by our token. It now only has the one case left to
     //      handle — a claim that landed before the fence — and DynamoDB orders the two writes.
     // If the fence itself cannot be confirmed, the claim's lease is the backstop: an expired lease
@@ -521,7 +541,7 @@ export async function runValidation(
       ...idOf(req),
       error: message,
     });
-    const fenced = await fenceRun(deps, req, config, runId);
+    const fenced = await fenceRun(deps, req, config);
     const released = await releaseToPending(deps, req, config, runId, `claim failed: ${message}`);
     return {
       ran: false,
@@ -534,7 +554,7 @@ export async function runValidation(
   }
   if (!claimed) {
     deps.log({
-      msg: 'flavor validation skipped — another run owns this flavor',
+      msg: 'flavor validation skipped — another run owns this flavor, or it changed since it was read',
       ...idOf(req),
       state: rec.state,
     });
@@ -838,6 +858,9 @@ async function writeVerdict(
           // Ours, or nothing: a verdict that lands after our own release (which removes the token)
           // or after an operator re-validate is refused instead of overwriting the newer state.
           runId,
+          // And only about the artifact we actually ran: belt-and-braces with the claim's CAS, so a
+          // verdict can never be attributed to an image the row names but this run never launched.
+          ...(evidence.imageArn ? { imageArn: evidence.imageArn } : {}),
           reason: verdict.reason,
           evidence,
           actor: req.actor,
@@ -928,16 +951,15 @@ async function releaseToPending(
   }
 }
 
-/** Fence `runId` against a late-landing claim. Bounded, never throws; true when confirmed. */
+/** Fence every claim based on an earlier read. Bounded, never throws; true when confirmed. */
 async function fenceRun(
   deps: OrchestratorDeps,
   req: FlavorValidationRequest,
   config: OrchestratorConfig,
-  runId: string,
 ): Promise<boolean> {
   try {
     await bounded('fence', config.verdictTimeoutMs, (signal) =>
-      deps.fence({ installationId: req.installationId, name: req.name, runId }, signal),
+      deps.fence({ installationId: req.installationId, name: req.name }, signal),
     );
     return true;
   } catch (err) {

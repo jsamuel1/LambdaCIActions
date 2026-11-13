@@ -180,7 +180,7 @@ test('a transition hands its AbortSignal to the HTTP layer, where the SDK honour
 // these condition expressions, so they are pinned on the wire rather than only in the orchestrator's
 // row model.
 
-test('the claim stamps a run token + lease and refuses a fenced token', async () => {
+test('the claim is a CAS on the read revision, identity and image, and stamps token + lease', async () => {
   const w = interceptWire();
   try {
     await store.claimFlavorValidation({
@@ -188,17 +188,46 @@ test('the claim stamps a run token + lease and refuses a fenced token', async ()
       name: 'custom-good',
       runId: 'run-a',
       leaseUntil: 1_700_000_900_000,
+      expect: {
+        rev: 3,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        imageArn: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:good',
+      },
+      now: new Date(1_700_000_000_000),
+    });
+    // A never-written row has no `rev`: it is matched by absence.
+    await store.claimFlavorValidation({
+      installationId: 42,
+      name: 'custom-good',
+      runId: 'run-b',
+      leaseUntil: 1_700_000_900_000,
+      expect: {
+        createdAt: '2026-01-01T00:00:00.000Z',
+        imageArn: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:good',
+      },
       now: new Date(1_700_000_000_000),
     });
   } finally {
     w.restore();
   }
-  const req = w.bodies[0];
+  const [req, fresh] = w.bodies;
   assert.match(req.UpdateExpression, /validationRunId = :runId/);
   assert.match(req.UpdateExpression, /validationLeaseUntil = :lease/);
+  assert.match(req.UpdateExpression, /ADD rev :one$/);
   assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
-  // A fenced token can never claim: this is what stops a late-landing claim stranding the row.
-  assert.match(req.ConditionExpression, /fencedRunId <> :runId/);
+  // The CAS: exactly the row the run read.
+  assert.match(req.ConditionExpression, /AND rev = :rev AND/);
+  assert.deepEqual(req.ExpressionAttributeValues[':rev'], { N: '3' });
+  assert.match(req.ConditionExpression, /createdAt = :createdAt AND imageArn = :imageArn/);
+  assert.deepEqual(req.ExpressionAttributeValues[':createdAt'], { S: '2026-01-01T00:00:00.000Z' });
+  assert.deepEqual(req.ExpressionAttributeValues[':imageArn'], {
+    S: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:good',
+  });
+  assert.match(fresh.ConditionExpression, /\(attribute_not_exists\(rev\) OR rev = :rev\)/);
+  assert.deepEqual(fresh.ExpressionAttributeValues[':rev'], { N: '0' });
+  // The scalar fence is gone from the condition (and dropped from rows that still carry it).
+  assert.doesNotMatch(req.ConditionExpression, /fencedRunId/);
+  assert.match(req.UpdateExpression, /REMOVE fencedRunId/);
   // Only from pending — or from a validating claim whose lease has EXPIRED (its λ is gone).
   assert.match(req.ConditionExpression, /#state = :pending/);
   assert.match(req.ConditionExpression, /validationLeaseUntil < :nowMs/);
@@ -206,19 +235,34 @@ test('the claim stamps a run token + lease and refuses a fenced token', async ()
   assert.match(req.ConditionExpression, /attribute_exists\(pk\)/);
 });
 
-test('the fence records the token and nothing else', async () => {
+test('the fence only advances the monotonic revision', async () => {
   const w = interceptWire();
   try {
-    await store.fenceFlavorValidationRun({ installationId: 42, name: 'custom-good', runId: 'run-a' });
+    await store.fenceFlavorValidationRun({ installationId: 42, name: 'custom-good' });
   } finally {
     w.restore();
   }
   const req = w.bodies[0];
-  assert.equal(req.UpdateExpression, 'SET fencedRunId = :runId');
-  assert.deepEqual(req.ExpressionAttributeValues[':runId'], { S: 'run-a' });
+  assert.equal(req.UpdateExpression, 'ADD rev :one');
+  assert.deepEqual(req.ExpressionAttributeValues[':one'], { N: '1' });
 });
 
-test('a run-owned verdict requires the token, and every transition drops ownership', async () => {
+test('every non-claim row write advances the revision too, so a claim on an older read fails', async () => {
+  const w = interceptWire();
+  try {
+    await store.transitionFlavorValidation({ installationId: 42, name: 'custom-good', to: 'pending' });
+    await store.repointFlavorImage({
+      installationId: 42,
+      name: 'custom-good',
+      imageArn: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:new',
+    });
+  } finally {
+    w.restore();
+  }
+  for (const req of w.bodies) assert.match(req.UpdateExpression, /ADD rev :one$/);
+});
+
+test('a run-owned verdict requires the token AND the launched image', async () => {
   const w = interceptWire();
   try {
     await store.transitionFlavorValidation({
@@ -226,6 +270,7 @@ test('a run-owned verdict requires the token, and every transition drops ownersh
       name: 'custom-good',
       to: 'valid',
       runId: 'run-a',
+      imageArn: 'arn:aws:lambda:us-west-2:123456789012:microvm-image:good',
       reason: 'smoke run passed',
     });
     // An operator re-validate (no token) must also end any run's ownership, so a stale verdict from
@@ -235,10 +280,11 @@ test('a run-owned verdict requires the token, and every transition drops ownersh
     w.restore();
   }
   const [owned, operator] = w.bodies;
-  assert.match(owned.ConditionExpression, /AND validationRunId = :runId$/);
+  assert.match(owned.ConditionExpression, /AND validationRunId = :runId AND imageArn = :imageArn$/);
   assert.deepEqual(owned.ExpressionAttributeValues[':runId'], { S: 'run-a' });
   for (const req of [owned, operator]) {
     assert.match(req.UpdateExpression, /REMOVE .*validationRunId, validationLeaseUntil/);
   }
   assert.doesNotMatch(operator.ConditionExpression, /validationRunId/);
+  assert.doesNotMatch(operator.ConditionExpression, /imageArn/);
 });

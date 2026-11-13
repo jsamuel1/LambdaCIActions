@@ -216,10 +216,14 @@ export interface CustomFlavorRecord {
   /** Epoch ms after which a `validating` claim may be taken over (its λ is provably gone). */
   validationLeaseUntil?: number;
   /**
-   * The last run token whose claim was ABANDONED by its own run (the claim write did not answer).
-   * A claim carrying this token is refused, so a claim that lands late cannot strand the row.
+   * Monotonic row revision (ADR-041). Absent on a freshly registered row (read as 0) and bumped by
+   * EVERY later write — claim, verdict, release, operator re-validate, image repoint, fence. A claim
+   * is conditional on the revision it READ, so it can only land on the exact row state its run
+   * inspected: any intervening write, including a fence by a run whose own claim did not answer,
+   * makes it fail. Because the value only ever grows, a claim that was refused once can never become
+   * admissible again.
    */
-  fencedRunId?: string;
+  rev?: number;
   createdAt: string;
   updatedAt: string;
   createdBy?: string;
@@ -523,6 +527,12 @@ export async function transitionFlavorValidation(
      * verdict and release so a write that lands late cannot touch a later run's claim.
      */
     runId?: string;
+    /**
+     * Require the row to still point at this image. The smoke λ passes the ARN it actually launched
+     * on its verdict, so a verdict can only ever describe the artifact the row names — independently
+     * of the run token, which a repoint already removes.
+     */
+    imageArn?: string;
     reason?: string;
     evidence?: FlavorValidationEvidence;
     actor?: string;
@@ -570,6 +580,8 @@ export async function transitionFlavorValidation(
   // Ownership ends with `validating`. Claims are made only by `claimFlavorValidation`, so every
   // target this function writes leaves the state and drops the token + lease with it.
   removes.push('validationRunId', 'validationLeaseUntil');
+  // Every write moves the revision, so a claim based on the row as it was BEFORE this write fails.
+  values[':one'] = 1;
 
   // `state` may be absent on a row written before this field existed; treat that as `pending`.
   const stateGuard = from
@@ -584,6 +596,10 @@ export async function transitionFlavorValidation(
     values[':runId'] = input.runId;
     ownerGuard = ' AND validationRunId = :runId';
   }
+  if (input.imageArn !== undefined) {
+    values[':imageArn'] = input.imageArn;
+    ownerGuard += ' AND imageArn = :imageArn';
+  }
 
   try {
     await requireDoc().send(
@@ -591,7 +607,9 @@ export async function transitionFlavorValidation(
         TableName: TABLE,
         Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
         UpdateExpression:
-          `SET ${sets.join(', ')}` + (removes.length ? ` REMOVE ${removes.join(', ')}` : ''),
+          `SET ${sets.join(', ')}` +
+          (removes.length ? ` REMOVE ${removes.join(', ')}` : '') +
+          ' ADD rev :one',
         ConditionExpression:
           `attribute_exists(pk) AND (${stateGuard}` +
           (allowsPending ? ' OR attribute_not_exists(#state)' : '') +
@@ -612,11 +630,19 @@ export async function transitionFlavorValidation(
 /**
  * Claim a flavor for ONE smoke run: `pending → validating`, stamped with the run's token + lease.
  *
- * The conditional write is the concurrency guard (ADR-041). Three clauses beyond the state check:
+ * The conditional write is the concurrency guard (ADR-041). Beyond the state check it is a
+ * COMPARE-AND-SWAP on the exact row the run read (`expect`):
  *
- * - `fencedRunId <> :runId` — a run whose claim did not answer fences its own token before
- *   releasing (see {@link fenceFlavorValidationRun}). Without it, a claim that settles AFTER that
- *   release would set `validating` with nobody left to move it out (reproduced live by review).
+ * - `rev` — the monotonic revision every write bumps. The claim lands only if nothing has written the
+ *   row since the run read it. That binds the claim to the inspected state: an operator re-validate
+ *   or image repoint in between makes it fail, so a run can never launch the image it READ and then
+ *   write a verdict onto a row that now names another one. It is also the fence against a claim
+ *   whose response was lost: {@link fenceFlavorValidationRun} bumps `rev`, after which that claim —
+ *   and every other claim based on an older read, however many generations of them are still in
+ *   flight — fails its condition forever, because `rev` never goes back.
+ * - `createdAt` + `imageArn` — the record's identity and artifact. `rev` restarts at 0 when a
+ *   flavor is deleted and re-registered under the same name, so `rev` alone cannot tell the two rows
+ *   apart; the registration timestamp can, and the ARN pins the artifact itself.
  * - an EXPIRED `validating` claim may be taken over. The lease outlives the claiming λ's own
  *   timeout, so its owner is provably dead; this is how a row stranded by a run that could not
  *   reach DynamoDB at all recovers on the next trigger, rather than only via an operator. A
@@ -632,6 +658,8 @@ export async function claimFlavorValidation(
     runId: string;
     /** Epoch ms. */
     leaseUntil: number;
+    /** The row as the run READ it. The claim lands only on exactly that row. */
+    expect: { rev?: number; createdAt: string; imageArn: string };
     reason?: string;
     actor?: string;
     now?: Date;
@@ -646,6 +674,9 @@ export async function claimFlavorValidation(
     ':lease': input.leaseUntil,
     ':nowMs': now.getTime(),
     ':now': now.toISOString(),
+    ':one': 1,
+    ':createdAt': input.expect.createdAt,
+    ':imageArn': input.expect.imageArn,
   };
   const sets = [
     '#state = :validating',
@@ -653,7 +684,8 @@ export async function claimFlavorValidation(
     'validationLeaseUntil = :lease',
     'updatedAt = :now',
   ];
-  const removes: string[] = [];
+  // `fencedRunId` is the scalar fence this revision replaced; drop it from rows that still carry it.
+  const removes: string[] = ['fencedRunId'];
   if (input.reason !== undefined) {
     sets.push('#reason = :reason');
     values[':reason'] = clampReason(input.reason);
@@ -664,16 +696,26 @@ export async function claimFlavorValidation(
     sets.push('updatedBy = :actor');
     values[':actor'] = input.actor;
   }
+  // A fresh registration has no `rev` yet; it reads as 0 and is matched by its absence.
+  const readRev = input.expect.rev ?? 0;
+  let revGuard: string;
+  if (readRev === 0) {
+    revGuard = '(attribute_not_exists(rev) OR rev = :rev)';
+  } else {
+    revGuard = 'rev = :rev';
+  }
+  values[':rev'] = readRev;
   try {
     await requireDoc().send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
         UpdateExpression:
-          `SET ${sets.join(', ')}` + (removes.length ? ` REMOVE ${removes.join(', ')}` : ''),
+          `SET ${sets.join(', ')} REMOVE ${removes.join(', ')} ADD rev :one`,
         ConditionExpression:
           'attribute_exists(pk)' +
-          ' AND (attribute_not_exists(fencedRunId) OR fencedRunId <> :runId)' +
+          ` AND ${revGuard}` +
+          ' AND createdAt = :createdAt AND imageArn = :imageArn' +
           ' AND (#state = :pending OR attribute_not_exists(#state)' +
           ' OR (#state = :validating AND (attribute_not_exists(validationLeaseUntil)' +
           ' OR validationLeaseUntil < :nowMs)))',
@@ -690,15 +732,18 @@ export async function claimFlavorValidation(
 }
 
 /**
- * Fence a run token so a claim carrying it can never land. Idempotent; touches nothing else.
+ * Fence every claim based on the row as it is NOW: bump `rev` and touch nothing else. Idempotent in
+ * effect (bumping twice fences the same set and more).
  *
  * Used by the smoke λ when its own claim did not answer: whether that claim landed is unknown, and
- * it may still be in flight. Once the fence holds, a late-settling claim fails its condition; a
- * claim that landed BEFORE the fence is then undone by the token-guarded release that follows.
- * Either way the row cannot be left `validating` by that run.
+ * it may still be in flight. A claim is a compare-and-swap on the revision its run read, so once the
+ * bump lands a late-settling claim fails its condition; a claim that landed BEFORE the bump is then
+ * undone by the token-guarded release that follows. Either way the row cannot be left `validating`
+ * by that run. The revision is MONOTONIC, so a later run's fence can never re-admit an older one's
+ * claim — the defect of a single overwritable `fencedRunId`.
  */
 export async function fenceFlavorValidationRun(
-  input: { installationId: number; name: string; runId: string },
+  input: { installationId: number; name: string },
   signal?: AbortSignal,
 ): Promise<void> {
   try {
@@ -706,14 +751,15 @@ export async function fenceFlavorValidationRun(
       new UpdateCommand({
         TableName: TABLE,
         Key: { pk: installPk(input.installationId), sk: flavorSk(input.name) },
-        UpdateExpression: 'SET fencedRunId = :runId',
+        UpdateExpression: 'ADD rev :one',
         ConditionExpression: 'attribute_exists(pk)',
-        ExpressionAttributeValues: { ':runId': input.runId },
+        ExpressionAttributeValues: { ':one': 1 },
       }),
       { abortSignal: signal },
     );
   } catch (err) {
-    // A deleted flavor needs no fence: there is no row for a late claim to land on.
+    // A deleted flavor needs no fence: there is no row for a late claim to land on, and a
+    // re-registered one has a new `createdAt` the late claim cannot match.
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return;
     throw err;
   }
@@ -743,13 +789,16 @@ export async function repointFlavorImage(input: {
         UpdateExpression:
           'SET imageArn = :arn, #state = :pending, updatedAt = :now' +
           (input.actor ? ', updatedBy = :actor' : '') +
-          ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil',
+          ' REMOVE #reason, evidence, validationRunId, validationLeaseUntil' +
+          // A claim based on the row before the swap must fail: it read the OLD artifact.
+          ' ADD rev :one',
         ConditionExpression: 'attribute_exists(pk)',
         ExpressionAttributeNames: { '#state': 'state', '#reason': 'reason' },
         ExpressionAttributeValues: {
           ':arn': input.imageArn,
           ':pending': 'pending' satisfies FlavorValidationState,
           ':now': iso,
+          ':one': 1,
           ...(input.actor ? { ':actor': input.actor } : {}),
         },
         ReturnValues: 'ALL_OLD',

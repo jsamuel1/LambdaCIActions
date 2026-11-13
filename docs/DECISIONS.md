@@ -2254,18 +2254,25 @@ the static gates; the smoke run itself is verified against a live environment.
      fallback (8 s) and each of the five cleanup steps (6 s) have fixed ceilings that sum to 46 s,
      inside the reserve, which `reserveFits()` checks and the tests pin.
 
-     Giving up on a write does not stop it landing, so the row is fenced by **run ownership**, not
-     by ordering. The claim (`claimFlavorValidation`) stamps `validationRunId` + a
-     `validationLeaseUntil` lease on the row; the run's verdict and its release both require that
-     token in their condition, and every transition out of `validating` removes it. So a late
-     verdict can never overwrite an operator's re-validate or a later run's claim. A claim that did
-     not answer is handled in two writes: first `fenceFlavorValidationRun` records the token as
-     `fencedRunId` (a claim carrying it fails its condition from then on, so one still in flight
-     can no longer land), then the token-guarded release undoes a claim that landed before the
-     fence. Reserved concurrency alone did not order those two in-flight writes. Finally, the
-     lease (15 min, longer than the λ timeout) means that a `validating` row whose λ is provably
-     gone, because it could not reach DynamoDB at all, is taken over by the next claim instead of
-     waiting for an operator.
+     Giving up on a write does not stop it landing, so the row is fenced by **run ownership and a
+     monotonic revision**, not by ordering. Every write to a `FLAVOR#` row (claim, verdict, release,
+     operator re-validate, image repoint) does `ADD rev 1`. The claim (`claimFlavorValidation`) is a
+     compare-and-swap on the row the run READ: its `rev`, its `createdAt` (record identity, because
+     a deleted and re-registered flavor restarts `rev`) and its `imageArn`. So a run validates only
+     the exact record and artifact it inspected; a repoint or delete+recreate between its read and
+     its claim makes the claim fail, and the write that changed the row triggers its own run. The
+     claim stamps `validationRunId` + a `validationLeaseUntil` lease; the run's verdict requires
+     that token AND the launched `imageArn`, the release requires the token, and every transition
+     out of `validating` removes the token. So a late verdict can never overwrite an operator's
+     re-validate or a later run's claim, nor describe an image the row no longer names. A claim
+     that did not answer is handled in two writes: first `fenceFlavorValidationRun` advances `rev`
+     (every claim based on an older read, however many generations of them are still in flight,
+     fails its condition from then on, and because `rev` never decreases no later fence can
+     re-admit one), then the token-guarded release undoes a claim that landed before the fence.
+     Reserved concurrency alone did not order those in-flight writes. Finally, the lease (15 min,
+     longer than the λ timeout) means that a `validating` row whose λ is provably gone, because it
+     could not reach DynamoDB at all, is taken over by the next claim instead of waiting for an
+     operator.
 
   Property 3 additionally requires that the verdict write itself cannot throw, which is why the
   flavor store's document client sets `marshallOptions.removeUndefinedValues`. The evidence map is
