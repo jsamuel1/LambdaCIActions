@@ -1066,14 +1066,6 @@ export async function listRepoRunners(params: {
 }
 
 /**
- * Delete a runner registration.
- *
- * Cleanup, and the reason it must not throw on 404: the normal path is that the runner ALREADY
- * removed itself when its single-use JIT registration was consumed, so "not found" is the success
- * case. Any other error is surfaced, because a registration we failed to remove is residue we left
- * in an operator's repository.
- */
-/**
  * Cancel a workflow run.
  *
  * Cleanup for a smoke run whose job was never served. A dispatched run with nothing to take it sits
@@ -1112,6 +1104,14 @@ export async function cancelWorkflowRun(params: {
   }
 }
 
+/**
+ * Delete a runner registration.
+ *
+ * Cleanup, and the reason it must not throw on 404: the normal path is that the runner ALREADY
+ * removed itself when its single-use JIT registration was consumed, so "not found" is the success
+ * case. Any other error is surfaced, because a registration we failed to remove is residue we left
+ * in an operator's repository.
+ */
 export async function deleteRepoRunner(params: {
   appId: string;
   pem: string;

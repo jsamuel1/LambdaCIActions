@@ -1478,3 +1478,33 @@ test('a dispatch that CREATED the run and then lost its response gets that run c
   assert.deepEqual(cancelled, [5001], 'confirmed ours by nonce — never the bystander');
   assert.equal(s.calls.find((c) => c.name === 'terminateVm')?.arg, 'mvm-1');
 });
+
+// A create-type effect that `bounded` never STARTED (the main phase was already spent) sent
+// nothing, so cleanup must not try to recover it. For the launch this is not just wasted work:
+// recovery RE-ISSUES the launch, so a recorded-but-unsent launch would make cleanup create a VM.
+for (const [effect, before, recovery] of [
+  ['mintSmokeRunner', 'defaultBranch', 'listRunners'],
+  ['launch', 'beginSmoke', 'launch'],
+  ['dispatch', 'stampVm', 'listDispatchRuns'],
+]) {
+  test(`a ${effect} never started for lack of budget is not "recovered" by cleanup`, async () => {
+    const s = scenario(happyOpts());
+    const original = s.deps[before];
+    let clockJump = 0;
+    const now = s.deps.now;
+    s.deps.now = () => now() + clockJump;
+    s.deps[before] = async (...args) => {
+      const out = await original(...args);
+      clockJump += 60_000; // past the end of the main phase
+      return out;
+    };
+    const res = await withinMs(2_000, runValidation(s.deps, { installationId: INSTALL, name: NAME }, HANG));
+    assert.equal(res.state, 'pending');
+    assert.equal(
+      s.calls.filter((c) => c.name === recovery).length,
+      0,
+      `${effect} was never sent, so cleanup has nothing to recover`,
+    );
+    assert.equal(s.names().includes(effect), false, `${effect} itself was not started`);
+  });
+}

@@ -656,12 +656,14 @@ export async function runValidation(
     seq = runSeq;
 
     const branch = await step('defaultBranch', (signal) => deps.defaultBranch(repo, signal));
-    mintSent = true;
-    const minted = await step('mintSmokeRunner', (signal) =>
+    const minted = await step('mintSmokeRunner', (signal) => {
       // A mint whose response is lost may still have REGISTERED the runner. Its name carries the
       // nonce, so cleanup finds it by name (`mintSent`) and deletes it rather than leaving it in
-      // the operator's repository.
-      deps.mintSmokeRunner(
+      // the operator's repository. Set HERE, inside the effect: `bounded` only invokes this once
+      // there is budget to start it, so the flag means "the request was sent" — not "we meant to".
+      // After the await would be too late: a lost response never resolves.
+      mintSent = true;
+      return deps.mintSmokeRunner(
         {
           repoFullName: repo,
           label,
@@ -670,8 +672,8 @@ export async function runValidation(
           name: runnerName,
         },
         signal,
-      ),
-    );
+      );
+    });
     runnerId = minted.runnerId;
 
     const smoke = await step('beginSmoke', (signal) =>
@@ -701,10 +703,14 @@ export async function runValidation(
       clientToken: `lca-validate-${req.installationId}-${runSeq}-${nonce}`,
       maximumDurationInSeconds: config.vmMaxDurationSeconds,
     };
-    pendingLaunch = launchRequest;
     let launched: { microvmId: string };
     try {
-      launched = await step('launch', (signal) => deps.launch(launchRequest, signal));
+      launched = await step('launch', (signal) => {
+        // Recorded only once the request is actually sent (see `mintSent`): cleanup RE-ISSUES a
+        // pending launch, so recording one that never left would make cleanup create a VM.
+        pendingLaunch = launchRequest;
+        return deps.launch(launchRequest, signal);
+      });
     } catch (err) {
       // Only a definitive refusal proves there is no VM to find.
       if (err instanceof LaunchRejectedError) pendingLaunch = undefined;
@@ -724,17 +730,20 @@ export async function runValidation(
     // Capture the lower bound BEFORE the API call. GitHub creates the run while processing the
     // dispatch, and `created_at` has only second granularity; sampling after a slow response can
     // move the floor into the next second and exclude the run we just created forever.
-    const dispatchedAtMs = deps.now();
-    dispatchSentAtMs = dispatchedAtMs;
+    let dispatchedAtMs = deps.now();
     // The LABEL, not the bare nonce. The smoke workflow's `runs-on` is
     // `["${{ inputs.lca_nonce }}"]` (nonce ONLY — see `smokeWorkflowYaml`): the input IS the label
     // GitHub matches against the runner's advertised labels, and the runner advertises
     // `smokeLabel(nonce)`. Dispatching the bare hex leaves the job permanently unmatched: observed
     // live on 2026-08-20, where the job sat queued with no runner able to take it, and the run was
     // condemned for "never reached a conclusion" — a verdict about OUR dispatch, not the image.
-    await step('dispatch', (signal) =>
-      deps.dispatch({ repoFullName: repo, workflow: wf, ref: branch, nonce: label }, signal),
-    );
+    await step('dispatch', (signal) => {
+      // Sampled immediately before the request, and recorded only once it is sent (see
+      // `mintSent`): cleanup searches for — and cancels — a run only if a dispatch went out.
+      dispatchedAtMs = deps.now();
+      dispatchSentAtMs = dispatchedAtMs;
+      return deps.dispatch({ repoFullName: repo, workflow: wf, ref: branch, nonce: label }, signal);
+    });
 
     const obs = await observeSmoke(deps, config, step, track, {
       repoFullName: repo,
