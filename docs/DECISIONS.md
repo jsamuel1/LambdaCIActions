@@ -2355,18 +2355,29 @@ the static gates; the smoke run itself is verified against a live environment.
   unaffected: GitHub ids are never zero. Note this lives in the baked guest image, so the fix reaches
   an environment only when its images are rebuilt.
 
-  **Live verification (2026-08-22, dev).** Both halves of this ADR's acceptance criterion now hold
-  against the real control plane:
+  **Live verification (2026-11-13, dev, final tree).** Both halves of this ADR's acceptance criterion
+  hold against the real control plane running the shipped implementation (revisioned claim CAS,
+  monotonic fence, run-token + image-bound verdict, `clientToken` and `maximumDurationInSeconds` on
+  RunMicrovm). Both rows started without a `rev` attribute (written by the earlier deploy), so the
+  claim's absent-revision branch ran against real DynamoDB too:
   - A deliberately broken image (`lca-dev-val-brokenagent`, whose `run.sh` exits 127) reached terminal
     `invalid` with the actionable reason "the image booted but its entrypoint/run-hook did not start
-    the agent", evidence `runnerRegistered: false`, `selfTerminated: false`, no leftover runner
-    registration and no live VM.
-  - The proven `lca-dev-node` image, registered as `custom-goodnode`, reached `valid` /
-    `routable: true` in 31 s with evidence `workflowConclusion: success`, `selfTerminated: true`,
-    `workflowRunId: 32603535501` — whose job ran on runner `lca-validate-251dd257105cce74`, the exact
-    AgentName that run minted. Its guest log shows the full contract: `job starting` → `Connected to
-    GitHub` → `Running job: validate` → `completed with result: Succeeded` → `self-terminate
-    requested`.
+    the agent", evidence `runnerRegistered: false`, `selfTerminated: false`. Its VM is `TERMINATED`,
+    its dispatched run `43366663525` was cancelled by cleanup, and no runner registration is left.
+  - `custom-goodnode` was REPOINTED through `POST /api/flavors/{name}/revalidate` at a node image
+    built with runner 2.338.2 (`lca-dev-val-goodnode-r2338`), and reached `valid` / `routable: true`
+    in under a minute (first poll `validating` 05:01:33Z, `valid` by 05:02:19Z). The raw row holds `rev: 6`, evidence `imageArn` equal to the row's `imageArn`,
+    `workflowConclusion: success`, `selfTerminated: true`, `workflowRunId: 43369267615` — whose job
+    `validate` ran on runner `lca-validate-bba114884dad2929`, the exact AgentName that run minted. Its
+    guest log shows `Connected to GitHub` → `Running job: validate` → `completed with result:
+    Succeeded` → `self-terminate requested`, and the VM is `TERMINATED`.
+
+  The same pass also showed the gate doing its job on a real defect: the catalog's `lca-dev-node`
+  image (runner 2.335.1) was condemned `invalid`, correctly — its agent connected and then exited with
+  "Runner version v2.335.1 is deprecated and cannot receive messages". An image that cannot take a
+  job is not routable, whatever produced it.
+
+  An earlier pass (2026-08-22) proved the same two outcomes on the pre-revision tree.
 
 - The console's Flavors screen renders custom flavors in every state behind an installation selector
   (a custom flavor is unaddressable without its installation), with the registration form, the
