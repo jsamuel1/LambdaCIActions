@@ -34,6 +34,18 @@ GitHub remains the definition + scheduler; we only supply compute.
 **Why**: Zero-migration path; users keep GitHub Actions semantics.
 **Consequences**: Ingestion + compat analysis complexity; some jobs unclaimable (`block`).
 
+**Amended by [ADR-054](#adr-054)**: this ADR is **no longer unconditional**, and the change is
+large enough to state here rather than only in the amending block. ADR-054 adds an opt-in fourth
+repo mode (`engine`) in which **we** own the definition *and* the scheduler, because two things this
+ADR could not have known are now established: a non-GitHub host emits no `workflow_job` webhook at
+all (so "route eligible jobs" has nothing to route), and GitHub Free withholds PR **governance** on
+private repos — not minutes — so the paid-plan gap cannot be closed by supplying compute.
+
+What stays true, and stays the default: for a repo on GitHub in `label`/`adopt` mode — every repo
+onboarded to date — GitHub remains the definition and scheduler, we only supply compute, and this
+ADR governs unchanged. The parser stays routing-first for those modes. `engine` mode is additive,
+off by default, and per repo; nothing about it is retrofitted onto an existing repo.
+
 ## ADR-005 — Two onboarding modes: `label` (default) and `adopt`
 **Status**: Accepted
 **Context**: Trade safety vs zero-edit convenience.
@@ -3226,3 +3238,654 @@ smoke job echoes `RUNNER_NAME`, and the recorded evidence pairs it with GitHub's
   open debt, not a claim.
 - A rebuild is an image swap, so it needs the ADR-049 quiesce gate like any other; the label
   stays claimed throughout, because a rebuild repoints an ARN and never unpublishes.
+
+---
+
+> **ADR numbering note.** This block takes **054..060**. `main` defines through **053**, and the
+> only free number below that, **052**, is claimed by the unmerged `kermes/task-velvet-duck`
+> (sealed pagination cursors) — so 054 is the lowest free start. Two hazards a later reader should
+> know about: the card that filed this work named 048 as the tail and 049 as contended, and both
+> facts were already stale (trunk had moved six commits); and `kermes/task-deep-eagle` currently
+> holds a **different** ADR-053 ("A JIT runner is matched by label, not bound to a job") from
+> trunk's ("A prebaked tool cache is unproven until a real job resolves it"), so that branch must
+> renumber before it lands and 053 must not be assumed free by anyone. ADR numbers are a shared
+> mutable namespace across branches and `test/adr-refs.test.mjs` only catches a duplicate once both
+> blocks are in one tree, so each branch renumbers to the lowest free block rather than deferring —
+> a gap is cheaper than a duplicate.
+
+## ADR-054 — We may own the definition and the scheduler, per repo, behind a fourth mode (M6)
+**Status**: Proposed (design only — no implementation) · amends [ADR-004](#adr-004) · extends
+[ADR-005](#adr-005) (onboarding modes) and [ADR-030](#adr-030) (claim gate)
+
+**Context**: [ADR-004](#adr-004) fixed the founding posture: "GitHub remains the definition +
+scheduler; we only supply compute." Everything downstream assumes it — Ingest claims off
+`workflow_job` webhooks, Provision mints a JIT runner ([ADR-003](#adr-003)), and the parser is
+deliberately routing-only (spec 03). Two requirements arrived that the posture cannot satisfy:
+
+1. **Non-GitHub hosts.** GitLab, Bitbucket, CodeCommit and Gitea emit no `workflow_job` webhook and
+   run no GitHub Actions. There is nothing to claim, so "supply compute" has no entry point at all.
+2. **The paid-plan gap is governance, not minutes.** The filing assumed Free metered our runners.
+   It does not: "GitHub Actions usage is **free** for **self-hosted runners**"
+   (docs.github.com/en/billing/concepts/product-billing/github-actions). What Free withholds on
+   **private** repos is required reviewers, protected branches and code owners — the plans page
+   lists them as what Pro/Team add — plus environments, which are public-repo-only on Free
+   ("Users with GitHub Free plans can only configure environments for public repositories").
+   No amount of cheaper compute closes that gap.
+
+**Decision**: Add a fourth `RepoMode`, **`engine`**, in which LCA evaluates triggers, plans the job
+DAG and dispatches jobs itself. `RepoMode` becomes `'label' | 'adopt' | 'off' | 'engine'`. Off by
+default, per repo, and additive: `label`/`adopt` keep working exactly as they do, and
+[ADR-004](#adr-004) continues to govern them.
+
+**Never dual-run, by where the engine reads workflows, not by asking GitHub not to schedule.**
+GitHub schedules every workflow under `.github/workflows` itself ("GitHub searches the
+`.github/workflows` directory in the root of your repository for workflow files" —
+docs.github.com/en/actions/concepts/workflows-and-actions/workflows). Guards inside LCA cannot stop
+that, so an engine that also read `.github/workflows` would run the same workflow twice: once on our
+engine, once on GitHub-hosted runners. Therefore:
+1. **The engine reads only `.lca/workflows/**`.** GitHub never schedules a file there; LCA never
+   schedules a file under `.github/workflows`. Each file has exactly one scheduler.
+2. **Activation is fail-closed:** a run is planned only when `mode === 'engine'`,
+   `engineEnabled === true` (kill switch, absent ⇒ off), the deployment carries the engine flag, the
+   repo is not on the platform deny list, and no `.github/workflows` file at that sha has the same
+   basename (a copied-not-moved twin is refused as `engine-twin-workflow`). The gates are re-checked
+   at every job release.
+3. Defence in depth, kept from the first draft: `decideClaim` refuses `workflow_job` in `engine`
+   mode, recorded and visible ([ADR-050](#adr-050)), and the planner refuses non-`engine` repos.
+
+**Why**: The alternatives are worse in ways that are easy to verify. *Replacing* the
+`workflow_job` path outright would regress every onboarded repo onto the least-proven subsystem in
+the platform to buy nothing they asked for. A *global* switch would make interception
+all-or-nothing across tenants — the exact property [ADR-030](#adr-030) made a deliberate per-repo
+choice. Within an `engine` repo the unit is the **workflow file**: GitHub offers no way to take
+some of a repo's jobs and leave the rest (which is why adopt mode is all-or-nothing per repo), but
+it only ever schedules files under `.github/workflows`, so a file's directory decides its scheduler.
+
+**Consequences**:
+- Design only. Nothing is implemented and no permission change is deployed by this ADR.
+- **Adopting `engine` mode is a file move, not a toggle**: `.github/workflows/x.yml` →
+  `.lca/workflows/x.yml`, same grammar. A repo can mix the two directories safely; no file runs on
+  both schedulers. Nothing depends on the customer disabling GitHub Actions.
+- An earlier draft of this ADR claimed the two claim-gate guards made dual-run "structurally
+  impossible" while admitting GitHub could still run the same files. That claim is withdrawn; the
+  directory split is the mechanism.
+- The parser is promoted from routing-only to **execution-grade** for `engine` mode (spec 03), which
+  is a much larger correctness surface: it must model `if:`, `needs:`, expressions, outputs and env.
+- **Refusal becomes a product surface, not an error path.** A partial engine that claims a job it
+  cannot faithfully run is worse than not claiming it, so an unsupported construct refuses the run
+  at plan time — before any VM boots — with a code, a reason and a fix ([ADR-050](#adr-050)).
+- Run ids stop being GitHub's; see [ADR-056](#adr-056). Engine rows get their own source-aware key,
+  and every writer of run rows changes to take it; status vocabulary and indexes are unchanged.
+
+## ADR-055 — Adopt Gitea's runner-protocol shape; never emulate GitHub's Actions service (M6)
+**Status**: Proposed (design only) · decides spec 06 Q1 · constrains [ADR-054](#adr-054)
+
+**Context**: An engine needs an agent inside the microVM, and the agent needs a protocol. Four
+options existed, and the choice is a feasibility question rather than a taste one — the card
+correctly named the undocumented protocol as the top risk, with a documented "no" as an acceptable
+outcome.
+
+**Decision**: Build **our own planner and our own agent**, modelled on the **shape** of Gitea's
+runner protocol. Do **not** keep `actions/runner` and emulate GitHub's Actions service.
+
+The evidence that decides it:
+
+| Option | Licence | Server contract specified? |
+|---|---|---|
+| Keep `actions/runner`, emulate the service | **MIT** (`raw.githubusercontent.com/actions/runner/main/LICENSE`) | **No.** Undocumented; the README covers install/use only and states "right now we are not taking contributions" |
+| `nektos/act` | **MIT** | n/a — a local executor that interprets workflow YAML; not a protocol |
+| **Gitea/Forgejo runner** | **MIT** (runner *and* `actions-proto-def`) | **Yes** — a published Protocol Buffer service whose entire surface is five RPCs: `Register`, `Declare`, `FetchTask`, `UpdateTask`, `UpdateLog` |
+| Our own agent | ours | ours |
+
+**Why**: The asymmetry is the whole argument. GitHub's server obligation is *unbounded and
+unpublished*; Gitea's is *five RPCs and published under MIT*. MIT on `actions/runner` lets us read
+the client but does not make the server a stable contract — we would be reverse-engineering an
+unversioned protocol that can change in any runner release, with no deprecation channel and a repo
+that will not accept our patches. The failure mode lands on customer CI, silently, at a time we do
+not choose. A protocol readable in one file is one we can implement, test and keep working.
+
+We take Gitea's shape but not its wire format, for a concrete reason: `FetchTask` is a **poll**, and
+our runners are single-use microVMs booted per job — the task is decided before the VM exists. So
+v1 hands the JobSpec down at boot and the agent only reports upward. Staying close to Gitea's
+surface keeps the Gitea/Forgejo provider ([ADR-060](#adr-060)) cheap later.
+
+**Consequences**:
+- We own an agent (`lca-agent`) and its compatibility with real workflows. `actions/runner` is no
+  longer in the `engine` path (it stays in `label`/`adopt`, untouched).
+- Lifting *algorithms* from `act`/Gitea (expression evaluation, matrix expansion) is open to us —
+  both are MIT — with attribution. What we refuse is depending on an unspecified protocol.
+- `act` publishes **no** "limitations" section, so there is no vendor fidelity claim to lean on:
+  every compatibility statement we make must be our own and tested against fixtures.
+- Cache is reimplementable (Gitea ships an MIT cache server); **artifacts may not be** — its own
+  config records the cost of drift as "the stock artifact actions refusing". Documented as spec 06
+  OQ-2, not smoothed over.
+
+## ADR-056 — Engine runs carry OUR ids, and coexistence is enforced at the claim gate (M6)
+**Status**: Proposed (design only) · decides spec 06 Q2 + Q3 · preserves the M2 idempotency contract
+
+**Context**: Idempotency is keyed on `(repo, run_id, job_id)` everywhere — SQS dedupe, the run row,
+GSI2, reports, refusals. `run_id` and `job_id` are **GitHub's**. With GitHub no longer dispatching,
+nobody issues them.
+
+**Decision**:
+- **`runId`** is a fixed-length hash of `(provider, repoKey, workflowPath, deliveryId)`, so a
+  redelivered webhook yields the same `runId` and the plan's conditional create is a no-op. A
+  console `workflow_dispatch` has no provider delivery, so the console sends a client idempotency
+  key and a control-plane dispatch λ records `DISPATCH#…` with a server-issued `dispatchId`
+  before enqueuing; `deliveryId = lca-dispatch:<dispatchId>`, and a retried request returns the
+  original (spec 06 § Console dispatch identity).
+- **One delivery is one trigger batch** (`TRIGGER#…`), written by whoever first receives the event
+  and before any plan. Its member set (every matching workflow) is fixed once and closed by each
+  member's plan commit or refusal; the batch is `sealed` when none remains. Anything that judges a
+  delivery as a whole, the PR verdict in particular, waits for the seal (spec 06 § Trigger batch).
+- **`jobId`** is a **deterministic hash** of `(runId, jobKey, matrixIndex)`, so a retried plan
+  release cannot mint a second row for the same logical job.
+- **`repoKey`** is `<provider>-<repoId>`, because provider repo ids are only unique per provider.
+- **Attempts are a key dimension.** Engine rows are
+  `ERUN#<repoKey>#<runId>#<jobId>#<attempt>`; a re-run writes a new row with `attempt + 1` and never
+  mutates the earlier attempt. `PlannedJob.latestAttempt` advances only in the same transaction
+  that creates the row it names, after a reservation record has fixed every attempt number in the
+  re-run set, so a crash mid-allocation is finished by recovery and never leaves the projection
+  pointing at no row (spec 06 § Re-run allocation).
+- **Rows exist before they may run, so dispatch is never inferred from presence.** Every engine
+  attempt row carries a release state (`waiting ⇄ [held]`, then `released`; an approval returns
+  a held job to `waiting` so it is released through the ordinary pass) beside its unchanged
+  `RunStatus`, and only a `released` row has a GSI1 key. A durable release obligation (a separate
+  `RELEASE` item beside the `RunPlan`, whose single GSI1 key pair is already its discovery entry;
+  `releaseSeq`, sparse GSI1 `RELEASE#pending`) is armed in the same transaction as every
+  terminal transition, plan readiness and re-run completion, and cleared only by a release pass
+  that saw the latest `releaseSeq`. The Reaper re-enqueues only `released` attempts, so it cannot
+  bypass `needs:` ordering or an approval (spec 06 § Release). **One index entry per item**: GSI1
+  has one key pair per item, so no item ever carries two logical obligations. **Every obligation
+  partition sorts by `dueAt`**, the time the Reaper must act if it is still owed, so the key
+  condition `gsi1sk <= now` returns exactly the due set and no backlog of not-yet-due items can
+  hide a lost one; an item with its own deadline (a gate's expiry) stores the earlier of the two.
+- **Matrix controls are durable.** Each matrix job definition has a `GROUP#<hash(jobKey)>` item: a
+  release takes a slot (`size(slots) < maxParallel`) in the release transaction, every terminal
+  transition frees it and re-arms release, and a failure whose effective result is `failure`
+  trips `fail-fast` for its re-run sequence in that same transaction (`ADD` to `trippedSeqs`)
+  and arms a `CANCEL#` obligation by unconditional upsert. **Every terminal transition is
+  independently committable**: it conditions only the attempt's own items, and touches shared
+  items (group, release, cancel, report, review head) only by idempotent, unconditional updates,
+  so two matrix legs failing at once both commit; the run's output total is updated inside the
+  terminal transaction itself, with a cap failure rebuilt as an unconditioned no-output failure,
+  so its cap decides the job's result rather than aborting the transition.
+  The canceller ends queued siblings directly and sets `cancelRequested` on running ones; the
+  agent learns it on its next broker response and the Reaper terminates any VM still running 5
+  minutes later, GitHub's own force-cancel window. `timeout-minutes` is a stamped `deadlineAt`
+  the Reaper enforces if the agent does not. `concurrency`, which is cross-run, is Refused until
+  its owner-and-queue design exists (spec 06 OQ-9).
+- **`continue-on-error` has one meaning across surfaces.** Each terminal attempt records its raw
+  conclusion, `tolerated` and an effective result computed by the status writer from the plan;
+  the job's check run shows the raw conclusion, while fail-fast, the plan's terminal state and
+  the PR verdict read the effective result. A tolerated failure neither fails a verdict nor
+  counts as the passing job green needs. Job-level `continue-on-error` on a job with dependents
+  is Refused until GitHub's behaviour there is recorded (spec 06 OQ-10).
+- **Outputs keep GitHub's limits and nothing smaller.** 1 MiB per job and 50 MiB per run, by
+  GitHub's UTF-16 accounting; written and read in ≤ 300 KB pages through the broker, so no
+  Lambda payload limit becomes a workflow limit. The run total is cumulative: one `OUTRES#<jobId>`
+  row per job holds its latest terminal attempt's bytes and is replaced by difference, never
+  removed, with the total in one `OUTBYTES` counter item created at 0 in the plan commit (a
+  DynamoDB comparison against an absent attribute is false, so an uncreated counter would fail
+  the first output as if it were the cap), so jobs run one after another cannot
+  exceed 50 MiB between them and no item grows with the job count. Both items change only in
+  the same transaction that makes the attempt terminal, conditioned on the attempt not being
+  terminal yet, so the one writer that closes an attempt is the only one that moves its
+  reservation, and `OUTBYTES` always equals the sum of the rows. A row describes its job's
+  latest terminal attempt only; an earlier attempt a re-run replaced keeps its own pages as
+  unread history and no longer counts. Output pages are **write-once**: a page `Put` is
+  conditioned on the item being absent and, in the same transaction, on the attempt row not
+  being terminal, and the terminal transaction condition-checks each page it names against the
+  hash and size the status writer measured. So the bytes a terminal row counts are the bytes a
+  reader fetches, and no page can change after the attempt closes, whatever a root step in the
+  VM sends. An output whose
+  value contains a masked value (a resolved secret, the checkout token, or an `::add-mask::`
+  value) is dropped in the VM before any page is sent, as GitHub skips it, and reads as `''`
+  downstream.
+- **Default-deny classifies every key GitHub defines.** `runs-on` is Supported: resolved per
+  matrix leg at plan time to one flavor by spec 03's order, with every label required to be one
+  we satisfy, and the run refused (`engine-runner-unsupported`) for a non-Linux, x86, group,
+  foreign or runtime-expression selector, a non-valid custom flavor, or a signal upgrade that
+  would drop a named toolchain. The `github` context is the delivered payload, stored verbatim
+  with the trigger batch (`EVENT#` chunks, `eventHash`), plus an enumerated property set;
+  `run_number`, `ref_protected` and the other properties we cannot reproduce, and `vars`, are
+  Refused (spec 06 OQ-11). Classification is **recursive**: a versioned census derived from
+  GitHub's reference gives every schema position and enum its own disposition, schema objects
+  are closed (an unknown key at any depth refuses), user-named maps are open on keys and typed
+  on values, and subtrees of unmatched events are not interpreted. `permissions` must be
+  declared and must reduce to `contents: read` or `{}`; omission, which inherits a repo or org
+  default we cannot mint, is refused. `container`/`services` `credentials` and `options` are
+  refused. A scheduled job fails when the reference's headings or value sets drift from the
+  census, and a mutation suite inserts an unknown key at every schema position.
+- **Path filters use GitHub's diff semantics, computed by us and recorded once.** Two-dot
+  `before..after` for pushes (new branch: the parent of the oldest pushed commit), three-dot
+  merge-base for pull requests, from the Git trees API (the compare API stops at 300 files);
+  more than 1,000 commits, a diff over its budget, or a persistent provider failure all mean
+  "run", as GitHub's timeout does; only the first 3,000 files in a fixed order are evaluated; tag
+  pushes skip path filters. The outcome is written with the batch membership, so a retry never
+  re-decides. GitHub's undocumented edge cases are pinned by conformance fixtures (spec 06 OQ-12).
+- **No hot item holds a collection that grows with input or time.** Output reservations, trigger
+  members and a PR head's batch ids are rows; every other field has a stated bound; user strings
+  in sort keys are hashed; a run's total job count is capped at 256 by us (GitHub's 256 is per
+  matrix). A test marshals the largest admissible shape of each item.
+- **Every webhook size has an outcome.** Up to 900 KB is planned; above that up to the Lambda
+  ceiling Ingest refuses it; between the Lambda ceiling and GitHub's 25 MB, where API Gateway
+  rejects the request before Ingest runs, a scheduled delivery reconciler reads GitHub's failed
+  deliveries (`GET /app/hook/deliveries`, 3-day retention) with the App JWT and writes the same
+  refusal, or plans a small delivery that failed for another reason, idempotently by delivery
+  guid. Above 25 MB GitHub does not deliver at all (spec 06 OQ-13).
+- **A plan with nothing to run is refused** (`engine-empty-plan`), and a PR head whose batches
+  matched no workflow gets no verdict at all, so an empty set can never read as green.
+- **A plan's complete input and the plan are one transaction.** The canonical event projection
+  (including console `workflow_dispatch` inputs), resolved action SHAs and the full job manifest
+  are written as immutable `INPUT#<n>` chunks (≤ 4 × 300 KB, inside DynamoDB's 4 MB transaction
+  limit) in the same transaction as the `RunPlan`, so no partial input can ever exist. A retry
+  never recomputes a stored plan, because tag refs are mutable; it adopts the stored input. The
+  Reaper finishes an interrupted plan, and Provision builds a JobSpec, from the table alone,
+  after the original event is gone.
+  The broker stays `GetItem`-only: VM status reports are forwarded to a control-plane status
+  writer that owns every engine row write.
+- **One source-aware key, used by every writer.** A `RunKey` union (`github` | `engine`) and one
+  `runRowKey()` replace `runPk()`; `transitionRun`, `stampMicrovmId` and `getRun` take a `RunKey`;
+  the GitHub branch is byte-identical to today. The Reaper writes by the stored `pk` of the row it
+  read from GSI1, never by re-deriving one. The broker ref grammar, `keysFromRef`, the Provision
+  queue message (new `source` field, absent ⇒ `github`) and the SQS dedupe id all carry the engine
+  key. Console routes are `#/eruns/{repoKey}/{runId}/{jobId}[/{attempt}]`, separate from the numeric
+  `#/runs/` route.
+- **Every run has a trust class** fixed at plan time from the event: `trusted`, `fork` (head repo id
+  ≠ base repo id, or head repo absent) or `restricted-bot` (`dependabot[bot]` and an installation
+  list). `fork` and `restricted-bot` get no secrets, no `vars`, no OIDC, and the read-only token
+  every class gets. A per-repo `forkPolicy` (`skip` default, `approve`, `run`) decides whether they
+  run at all; approval never raises the class, and re-runs inherit it.
+- Triggers in v1: `push`, `pull_request`, `workflow_dispatch` from our console. **Not**
+  `pull_request_target`, and **not** `schedule`; an unsupported trigger never matches.
+
+**Why**: The first draft gave engine rows an `ERUN#` prefix but left every existing writer deriving
+`RUN#` from loose ids, so the Reaper would read an engine row through GSI1 and write its terminal
+state to a `RUN#` key that does not exist; and it had no attempt dimension, so a re-run could only
+overwrite the attempt it replaced. A key that every writer receives, rather than re-derives, removes
+the first class of bug; an attempt in the key removes the second. Determinism (not a counter) is
+what makes redeliveries and release retries safe, the same property the SQS dedupe already relies
+on. GitHub withholds secrets from fork and Dependabot triggers ("secrets are not passed to the
+runner when a workflow is triggered from a forked repository"; "Secrets are not available to
+workflows triggered by Dependabot events"); an engine that did not would hand tenant secrets to
+anyone who can open a PR. Re-runs keeping the original trust mirrors GitHub ("Re-runs use the
+privileges of the actor who initially triggered the workflow").
+
+`pull_request_target` is excluded on security grounds, not scope: it runs **base-repo** code with a
+writable token against **fork** content, which is precisely the fork-PR escalation this design must
+not open. `schedule` is excluded because owning cron means owning a distributed timer plus a
+catch-up-vs-skip policy after an outage, and getting that wrong silently double-runs deploy
+workflows (spec 06 OQ-1).
+
+**Consequences**:
+- Dual-run is prevented by [ADR-054](#adr-054)'s directory split; the claim-gate refusal stays as
+  defence in depth, and a repo in `engine` mode with leftover `.github/workflows` files produces
+  **visible** refusals on the Unclaimed screen rather than silence.
+- **Collision-safety rests on the key, not on an attribute.** `putQueuedRun` creates with
+  `attribute_not_exists(pk)`, so had identity lived in a `source` attribute, an engine id colliding
+  with a GitHub one would have been rejected as a duplicate before the attribute was read.
+- No migration of existing rows: `RUN#…` rows are untouched. GSI1 (`RUNSTATUS#<status>`) is shared;
+  engine rows use GSI2 partition `REPORUNS#<repoKey>`, so per-repo history for a GitHub repo using
+  both paths is two bounded queries merged by time.
+- **The writer refactor is real work and is phase 2's first task**: every run-store mutation and
+  read changes signature, and a test asserts no caller builds a run key outside `runRowKey()`.
+- The management λ's table-wide `UpdateItem` ([ADR-025](#adr-025)) must be narrowed with
+  `dynamodb:LeadingKeys` to `INSTALL#*` and exactly `CONFIG#AUDIT` before engine rows (which carry
+  trust class and approvals) exist. `CONFIG#AUDIT` stays because the management λ's flavor routes
+  write the operator audit trail (`appendAudit`); those writes are best-effort, so dropping the
+  partition would have emptied the trail silently. The phase-2 test drives every existing
+  management write against the narrowed policy, and denies every engine prefix and every other
+  `CONFIG#` row. Fork approvals and re-runs from the console are enqueued to the control plane.
+- Engine refusals key on the plan (`REFUSAL#ERUN#<repoKey>#<runId>`), because a refused run has no
+  jobs, or, for a delivery refused whole before any workflow is a member, on the trigger
+  (`REFUSAL#TRIGGER#<repoKey>#<triggerId>`); each carries a `REPORT` obligation item created in
+  the same transaction, because the refusal record's one GSI1 entry is the Unclaimed screen's
+  `REFUSALS` partition. Host identities are `e1r:<repoKey>:<runId>` and
+  `e1t:<repoKey>:<triggerId>`.
+
+## ADR-057 — We hold tenant CI secrets behind a write broker and a tag-scoped resolver; we do not merge (M6)
+**Status**: Proposed (design only) · decides spec 06 secret custody + spec 07 Q5 · consistent with
+[ADR-008](#adr-008), [ADR-025](#adr-025), [ADR-031](#adr-031)
+
+**Context**: Today we hold **no** customer CI secrets: GitHub injects them into a job we never see
+inside, and our SSM parameters are platform credentials ([ADR-008](#adr-008)). An engine must
+resolve `secrets.*` itself. Separately, [ADR-031](#adr-031) established that `contents:write` — the
+permission that can write to a customer's repo — stays off by default, and spec 07 asks whether we
+should enforce merges when Free repos have no branch protection.
+
+**Decision**, two halves that share one principle — *hold the least authority that still does the
+job*:
+
+**(a) Secrets.** Tenant CI secrets live in **SSM SecureString** (standard tier) under
+`/lca/<env>/tenant/<installationId>/secrets/<NAME>/<opId>`, one parameter per write, encrypted with one environment-level tenant
+key. KMS binds each ciphertext to the encryption context `PARAMETER_ARN = <parameter ARN>`, and
+that context, not the key boundary, is what isolates tenants.
+- **Size: at most 4096 bytes per value, refused at intake (`secret-too-large`).** The Standard
+  tier's maximum value size is 4 KB and the Advanced tier's 8 KB
+  (docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-advanced-parameters.html),
+  so no Parameter Store tier can hold GitHub's 48 KB. We state the smaller limit rather than
+  promise compatibility the store cannot deliver; the console names GitHub's own large-secret
+  workaround. Segmenting across parameters was rejected (a crash between segment writes would
+  leave a value mixing old and new bytes); Secrets Manager (65,536 bytes) is the route if tenants
+  need more, behind its own isolation design (spec 06 OQ-8). Each installation is capped at 100
+  secret names (`secret-quota`). Because every write creates a new parameter and the superseded
+  one is deleted only after a grace period, a name cap does not bound physical parameters, so
+  each write also takes a **parameter slot** on two counters, the installation's (at most 200)
+  and the environment's (at most its granted allocation, `tenantSecretSlotBudget`, 8,000 in
+  `prod` and 1,000 for every dev-shaped name). Because Parameter Store's 10,000 Standard
+  parameters are per account and Region while any number of environment names may pin one
+  account, each environment's budget is a **durable allocation** from one account-level
+  registry (`LCA-Account` stack, `lca-account-quota` table, cap 9,500, leaving 500 for
+  parameters created outside this design, never for late effects), granted at deploy time by one cross-table
+  transaction that fails the deployment (`account-quota-exhausted`) when the account's
+  allocations would cross the cap. Each allocation charges the registry its tenant budget plus
+  a separate fixed 50-parameter platform reserve, and only the tenant budget is written onto the
+  environment's counter item, which the broker's admission condition compares against, so an
+  ungranted environment refuses every write, the platform reserve cannot be admitted as tenant
+  capacity, and separately enforced local budgets cannot sum past the quota. An allocation is
+  released only by a hand-run, generation-fenced procedure that first removes the counter's
+  budget (so every later begin is refused), then drains every installation named by the
+  environment's `SECRETOWNERS` owner index (one base-table partition written in every write's
+  begin transaction, so a begun write with no parameter yet is still found, and no installation
+  index or SSM listing is trusted for completeness) and censuses the environment's parameters,
+  and only then returns the budget, less its quarantined slots, which move to a
+  `QUARANT#<env>#<gen>` row that stays charged until a redeploy of the environment takes those
+  slots back into its new allocation in the same transaction that deletes the row, so each
+  quarantined slot is charged to the registry exactly once however many release and redeploy
+  cycles run. The redeploy can read the retained counter only because the environment's Data
+  stack is never deleted by a release: it is termination-protected and keeps owning the
+  fixed-name `lca-<env>` table, and the redeploy is an update of it that bumps an allocation
+  epoch. `RETAIN` alone was rejected as the mechanism, because a retained table whose stack is
+  gone is no longer CloudFormation's, and an ordinary deploy of a re-created stack fails
+  `ResourceAlreadyExistsException` on the same name before the allocation resource runs (the
+  hazard ADR-033 met with the run log group); a table orphaned anyway is re-adopted by
+  CloudFormation resource import, then the rest of the stack is deployed and absorbs as usual.
+  Checking the path empty and then releasing was
+  rejected, because a still-deployed broker could admit a write between the check and the
+  release. Both counters are conditioned into the begin transaction, so rapid rotation is refused
+  (`secret-capacity`) before it can exhaust the shared quota. A slot is released only in the
+  transaction that records its parameter's confirmed deletion (or a write's confirmed
+  rejection). A write whose outcome is unknown is **quarantined**: its slot stays charged to the
+  installation, the environment and the account for ever in v1 (spec 06 OQ-15), because AWS
+  publishes no bound on when a received `PutParameter` finishes; an earlier draft released it
+  after 24 hours and let a fixed 500-parameter margin absorb later landings, which was rejected
+  because the number of such writes is unbounded and 501 would defeat it. A late landing can
+  therefore only create a parameter at a path whose slot is already charged, and the sweep
+  deletes it. The
+  orphan sweep counts any parameter it finds unnamed before deleting it; and an alarm fires at
+  80 % of the account quota on a daily measured count of every parameter in the account, as a
+  check on the allocation rather than the mechanism. Parameter Store and KMS request rates are
+  also account-wide and are not allocated: co-tenanted environments can throttle each other's
+  resolution, which fails an attempt closed (`engine-secret-unavailable`), never open.
+  The name quota is an atomic set of names. An operation on a name begins with **one transaction**
+  that creates a durable operation record on the name's index row (which locks the name), the
+  name and slot reservations and the `pending` audit row together, so no crash can leave a reservation
+  without its audit or lock. Each write stores its value at a parameter path unique to that
+  operation (`<NAME>/<opId>`, created with `Overwrite` false) and the index row's `current`
+  points at the value, so no stale or late SSM call can land on a parameter another operation
+  uses. A call whose outcome is unknown is settled by a single-purpose settler that observes the
+  operation's own path through metadata-only `DescribeParameters`; the name stays locked until
+  then, and a periodic orphan sweep removes any parameter no row names. An expiring lease was
+  rejected because `PutParameter` and `DeleteParameter` take no client token, so a lease cannot
+  fence a call that lands after it expires.
+- **Writes** go through a new single-purpose control-plane λ, `lca-<env>-tenantsecrets`, invoked
+  by the console exactly as the appcfg broker is ([ADR-034](#adr-034)). The console λ keeps
+  [ADR-025](#adr-025)'s grants unchanged: **no** `ssm:PutParameter`, no KMS. The broker holds
+  `PutParameter`/`DeleteParameter` on the tenant path and `kms:Encrypt` conditioned on
+  `kms:EncryptionContext:PARAMETER_ARN`, and **no** `GetParameter*` or `kms:Decrypt`: it cannot read
+  back what it writes. Its settler holds `DescribeParameters` (metadata only; it cannot be scoped
+  to a path, so it can list every parameter's name in the account, which is the stated residual)
+  and `DeleteParameter`, and also no read of a value. Intake returns presence only, or `pending`.
+- **Reads** go through a second single-purpose λ, `lca-<env>-secretresolver`, the only principal
+  that can decrypt. The hook broker invokes it with only the VM's capability-verified ref; the
+  resolver reads the stored JobSpec (names + installation id, no values), then assumes a reader
+  role with STS session tag `installationId=<that id>`. The reader role's policy is attribute-based
+  (`${aws:PrincipalTag/installationId}` in both the SSM resource and the
+  `kms:EncryptionContext:PARAMETER_ARN` condition), so the credentials in hand cannot fetch another
+  installation's parameter, whatever the code asks for. The resolver follows a name's `current`
+  pointer only within that name's own path prefix.
+- A secret reaches a VM only if it is **named** in the plan and the run is `trusted`
+  ([ADR-056](#adr-056)); plaintext is returned once in the broker's `jobspec` response and never
+  written to a table row. No `secrets: inherit` in v1. Values are registered with the agent's masker
+  before step 1, and that mask set (plus the checkout token and every `::add-mask::` value)
+  governs every channel out of the VM: logs, step and job status, summaries and annotations are
+  masked, and a job output that contains a masked value is dropped, not stored. Detection is by
+  literal value, as on GitHub, so a `trusted` workflow that transforms its own secret can still
+  leak it; that residual is the repo owner's, as it is on GitHub.
+- **Fail-closed:** a named secret that is set but cannot be read fails the attempt before step 1
+  (`engine-secret-unavailable`); a name never set resolves to `''`, as on GitHub.
+- **Audit:** write audit rows (no values); every decrypt is a CloudTrail KMS event naming the
+  parameter ARN.
+
+**(b) Merging.** We **report and advise; we do not merge.** `contents:write` stays off by default.
+
+**(c) Review authority.** **We never post `APPROVE`.** Every CI result on a pull request is
+produced by code the PR's author controls: a same-repository PR is `trusted` and runs its own
+head, so its author can weaken a test, edit a build script the unchanged workflow calls, or, in
+the `docker` flavor, forge the attempt's result from a root step ((d) below). No filter on
+workflow files or trust class separates that from the change under review, so an `APPROVE` built
+from such a result would be the author approving their own change through our App. An approval
+signal the author cannot influence is spec 07 OQ-8.
+- The review event type is `COMMENT | REQUEST_CHANGES`; there is no `reviewApprove` toggle and
+  no approve operation on the provider port, so the rule cannot be undone by configuration.
+- `REQUEST_CHANGES`, the one review that carries merge effect, is opt-in
+  (`reviewRequestChanges`), refused by the console and degraded to `COMMENT` by the reporter
+  wherever our App cannot dismiss reviews on the target branch, and dismissed by us when
+  superseded. It fails closed: a stale one blocks a merge and never authorises one.
+- A review reaches GitHub only under a claim on the PR's head projection for the **latest**
+  intent of a **closed** verdict (every trigger batch for the sha sealed, every member plan
+  terminal); a stale intent is skipped, and the projection's visible-review pointer moves only in
+  the same transaction that records the displaced review's cleanup obligation (spec 07 § Review
+  lifecycle).
+- **Every external effect follows one claim protocol** (spec 07 § Effect obligations and claims):
+  a durable obligation item created with the state change that makes it owed; a claim carrying a
+  unique holder id and a monotonic fence, conditioned into every record; a hard deadline under
+  which no effect is started (60 s claim, 15 s margin, 12 s client timeout, against GitHub's
+  documented 10 s server limit); a takeover that observes the host for the previous holder's
+  effect before acting; and adoption plus an alarm for any duplicate a GitHub anomaly still
+  produces. An external POST is not made exactly-once, and the design does not claim it is.
+- Our approval gate uses its **own** check run (`LCA: approve · …`), born `completed` +
+  `action_required` and only ever changed in conclusion; the job's execution check run is created
+  after approval and runs forward normally, so no completed check run is ever reopened, and a
+  required check on the job's name is satisfied only by the job actually passing. The `GATE`
+  item is created in the hold transaction, indexed under `GATES#open` by `dueAt` (the earlier of
+  its owed report's due time and its expiry) while it owes a check run or a decision. Approval
+  returns the job to the release pass, so `max-parallel` and fail-fast still apply; rejection
+  and expiry settle the gate, the attempt, its report and the release obligation in one
+  transaction; the Reaper delivers lost check runs and enforces the 30-day expiry.
+- **One authority per check name.** A required check is configured by name, and GitHub warns
+  that duplicate names "can cause ambiguous status check results" without saying which run wins.
+  Job check names carry their trigger context (`LCA / <workflowKey> / <jobName> [<context>]`,
+  where context is `push <branch>`, `pull_request → <base>`, or a per-dispatch id that no
+  required check can name), every non-job check lives in a disjoint `LCA: …` namespace, both
+  prefixes carry the App slug for every deployment but the canonical one (`LCA (<slug>) / …`),
+  because the owner item lives in one deployment's table while a repo's check names are shared
+  by every App installed on it, and observe/adopt listings filter by our `app_id`. A
+  `CHECKNAME#` owner item gives each name on a sha one current attempt plus a claim key, which
+  includes the stored event payload's hash and the job definition's hash, so it covers every
+  input a job can read from its trigger. Only a
+  run with the same claim key (a re-run or redelivery) may take the name over; a different claim
+  key marks the name contested, which posts one `failure` under it and retires every contestant,
+  so no run's green can stand in for a different run's result. A new owner renames the previous
+  run out of the name
+  before it creates its own (so the name is briefly pending, which blocks), and if the rename is
+  refused, concludes the old run `cancelled`. A duplicate is never concluded `neutral` under a
+  job's name, because `neutral` satisfies a required check.
+- **Refusals are reported through a durable obligation**, created with the refusal record:
+  check run `LCA: refused · …` (`neutral`), or a commit status `error` when `checks:write` is not
+  granted.
+- **A verdict is a reduction over what ran.** Every green condition is existential (a job ran and
+  passed); a head whose batches matched no workflow creates no intent and no review, and a green,
+  all-skipped or all-tolerated set is quiet. The verdict reads the same effective result as
+  fail-fast and the plan, and its basis stores it.
+- **Events have consumers.** v1 subscribes to `pull_request` and `check_run` (`requested_action`
+  and `rerequested`, both one re-run path). `check_suite` arrives automatically with
+  `checks:write` and is acknowledged and dropped. `issue_comment`, `pull_request_review`,
+  `branch_protection_rule` and `repository_ruleset` are not requested: none has a designed
+  consumer (spec 07 OQ-4, OQ-7, OQ-8).
+
+**(d) The agent's token versus the job's code.** Inside the VM the per-run capability token is
+held only by `lca-agent`, running as its own uid without `sudo`; steps run as `runner` through
+`setpriv`, with an environment built from the JobSpec, `/proc` mounted `hidepid`, and no
+inherited descriptor or file carrying the token. The broker accepts reports only in agent order
+and, after `job-status`, only logs and `terminate`, and nothing a VM reports decides a platform
+fact (trust, secrets, check names, gates, deadlines, verdict rules). Residual, stated: in the
+`docker` flavor a step can become root and read the token, which lets it forge only its own
+attempt's result, the same authority over its own result that a job has on GitHub, where "The
+individual jobs in a workflow can interact with (and compromise) other jobs"; a no-`sudo` mode is
+spec 06 OQ-14.
+
+**Why**: Owning secrets converts us from a compute supplier into a **secrets holder**, so the
+containment must be something IAM and KMS enforce, not prose. The first draft gave the console
+`PutParameter`, contradicting [ADR-025](#adr-025), and claimed a shared dispatcher could decrypt
+"only for the tenant it is currently dispatching", which a static Lambda role cannot express. A
+session tag set from the stored JobSpec and an ABAC policy can. A key per installation was
+rejected: it adds onboarding work, cost and key-policy fan-out without stopping any attack the
+encryption-context condition does not already stop. On merging, the decisive fact is that `PUT /repos/{o}/{r}/pulls/{n}/merge` requires
+**Contents: write**, not `pull_requests:write`
+(docs.github.com/en/rest/authentication/permissions-required-for-github-apps) — so "we gate merges
+ourselves" is not a small extra scope, it is the same elevated permission [ADR-031](#adr-031) keeps
+off, and it would make us an actor that can write to any granted repo's default branch.
+
+**The honest limits, stated because they do not go away**:
+- On a Free **private** repo our `REQUEST_CHANGES` is **advisory**: with no branch protection
+  available, nothing stops a human merging over it. The console must say so. Presenting it as
+  a gate would be a false security claim — the worst outcome for a governance feature.
+- Whether an **App's** approval would satisfy a required approving review is **NOT STATED** in
+  GitHub's docs (the reviews API documents only the vocabulary; protected branches speaks of
+  "reviewers with write permissions"). v1 never posts one, so nothing depends on it — spec 07 OQ-1.
+- What we *can* enforce is real but no stronger than GitHub's own: a required **status check**
+  sourced from a specific App is explicitly contemplated ("in some cases you may only want to
+  accept a status check from a specific GitHub App"), so on a plan that allows branch protection
+  our check run is an enforced gate that the PR's checks ran and reported success. Like a
+  GitHub-hosted required check, that result is produced by the PR's own code, so it gates on
+  "the checks passed", never on "someone other than the author approved".
+- Our own **LCA approval gate** governs what we actually control — whether our runner executes — and
+  holds the job **before dispatch**, so nothing is running while it waits. It is not a merge gate
+  and must never be described as one.
+- Residual, small and bounded: a stale review can be visible for one reporter loop when a newer
+  verdict lands between the claim and the POST; the record of the stale one writes its cleanup in
+  the same transaction that makes it visible, so it is dismissed or noted on the next step, never
+  stranded.
+- Residual, unavoidable: a `trusted` run's own workflow can exfiltrate the secrets it names. That is
+  true on GitHub too. What must hold: no untrusted trigger receives a secret, and no run receives
+  another tenant's.
+- Residual, bounded to one attempt: a step with root (the `docker` flavor) can impersonate the
+  agent for its own attempt ((d) above). It cannot reach another attempt, run, repo or tenant,
+  and since no CI result produces an `APPROVE` ((c) above), it gains no review authority.
+- Residual, by design: a full compromise of the resolver's code can assume the reader role with any
+  tag; a full compromise of the console can *overwrite* (never read) secrets through the write
+  broker. Both are single-purpose functions with one caller each, and every write and decrypt is
+  audited.
+
+## ADR-058 — Third-party actions are SHA-pinned, owner-allowlisted and cached by us (M6)
+**Status**: Proposed (design only) · decides spec 06 Q4 · extends the compat vocabulary of
+[ADR-007](#adr-007) and spec 03
+
+**Context**: `uses:` fetches and executes third-party code. Under [ADR-004](#adr-004) that was
+GitHub's problem — the runner pulled actions from GitHub's service. Under
+[ADR-054](#adr-054) it becomes ours: we resolve, fetch, cache and hand it to a microVM.
+
+**Decision**:
+1. **Commit-SHA pins only.** A tag/branch ref is resolved to a SHA **at plan time** and the SHA is
+   recorded on the run. Tags are not refused (that would refuse essentially every real workflow) —
+   they are pinned-on-first-use and the resolution is reported.
+2. **Owner allowlist, default-deny**, per installation; v1 seeds `actions/*` only. An allowlisted
+   owner never overrides spec 06's matrix (`actions/upload-artifact` stays Refused until phase 6).
+3. **Cached in our account, keyed by SHA, immutable.**
+4. **arm64 verified before dispatch**, mapped onto the existing compat levels: unresolvable →
+   `risk`, known-x86-only → `block`. A JS action (`runs.using: node20|node24`) is arch-neutral; a
+   Docker action is not; a composite action is only as neutral as its steps.
+5. **Refused in v1** (the whole run, at plan time): Docker container actions, composite actions,
+   any `uses:` pointing at a private repo we hold no grant for, artifact actions, and `actions/cache`
+   at any SHA without recorded fail-open evidence. `actions/cache` at an evidence-listed SHA is the
+   one **declared degradation** (always-miss) in v1, because a miss changes speed and never the
+   result.
+
+**Why**: A tag is mutable — the same `@v4` can be a different tree tomorrow — so a tag-pinned run is
+neither reproducible nor auditable; pinning at plan time gives both without breaking existing YAML.
+Our own cache means a run does not depend on the upstream still existing, and a deleted upstream
+cannot break a rebuild. Reusing `ok`/`warn`/`risk`/`block` rather than inventing a second vocabulary
+keeps one story for "we can't run this" across ingestion and the engine.
+
+**Consequences**:
+- An allowlist is a support burden: a legitimate action outside `actions/*` needs an
+  explicit add, and the refusal must name that as the fix.
+- Pinning changes what a re-run means — a re-run replays the **pinned** SHA, so it cannot silently
+  pick up a moved tag. That is the point, and it must be visible in the UI.
+- Composite/Docker actions being refused is a real compatibility cliff for many real workflows; it
+  is phase 6, and spec 06's matrix states it rather than implying support.
+
+## ADR-059 — Our own CD stays on the `workflow_job` path; GitHub OIDC cannot be reproduced (M6)
+**Status**: Proposed (design only) · protects [ADR-047](#adr-047) · constrains [ADR-054](#adr-054)
+
+**Context**: [ADR-047](#adr-047) dogfoods the platform for **deployment**: `deploy.yml` runs on our
+own microVM runners and assumes `LCA-Deploy-<env>` via **GitHub OIDC**, with trust pinned
+`StringEquals` on `repo:jsamuel1/LambdaCIActions:ref:refs/heads/main` and `aud=sts.amazonaws.com`.
+It verified (probe run 30789251216) that a job declaring `id-token: write` on our JIT runner does
+receive `ACTIONS_ID_TOKEN_REQUEST_URL`, because the endpoint rides the **job message** rather than
+the runner registration. A self-owned engine emits no GitHub job message — so there is no id-token
+endpoint, and issuer `https://token.actions.githubusercontent.com` is GitHub's to sign, not ours:
+"Every time your job runs, GitHub's OIDC provider auto-generates an OIDC token."
+(docs.github.com/en/actions/concepts/security/openid-connect)
+
+**Decision**: **`LambdaCIActions` itself is excluded from `engine` mode.** Our CD keeps running on
+the `workflow_job` path (`label`/`adopt`), so [ADR-047](#adr-047)'s OIDC trust is untouched. For
+*tenant* jobs needing cloud identity under `engine` mode, the design is our **own** OIDC issuer
+(LCA-hosted JWKS, `iss=https://oidc.<console-domain>`, subject
+`repo:<host>/<owner>/<repo>:ref:<ref>`) registered by the customer as a **separate** IAM identity
+provider — additive, phase 6.
+
+**Why**: Migrating the workflow that deploys the platform onto the platform's newest and least
+proven subsystem inverts the dependency that makes CD safe. [ADR-047](#adr-047)(e) already refuses
+to let CD deploy the control plane for the same reason — a bad deploy leaves no runner to deploy the
+fix — and (f) keeps the workstation path first-class precisely for when the platform is down. If
+`engine`-mode CD lost its OIDC token, the fallback would be that manual path: exactly what CD
+exists to replace.
+
+**Consequences**:
+- The dogfooding claim narrows honestly: we dogfood our runners for CI **and** CD, and we do **not**
+  dogfood `engine` mode for CD. Said plainly rather than left for someone to discover.
+- Our own issuer will mint only for `trusted` runs ([ADR-056](#adr-056)).
+- Our own issuer is **not a drop-in** for `token.actions.githubusercontent.com`: every trust policy
+  naming GitHub's issuer must be extended by the customer, deliberately. Claiming otherwise would be
+  the most dangerous compatibility promise in this design.
+- A second issuer is a second key to rotate and publish — real operational surface, deferred with
+  eyes open (spec 06 OQ-4).
+- `runner_environment` is a documented OIDC claim, so a customer *can* distinguish token sources in
+  a trust policy once our issuer exists.
+
+## ADR-060 — One capability-declaring git-host port; GitHub first, Gitea second (M6)
+**Status**: Proposed (design only) · decides spec 06 provider abstraction · enables spec 07's
+reporting port
+
+**Context**: "Also serve non-GitHub hosts" is half the motivation for [ADR-054](#adr-054), and
+today every GitHub assumption is inlined — webhook HMAC, `workflow_job` shape, installation tokens,
+`generate-jitconfig`. A port drawn wrongly either leaks GitHub everywhere or flattens away the
+surface we actually have a customer for.
+
+**Decision**: One `GitHostProvider` port covering webhook verification, event parsing, workflow
+listing/fetch, the changed-file set for path filters, recovery of rejected deliveries, scoped
+checkout-token minting, status reporting, review posting and deep-linking.
+It is **capability-declaring**, not lowest-common-denominator: each provider states
+`checkRuns`/`commitStatuses`/`inlineComments`/`reviewApproval`/`requestedActions`/`pathFilters`/`deliveryLog`
+and the engine and reporter degrade explicitly: no `pathFilters` refuses any workflow with a
+path filter rather than guessing; no `deliveryLog` states the front-door limit as the ceiling and
+alarms on rejections. **v1 implements GitHub only; Gitea/Forgejo is the second implementation.**
+
+**Why**: Collapsing to the intersection of all hosts would discard check runs, annotations and the
+re-run button — GitHub's richest surface and the one with a real consumer. Pretending every host has
+check runs would make the reporter lie. Declaring capabilities lets a host without a surface degrade
+*visibly* (a GitLab MR note carries the console link where GitHub gets a button) instead of dropping
+the affordance without trace. Gitea is second because [ADR-055](#adr-055) already modelled its
+runner protocol, so it validates the port at the lowest cost — GitLab is the larger prize but a
+bigger first step, and picking it would test the port and a new protocol at once.
+
+**Consequences**:
+- GitLab, Bitbucket and CodeCommit are **named to keep the port honest, not promised**. Naming them
+  in the enum without implementations is deliberate; a port with one implementation is not yet a
+  port, and the second one is what proves it (phase 5).
+- Reporting is best-effort and must never change a run's outcome: the run row is written **before**
+  any report is attempted, so the console is authoritative and the PR surface is a projection of it.
+- Every provider needs its own webhook-verification story; HMAC-SHA256 is GitHub's, not universal.

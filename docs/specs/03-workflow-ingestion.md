@@ -65,6 +65,21 @@ analysis matches.
 Parse YAML into a normalized structure (don't attempt full GitHub semantics — extract what
 routing/compat needs):
 
+> **Routing-only is a deliberate scope, and M6 proposes promoting it.** Everything below is what the
+> shipped parser does: enough to decide *which flavor* a job GitHub already scheduled should run on.
+> It models no step semantics, no `if:`, no `needs:`, no expressions, no `outputs`, no `env` and no
+> `concurrency`, because nothing in `label`/`adopt` mode needs them — GitHub evaluates all of that.
+> For `engine` mode ([ADR-054](../DECISIONS.md#adr-054)) the same parser must become
+> **execution-grade**: it becomes the thing that decides whether a job runs at all and in what order,
+> so every construct it currently ignores turns into either a supported feature or an explicit
+> refusal. That is a much larger correctness surface and it is specified separately in
+> [spec 06](06-workflow-engine.md) — **not implemented**. The routing-only contract here stays
+> authoritative for the two shipped modes. In `engine` mode `runs-on` keeps the resolution order
+> below but is stricter: every label must be one we satisfy, and a label the `workflow_job` path
+> would leave on GitHub-hosted (non-Linux, x86, a group, a foreign fleet) refuses the run, because
+> nothing else will run an engine workflow
+> ([06 § `runs-on` in engine mode](06-workflow-engine.md#runs-on-in-engine-mode-flavor-selection)).
+
 ```jsonc
 {
   "path": ".github/workflows/ci.yml",
@@ -231,6 +246,14 @@ Per-repo setting stored on the `Repo` row:
 - `adopt` — claim standard-label jobs too (drop-in, no YAML edits). Powerful; requires
   confidence in compat, and it is **all-or-nothing per repo**: GitHub offers no way to take
   some `ubuntu-latest` jobs and leave the rest on GitHub-hosted runners.
+
+> **A fourth mode, `engine`, is proposed for M6** ([ADR-054](../DECISIONS.md#adr-054)) and **not
+> implemented**: LCA owns the trigger evaluation and scheduling, not just the compute, for workflow
+> files under `.lca/workflows/`. GitHub only schedules files under `.github/workflows/`, so no file
+> runs on both schedulers. In `engine` mode `decideClaim` also refuses every `workflow_job` webhook
+> early, and the planner refuses any repo not in `engine` mode. The parser runs on `.lca/workflows`
+> files in `engine` mode and on `.github/workflows` files in the other modes. See
+> [spec 06](06-workflow-engine.md).
 
 Default on install: `label` (safe). UI nudges toward `adopt` once compat is green. Switching
 mode re-scans the repo, because the stored routing preview is resolved with the mode.

@@ -8,6 +8,7 @@ security + failure-handling posture.
 
 - [Design goals & non-goals](#design-goals--non-goals)
 - [The three planes](#the-three-planes)
+- [The execution plane (proposed, M6)](#the-execution-plane-proposed-m6)
 - [Component inventory](#component-inventory)
 - [Request flows](#request-flows)
 - [Data model](#data-model)
@@ -31,6 +32,10 @@ security + failure-handling posture.
 
 - x86_64 runners (microVMs are arm64/Graviton only).
 - Replacing GitHub as the source of truth for workflow definitions (we read, we don't host).
+  **Qualified for M6** ([ADR-054](DECISIONS.md#adr-054)): still true for `label`/`adopt` mode — i.e.
+  every repo onboarded to date — but an opt-in fourth mode (`engine`) proposes that we own the
+  definition *and* the scheduler for repos that ask for it. See
+  [the execution plane](#the-execution-plane-proposed-m6).
 - Cross-cloud runners (AWS only).
 - Warm pools / runner reuse (single-use only in v1; revisit if cold-start hurts).
 
@@ -64,6 +69,127 @@ vanity hostname when one is configured ([ADR-036](DECISIONS.md#adr-036)).
 │ JIT token minting        │   │ ECR/code bucket snapshots │   │ Cognito / GitHub OAuth   │
 └──────────────────────────┘   └───────────────────────────┘   └──────────────────────────┘
 ```
+
+## The execution plane (proposed, M6)
+
+**Status: designed, not built** — [spec 06](specs/06-workflow-engine.md),
+[spec 07](specs/07-review-integration.md), [ADR-054](DECISIONS.md#adr-054)..[ADR-060](DECISIONS.md#adr-060).
+Everything above this section describes the shipped system; everything in it describes a proposal.
+
+The three planes above all assume **GitHub schedules and we execute**. A fourth plane appears when
+that assumption is inverted for a repo in the new `engine` mode: the plane that decides *what should
+run*, which today is GitHub's Actions service.
+
+```
+┌── Execution plane (M6, proposed) ────────────────────────────┐
+│ Trigger λ    match `on:` → which workflows fire            │
+│ Planner λ    parse → matrix → `needs` DAG → `if:` → RunPlan │
+│ Release λ    dispatch jobs whose deps are terminal          │
+│ Reporter λ   check runs / statuses / reviews → the git host │
+│ lca-agent    in-VM: runs steps, reports via the broker      │
+└───────────────────────────────────────────────────┘
+```
+
+**Coexistence, not replacement.** `RepoMode` gains a fourth value. In `engine` mode the engine
+schedules files under `.lca/workflows/` and nothing else; GitHub keeps scheduling any file still
+under `.github/workflows/`. Each file has exactly one scheduler:
+
+| Mode | Scheduler | Executor | Plane doing the deciding |
+|---|---|---|---|
+| `off` | GitHub | GitHub-hosted | — |
+| `label` | GitHub | us (LCA-labelled jobs) | control |
+| `adopt` | GitHub | us (standard labels too) | control |
+| **`engine`** | **us**, for `.lca/workflows/**` | **us** | **execution** |
+
+**No workflow runs on both schedulers**, because a deploying workflow run twice would deploy twice.
+The mechanism is the directory: GitHub only searches `.github/workflows`, and the engine only reads
+`.lca/workflows`. Activation is fail-closed (`mode`, `engineEnabled`, deployment flag, deny list, and
+a refusal when a same-named twin is still under `.github/workflows`). Two guards stay as defence in
+depth: the claim gate refuses `workflow_job` in `engine` mode (visibly, as a refusal record —
+[ADR-050](DECISIONS.md#adr-050)), and the planner refuses repos not in `engine` mode
+([ADR-054](DECISIONS.md#adr-054)).
+
+**Untrusted triggers get no secrets.** Every engine run has a trust class fixed at plan time from
+the event (`trusted`, `fork`, `restricted-bot`); only `trusted` runs receive secrets or OIDC
+(`vars` is refused for every class in v1),
+and every class gets a read-only checkout token ([ADR-056](DECISIONS.md#adr-056)).
+
+### D. Engine run (proposed): trigger → plan → dispatch → report
+
+```
+git host        Ingest λ     Planner λ    SQS      Provision λ    microVM        Reporter λ
+  │ push / PR       │            │          │           │            │              │
+  ├───────────────▶ verify HMAC  │          │           │            │              │
+  │                 │ mode==engine? write trigger batch (+ PR head projection), then enqueue
+  │                 ├──────────▶ fetch .lca/workflows @sha            │              │
+  │                 │            │ match `on:` (+ changed-file set for path filters) → fix batch members; classify trust
+  │                 │            │ expand matrix, order  │            │              │
+  │                 │            │ `needs`, eval `if:`   │            │              │
+  │                 │            │  ── unsupported? ──▶ REFUSE run (no VM booted) ──▶ neutral check
+  │                 │            │ plan input (event, inputs, SHAs, job manifest) + RunPlan: one transaction
+  │                 │            │ attempt rows created `waiting`; release pass → `released`
+  │                 │            ├─enqueue─▶│           │            │              │
+  │                 │            │          ├──poll────▶│            │              │
+  │                 │            │          │  stash JobSpec (names, no values) by ref
+  │                 │            │          │  mint capability token │              │
+  │                 │            │          │           ├──launch───▶│              │
+  │                 │            │          │           │   lca-agent (own uid, sole token holder) → broker: jobspec (+ resolver: secrets)
+  │                 │            │          │           │   runs steps as `runner` → step-status (broker → status writer) │
+  │                 │            │          │           │   needs-outputs / job-outputs: ≤300 KB pages, never one big payload │
+  │                 │            │          │           │   job-status: terminal + release obligation, one write │
+  │                 │            │          │           │            │ self-terminate
+  │                 │  release pass: next ready jobs (Reaper re-drives an armed obligation) │
+  ◀── check run / status / review, deep-linked to the console ───────────────────┤
+
+  every 5 min: delivery reconciler λ ──App JWT──▶ GET /app/hook/deliveries?status=failure
+               │ failed push/PR for an engine repo, no TRIGGER# yet → fetch payload
+               └─▶ same Ingest logic: plan it (≤ 900 KB) or write the sealed `engine-event-too-large` refusal
+```
+
+The **delivery reconciler** exists because the webhook route's front door (HTTP API 10 MB, Lambda
+synchronous invoke 6 MB) is smaller than GitHub's 25 MB delivery cap; a delivery it rejects never
+reaches Ingest, and GitHub's delivery log (3-day retention) is the only place it is visible. It
+reads the App PEM Provision already reads, writes only through Ingest's idempotent transactions,
+and alarms when its cursor goes stale (spec 06 § The `github` context).
+
+Properties that carry over from the shipped hot path on purpose, rather than being redesigned:
+
+- **JobSpec by reference through the hook broker.** The 4 KB run-hook payload cap
+  ([ADR-016](DECISIONS.md#adr-016)) and the no-ambient-authority rule
+  ([ADR-021](DECISIONS.md#adr-021)) both still apply, so a JobSpec is stashed and fetched exactly
+  as a JIT config is — the VM still learns no `microvmId` and holds no DynamoDB or terminate rights.
+  Inside the VM the capability token is held only by `lca-agent` under its own uid; steps run as
+  `runner` and cannot read it in unprivileged flavors ([ADR-057](DECISIONS.md#adr-057) (d)).
+- **Job-level run states are unchanged** (`queued → provisioning → running → completed|failed|timed_out`)
+  as a vocabulary, and each re-run is a new attempt row. Engine rows use a source-aware key
+  (`ERUN#<repoKey>#<runId>#<jobId>#<attempt>`), and every run-store writer takes that key instead of
+  re-deriving one; the Reaper writes by the stored `pk` of the row it read
+  ([ADR-056](DECISIONS.md#adr-056)). The engine adds a plan level *above* (with `held` and
+  `refused`), a step level *below*, and a release state (`waiting ⇄ [held]`, then `released`)
+  beside each attempt's status: rows exist before they may run, only `released` rows are in the
+  status index, and the Reaper re-enqueues only those, so recovery cannot bypass `needs:`, a
+  matrix's `max-parallel` slot, fail-fast or an approval.
+- **Every crash point leaves a durable obligation, not a lost one.** A delivery's trigger batch is
+  written before anything is enqueued, and is sealed only when every matching workflow is planned
+  or refused; a plan's input and the plan commit in one transaction; a terminal transition arms the
+  plan's release obligation in the same write; a release, a hold, a refusal, a fail-fast trip and
+  a review pointer move each create the report, gate, cancel or cleanup obligation they make owed
+  in the same write. Each obligation is its own item with one sparse index entry sorted by when it
+  is due, so the Reaper's `dueAt <= now` query finds every due one. External
+  effects run under holder-fenced, deadline-bound claims (spec 07 § Effect obligations and claims),
+  and each job check name has one owning attempt per sha, so a required check never chooses
+  between two runs.
+- **Refusal costs nothing and happens before boot.** Any construct outside spec 06's Supported and
+  Degraded classes (default-deny) refuses the **whole run** at plan time, so a partial engine cannot
+  half-execute a workflow — the failure mode the design most needs to avoid.
+- **Reporting is a projection, never the record.** The run row is written before any report is
+  attempted; a failed report degrades the *display*, never the run.
+
+**What does not carry over: GitHub OIDC.** `id-token: write` works today because GitHub mints the
+token off the job message ([ADR-047](DECISIONS.md#adr-047)); an engine-dispatched job has no such
+message and therefore no id-token endpoint. Our own CD is consequently **excluded** from `engine`
+mode ([ADR-059](DECISIONS.md#adr-059)) — the workflow that deploys the platform must not depend on
+the platform's newest subsystem.
 
 ## Component inventory
 
@@ -155,6 +281,15 @@ copying log bodies into DynamoDB.
 - **UI auth**: GitHub OAuth; a user sees only installations they can admin on GitHub. Optional Cognito layer for session mgmt.
 - **Runner isolation**: single-use microVM per job; no runner reuse ⇒ no cross-job leakage. Optional VPC attachment with egress filtering for jobs touching private resources.
 - **Secrets never in code/CFN**: SecureStrings are created out-of-band and only *referenced* by CDK (CloudFormation cannot create SecureStrings).
+- **We hold no customer CI secrets today.** GitHub injects them into a job we never see inside; every
+  SSM parameter we own is a *platform* credential. **M6 would change that** — an engine must resolve
+  `secrets.*` itself, which turns us from a compute supplier into a secrets holder. The proposed
+  containment: writes through a single-purpose control-plane broker (the console λ keeps ADR-025's
+  no-`PutParameter` boundary); reads only through a resolver that assumes a reader role tagged with
+  the JobSpec's installation id, whose ABAC policy and KMS encryption-context condition admit only
+  that installation's path; no secrets at all for fork or bot triggers; at most 4096 bytes per
+  value, the Standard-tier limit, refused at intake above that
+  ([ADR-057](DECISIONS.md#adr-057)). Not implemented.
 
 ## Scaling, quotas & failure handling
 

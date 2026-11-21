@@ -78,6 +78,8 @@ docs/
     03-workflow-ingestion.md  Parsing existing workflows → runner routing
     04-web-ui.md           Management console + management API
     05-infrastructure.md   CDK stacks, secrets, deploy phases
+    06-workflow-engine.md  M6 (design only): our own definition + scheduler
+    07-review-integration.md  M6 (design only): check runs, PR reviews, approval gate
 bin/        CDK app entrypoint (lca.ts)
 lib/        CDK stacks (image-, data-, control-, mgmt-, web-, cert-, deploy-stack.ts) + env-config.ts
 src/        Lambda source (ingest/, discover/, provision/, reaper/, mgmt/, rewrite/, shared/)
@@ -114,6 +116,21 @@ Deploy-time evidence for the `dev` environment lives in
 [docs/VERIFY-DEPLOY-ADR021-M4.md](docs/VERIFY-DEPLOY-ADR021-M4.md) (the ADR-021 broker + M4
 cutover, 2026-07-29) and [docs/VERIFY-M4.md](docs/VERIFY-M4.md) (operator walkthrough of the
 deployed console).
+
+**M6 is designed, not built.** [spec 06](docs/specs/06-workflow-engine.md) and
+[spec 07](docs/specs/07-review-integration.md) propose that LCA own the workflow **definition and
+scheduler** for repos that opt in (a fourth `engine` mode), and post **check runs, PR reviews and an
+approval gate** back into the pull-request view. There is **no implementation** — zero code under
+`src/`, `web/`, `lib/`, `microvm/`.
+
+Worth correcting the usual motivation for it: GitHub Free does **not** meter our runners —
+"GitHub Actions usage is free for self-hosted runners"
+([billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions)). What Free
+withholds on **private** repos is *governance* (required reviewers, protected branches, code owners
+are Pro/Team; environments are public-repo-only). So M6 is about **PR governance and portability to
+non-GitHub hosts**, not cost. It amends the founding
+[ADR-004](docs/DECISIONS.md#adr-004) ("read workflows, don't host them"), which still governs the two
+shipped modes unchanged. See [ROADMAP § M6](docs/ROADMAP.md#m6--our-own-workflow-engine--review-integration).
 
 ## License
 
