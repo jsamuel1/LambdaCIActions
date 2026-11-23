@@ -69,6 +69,18 @@ Generated on creation and stored in SSM SecureString:
 | `contents` | read | Fetch `.github/workflows/*.yml` for ingestion |
 | `metadata` | read | Baseline (mandatory) |
 
+> **Proposed additions (M6, not deployed).** [spec 07](07-review-integration.md) designs a PR
+> reporting surface needing `checks:write`, `pull_requests:write` and `statuses:write` — required
+> only because an `engine`-mode run has no native GitHub status to render (see OQ-2 below).
+> `contents:write` remains **off by default** ([ADR-031](../DECISIONS.md#adr-031),
+> [ADR-057](../DECISIONS.md#adr-057)). New events: `pull_request` and `check_run` (the re-run
+> button). We never post `APPROVE` ([07 § Why we never post `APPROVE`](07-review-integration.md#why-we-never-post-approve)).
+> `check_suite` arrives automatically with `checks:write` and is acknowledged and dropped.
+> `issue_comment`, `pull_request_review`, `branch_protection_rule` and `repository_ruleset` are
+> deliberately **declined**: the first's read radius (every comment on every issue in every
+> granted repo) exceeds the value of a chatops verb, and the others have no designed consumer
+> ([07 § Permissions & events](07-review-integration.md#permissions--events)).
+
 | Event | Why |
 |---|---|
 | `workflow_job` | The hot-path trigger (`queued` → provision) |
@@ -138,5 +150,14 @@ runner bootstrap (see [02](02-microvm-runners.md)) launches the agent with it.
 ## Open questions
 
 - **OQ-1**: Repo-level vs org-level runner groups for v1 default? (Leaning repo-level.)
-- **OQ-2**: Do we need `checks:write` to surface richer status back into the PR UI, or is the native Actions job status enough? (Leaning: not needed — GitHub already renders job status.)
+- ~~**OQ-2**: Do we need `checks:write` to surface richer status back into the PR UI, or is the
+  native Actions job status enough?~~ — **resolved (M6 design, [ADR-057](../DECISIONS.md#adr-057) /
+  [spec 07](07-review-integration.md))**: **conditionally yes.** The original "not needed — GitHub
+  already renders job status" was correct *while GitHub is the scheduler*, and it stays correct for
+  `label`/`adopt` mode. It fails for `engine` mode ([ADR-054](../DECISIONS.md#adr-054)), because **a
+  run GitHub did not schedule is a run GitHub cannot render** — there is no native status to rely on.
+  Spec 07 therefore requests `checks:write`, `pull_requests:write` and `statuses:write`, each mapped
+  to exactly one surface, all opt-in behind [ADR-031](../DECISIONS.md#adr-031)-shaped gates, with
+  `contents:write` still declined (merging needs it — [ADR-057](../DECISIONS.md#adr-057)). **Not
+  deployed**: the grants are designed, not requested.
 - **OQ-3**: Multi-account / multi-region deploy — one App per AWS account+region, or one App fanning out? (Affects webhook routing.)
